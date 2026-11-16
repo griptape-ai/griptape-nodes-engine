@@ -243,6 +243,42 @@ The File Output Settings node exposes what the situation had hidden, and each fi
 
 Anything you set here applies only to the node it is connected to. To change where *every* node writes, edit the situation in your project file instead.
 
+## Putting a file's size, frame rate, or codec in its name
+
+A situation's macro can include facts about the image or video being saved. Add a `media.` variable and the engine reads the value from the file as it saves. Nodes need no changes, and it works in every situation.
+
+| Variable              | What it holds                                 | Filled in for |
+| --------------------- | --------------------------------------------- | ------------- |
+| `{media.width}`       | Width in pixels                               | Images, video |
+| `{media.height}`      | Height in pixels                              | Images, video |
+| `{media.fps}`         | Frames per second, such as `24` or `23.976`   | Video         |
+| `{media.duration}`    | Length in seconds                             | Video         |
+| `{media.codec}`       | Codec name, such as `h264`                    | Video         |
+| `{media.channels}`    | Number of color channels, such as `3` for RGB | Images        |
+| `{media.color_space}` | Color space, such as `RGB` or `RGBA`          | Images        |
+
+For example, this macro saves a 1920x1080 image as `render_1920x1080.png`:
+
+```yaml
+macro: "{outputs}/{file_name_base}_{media.width}x{media.height}.{file_extension}"
+```
+
+A variable has no value when it doesn't apply to the file, such as `{media.fps}` on an image or any `media.` variable on a text file. Mark it optional with `?` so it drops out instead of stopping the save. Put the text around it inside the variable, after a colon, so that text drops out too: `^_` adds `_` before the value, and `fps` adds `fps` after it. This macro adds the size for images and video and the frame rate only for video:
+
+```yaml
+macro: "{outputs}/{file_name_base}{media.width?:^_}{media.height?:^x}{media.fps?:fps:^_}.{file_extension}"
+```
+
+It saves `render_1920x1080.png`, `render_1920x1080_24fps.mp4`, and `render.txt`. Text typed outside the braces always stays, so `{file_name_base}_{media.width?}x{media.height?}` would save a text file as `render_x.txt`.
+
+Things to know:
+
+- The values come from the file's contents, not its name. If a node saves a PNG under a `.jpg` name, the PNG's size is used.
+- The project page shows a warning for a `media.` name that isn't in the table. The project still loads, and the misspelled variable has no value.
+- Nodes can't supply their own `media.` values. The prefix is reserved for what the engine reads from the file.
+- In a file sequence, each frame is read as it's saved, so `media.` variables work in the frame's file name. They have no value in the sequence's folder name, because the folder is chosen before any frame exists.
+- Audio files aren't read yet, so `media.` variables have no value for them.
+
 ## Adding custom situations
 
 See [Customization Guide](customization.md) for examples.

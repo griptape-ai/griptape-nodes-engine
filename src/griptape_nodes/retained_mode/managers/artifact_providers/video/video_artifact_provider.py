@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, ClassVar
 
 from static_ffmpeg import run as static_ffmpeg_run
 
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
     BaseArtifactProvider,
+    StagedWriteInspection,
     WriteVettingPolicy,
 )
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
@@ -43,6 +45,19 @@ class VideoArtifactMetadata(BaseArtifactMetadata):
     codec: str
     frame_rate: float
     file_size: int
+
+    def to_media_info(self) -> MediaInfo:
+        """Map ffprobe's fields. ffprobe gives 0 or "unknown" for what it could not read; those stay unset."""
+        codec = None
+        if self.codec != "unknown":
+            codec = self.codec
+        return MediaInfo(
+            width=self.width or None,
+            height=self.height or None,
+            fps=self.frame_rate or None,
+            duration=self.duration_seconds or None,
+            codec=codec,
+        )
 
 
 class VideoArtifactProvider(BaseArtifactProvider):
@@ -161,6 +176,26 @@ class VideoArtifactProvider(BaseArtifactProvider):
             container_format=detected_format,
         )
 
+    def inspect_staged_write(self, source_path: str, detected_format: str) -> StagedWriteInspection:
+        """Vet a staged video write and read its media properties from one ffprobe run.
+
+        Same checkpoint and fail-closed behavior as ``check_write_format_from_path``.
+        """
+        probe_data = self._run_ffprobe(source_path)
+        denial = self._check_codecs_in(
+            probe_data,
+            action=CheckpointAction.WRITE_VIDEO_CODEC,
+            container_format=detected_format,
+        )
+        if denial is not None:
+            return StagedWriteInspection(denial=denial)
+        if probe_data is None:
+            return StagedWriteInspection()
+        metadata = self._parse_probe_data(probe_data, source_path)
+        if metadata is None:
+            return StagedWriteInspection()
+        return StagedWriteInspection(media_info=metadata.to_media_info())
+
     def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
         """Gate a pending video read against the READ_VIDEO_CODEC checkpoint.
 
@@ -183,7 +218,21 @@ class VideoArtifactProvider(BaseArtifactProvider):
         action: CheckpointAction,
         container_format: str,
     ) -> CheckpointDenial | None:
-        """Probe ``source_path`` for its video codecs and evaluate ``action``.
+        """Probe ``source_path`` and evaluate ``action`` for its video codecs."""
+        return self._check_codecs_in(
+            self._run_ffprobe(source_path),
+            action=action,
+            container_format=container_format,
+        )
+
+    def _check_codecs_in(
+        self,
+        probe_data: dict | None,
+        *,
+        action: CheckpointAction,
+        container_format: str,
+    ) -> CheckpointDenial | None:
+        """Evaluate ``action`` for every video codec in an ffprobe payload.
 
         Evaluates every video stream in the container. Common containers
         (mp4, mov, mkv) can carry more than one video stream -- a main
@@ -206,7 +255,6 @@ class VideoArtifactProvider(BaseArtifactProvider):
         code on the read side) is expected to wrap this detail with any
         file-name framing.
         """
-        probe_data = self._run_ffprobe(source_path)
         codecs = self._codecs_from_probe_data(probe_data)
         if not codecs:
             return CheckpointDenial(
