@@ -1023,7 +1023,7 @@ class TestExecuteNodeWorkerRoute:
             sent.append(lease_id)
             return success
 
-        wm.worker_unavailable_reason.return_value = None
+        wm.may_start_worker.return_value = True
         wm.wait_until_executable = AsyncMock(side_effect=lambda *_, **__: calls.append("wait"))
         wm.acquire_lease = AsyncMock(side_effect=lambda *_: calls.append("acquire") or lease)
         lib_mgr.workers.get_worker_for_library.side_effect = lambda *_: calls.append("pick") or "eng-id"
@@ -1052,7 +1052,7 @@ class TestExecuteNodeWorkerRoute:
         wm = MagicMock()
         node_manager = _make_node_manager(library_manager=lib_mgr, worker_manager=wm)
         wm.wait_until_executable = AsyncMock()
-        wm.worker_unavailable_reason.return_value = "engine eng-2 did not answer."
+        wm.may_start_worker.return_value = False
         wm.acquire_lease = AsyncMock()
         lib_mgr.workers.get_worker_for_library.return_value = None
 
@@ -1066,7 +1066,7 @@ class TestExecuteNodeWorkerRoute:
 
     def _make_library_route_worker_manager(self) -> MagicMock:
         wm = MagicMock(spec=WorkerManager)
-        wm.worker_unavailable_reason.return_value = None
+        wm.may_start_worker.return_value = True
         wm.wait_until_executable = AsyncMock()
         wm.acquire_lease = AsyncMock(return_value=None)
         wm.release_after_node = MagicMock()

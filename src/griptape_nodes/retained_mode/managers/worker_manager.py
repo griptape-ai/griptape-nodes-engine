@@ -2648,6 +2648,11 @@ class WorkerManager(EngineScoped):
         if ready is not None:
             ready.set()
 
+    def may_start_worker(self, library_name: str | None) -> bool:
+        """Whether `library_name`'s worker may be started: nothing has ruled it out, or what did is retryable."""
+        unavailable = self._worker_unavailable.get(library_name)
+        return unavailable is None or unavailable.retryable
+
     def note_worker_unavailable(self, library_name: str | None, reason: str, *, retryable: bool = False) -> None:
         """Record why no worker will run `library_name`, and release anything waiting on one.
 
@@ -2764,8 +2769,7 @@ class WorkerManager(EngineScoped):
         if self.is_worker_running_or_starting(library_name):
             return False
         # A worker that ended on its own left a reason, which stays until the library is reset.
-        unavailable = self._worker_unavailable.get(library_name)
-        return unavailable is None or unavailable.retryable
+        return self.may_start_worker(library_name)
 
     def get_topics_to_subscribe(self) -> list[str]:
         """Build the list of topics to subscribe to at connection start.
