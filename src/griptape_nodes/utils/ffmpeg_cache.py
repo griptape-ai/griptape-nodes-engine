@@ -156,7 +156,6 @@ def get_or_find_platform_executables(
     Same signature as `static_ffmpeg.run.get_or_fetch_platform_executables_else_raise`,
     which it replaces. A caller that passes `download_dir` asked for that directory
     specifically, so it skips the PATH lookup.
-
     """
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
