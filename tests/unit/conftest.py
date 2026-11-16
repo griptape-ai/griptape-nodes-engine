@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.managers.external_environment import (  # noqa
 from griptape_nodes.retained_mode.runtime.read_observer import install_workflow_read_observer  # noqa: E402
 from griptape_nodes.utils import engine_dirs  # noqa: E402
 from tests.unit.host_workflow_reads import HostWorkflowRead, HostWorkflowReadRecorder  # noqa: E402
+from tests.worker_processes import no_local_worker_processes  # noqa: E402, F401 (an autouse fixture)
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module

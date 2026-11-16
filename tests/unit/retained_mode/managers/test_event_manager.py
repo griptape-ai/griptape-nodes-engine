@@ -35,7 +35,6 @@ from griptape_nodes.retained_mode.events.execution_events import NodeFinishProce
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.retained_mode.events.worker_events import CheckLeaseRequest, CheckLeaseResultSuccess
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -2762,75 +2761,22 @@ class TestResultWorkflowId:
         assert workflow_id == "named"
 
 
-class _RecordingWorkerRequestClient:
-    """Stands in for a worker's RequestClient, recording where each request goes and answering it."""
-
-    def __init__(self, answer: dict) -> None:
-        self.answer = answer
-        self.sent: list[dict] = []
-
-    async def request_from_worker(
-        self,
-        event_request: EventRequest,
-        request_topic: str,
-        worker_response_topic: str,
-        timeout_ms: int | None = None,
-    ) -> dict:
-        self.sent.append(
-            {
-                "request": event_request.request,
-                "request_topic": request_topic,
-                "response_topic": worker_response_topic,
-                "timeout_ms": timeout_ms,
-            }
-        )
-        return self.answer
-
-
-class TestAWorkerRequestingAnotherEngine:
-    """A worker another engine runs reaches that engine, not its orchestrator, as one of that engine's clients."""
-
-    @pytest.mark.asyncio
-    async def test_publishes_on_that_engine_s_topic_and_hears_back_on_its_own(self, engine: Engine) -> None:
-        client = _RecordingWorkerRequestClient(
-            {
-                "event_type": "EventResultSuccess",
-                "result_type": CheckLeaseResultSuccess.__name__,
-                "result": {"result_details": "held"},
-            }
-        )
-        engine.event_manager.configure_worker_forwarding(
-            request_client=client,  # type: ignore[arg-type]
-            orchestrator_request_topic="sessions/artist-sess/request",
-            worker_response_topic="sessions/artist-sess/workers/w1/response",
-            websocket_event_loop=asyncio.get_running_loop(),
-            timeout_ms=5000,
-        )
-        request = CheckLeaseRequest(lease_id="lease-1", worker_engine_id="w1")
-
-        with patch.object(engine, "get_engine_id", return_value="w1"):
-            result = await engine.event_manager.request_engine_from_worker("gpu-01", request)
-
-        assert isinstance(result, CheckLeaseResultSuccess)
-        assert client.sent == [
-            {
-                "request": request,
-                "request_topic": "engines/gpu-01/request",
-                "response_topic": "engines/w1/response",
-                "timeout_ms": 5000,
-            }
-        ]
-
-
 class TestResultContextFromRequest:
     def test_carries_every_envelope_field_dispatch_reads(self) -> None:
         """A field added to `ResultContext` but not here would be dropped by every transport."""
         sender = RequestSender(engine_id="other", session_id="s1")
         event = EventRequest(
-            request=_ProbeRequest(), request_id="req-1", response_topic="t", sender=sender, open_workflow_id="wf-1"
+            request=_ProbeRequest(),
+            request_id="req-1",
+            response_topic="t",
+            sender=sender,
+            open_workflow_id="wf-1",
+            origin_engine_id="w1",
         )
 
         context = result_context_from_request(event)
 
-        assert context == ResultContext(response_topic="t", request_id="req-1", sender=sender, open_workflow_id="wf-1")
+        assert context == ResultContext(
+            response_topic="t", request_id="req-1", sender=sender, open_workflow_id="wf-1", origin_engine_id="w1"
+        )
         assert context.keys() == ResultContext.__annotations__.keys()

@@ -339,11 +339,19 @@ class _Links:
     """Answers every request with a fixed result, and records the lost-link callback it is given."""
 
     def __init__(self) -> None:
-        self.asked: list[tuple[str, object, float | None]] = []
+        self.asked: list[tuple[str, object, float | None, str | None, str | None]] = []
         self.link_lost: object = None
 
-    async def request(self, engine_id: str, request: object, *, timeout_s: float | None) -> object:
-        self.asked.append((engine_id, request, timeout_s))
+    async def request(
+        self,
+        engine_id: str,
+        request: object,
+        *,
+        timeout_s: float | None,
+        open_workflow_id: str | None = None,
+        origin_engine_id: str | None = None,
+    ) -> object:
+        self.asked.append((engine_id, request, timeout_s, open_workflow_id, origin_engine_id))
         return ResultPayloadFailure(result_details="answered")
 
     def on_engine_lost(self, callback: object) -> None:
@@ -370,7 +378,7 @@ class TestRequestingAnotherEngine:
         result = await engine.request("gpu-01", request, timeout_s=1.0)
 
         assert isinstance(result, ResultPayloadFailure)
-        assert links.asked == [("gpu-01", request, 1.0)]
+        assert links.asked == [("gpu-01", request, 1.0, None, None)]
         assert links.link_lost is not None
         assert engine.can_reach_other_engines
 

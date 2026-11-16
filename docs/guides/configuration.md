@@ -158,28 +158,28 @@ A nested setting (one that lives inside an object like `worker`, `agent`, or `li
 GTN_CONFIG_<PARENT>__<SUB_KEY>=<value>
 ```
 
-A double underscore is required rather than a single one because setting names already contain underscores. `GTN_CONFIG_WORKER_HEARTBEAT_TIMEOUT_S` would be ambiguous between a top-level setting named `worker_heartbeat_timeout_s` and `worker.heartbeat_timeout_s`. No setting name contains `__`, so it unambiguously marks where the path descends a level.
+A double underscore is required rather than a single one because setting names already contain underscores. `GTN_CONFIG_WORKER_LIBRARY_LOAD_TIMEOUT_S` would be ambiguous between a top-level setting named `worker_library_load_timeout_s` and `worker.library_load_timeout_s`. No setting name contains `__`, so it unambiguously marks where the path descends a level.
 
 Environment variable overrides have the **highest priority** — they win over user config files, project-adjacent config files, the per-project workspace override, and built-in defaults.
 
 Examples:
 
-| Setting                      | Environment variable                     |
-| ---------------------------- | ---------------------------------------- |
-| `workspace_directory`        | `GTN_CONFIG_WORKSPACE_DIRECTORY`         |
-| `libraries_directory`        | `GTN_CONFIG_LIBRARIES_DIRECTORY`         |
-| `project_file`               | `GTN_CONFIG_PROJECT_FILE`                |
-| `log_level`                  | `GTN_CONFIG_LOG_LEVEL`                   |
-| `storage_backend`            | `GTN_CONFIG_STORAGE_BACKEND`             |
-| `worker.heartbeat_timeout_s` | `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S` |
-| `library.lazy_node_loading`  | `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`  |
-| `agent.system_prompt`        | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`        |
+| Setting                         | Environment variable                        |
+| ------------------------------- | ------------------------------------------- |
+| `workspace_directory`           | `GTN_CONFIG_WORKSPACE_DIRECTORY`            |
+| `libraries_directory`           | `GTN_CONFIG_LIBRARIES_DIRECTORY`            |
+| `project_file`                  | `GTN_CONFIG_PROJECT_FILE`                   |
+| `log_level`                     | `GTN_CONFIG_LOG_LEVEL`                      |
+| `storage_backend`               | `GTN_CONFIG_STORAGE_BACKEND`                |
+| `worker.library_load_timeout_s` | `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S` |
+| `library.lazy_node_loading`     | `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`     |
+| `agent.system_prompt`           | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`           |
 
 This is useful for scripted environments, containers, and CI/CD pipelines where you want to inject configuration without modifying any config files:
 
 ```bash
 GTN_CONFIG_PROJECT_FILE=/shared/studio-project.yml gtn
-GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 gtn
+GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S=30 gtn
 GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING=false gtn
 GTN_CONFIG_AGENT__SYSTEM_PROMPT="Answer tersely." gtn
 ```

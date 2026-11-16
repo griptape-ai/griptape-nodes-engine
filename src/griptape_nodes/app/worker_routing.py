@@ -13,7 +13,7 @@ there. This module provides:
 - ``register_remote_handlers``: swaps the dispatch table entries on a
   just-configured worker after ``configure_worker_forwarding`` has wired up
   the RequestClient and loop references.
-- ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` and their Success/Failure
+- ``ReloadConfigRequest`` and its Success/Failure
   payloads: orchestrator-originated broadcasts that every worker handles
   locally to re-read shared on-disk state. They live here, not in
   ``worker_events.py``, because their reason for existing is a routing
@@ -28,7 +28,9 @@ routing metadata.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
@@ -71,13 +73,13 @@ from griptape_nodes.retained_mode.events.worker_events import (
     DropLibraryNamedLocalObjectsRequest,
     DropLibraryNamedLocalObjectsResultFailure,
     DropLibraryNamedLocalObjectsResultSuccess,
-    RegisterWorkerRequest,
+    GetCommittedProjectRequest,
+    GetCommittedProjectResultSuccess,
     StartWorkerRequest,
-    UnregisterWorkerRequest,
-    WorkerHeartbeatRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.request_handlers import ForwardingHandler
+from griptape_nodes.retained_mode.runtime.binding import create_task_bound_to_no_workflow
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 logger = logging.getLogger("griptape_nodes")
@@ -89,7 +91,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
-    from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 
 HandlerCallback = "Callable[[RequestPayload], ResultPayload | Awaitable[ResultPayload]]"
@@ -186,36 +187,8 @@ class DropAllLocalObjectsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 
 @dataclass
 @PayloadRegistry.register
-class RefreshSecretsRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by the orchestrator to each registered worker after a secret mutation succeeds.
-
-    The global .env at ~/.config/griptape_nodes/.env is shared across
-    processes on the same machine, but the worker's os.environ snapshot
-    was populated at boot from the file as it existed then. Without this
-    refresh, get_secret() would see the stale env-var shadow (its highest
-    priority source) even after the orchestrator updated the file.
-
-    Uses SkipTheLineMixin to avoid a queued ExecuteNodeRequest reading
-    the stale secret before the refresh lands.
-    """
-
-
-@dataclass
-@PayloadRegistry.register
-class RefreshSecretsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Worker refreshed its secrets from the shared .env file."""
-
-
-@dataclass
-@PayloadRegistry.register
-class RefreshSecretsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Worker failed to refresh its secrets."""
-
-
-@dataclass
-@PayloadRegistry.register
 class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by the orchestrator to each registered worker after it switches projects.
+    """Sent by the orchestrator to a worker as it starts, and to each worker after it switches projects.
 
     The orchestrator is the single source of truth for the current project, but a
     worker is only restarted on a switch that changes library config. A switch that
@@ -224,19 +197,13 @@ class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
     to adopt the orchestrator's new project so env vars, directory macros, and
     situation/path macros resolve against the right project.
 
-    project_id is the opaque id of the new current project (SYSTEM_DEFAULTS_KEY for
-    system defaults). A worker boots like an engine off the same shared on-disk
-    config, so the orchestrator's registry id is already loaded in the worker.
+    It names no project: the worker asks the orchestrator which one it is on
+    (`GetCommittedProjectRequest`) and adopts that, so activations that overlap
+    cannot leave it on an older one.
 
     Uses SkipTheLineMixin so the worker activates the new project immediately, ahead
     of any queued ExecuteNodeRequest that would otherwise run against the stale one.
     """
-
-    project_id: str
-    # Generation of the orchestrator's committed activation. The worker adopts strictly increasing
-    # generations only, so two activations that overlap resolve to the newer one regardless of the
-    # order they arrive or finish in.
-    generation: int = 0
 
 
 @dataclass
@@ -343,20 +310,11 @@ LOCAL_ONLY_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         ExecuteNodeRequest,
         # Cancels that execution, so it belongs to the process running it.
         CancelExecuteNodeRequest,
-        # Published to the orchestrator, never dispatched here, so this entry is inert. Listed to keep
-        # the worker wire out of the forwarding path by construction rather than by luck.
-        RegisterWorkerRequest,
-        # Same, on graceful shutdown.
-        UnregisterWorkerRequest,
-        # Liveness challenge addressed to this worker; a forwarded answer would prove nothing about it.
-        WorkerHeartbeatRequest,
         # Orchestrator-internal, issued and handled there, so it never crosses the boundary. Inert here.
         StartWorkerRequest,
         # Addressed to this worker: re-read the config file both processes share. The orchestrator
         # installs no handler, so forwarding would not find one.
         ReloadConfigRequest,
-        # Addressed to this worker: refresh its env-var view of the shared .env.
-        RefreshSecretsRequest,
         # Addressed to this worker: adopt the project the orchestrator switched to.
         ActivateProjectRequest,
         # Adopting a project reloads THIS worker's libraries. Forwarding would instead reload the
@@ -522,7 +480,7 @@ async def _handle_drop_all_local_objects(
 
     try:
         # Off the loop: a release hook is `del model` plus a CUDA cache flush, and blocking the
-        # worker's loop past the heartbeat timeout gets it evicted mid-load.
+        # worker's loop holds up every request and event it handles meanwhile.
         if request.workflow_id is None:
             dropped = await to_thread(resource_manager.drop_all_local_objects)
         else:
@@ -559,7 +517,7 @@ async def _handle_drop_local_objects(
 
     try:
         # Off the loop for the same reason as its sibling: a release hook is `del model` plus a CUDA cache
-        # flush, and a worker whose loop is blocked past the heartbeat timeout is evicted mid-load.
+        # flush, and a worker whose loop is blocked holds up every request and event it handles meanwhile.
         dropped = await to_thread(release_all)
     except Exception as e:
         details = f"Attempted to release {len(request.keys)} held object(s). Failed because of {type(e).__name__}: {e}."
@@ -577,7 +535,7 @@ async def _handle_drop_library_named_local_objects(
 
     try:
         # Off the loop for the same reason as its siblings: a release hook is `del model` plus a CUDA
-        # cache flush, and a worker whose loop is blocked past the heartbeat timeout is evicted.
+        # cache flush, and a worker whose loop is blocked holds up every request and event it handles meanwhile.
         dropped = await to_thread(resource_manager.drop_library_named_local_objects)
     except Exception as e:
         details = (
@@ -588,63 +546,129 @@ async def _handle_drop_library_named_local_objects(
     return DropLibraryNamedLocalObjectsResultSuccess(result_details=f"Released {dropped} library-named object(s).")
 
 
+class WorkerSettleError(Exception):
+    """A starting worker could not take on the startup state its orchestrator sent, for the reason given."""
+
+
+class _ProjectAdoptions:
+    """Adopts the orchestrator's project for the activations a worker is sent, one adoption at a time.
+
+    An activation names no project, so an adoption reads the orchestrator's when it starts, and
+    running them one at a time in any order leaves the worker on the newest. Whatever arrives while
+    one runs waits for the next, which answers all of them at once.
+    """
+
+    def __init__(self, adopt: Callable[[], Coroutine[Any, Any, ResultPayload]]) -> None:
+        self._adopt = adopt
+        self._waiting: list[asyncio.Future[ResultPayload]] = []
+        self._arrived = asyncio.Event()
+        self._consumer: asyncio.Task[None] | None = None
+
+    async def adopt(self) -> ResultPayload:
+        """Adopt the orchestrator's project, with the adoption that answers this activation and those beside it."""
+        loop = asyncio.get_running_loop()
+        answered: asyncio.Future[ResultPayload] = loop.create_future()
+        self._waiting.append(answered)
+        self._arrived.set()
+        if self._consumer is None:
+            self._consumer = create_task_bound_to_no_workflow(loop, self._consume())
+        return await answered
+
+    async def _consume(self) -> None:
+        while True:
+            await self._arrived.wait()
+            self._arrived.clear()
+            batch, self._waiting = self._waiting, []
+            try:
+                result = await self._adopt()
+            # Any failure belongs to the activations waiting on it; ending here would leave every later one waiting forever.
+            except Exception as e:
+                for answered in batch:
+                    answered.set_exception(e)
+                continue
+            for answered in batch:
+                answered.set_result(result)
+
+
 async def _adopt_on_engine_loop(
-    request: ActivateProjectRequest,
-    adopt: Callable[[ActivateProjectRequest], Coroutine[Any, Any, ResultPayload]],
+    adopt: Callable[[], Coroutine[Any, Any, ResultPayload]],
     *,
     event_manager: EventManager,
-    worker_settled: asyncio.Event,
+    worker_settled: Future[None],
 ) -> ResultPayload:
-    """Run `adopt` on the engine loop, and settle the worker once it succeeds.
+    """Run `adopt` on the engine loop, and settle the worker with how it ends.
 
-    ActivateProjectRequest arrives on the transport loop, which also answers heartbeats. Adoption is a
-    whole project switch, with file I/O and synchronous requests that block the loop they run on, so it
-    runs on the engine loop and is only awaited here.
+    ActivateProjectRequest can be handled on a loop other than the engine's. Adoption is a whole
+    project switch, with file I/O and synchronous requests that block the loop they run on, so it runs
+    on the engine loop and is only awaited here.
     """
     engine_loop = event_manager.event_loop
     if engine_loop is None:
         details = (
-            f"Attempted to adopt orchestrator project '{request.project_id}'. "
-            f"Failed because this worker's engine event loop is not running."
+            "Attempted to adopt the orchestrator's project. "
+            "Failed because this worker's engine event loop is not running."
         )
+        _settle(worker_settled, failure=details)
         return ActivateProjectResultFailure(result_details=details)
 
-    adoption = asyncio.run_coroutine_threadsafe(adopt(request), engine_loop)
-    result = await asyncio.wrap_future(adoption)
+    adoption = asyncio.run_coroutine_threadsafe(adopt(), engine_loop)
+    adoption.add_done_callback(functools.partial(_settle_with_adoption, worker_settled))
+    return await asyncio.wrap_future(adoption)
 
-    # Set on this loop, not the engine loop: worker startup waits on it here, and asyncio.Event is not
-    # safe to set from another thread.
-    if result.succeeded():
-        worker_settled.set()
-    return result
+
+def _settle_with_adoption(worker_settled: Future[None], adoption: Future[ResultPayload]) -> None:
+    """Settle the worker with how `adoption` ended. A failed one ends the wait too, with its reason.
+
+    A starting worker waits on nothing but this, for as long as its channel is open, so an adoption
+    that failed without ending the wait would leave it waiting on an orchestrator with nothing more to send.
+    """
+    if adoption.cancelled():
+        return
+    error = adoption.exception()
+    if error is not None:
+        _settle(worker_settled, failure=f"{type(error).__name__}: {error}")
+        return
+    result = adoption.result()
+    if result.failed():
+        _settle(worker_settled, failure=str(result.result_details))
+        return
+    _settle(worker_settled, failure=None)
+
+
+def _settle(worker_settled: Future[None], *, failure: str | None) -> None:
+    """End what a starting worker waits on, once: whatever settles it first stands."""
+    if worker_settled.done():
+        return
+    if failure is not None:
+        worker_settled.set_exception(WorkerSettleError(failure))
+        return
+    worker_settled.set_result(None)
 
 
 def register_broadcast_handlers(
     event_manager: EventManager,
     *,
     config_manager: ConfigManager,
-    secrets_manager: SecretsManager,
     project_manager: ProjectManager,
-) -> asyncio.Event:
+) -> Future[None]:
     """Install worker-side handlers for orchestrator-originated broadcasts.
 
-    Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` /
-    ``ActivateProjectRequest`` from the orchestrator and respond by re-reading
+    Workers receive ``ReloadConfigRequest`` / ``ActivateProjectRequest`` from the orchestrator and respond by re-reading
     the shared on-disk state or adopting the orchestrator's current project. The
     actual work is delegated to the corresponding manager so domain logic stays
     in the manager and routing decisions stay here.
 
     Returns:
-        An event set once this worker has settled the startup state the orchestrator sent it, and
-        may begin loading libraries. Today that state is the project, settled either by adopting an
-        activation or by finding it already stale -- libraries resolve against the workspace a
-        project decides, and the orchestrator sends the activation rather than answering
-        registration with it, so nothing else orders the two.
+        A future done once this worker has settled the startup state the orchestrator sent it, and
+        may begin loading libraries, or holding a `WorkerSettleError` once it has failed to. Today
+        that state is the project, settled by the first activation it adopts -- libraries resolve
+        against the workspace a project decides, and the orchestrator sends the activation rather
+        than answering registration with it, so nothing else orders the two.
 
         Deliberately named for the worker rather than the project: a second piece of startup state
-        should gate this same event rather than introduce a second one for the caller to wait on.
+        should gate this same future rather than introduce a second one for the caller to wait on.
     """
-    worker_settled = asyncio.Event()
+    worker_settled: Future[None] = Future()
 
     def handle_reload_config(request: ReloadConfigRequest) -> ResultPayload:  # noqa: ARG001
         try:
@@ -654,69 +678,47 @@ def register_broadcast_handlers(
             return ReloadConfigResultFailure(result_details=details)
         return ReloadConfigResultSuccess(result_details="Reloaded config from disk.")
 
-    def handle_refresh_secrets(request: RefreshSecretsRequest) -> ResultPayload:  # noqa: ARG001
-        try:
-            secrets_manager.refresh_from_env_file()
-        except Exception as e:
-            details = f"Attempted to refresh secrets from shared .env file. Failed because of {type(e).__name__}: {e}."
-            return RefreshSecretsResultFailure(result_details=details)
-        return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
-
-    # Activation awaits internally, so two arriving close together interleave: the older can pass
-    # the staleness check, suspend, and finish after the newer, leaving the worker on the older
-    # project while both report success. Overlap is a property of the await, not of who sent it. The
-    # staleness check must stay inside the lock -- it reads the generation the previous holder wrote.
-    #
-    # TODO(griptape-ai/internal#266): a single-consumer queue replaces this and the generations,
-    # making the ordering structural rather than a rule every future caller has to remember.
-    adoption_lock = asyncio.Lock()
-
-    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
-        return await _adopt_on_engine_loop(
-            request, _adopt_project, event_manager=event_manager, worker_settled=worker_settled
-        )
-
-    async def _adopt_project(request: ActivateProjectRequest) -> ResultPayload:
+    async def _adopt_project() -> ResultPayload:
         # A concurrent ReloadConfigRequest is safe to interleave with this: _activate_project does
         # clear_project_layers() plus a full re-merge, so a load_configs() landing alongside it only
         # refreshes the user layer idempotently.
-        #
+        asked = await event_manager.forward_to_orchestrator(GetCommittedProjectRequest(), ResultContext())
+        if not isinstance(asked.result, GetCommittedProjectResultSuccess):
+            details = (
+                "Attempted to adopt the orchestrator's project. Failed because it did not say which: "
+                f"{asked.result.result_details}"
+            )
+            return ActivateProjectResultFailure(result_details=details)
+        project_id = asked.result.project_id
         # A worker's project registry is frozen at boot, so a project the orchestrator registered
         # after this worker spawned is absent here. Re-read the shared config and re-run discovery so
         # the worker learns it, and fail loud if the id is still unknown: landing on a stale project
         # while reporting success is the divergence this whole path exists to prevent.
-        async with adoption_lock:
-            if project_manager.is_stale_adoption(request.project_id, request.generation):
-                # Settled, not adopted: a newer activation already landed, so whatever is waiting
-                # on this has the answer it needs.
-                return ActivateProjectResultSuccess(
-                    result_details=(
-                        f"Skipped adopting project '{request.project_id}' (generation "
-                        f"{request.generation}): a newer activation was already adopted."
-                    )
-                )
-            if not await project_manager.ensure_project_loaded(request.project_id):
-                details = (
-                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                    f"Failed because the id is absent from the worker's registry even after "
-                    f"reloading config and re-running registered-project discovery."
-                )
-                return ActivateProjectResultFailure(result_details=details)
-
-            set_result = await project_manager.on_set_current_project_request(
-                SetCurrentProjectRequest(project_id=request.project_id)
+        if not await project_manager.ensure_project_loaded(project_id):
+            details = (
+                f"Attempted to adopt orchestrator project '{project_id}'. "
+                f"Failed because the id is absent from the worker's registry even after "
+                f"reloading config and re-running registered-project discovery."
             )
-            if set_result.failed():
-                details = (
-                    f"Attempted to adopt orchestrator project '{request.project_id}'. "
-                    f"Failed with result: {set_result.result_details}"
-                )
-                return ActivateProjectResultFailure(result_details=details)
-            project_manager.record_adopted_generation(request.generation)
-        return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
+            return ActivateProjectResultFailure(result_details=details)
+
+        set_result = await project_manager.on_set_current_project_request(
+            SetCurrentProjectRequest(project_id=project_id)
+        )
+        if set_result.failed():
+            details = (
+                f"Attempted to adopt orchestrator project '{project_id}'. "
+                f"Failed with result: {set_result.result_details}"
+            )
+            return ActivateProjectResultFailure(result_details=details)
+        return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {project_id}.")
+
+    adoptions = _ProjectAdoptions(_adopt_project)
+
+    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:  # noqa: ARG001
+        return await _adopt_on_engine_loop(adoptions.adopt, event_manager=event_manager, worker_settled=worker_settled)
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
-    event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
     event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)
 
     _register_local_object_handlers(event_manager)
