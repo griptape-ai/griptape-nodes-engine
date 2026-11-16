@@ -2071,9 +2071,7 @@ class BaseNode(ABC):
         between the run and the copy-back and the write goes through -- but the
         alternatives are worse: seeding one dict for a whole copy-back loop would hand
         one flow's variables to a node in another (see the no-per-flow-key note on
-        ``get_variables_if_enabled``), and ``_resolve_variables_for_node`` cannot be
-        swapped in as-is because it returns ``{}`` where this returns ``None``, and
-        those two invert the guard.
+        ``get_variables_if_enabled``).
         """
         # get_variables_without_memoizing, not get_variables_if_enabled: this runs
         # outside aprocess_scope(), where the latter's memo write has no reset token

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import NodeResolutionState
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
@@ -36,17 +37,28 @@ def _variable(engine: Engine, name: str, value: str) -> None:
     assert isinstance(result, CreateVariableResultSuccess)
 
 
-def _node(engine: Engine, name: str, text: str = "") -> MockNode:
-    """A RESOLVED node in FLOW with a `text` input/property and a `result` output."""
+def _node(engine: Engine, name: str, text: str = "", *, substitutes: bool = True, in_flow: bool = True) -> MockNode:
+    """A RESOLVED node with a `text` input/property and a `result` output.
+
+    `substitutes=False` opts `text` out of variable substitution. `in_flow=False` leaves the node
+    out of every flow, so looking up its variables fails.
+    """
     node = MockNode(name=name)
     node.add_parameter(
-        Parameter(name="text", tooltip="Text", type="str", allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY})
+        Parameter(
+            name="text",
+            tooltip="Text",
+            type="str",
+            allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            allow_variable_substitution=substitutes,
+        )
     )
     node.add_parameter(Parameter(name="result", tooltip="Result", type="str", allowed_modes={ParameterMode.OUTPUT}))
     node.parameter_values["text"] = text
     workflow = engine.current_workflow()
     engine.object_manager.add_object_by_name_in(workflow, name, node)
-    workflow.nodes.name_to_parent_flow_name[name] = FLOW
+    if in_flow:
+        workflow.nodes.name_to_parent_flow_name[name] = FLOW
     node.state = NodeResolutionState.RESOLVED
     return node
 
@@ -127,4 +139,32 @@ class TestTemplateRerun:
             reader.validate_before_workflow_run()
 
         lookup.assert_not_called()
+        assert reader.state == NodeResolutionState.RESOLVED
+
+    def test_a_parameter_that_opts_out_of_substitution_holds_no_template(self, engine: Engine) -> None:
+        """`{SHOT}` in a parameter that substitution skips is plain text, so it never sends the node back."""
+        reader = _node(engine, "reader", "shot {SHOT}", substitutes=False)
+
+        with patch.object(VariableResolver, "get_variables_without_memoizing") as lookup:
+            reader.validate_before_workflow_run()
+
+        lookup.assert_not_called()
+        assert reader.state == NodeResolutionState.RESOLVED
+
+    @pytest.mark.parametrize("cause", ["not in any flow", "substitution off"])
+    def test_recording_and_checking_agree_when_there_are_no_variables_to_use(self, engine: Engine, cause: str) -> None:
+        """What a run records and what the next check renders come out the same when there are no variables to use.
+
+        `{title?}` is the token that tells them apart: with no variables it renders as written, and
+        with an empty variable dict it renders as nothing. Recording one and checking the other would
+        send the node back to run on every play.
+        """
+        reader = _node(engine, "reader", "Hello {title?}", in_flow=cause != "not in any flow")
+        if cause == "substitution off":
+            engine.current_workflow().variables.substitution_enabled = False
+        executor = NodeExecutor(engine=engine)
+        reader.record_templates_for_run(executor._resolve_variables_for_node(engine.current_workflow(), "reader"))
+
+        reader.validate_before_workflow_run()
+
         assert reader.state == NodeResolutionState.RESOLVED
