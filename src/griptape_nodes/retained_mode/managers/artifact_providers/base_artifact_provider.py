@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
@@ -41,6 +43,18 @@ class BaseArtifactMetadata(BaseModel):
 
     Subclass and add fields for each artifact type (e.g. ImageArtifactMetadata).
     """
+
+    def to_media_info(self) -> MediaInfo:
+        """Map this metadata onto the names save-path macros use. Override per artifact type."""
+        return MediaInfo()
+
+
+@dataclass(frozen=True)
+class StagedWriteInspection:
+    """What a provider found in a staged pending write: a vet refusal, and the file's media properties."""
+
+    denial: CheckpointDenial | None = None
+    media_info: MediaInfo = field(default_factory=MediaInfo)
 
 
 class BaseArtifactProvider(EngineScoped, ABC):
@@ -330,6 +344,22 @@ class BaseArtifactProvider(EngineScoped, ABC):
         """
         return None
 
+    def inspect_staged_write(self, source_path: str, detected_format: str) -> StagedWriteInspection:
+        """Vet a staged pending write and read its media properties from the same file.
+
+        Called by ``OSManager`` instead of ``check_write_format_from_path`` when the write is
+        vetted from a path and its path template also uses ``media.*`` values. The same
+        staging rules apply: read ``source_path``, don't retain or write to it.
+
+        The default makes the two separate calls and skips the read when the vet refuses.
+        Override it when the vet and the metadata come from one read of the file, so the file
+        is read once (video runs ffprobe once for both).
+        """
+        denial = self.check_write_format_from_path(source_path, detected_format)
+        if denial is not None:
+            return StagedWriteInspection(denial=denial)
+        return StagedWriteInspection(media_info=self.get_media_info(source_path))
+
     def check_write_format_from_path(
         self,
         source_path: str,  # noqa: ARG002
@@ -404,6 +434,17 @@ class BaseArtifactProvider(EngineScoped, ABC):
             otherwise ``None``.
         """
         return None
+
+    @classmethod
+    def get_media_info(cls, source_path: str) -> MediaInfo:
+        """Read the media properties save-path macros use from the file at ``source_path``.
+
+        Empty when the provider has no metadata for the file.
+        """
+        metadata = cls.get_artifact_metadata(source_path)
+        if metadata is None:
+            return MediaInfo()
+        return metadata.to_media_info()
 
     @classmethod
     @abstractmethod

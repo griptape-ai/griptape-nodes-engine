@@ -45,6 +45,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, _active_request_sender
 from griptape_nodes.retained_mode.managers.library.common import LibraryLifecycleState
+from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.managers.settings import DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY
 from griptape_nodes.retained_mode.managers.worker_manager import (
     _REPORT_ATTEMPTS,
@@ -318,6 +319,50 @@ class TestAWorkerChannelEndingReleasesWaiters:
 
         assert worker_manager.has_settled("My Library"), "a waiter would otherwise block until the load timeout"
         assert worker_manager.worker_unavailable_reason("My Library") is not None
+
+    @pytest.mark.asyncio
+    async def test_a_library_worker_that_crashed_after_loading_is_started_again_by_the_next_node(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        worker_manager.expect_worker("My Library")
+        worker_manager.note_library_loaded("My Library")
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key="My Library")
+
+        await worker_manager._forget_local_worker(_ENGINE)
+
+        assert "next node starts it again" in str(worker_manager.worker_unavailable_reason("My Library"))
+        with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
+            await worker_manager.wait_until_executable("My Library", start_stopped=False)
+        start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ending", ["before_loading", "refused"])
+    async def test_a_library_worker_that_never_served_or_was_refused_is_not_started_again(
+        self, worker_manager: WorkerManager, ending: str
+    ) -> None:
+        """Either would end the same way again."""
+        worker_manager.expect_worker("My Library")
+        registration = WorkerRegistration(worker_key="My Library")
+        if ending == "refused":
+            worker_manager.note_library_loaded("My Library")
+            registration.gone_reason = "its worker process runs a different engine."
+        worker_manager._workers[_ENGINE] = registration
+
+        await worker_manager._forget_local_worker(_ENGINE)
+
+        assert "next node starts it again" not in str(worker_manager.worker_unavailable_reason("My Library"))
+        with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
+            await worker_manager.wait_until_executable("My Library")
+        start.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_nothing_recorded_is_not_started_by_a_wait(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        """It runs in this process, or its worker is started when it loads."""
+        with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
+            await worker_manager.wait_until_executable("My Library")
+        start.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_forget_library_drops_the_recorded_reason(self, worker_manager: WorkerManager) -> None:
@@ -1700,7 +1745,7 @@ class TestStartingAWorkerOnAnotherEngine:
         assert "no room" in str(worker_manager.worker_unavailable_reason(_LIBRARY))
 
         with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
-            await worker_manager._ask_host_to_restart_stopped_worker(_LIBRARY)
+            await worker_manager._start_worker_if_stopped(_LIBRARY)
         start.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -1714,10 +1759,34 @@ class TestStartingAWorkerOnAnotherEngine:
 
         worker_manager.note_worker_unavailable(_LIBRARY, "the connection to gpu-01 was lost.")
         with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
-            await worker_manager._ask_host_to_restart_stopped_worker(_LIBRARY)
+            await worker_manager._start_worker_if_stopped(_LIBRARY)
 
         start.assert_not_awaited()
         assert worker_manager.worker_unavailable_reason(_LIBRARY) == "the connection to gpu-01 was lost."
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("at_capacity", "asked_again"), [(True, True), (False, False)])
+    async def test_a_node_after_a_refused_start_leases_and_starts_only_when_the_refusal_may_pass(
+        self, worker_manager: WorkerManager, *, at_capacity: bool, asked_again: bool
+    ) -> None:
+        """The node's own sequence: a capacity refusal is leased and started again, any other refusal is not."""
+        _host_engine(worker_manager)
+        refused = worker_events.StartWorkerForEngineResultFailure(result_details="no room", at_capacity=at_capacity)
+        with patch.object(worker_manager, "_ask_engine_to_start_worker", new=AsyncMock(return_value=refused)):
+            await _start_on_host_engine(worker_manager)
+        node_manager = MagicMock()
+        node_manager.engine.library_manager.workers.get_worker_for_library.return_value = None
+
+        with (
+            patch.object(worker_manager, "acquire_lease", new=AsyncMock(return_value=None)) as lease,
+            patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start,
+        ):
+            await NodeManager._execute_node_in_library_worker(
+                node_manager, MagicMock(), MagicMock(), MagicMock(), worker_manager, _LIBRARY
+            )
+
+        assert lease.await_count == int(asked_again)
+        assert start.await_count == int(asked_again)
 
     @pytest.mark.asyncio
     async def test_a_start_refused_for_another_reason_is_not_asked_again(self, worker_manager: WorkerManager) -> None:
@@ -1725,7 +1794,7 @@ class TestStartingAWorkerOnAnotherEngine:
         await _start_on_host_engine(worker_manager)
 
         with patch.object(worker_manager, "handle_start_worker_request", new=AsyncMock()) as start:
-            await worker_manager._ask_host_to_restart_stopped_worker(_LIBRARY)
+            await worker_manager._start_worker_if_stopped(_LIBRARY)
         start.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1985,6 +2054,19 @@ class TestARemoteWorkerExits:
         # Anything awaiting this worker through `route_to_worker` watches `gone`, not a tracked future.
         assert registration.gone.is_set()
         assert worker_manager.worker_unavailable_reason(_LIBRARY) is not None
+
+    @pytest.mark.asyncio
+    async def test_a_registered_worker_that_crashes_may_be_started_again(self, worker_manager: WorkerManager) -> None:
+        """Its library's next node leases that engine and starts it there again."""
+        _host_engine(worker_manager)
+        worker_manager._workers[_ENGINE] = WorkerRegistration(worker_key=_LIBRARY, host_engine_id=_HOST_ENGINE)
+
+        await _sent_by(
+            _FROM_HOST_ENGINE, worker_manager.handle_report_worker_exited_request, _exited(_ENGINE, "exited")
+        )
+
+        assert worker_manager.may_start_worker(_LIBRARY)
+        assert "next node starts it again" in str(worker_manager.worker_unavailable_reason(_LIBRARY))
 
     @pytest.mark.asyncio
     async def test_a_loaded_worker_the_engine_stopped_leaves_the_library_free_to_start_again(

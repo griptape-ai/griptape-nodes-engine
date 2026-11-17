@@ -721,6 +721,35 @@ class TestSidecarMetadata:
         assert not (temp_dir / ".griptape-nodes-metadata").exists()
         assert not (temp_dir / "griptape-nodes-provenance").exists()
 
+    def test_coerce_updates_record_file_extension_variable(self, engine: Engine, temp_dir: Path) -> None:
+        """When coercion fires, the record situation's file_extension is rewritten to match the on-disk name."""
+        engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
+        os_manager = engine.os_manager
+        requested_path = temp_dir / "image.png"
+
+        file_metadata = SidecarContent(
+            situation=SituationMetadata(
+                name="save_node_output",
+                macro="{outputs}/{file_name_base}.{file_extension}",
+                variables={"file_name_base": "image", "file_extension": "png"},
+            ),
+        )
+
+        request = WriteFileRequest(
+            file_path=str(requested_path),
+            content=_jpeg_bytes(),
+            file_metadata=file_metadata,
+        )
+        result = os_manager.engine.handle_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert result.provenance is not None
+        data = _yaml_load(Path(result.provenance.record_path).read_text())
+        assert data["situation"]["variables"]["file_extension"] == "jpg"
+        # The caller's metadata is left as it was, so a reused destination doesn't carry it over.
+        assert file_metadata.situation is not None
+        assert file_metadata.situation.variables == {"file_name_base": "image", "file_extension": "png"}
+
     def test_legacy_file_metadata_shims_to_provenance_record(self, engine: Engine, temp_dir: Path) -> None:
         """Deprecated file_metadata callers get a provenance record instead of a sidecar."""
         engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
@@ -943,34 +972,6 @@ class TestExtensionCoercion:
         assert isinstance(result, WriteFileResultSuccess)
         assert Path(result.final_file_path) == requested_path
         assert any("Could not recognize the bytes as a known file format" in r.message for r in caplog.records)
-
-    def test_coerce_updates_sidecar_file_extension_variable(self, engine: Engine, temp_dir: Path) -> None:
-        """When coercion fires, the sidecar's situation.variables.file_extension is rewritten to match."""
-        os_manager = engine.os_manager
-        requested_path = temp_dir / "image.png"
-
-        file_metadata = SidecarContent(
-            situation=SituationMetadata(
-                name="save_node_output",
-                macro="{outputs}/{file_name_base}.{file_extension}",
-                variables={"file_name_base": "image", "file_extension": "png"},
-            ),
-        )
-
-        request = WriteFileRequest(
-            file_path=str(requested_path),
-            content=_jpeg_bytes(),
-            file_metadata=file_metadata,
-        )
-        result = os_manager.engine.handle_request(request)
-
-        assert isinstance(result, WriteFileResultSuccess)
-        # The mutation happens before write_sidecar runs, so the in-memory metadata
-        # passed in should be updated. Verify by checking the request's metadata.
-        assert request.file_metadata is not None
-        assert request.file_metadata.situation is not None
-        assert request.file_metadata.situation.variables is not None
-        assert request.file_metadata.situation.variables["file_extension"] == "jpg"
 
     def test_coerce_skipped_for_text_content(self, engine: Engine, temp_dir: Path) -> None:
         """Text writes should never trigger sniffing/rename."""

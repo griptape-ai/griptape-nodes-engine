@@ -41,7 +41,9 @@ To test your engine changes, run the published `griptape-nodes` app with your lo
 make run
 ```
 
-This pulls the published app into a cached ephemeral environment and imports the engine from this checkout's `src` directory, so engine edits are reflected immediately with no reinstall. Pass arguments through `ARGS`, e.g. `make run ARGS=init` to trigger the initial setup prompts. Use `make run/refresh` to pull the latest published app first.
+This pulls the app's nightly build into a cached ephemeral environment and imports the engine from this checkout's `src` directory, so engine edits are reflected immediately with no reinstall. The nightly build follows the app's main branch, so it keeps up with engine changes that the published app doesn't have yet. Pass arguments through `ARGS`, e.g. `make run ARGS=init` to trigger the initial setup prompts. Use `make run/refresh` to pull the latest nightly app first.
+
+The nightly app is downloaded with the [GitHub CLI](https://cli.github.com/) from the app's internal repository. Without access to it, run `make run/published` instead, which uses the published app from PyPI. An engine change that the published app hasn't caught up with yet can break it.
 
 ### Debugging in VS Code
 
