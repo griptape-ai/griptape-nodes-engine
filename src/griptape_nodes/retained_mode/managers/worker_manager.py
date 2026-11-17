@@ -1793,7 +1793,7 @@ class WorkerManager(EngineScoped):
         library_name = request.library_name
         worker_engine_id = request.worker_engine_id
         worker_key = f"{session_id}/{library_name}"
-        refusal = self._start_refusal(library_name, session_id, worker_key, worker_engine_id)
+        refusal = self._start_refusal(library_name, session_id, worker_key, worker_engine_id, engine_id)
         if refusal is not None:
             return refusal
         resolved = self._prefixed_worker_command(
@@ -2002,15 +2002,24 @@ class WorkerManager(EngineScoped):
         await self._terminate_via_spawn_loop(registration.worker_key, proc)
 
     def _start_refusal(
-        self, library_name: str, session_id: str, worker_key: str, worker_engine_id: str
+        self, library_name: str, session_id: str, worker_key: str, worker_engine_id: str, owning_engine_id: str
     ) -> worker_events.StartWorkerForEngineResultFailure | None:
         """The failure a start of `worker_key`'s worker for that session returns, or None if this engine will start it."""
-        # The ID shares the table with this engine's own workers. An earlier served worker's is replaced.
-        if self._own_worker(worker_engine_id) is not None:
+        # The ID shares the table with this engine's own workers. An earlier one served for the same engine is replaced.
+        served = self._served_worker(worker_engine_id)
+        served_for_another = (
+            served is not None and cast("_ServedFor", served.serves).owning_engine_id != owning_engine_id
+        )
+        if (
+            self._own_worker(worker_engine_id) is not None
+            or served_for_another
+            or worker_engine_id in self._starts_asked_of_hosts
+            or worker_engine_id == self.engine.get_engine_id()
+        ):
             return worker_events.StartWorkerForEngineResultFailure(
                 result_details=(
                     f"Attempted to start worker {worker_engine_id} for library '{library_name}'. Failed because "
-                    "that worker ID already names one of this engine's workers."
+                    "that ID is already in use on this engine."
                 )
             )
         starting = any(
