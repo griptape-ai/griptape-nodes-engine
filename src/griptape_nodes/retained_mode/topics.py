@@ -46,30 +46,6 @@ def engine_response_topic(engine_id: str) -> str:
     return f"engines/{engine_id}/response"
 
 
-def engine_topic_prefix(engine_id: str) -> str:
-    """The prefix of every topic addressed to one engine, such as replies to its requests."""
-    return f"engines/{engine_id}/"
-
-
-def worker_request_topic(session_id: str | None, worker_engine_id: str) -> str:
-    """Topic one worker engine of the session receives requests on."""
-    return f"sessions/{session_id}/workers/{worker_engine_id}/request"
-
-
-def worker_response_topic(session_id: str | None, worker_engine_id: str) -> str:
-    """Topic one worker engine of the session sends its results on."""
-    return f"sessions/{session_id}/workers/{worker_engine_id}/response"
-
-
-def worker_engine_id_of_topic(topic: str) -> str | None:
-    """The worker a session worker topic (`sessions/<session>/workers/<worker>/...`) names, or None for any other topic."""
-    match topic.split("/"):
-        case ["sessions", _session_id, "workers", worker_engine_id, _, *_] if worker_engine_id:
-            return worker_engine_id
-        case _:
-            return None
-
-
 def engine_id_of_response_topic(topic: str) -> str | None:
     """The engine an `engine_response_topic` names, or None for any other topic."""
     prefix, _, rest = topic.partition("/")

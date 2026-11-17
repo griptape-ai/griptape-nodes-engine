@@ -80,11 +80,15 @@ class WorkerHello:
     failure_reason: str | None = None
 
 
-def event_request_envelope(event_request: EventRequest, topic: str = CHANNEL_REQUEST_TOPIC) -> dict[str, Any]:
+def event_request_envelope(event_request: EventRequest) -> dict[str, Any]:
     """The wire envelope for `event_request`, giving it a request id if it has none."""
     if not event_request.request_id:
         event_request.request_id = uuid.uuid4().hex
-    return {"type": EVENT_REQUEST, "topic": topic, "payload": json.loads(converters.engine.dumps(event_request))}
+    return {
+        "type": EVENT_REQUEST,
+        "topic": CHANNEL_REQUEST_TOPIC,
+        "payload": json.loads(converters.engine.dumps(event_request)),
+    }
 
 
 def read_event_request(envelope: dict[str, Any]) -> EventRequest:

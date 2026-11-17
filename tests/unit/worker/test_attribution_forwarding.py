@@ -209,8 +209,6 @@ class TestSpendRequestsAreForwardedFromWorkers:
         worker = EventManager()
         worker.configure_worker_forwarding(
             request_client=_ChannelRequestSender(side),
-            orchestrator_request_topic="request",
-            worker_response_topic="response",
             websocket_event_loop=asyncio.get_running_loop(),
         )
         event = await worker.forward_to_orchestrator(BudgetAccessRequest(model="gpt-4o"), ResultContext())

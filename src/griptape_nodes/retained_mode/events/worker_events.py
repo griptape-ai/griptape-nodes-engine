@@ -166,12 +166,6 @@ class WithdrawSessionOfferResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
 
 @dataclass
 @PayloadRegistry.register
-class WithdrawSessionOfferResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The engine could not forget the sender's sessions."""
-
-
-@dataclass
-@PayloadRegistry.register
 class StopWorkerForEngineRequest(RequestPayload):
     """Sent by the artist's engine to the engine it asked to start a worker, to stop that worker.
 
@@ -293,12 +287,6 @@ class ReleaseLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 
 @dataclass
 @PayloadRegistry.register
-class ReleaseLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The engine could not release the lease."""
-
-
-@dataclass
-@PayloadRegistry.register
 class ReportPlaceInLineRequest(RequestPayload):
     """Sent by an engine to the artist's engine while one of its leases waits there, each time its place changes.
 
@@ -318,12 +306,6 @@ class ReportPlaceInLineRequest(RequestPayload):
 @PayloadRegistry.register
 class ReportPlaceInLineResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The artist's engine passed the place in line on."""
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportPlaceInLineResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """The place in line came from an engine other than the one the lease waits on."""
 
 
 @dataclass

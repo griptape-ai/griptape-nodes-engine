@@ -113,13 +113,7 @@ class RemoteWorkerRequest(NamedTuple):
 class WorkerRequestSender(Protocol):
     """How a worker sends a request to the engine it works for and awaits the raw result payload."""
 
-    async def request_from_worker(
-        self,
-        event_request: EventRequest,
-        request_topic: str,
-        worker_response_topic: str,
-        timeout_ms: int | None = None,
-    ) -> dict[str, Any]: ...
+    async def request_from_worker(self, event_request: EventRequest) -> dict[str, Any]: ...
 
 
 RP = TypeVar("RP", bound=RequestPayload, default=RequestPayload)
@@ -434,10 +428,7 @@ class EventManager(EngineScoped):
         # configure_worker_forwarding() is called at worker startup.
         self._worker_forwarding_enabled: bool = False
         self._worker_request_client: WorkerRequestSender | None = None
-        self._orchestrator_request_topic: str | None = None
-        self._worker_response_topic: str | None = None
         self._websocket_event_loop: asyncio.AbstractEventLoop | None = None
-        self._forward_timeout_ms: int | None = None
         # Node-execution refcount. Incremented on node_execution_scope entry,
         # decremented on exit. Plain instance state guarded by a lock so any thread
         # -- including threads spawned inside third-party libraries (diffusers,
@@ -1358,27 +1349,18 @@ class EventManager(EngineScoped):
         self,
         *,
         request_client: WorkerRequestSender,
-        orchestrator_request_topic: str,
-        worker_response_topic: str,
         websocket_event_loop: asyncio.AbstractEventLoop,
-        timeout_ms: int | None = None,
     ) -> None:
         """Enable worker -> orchestrator forwarding for requests originated from node execution.
 
-        Called once at worker startup after the RequestClient is constructed and topics
-        are subscribed. Inert on the orchestrator (never called there).
+        Called once at worker startup. Inert on the orchestrator (never called there).
 
-        websocket_event_loop is the loop that owns the Client (the daemon thread's loop).
-        Forwarding is dispatched there via run_coroutine_threadsafe so the sync
-        handle_request path can block its own thread on the result, which is only safe when
-        the coroutine runs on another thread's loop. RequestClient's own state is
-        loop-agnostic, so the hop is about the blocking caller rather than about reaching it.
+        Forwarding is dispatched onto websocket_event_loop via run_coroutine_threadsafe so the
+        sync handle_request path can block its own thread on the result, which is only safe
+        when the coroutine runs on another thread's loop.
         """
         self._worker_request_client = request_client
-        self._orchestrator_request_topic = orchestrator_request_topic
-        self._worker_response_topic = worker_response_topic
         self._websocket_event_loop = websocket_event_loop
-        self._forward_timeout_ms = timeout_ms
         self._worker_forwarding_enabled = True
 
     @contextmanager
@@ -1464,22 +1446,11 @@ class EventManager(EngineScoped):
         payload, and reconstructs it as an EventResultSuccess/EventResultFailure whose
         shape matches the locally-dispatched path.
 
-        The send/track/await is dispatched onto the websocket event loop (configured via
-        configure_worker_forwarding), the loop that owns the transport. Reaching
-        RequestClient state does not require that -- the state is loop-agnostic -- but the
-        sync handle_request path does, since it blocks its own thread on the result and can
-        only do so when the coroutine runs on another thread's loop.
+        The send is dispatched onto the loop configure_worker_forwarding was given, since the
+        sync handle_request path blocks its own thread on the result and can only do so when
+        the coroutine runs on another thread's loop.
         """
-        if self._orchestrator_request_topic is None or self._worker_response_topic is None:
-            msg = "Worker forwarding is enabled but not fully configured."
-            raise RuntimeError(msg)
-
-        response_payload = await self._send_from_worker(
-            request,
-            request_topic=self._orchestrator_request_topic,
-            response_topic=self._worker_response_topic,
-            open_workflow_id=self._bound_worker_workflow_id(),
-        )
+        response_payload = await self._send_from_worker(request, open_workflow_id=self._bound_worker_workflow_id())
         result_payload = read_forwarded_result(request, response_payload)
 
         event_cls: type[EventResultSuccess | EventResultFailure]
@@ -1495,10 +1466,8 @@ class EventManager(EngineScoped):
             engine_id=self.engine.get_engine_id(),
         )
 
-    async def _send_from_worker(
-        self, request: RequestPayload, *, request_topic: str, response_topic: str, open_workflow_id: str | None = None
-    ) -> dict:
-        """Publish `request` from this worker on `request_topic` and await the raw reply on `response_topic`.
+    async def _send_from_worker(self, request: RequestPayload, *, open_workflow_id: str | None = None) -> dict:
+        """Send `request` from this worker to the engine it works for and await the raw reply.
 
         `open_workflow_id` names the workflow the request runs in on the engine that receives it.
         """
@@ -1507,10 +1476,7 @@ class EventManager(EngineScoped):
             raise RuntimeError(msg)
         response_future = asyncio.run_coroutine_threadsafe(
             self._worker_request_client.request_from_worker(
-                event_request=EventRequest(request=request, open_workflow_id=open_workflow_id),
-                request_topic=request_topic,
-                worker_response_topic=response_topic,
-                timeout_ms=self._forward_timeout_ms,
+                EventRequest(request=request, open_workflow_id=open_workflow_id)
             ),
             self._websocket_event_loop,
         )

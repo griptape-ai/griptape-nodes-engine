@@ -324,16 +324,16 @@ def test_a_worker_waits_longer_than_its_parent_waits_on_another_engine() -> None
 
 @pytest.mark.asyncio
 async def test_a_worker_bounds_what_it_forwards_to_its_engine_only_once_accepted() -> None:
-    """Starting, a forwarded request waits for as long as the channel is open, whatever bound its sender names."""
+    """Starting, a forwarded request waits for as long as the channel is open."""
     link = MagicMock()
     link.request_async = AsyncMock(return_value={})
     side = WorkerSide(link, on_parent_gone=lambda: None)
     sender = runtime._ChannelRequestSender(side)
     asked = EventRequest(request=GetCommittedProjectRequest())
 
-    await sender.request_from_worker(asked, "request-topic", "response-topic", timeout_ms=1)
+    await sender.request_from_worker(asked)
     side.begin_serving()
-    await sender.request_from_worker(asked, "request-topic", "response-topic", timeout_ms=1)
+    await sender.request_from_worker(asked)
 
     waited = [call.args[1] for call in link.request_async.call_args_list]
     assert waited == [None, runtime.PARENT_REQUEST_TIMEOUT_S]

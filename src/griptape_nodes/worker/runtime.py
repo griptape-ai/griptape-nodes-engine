@@ -67,7 +67,6 @@ from griptape_nodes.worker.channel import (
 from griptape_nodes.worker.wire import (
     APP_EVENT,
     AUTHORIZATION_CHECKPOINT,
-    CHANNEL_REQUEST_TOPIC,
     EVENT_REQUEST,
     EVENT_RESULT,
     EXECUTION_EVENT,
@@ -100,9 +99,6 @@ PARENT_REQUEST_TIMEOUT_S = ENGINE_REQUEST_TIMEOUT_S + 30.0
 
 # Longest log message sent on to the editor, as the editor's own engine log handler cuts it.
 _LOG_MESSAGE_MAX_LENGTH = 500
-
-# The response topic a forwarded request names. The channel carries the reply, so nothing routes on it.
-_CHANNEL_RESPONSE_TOPIC = "worker"
 
 
 class WorkerStartupError(Exception):
@@ -352,15 +348,9 @@ class _ChannelRequestSender:
     def __init__(self, side: WorkerSide) -> None:
         self._side = side
 
-    async def request_from_worker(
-        self,
-        event_request: EventRequest,
-        request_topic: str,
-        worker_response_topic: str,  # noqa: ARG002 (the channel carries the reply)
-        timeout_ms: int | None = None,  # noqa: ARG002 (the worker's side says how long, by whether it is starting)
-    ) -> dict[str, Any]:
-        envelope = event_request_envelope(event_request, request_topic)
-        return await self._side.link.request_async(envelope, self._side.parent_timeout_s)
+    async def request_from_worker(self, event_request: EventRequest) -> dict[str, Any]:
+        # The worker's side says how long to wait, by whether it is still starting.
+        return await self._side.link.request_async(event_request_envelope(event_request), self._side.parent_timeout_s)
 
 
 class _EditorLogHandler(logging.Handler):
@@ -494,8 +484,6 @@ def prepare_worker_engine(engine: Engine, side: WorkerSide) -> Future[None]:
         raise WorkerStartupError(msg)
     event_manager.configure_worker_forwarding(
         request_client=_ChannelRequestSender(side),
-        orchestrator_request_topic=CHANNEL_REQUEST_TOPIC,
-        worker_response_topic=_CHANNEL_RESPONSE_TOPIC,
         websocket_event_loop=_start_forwarding_loop(),
     )
     register_remote_handlers(event_manager)
