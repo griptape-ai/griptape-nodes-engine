@@ -25,9 +25,10 @@ ATTRIBUTION_SCHEMA_VERSION = 1
 class RunAttribution:
     """The workflow run a model call belongs to, saved when the call starts.
 
-    A call can report after its run has ended, when another workflow or project is open. Passing
-    the saved value on the call's budget requests keeps the report on the run, workflow and project
-    that made it, so it also counts against that project's budgets.
+    A call can report after its run has ended, when another run or project is current. Passing the
+    saved value on the call's budget requests keeps the report on the run, workflow and project that
+    made it, so it also counts against that project's budgets. Its workflow has to still be open: a
+    request from a workflow that has since been closed is refused before it is sent.
 
     Args:
         run_id: The run, the id its request's result and `RunStartedEvent` name.
