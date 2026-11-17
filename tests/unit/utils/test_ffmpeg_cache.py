@@ -53,7 +53,6 @@ def _restore_static_ffmpeg_globals(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(ffmpeg_cache, "_resolution_installed", False)
     monkeypatch.setattr(ffmpeg_cache, "_configured_install_wins", False)
-    monkeypatch.setattr(ffmpeg_cache, "_logged_source", None)
 
 
 class TestResolveFfmpegDirectory:
@@ -269,19 +268,6 @@ class TestGetOrFindPlatformExecutables:
 
         assert get_or_find_platform_executables() == (ffmpeg_path, ffprobe_path)
         assert fetched == []
-
-    def test_logs_the_choice_once_at_info(self, system_bin: Path, caplog: pytest.LogCaptureFixture) -> None:
-        """Which binary runs depends on the launch environment, so problem reports need it at INFO."""
-        _make_executable(system_bin, "ffmpeg")
-        _make_executable(system_bin, "ffprobe")
-
-        with caplog.at_level(logging.INFO, logger="griptape_nodes"):
-            get_or_find_platform_executables()
-            get_or_find_platform_executables()
-
-        messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
-        assert len(messages) == 1
-        assert "from PATH" in messages[0]
 
 
 def _make_cached_install(cache_directory: Path, monkeypatch: pytest.MonkeyPatch) -> None:

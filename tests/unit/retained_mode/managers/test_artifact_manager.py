@@ -2097,7 +2097,6 @@ class TestFfmpegCacheRedirect:
         )
         monkeypatch.setattr(ffmpeg_cache, "_resolution_installed", False)
         monkeypatch.setattr(ffmpeg_cache, "_configured_install_wins", False)
-        monkeypatch.setattr(ffmpeg_cache, "_logged_source", None)
 
     @pytest.mark.asyncio
     async def test_redirects_away_from_the_package_directory(self) -> None:

@@ -48,7 +48,6 @@ logger = logging.getLogger("griptape_nodes")
 
 _resolution_installed = False
 _configured_install_wins = False
-_logged_source: str | None = None
 
 # Captured at import, before `prefer_system_ffmpeg` replaces the module attribute.
 _fetch_platform_executables = static_ffmpeg.run.get_or_fetch_platform_executables_else_raise
@@ -175,19 +174,19 @@ def get_or_find_platform_executables(
         return _fetch_platform_executables(fix_permissions=fix_permissions, download_dir=download_dir)
 
     if _configured_install_wins and _has_cached_install():
-        _log_source(f"Using ffmpeg from the 'ffmpeg_directory' setting: {static_ffmpeg.run.get_platform_dir()}")
+        logger.debug("Using ffmpeg from the 'ffmpeg_directory' setting: %s", static_ffmpeg.run.get_platform_dir())
         return _fetch_platform_executables(fix_permissions=fix_permissions)
 
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
     if ffmpeg_path is None or ffprobe_path is None:
-        _log_source(
-            f"ffmpeg and ffprobe are not both on PATH. Using the copy in '{static_ffmpeg.run.SELF_DIR}', "
-            "downloading it first if it is missing."
+        logger.debug(
+            "ffmpeg and ffprobe are not both on PATH. Using the copy in '%s', downloading it first if it is missing.",
+            static_ffmpeg.run.SELF_DIR,
         )
         return _fetch_platform_executables(fix_permissions=fix_permissions)
 
-    _log_source(f"Using ffmpeg '{ffmpeg_path}' and ffprobe '{ffprobe_path}' from PATH")
+    logger.debug("Using ffmpeg '%s' and ffprobe '%s' from PATH", ffmpeg_path, ffprobe_path)
     return ffmpeg_path, ffprobe_path
 
 
@@ -199,13 +198,3 @@ def _has_cached_install() -> bool:
         # `static_ffmpeg` has no build for this platform, so there is nothing cached.
         return False
     return (Path(platform_dir) / "installed.crumb").exists()
-
-
-def _log_source(message: str) -> None:
-    """Log which ffmpeg is used at INFO, once per change, since callers resolve it on every run."""
-    global _logged_source  # noqa: PLW0603
-
-    if message == _logged_source:
-        return
-    _logged_source = message
-    logger.info(message)
