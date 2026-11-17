@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 import anyio
 import pytest
+import static_ffmpeg._add_paths
 import static_ffmpeg.run
 from PIL import Image
 from pydantic import ValidationError
@@ -2076,7 +2077,7 @@ class TestFfmpegCacheRedirect:
     That directory is read-only when the engine runs from a packaged app -- notably the Linux
     AppImage's FUSE mount, where it made every ffmpeg-dependent node fail with Errno 30. The
     redirect lives here rather than in engine boot because the video artifact provider is what
-    depends on `static_ffmpeg`. It is process-wide and installed once, so `_redirect_installed`
+    depends on `static_ffmpeg`. It is process-wide and installed once, so `_resolution_installed`
     is forced to `False` here to make each test's broadcast act as the process's first.
     """
 
@@ -2084,7 +2085,18 @@ class TestFfmpegCacheRedirect:
     def _restore_static_ffmpeg_globals(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(static_ffmpeg.run, "SELF_DIR", static_ffmpeg.run.SELF_DIR)
         monkeypatch.setattr(static_ffmpeg.run, "LOCK_FILE", static_ffmpeg.run.LOCK_FILE)
-        monkeypatch.setattr(ffmpeg_cache, "_redirect_installed", False)
+        monkeypatch.setattr(
+            static_ffmpeg.run,
+            "get_or_fetch_platform_executables_else_raise",
+            static_ffmpeg.run.get_or_fetch_platform_executables_else_raise,
+        )
+        monkeypatch.setattr(
+            static_ffmpeg._add_paths,
+            "get_or_fetch_platform_executables_else_raise",
+            static_ffmpeg._add_paths.get_or_fetch_platform_executables_else_raise,  # pyright: ignore[reportPrivateImportUsage]
+        )
+        monkeypatch.setattr(ffmpeg_cache, "_resolution_installed", False)
+        monkeypatch.setattr(ffmpeg_cache, "_configured_install_wins", False)
 
     @pytest.mark.asyncio
     async def test_redirects_away_from_the_package_directory(self) -> None:
