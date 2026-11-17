@@ -1,6 +1,6 @@
 # Admin Dashboard
 
-The Admin Dashboard is the administration interface built into the Griptape Nodes editor. Organization owners use it to issue and manage license keys, organize users into access groups, control which libraries, nodes, models, and projects each user can access, and, in beta, set credit budgets and audit where credits are spent.
+The Admin Dashboard is the administration interface built into the Griptape Nodes editor. Organization owners use it to issue and manage license keys, organize users into access groups, control which libraries, nodes, models, and projects each user can access, set credit budgets, and audit where credits are spent.
 
 ## Who can use it
 
@@ -25,7 +25,7 @@ The dashboard opens in its own window, separate from the editor, so you can admi
 The dashboard has:
 
 - A **top bar** with a **Back to Editor** link, the active organization (or an organization switcher), and the signed-in user.
-- A **sidebar** with the sections: **License Keys**, **Access Groups**, and **Permission Editor**, plus **Spend & Budgets** and **Usage Audit** when their [beta](#turning-on-spend-budgets-and-usage-audit) is turned on.
+- A **sidebar** with the sections: **License Keys**, **Access Groups**, and **Permission Editor**, plus **Spend & Budgets** and **Usage Audit** when your organization's plan includes them.
 - A **Dashboard Settings** menu pinned to the bottom of the sidebar, with links to the onboarding guide and this documentation.
 
 ### The welcome dialog
@@ -121,48 +121,42 @@ Create a group with **+ Add New Access Group**, giving it a name and optionally 
 
 ## Spend & Budgets
 
-!!! warning "Beta"
+!!! note "Which plans include it"
 
-    **Spend & Budgets** and **Usage Audit** are in beta. They may change before they leave beta, and they are hidden until you turn them on. See [Turning on Spend & Budgets and Usage Audit](#turning-on-spend-budgets-and-usage-audit).
+    **Spend & Budgets** is included with the Enterprise plan. On other plans it does not appear in the sidebar.
 
 **Spend & Budgets** is where you cap how many credits your organization spends on AI models. A budget is a credit limit on one part of your organization, such as a show, a sequence, an artist's license key, or a department, over a period such as a month.
 
 Griptape Cloud checks the budgets that cover a call **before** the model runs. If the call would put a budget with a **Hard Limit** over its limit, the call is refused, nothing is charged, and the run stops at that node. The artist sees which budget stopped it; see [What artists see when a budget stops them](#what-artists-see-when-a-budget-stops-them).
 
-### Turning on Spend & Budgets and Usage Audit
-
-1. Open the Admin Dashboard.
-1. Click the **flask** button in the top bar to open **Admin Beta Features**.
-1. Turn on **Admin Beta Features**, then turn on **Spend & Budgets and Usage Audit**.
-
-![The Admin Beta Features menu, with Spend & Budgets and Usage Audit listed under Admin](../assets/img/enterprise/admin_dashboard-beta_menu.png)
-
 ### The overview
 
 ![The Spend & Budgets overview cards](../assets/img/enterprise/admin_dashboard-spend_overview.png)
 
-| Card                       | Shows                                                                                                                                                                                                                                                             |
-| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Org Balance**            | The credits your organization has left to spend.                                                                                                                                                                                                                  |
-| **Oversubscribed Budgets** | Every budget's limit added together, and how far that total is above your balance. Nested budgets are counted on top of their parents and reset periods are ignored, so this is "how much have we allowed to be spent", not a forecast. Use it as a sanity check. |
-| **Budgets Above 75%**      | How many budgets have used more than 75% of their limit. Click the arrow to list them.                                                                                                                                                                            |
-| **Budget Exhausted**       | How many budgets have reached their limit. Click the arrow to list them.                                                                                                                                                                                          |
-| **Purchase History**       | Your organization's most recent credit purchase and when it was made.                                                                                                                                                                                             |
+| Card                             | Shows                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Org Balance**                  | The credits your organization has left to spend.                                                                                                                                                                                                                                                                                                         |
+| **Monthly Limits**               | Your organization's monthly cap (see [Organization-wide caps](#organization-wide-caps)) and whether it is within your balance. Below it, the monthly limits of your projects, access groups, license keys, and the Fallback Budget, each added up on its own. A total higher than the cap is marked **above cap**, because the cap stops spending first. |
+| **Budgets Past Alert Threshold** | How many budgets have passed their own alert threshold but not yet their limit. Click the arrow to list them.                                                                                                                                                                                                                                            |
+| **Budget Exhausted**             | How many budgets have reached their limit. Click the arrow to list them.                                                                                                                                                                                                                                                                                 |
+| **Purchase History**             | Your organization's most recent credit purchase and when it was made.                                                                                                                                                                                                                                                                                    |
+
+**Monthly Limits** counts only monthly budgets, since your balance is spent month to month. It keeps the four totals apart because a single call counts toward its project, its license key and its access groups at once, so adding them together would count it more than once. A project's total includes only top-level projects, because a sub-project's spend is already part of its parent's.
 
 ### The budget table
 
 ![The Spend & Budgets page with budgets for two shows, a feature, a pilot, artist keys and departments](../assets/img/enterprise/admin_dashboard-spend_budgets.png)
 
-Budgets are grouped into three sections: **Projects**, **License Keys**, and **Access Groups**. Each row shows:
+Budgets are grouped into four sections: **Organization**, **Projects**, **License Keys**, and **Access Groups**. Each row shows:
 
 - **Scope:** the budget's name. Budgets for sub-projects are nested under their parent project.
-- **Spent:** a bar, the percentage of the limit used, and the amount spent in the current period. A sub-project's spend is included in its parent's.
+- **Spent:** a bar, the percentage of the limit used, and the amount spent in the current period. A bell appears once spending passes the budget's alert threshold (see [Alert Thresholds](#alert-thresholds)). A sub-project's spend is included in its parent's.
 - **Limit:** the most that may be spent in the period.
 - **Enforcement:** **Hard Limit** or **Soft Limit** (see below).
 - **Period:** how often spending starts over.
 - **Resets In:** how long until the period ends and the spend goes back to zero.
 
-The chips above the table filter it by section, by status (**Over 75%**, **Reached 100%**, **Hard Limit**, **Soft Limit**), or to your **Favourites** or **Frozen** budgets. **Total Spent** is what your organization has spent in total. It comes from your credit history rather than adding up the rows, because a single call counts toward its project, its license key and its access groups at once. The search box matches names, amounts and periods, and also understands searches like `over 80%`.
+The chips above the table filter it by section, by status (**Past alert threshold**, **Reached 100%**, **Hard Limit**, **Soft Limit**), or to your **Favourites** or **Frozen** budgets. **Total Spent** is what your organization has spent in total. It comes from your credit history rather than adding up the rows, because a single call counts toward its project, its license key and its access groups at once. The search box matches names, amounts and periods, and also understands searches like `over 80%`.
 
 To edit, favourite, freeze or delete a budget, hover its row and click **⋮**.
 
@@ -170,19 +164,24 @@ To edit, favourite, freeze or delete a budget, hover its row and click **⋮**.
 
 When you create a budget you choose its **Scope Type**:
 
+- **Organization:** everything your organization spends, whatever project, key or group it comes from. See [Organization-wide caps](#organization-wide-caps).
 - **Projects:** a project and everything under it. Choose an engine first; its projects are listed so you can pick one, at any depth. A budget on a show covers every sequence and shot in it, and you can add separate budgets for sequences inside it, which are nested under the show in the table.
 - **License Keys:** everything one license key spends, whatever project it works in.
 - **Access Groups:** everything spent by the license keys in an access group. A key in two groups counts toward both, which is why the **Access Groups** section shows no total.
 
 A call usually falls under more than one budget, for example its sequence, its show, the artist's key and the artist's department. **Every hard-limited budget that covers it must have room for the call**, so the tightest one decides.
 
-#### The organization default
+### The Organization section
 
-Every organization has a budget named **Organization default**, listed under **Projects**. It counts spend that no project budget covers, so you can see work happening outside your shows. It is always a soft limit: it never blocks anything. You can change its limit and period, but you cannot delete it.
+The **Organization** section sits at the top of the table, above **Projects**. It holds your organization-wide caps and the Fallback Budget.
 
 #### Organization-wide caps
 
-To cap everything your organization spends, whatever project or key it comes from, you can create a budget over the whole organization through the Griptape Cloud API. It appears under **Projects**. You can have one per period, so a daily cap can run alongside a monthly one.
+An organization-wide cap limits everything your organization spends, whatever project, key or group it comes from. Create one with **+ Create Budget** and the **Organization** scope type, or with **Add organization budget** in the Organization section when you have none yet. You can have one per period, so a daily cap can run alongside a monthly one. A monthly cap is the figure the **Monthly Limits** card shows.
+
+#### The Fallback Budget
+
+Every organization has a **Fallback Budget**, listed last in the Organization section. It counts spend that no project budget covers, including calls with no project at all, so you can see work happening outside your shows. It is always a soft limit: it alerts but never blocks anything. You can change its limit and period, but you cannot freeze or delete it.
 
 ### Creating a budget
 
@@ -190,7 +189,7 @@ Click **+ Create Budget**.
 
 ![The Create New Budget dialog, filled in for a monthly $7,000 budget on the Comp access group](../assets/img/enterprise/admin_dashboard-create_budget.png)
 
-- **Scope Type**, then the project, license key, or access group it covers. The scope cannot be changed later.
+- **Scope Type**, then the project, license key, or access group it covers. An **Organization** budget needs no choice: it covers all spend. The scope cannot be changed later.
 - **Name:** how the budget appears in the table and in the message artists see when it stops them. It defaults to the scope's name.
 - **Set Budget Limit:** in dollars, for the period.
 - **Freeze Budget Limit:** see [Freezing a budget](#freezing-a-budget).
@@ -198,15 +197,19 @@ Click **+ Create Budget**.
     - **Hard Limit:** a call that would go over the limit does not run.
     - **Soft Limit:** calls keep running past the limit, and the row shows that the limit was reached. Use it to watch spending without stopping anyone.
 - **Period:** **Daily**, **Weekly**, **Monthly**, **Yearly**, or **Lifetime**. Periods start at midnight UTC on calendar boundaries; weeks start on Monday. A lifetime budget never resets.
-- **Alert Thresholds:** the percentage of the limit, from 75% to 100%, at which the organization's owner is emailed, as well as at 100% (see below). Whatever threshold you choose, the bar in the **Spent** column has a marker at 75% and turns amber once spending passes 75%.
+- **Alert Thresholds:** the percentage of the limit, from 75% to 100%, at which the organization's owner is emailed, as well as at 100% (see below).
 
-![A budget past 75%: the bar turns amber after the marker](../assets/img/enterprise/admin_dashboard-alert_threshold.png)
+#### Alert Thresholds
+
+A budget's alert threshold shows in the **Spent** column. The bar has a marker at the threshold and turns amber once spending passes it, and a bell appears beside the percentage. Hover the bell to see the threshold, for example "Spend has passed this budget's 90% alert threshold." A budget with more than one threshold uses the lowest. At 100% the whole bar turns red and the bell goes away. The **Past alert threshold** chip and the **Budgets Past Alert Threshold** card list the budgets showing a bell.
+
+![A budget past its alert threshold: the bar turns amber after the marker and a bell appears](../assets/img/enterprise/admin_dashboard-alert_threshold.png)
 
 When a budget passes a threshold, the organization's owner gets an email. That includes a budget you edit so that it is already past one, for example by lowering its limit. Every budget also emails at 100%, whatever threshold you chose and whether its limit is hard or soft, and a **Hard Limit** budget that refuses a call sends that 100% email if it hasn't gone out yet. Thresholds crossed at the same moment send one email, for the highest; one crossed later in the period sends another. Raising the limit back above a threshold resets it, so crossing it again sends a new email.
 
 !!! note "Who gets alert emails"
 
-    During the beta, alert emails go only to the organization's owner, the account that created it. They cannot be sent to other people or set per budget yet.
+    Alert emails go only to the organization's owner, the account that created it. They cannot be sent to other people or set per budget.
 
 ### Freezing a budget
 
@@ -216,7 +219,7 @@ Freezing a budget stops all work under it straight away, whatever is left of its
 
 ### What counts toward a budget
 
-During the beta, budgets count calls paid for with your organization's **Griptape credits**. Calls that use your own provider API keys are not counted, whether they go through Griptape Cloud or straight to the provider.
+Budgets count calls paid for with your organization's **Griptape credits**. Calls that use your own provider API keys are not counted, whether they go through Griptape Cloud or straight to the provider.
 
 ### What artists see when a budget stops them
 
@@ -228,9 +231,9 @@ The agent chat shows a similar message when a budget stops a reply. Nothing is c
 
 ## Usage Audit
 
-!!! warning "Beta"
+!!! note "Which plans include it"
 
-    **Usage Audit** is in beta and hidden until you turn it on with **Spend & Budgets**. See [Turning on Spend & Budgets and Usage Audit](#turning-on-spend-budgets-and-usage-audit).
+    **Usage Audit** is included with the Professional plan and above. On other plans it does not appear in the sidebar.
 
 **Usage Audit** shows where your organization's credits went, so you can see which shows, artists and models are spending, and set budgets to match.
 
@@ -238,14 +241,14 @@ The agent chat shows a similar message when a budget stops a reply. Nothing is c
 
 ### Choosing the dates
 
-The page opens on the current month so far. Click the dates in the **Date Range** card to choose a different range, then **Apply**. Every chart and total on the page uses the range.
+The page opens on the last 30 days. Click the dates in the **Date Range** card to choose a different range: pick one of the quick ranges (**Last 1 day**, **Last 30 days**, **Last 90 days**, or **This month**), which applies straight away, or set the dates yourself and click **Apply**. Every chart and total on the page uses the range.
 
 ![The Usage Audit date range picker](../assets/img/enterprise/admin_dashboard-usage_date_range.png)
 
 ### The tabs
 
 - **Overview:** the total spent in the range, spend by project, by license key, by access group, and by model provider, and how many calls there were of each kind (image, video, 3D, text).
-- **Projects:** pick a project from the list to see its spend over time, which models it used, and how it stands against its budget. The list is nested the same way as your projects, and a warning icon marks any above 75% of its budget.
+- **Projects:** pick a project from the list to see its spend over time, which models it used, and how it stands against its budget. The list is nested the same way as your projects, and a warning icon marks any past its budget's alert threshold.
 - **License Keys:** the same, per license key.
 - **Access Groups:** the same, per access group. A key in two groups counts toward both, so group totals can add up to more than your organization spent.
 - **Per Model:** spend by model provider, and within each provider by model.
@@ -359,4 +362,4 @@ A typical rollout looks like:
 1. **Create a license key per user**, adding each key to the right access groups, and send each user their token.
 1. Users **activate** their seats by pasting the token into the desktop application. On-premises deployments use an [Admin Server](admin_server.md). License-activated users get the editor only; the Admin Dashboard never appears for them.
 1. Monitor and manage seats from the License Keys section. Watch active **sessions**, **release** stuck ones, **reissue** lost tokens, and **revoke** keys when someone leaves.
-1. In beta, **set budgets** in Spend & Budgets for each show, key or department, and check **Usage Audit** to see where credits are going.
+1. **Set budgets** in Spend & Budgets for each show, key or department, and check **Usage Audit** to see where credits are going.
