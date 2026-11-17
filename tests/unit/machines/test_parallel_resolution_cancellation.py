@@ -27,6 +27,7 @@ from tests.unit.machines.scheduler_stubs import (
     let_the_run_finish,
     machine_running_one_node,
     node_stub,
+    wait_for_node_state,
 )
 
 if TYPE_CHECKING:
@@ -75,10 +76,7 @@ class TestStaleCancellationDoesNotLeakIntoTheNextRun:
 
         machine.inject_node(node)
 
-        for _ in range(20):
-            if dag_builder.node_to_reference["previously_cancelled"].node_state is NodeState.PROCESSING:
-                break
-            await asyncio.sleep(0)
+        await wait_for_node_state(dag_builder, "previously_cancelled", NodeState.PROCESSING)
 
         assert dag_builder.node_to_reference["previously_cancelled"].node_state is NodeState.PROCESSING, (
             "node should have been dispatched"
@@ -101,10 +99,10 @@ class TestStaleCancellationDoesNotLeakIntoTheNextRun:
         await asyncio.sleep(0)
         machine.inject_node(node)
 
-        for _ in range(20):
-            if dag_builder.node_to_reference["running_then_cancelled"].node_state is NodeState.PROCESSING:
-                break
-            await asyncio.sleep(0)
+        await wait_for_node_state(dag_builder, "running_then_cancelled", NodeState.PROCESSING)
+        assert dag_builder.node_to_reference["running_then_cancelled"].node_state is NodeState.PROCESSING, (
+            "node should have been dispatched"
+        )
         assert not flag.is_set()
 
         await machine.cancel_all_nodes()
