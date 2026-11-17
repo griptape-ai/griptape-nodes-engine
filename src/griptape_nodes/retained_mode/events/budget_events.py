@@ -46,23 +46,34 @@ class RunAttribution:
 @dataclass
 @PayloadRegistry.register
 class GetAttributionContextRequest(RequestPayload):
-    """Describe the current project so an outbound call can be attributed to it.
+    """Describe the current call so it can be attributed: its project, workflow, run and node.
 
-    The result carries project ids and no credential. Ids are user-influenced -- usually a slug
-    of the project name, replaceable with any string, and a filesystem path on a project created
-    before ids existed -- and all of it is visible to an SSL-inspecting egress proxy.
+    The result carries no credential. It carries the same tags a direct call reports: project ids,
+    the workflow name, the run id, engine and session ids, and the running node's class. Project
+    ids are user-influenced -- usually a slug of the project name, replaceable with any string, and
+    a filesystem path on a project created before ids existed -- and the workflow name is what the
+    artist typed. All of it is visible to an SSL-inspecting egress proxy.
 
     Best-effort: nothing here raises. Not knowing which project to bill is not a reason to refuse
     work -- the spend is legitimate, it just lands unattributed. A chain that cannot be read
-    yields a Failure rather than an empty chain, which would assert that no project is open.
+    yields a Failure rather than an empty chain, which would assert that no project is open. The
+    exception is a call from a running node, whose header takes the project chain its run saved
+    when it started, as its direct report does: a chain unreadable then was saved as no project.
 
     Use when: A node or driver is about to make a credit-consuming call and wants the spend
     attributed to the project the user is working in.
+
+    Args:
+        part_of_workflow_run: False for a call made outside the workflow, such as a chat turn with
+            the assistant. Its header then names only the project, engine and session: a workflow
+            may be running at the same time, and its run and name aren't this call's.
 
     Results: GetAttributionContextResultSuccess (a header value is available) |
         GetAttributionContextResultFailure (none could be produced; the call should still
         proceed, unattributed)
     """
+
+    part_of_workflow_run: bool = field(default=True, kw_only=True)
 
     # Per-call and useful only to the direct caller; otherwise the Success payload broadcasts on
     # the WebSocket feed once per metered call.
@@ -78,9 +89,12 @@ class GetAttributionContextRequest(RequestPayload):
 class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """An attribution header value is available; attach it to the outbound request.
 
-    `header_value` is `base64url(utf-8 JSON)` with padding kept, decoding to `{"v": 1}` when no
-    project is open and `{"v": 1, "tags": {"project": [...]}}` otherwise. The bare envelope is
-    sent for forward-compatibility rather than as a signal. `<system-defaults>` never travels.
+    `header_value` is `base64url(utf-8 JSON)` with padding kept, decoding to `{"v": 1, "tags": {...}}`
+    with the same tags a direct call reports, or to the bare `{"v": 1}` when there are none. The
+    bare envelope is sent for forward-compatibility rather than as a signal. `<system-defaults>`
+    never travels. Tags other than `project` are left out, `workflow` first, when leaving them out
+    lets a header be sent that couldn't be with them: over Griptape Cloud's 4096-byte limit, or not
+    valid UTF-8. A project chain over the limit on its own is sent with `project` only.
 
     Args:
         header_value: The encoded header value to send
@@ -89,8 +103,9 @@ class GetAttributionContextResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
         schema_version: The payload schema version encoded in `header_value`
         project_chain: The project ids the call is attributed to, leaf-first, each exactly as
             stored -- unstripped, uncut, never repaired. Populated from the same pass that built
-            `header_value`, so the two cannot disagree. Empty only when no project is open; a
-            chain that could not be read yields a Failure instead.
+            `header_value`, so the two cannot disagree. Empty when no project is open, or for a
+            running node whose run could not read its chain when it started; otherwise a chain
+            that could not be read yields a Failure instead.
     """
 
     header_value: str

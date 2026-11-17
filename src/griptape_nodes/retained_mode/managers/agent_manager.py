@@ -1441,7 +1441,7 @@ class AgentManager(EngineScoped):
         """
         if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
             return {}
-        result = await self.engine.ahandle_request(GetAttributionContextRequest())
+        result = await self.engine.ahandle_request(GetAttributionContextRequest(part_of_workflow_run=False))
         if not isinstance(result, GetAttributionContextResultSuccess):
             return {}
         return {result.header_name: result.header_value}
