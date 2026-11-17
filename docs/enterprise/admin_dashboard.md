@@ -1,6 +1,6 @@
 # Admin Dashboard
 
-The Admin Dashboard is the administration interface built into the Griptape Nodes editor. Organization owners use it to issue and manage license keys, organize users into access groups, control which libraries, nodes, models, and projects each user can access, set credit budgets, and audit where credits are spent.
+The Admin Dashboard is the administration interface built into the Griptape Nodes editor. Organization owners use it to issue and manage license keys, organize users into access groups, control which libraries, nodes, models, and projects each user can access, and, depending on your plan, set credit budgets and audit where credits are spent.
 
 ## Who can use it
 
@@ -233,7 +233,7 @@ The agent chat shows a similar message when a budget stops a reply. Nothing is c
 
 !!! note "Which plans include it"
 
-    **Usage Audit** is included with the Professional plan and above. On other plans it does not appear in the sidebar.
+    **Usage Audit** is included with the Professional, Paid, Partner, and Enterprise plans. On other plans it does not appear in the sidebar.
 
 **Usage Audit** shows where your organization's credits went, so you can see which shows, artists and models are spending, and set budgets to match.
 
@@ -362,4 +362,4 @@ A typical rollout looks like:
 1. **Create a license key per user**, adding each key to the right access groups, and send each user their token.
 1. Users **activate** their seats by pasting the token into the desktop application. On-premises deployments use an [Admin Server](admin_server.md). License-activated users get the editor only; the Admin Dashboard never appears for them.
 1. Monitor and manage seats from the License Keys section. Watch active **sessions**, **release** stuck ones, **reissue** lost tokens, and **revoke** keys when someone leaves.
-1. **Set budgets** in Spend & Budgets for each show, key or department, and check **Usage Audit** to see where credits are going.
+1. **Set budgets** in [Spend & Budgets](#spend-budgets) for each show, key or department, and check [Usage Audit](#usage-audit) to see where credits are going, if your plan includes them.
