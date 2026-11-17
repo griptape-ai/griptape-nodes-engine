@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.os_events import DeletionOutcome
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue
 from griptape_nodes.traits.options import Options
@@ -1585,6 +1586,10 @@ class UninstallLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     unloaded: bool = False
     config_entry_removed: bool = False
     directory_deleted: bool = False
+    # Which kind of delete the folder got. None when this call deleted nothing, including when
+    # the folder was already gone. `PREFER_RECYCLE_BIN` falls back to a permanent delete where
+    # the platform has no recycle bin, so the editor can only promise recovery when this says so.
+    deletion_outcome: DeletionOutcome | None = None
     restart_required: bool = False
 
 

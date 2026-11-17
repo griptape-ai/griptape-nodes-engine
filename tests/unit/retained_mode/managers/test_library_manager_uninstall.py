@@ -40,6 +40,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnsafePathBlocker,
     UnwritableConfigBlocker,
 )
+from griptape_nodes.retained_mode.events.os_events import DeletionOutcome
 from griptape_nodes.retained_mode.managers.library.uninstall import _unsafe_install_directory
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import (
@@ -751,6 +752,36 @@ class TestRepeatedUninstall:
         assert isinstance(first, UninstallLibraryResultSuccess), first.result_details
         assert isinstance(second, UninstallLibraryResultFailure)
         assert isinstance(second.blocked_by, NotFoundBlocker)
+
+
+class TestDeletionOutcome:
+    @pytest.mark.asyncio
+    async def test_a_real_delete_reports_which_kind_it_was(self, engine: Engine, workspace: Path) -> None:
+        """`PREFER_RECYCLE_BIN` falls back to a permanent delete, so the result says which happened."""
+        manifest = _write_manifest(workspace / "libs" / "outcome", "Outcome Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Outcome Library", registered_path=str(manifest))
+
+        result = await _uninstall_after_preview(engine, manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.directory_deleted
+        assert result.deletion_outcome in (DeletionOutcome.SENT_TO_RECYCLE_BIN, DeletionOutcome.PERMANENTLY_DELETED)
+
+    @pytest.mark.asyncio
+    async def test_a_folder_already_gone_reports_no_outcome(self, engine: Engine, workspace: Path) -> None:
+        """Nothing was deleted by this call, so there is no outcome to report."""
+        manifest = _write_manifest(workspace / "libs" / "vanished", "Vanished Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Vanished Library", registered_path=str(manifest))
+        await _preview(engine, manifest)
+        shutil.rmtree(manifest.parent)
+
+        result = await engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest)))
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.directory_deleted
+        assert result.deletion_outcome is None
 
 
 class TestConcurrentUninstalls:

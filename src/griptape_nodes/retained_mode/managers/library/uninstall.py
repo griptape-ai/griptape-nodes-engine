@@ -40,7 +40,9 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
     DeleteFileResultFailure,
+    DeleteFileResultSuccess,
     DeletionBehavior,
+    DeletionOutcome,
 )
 from griptape_nodes.retained_mode.managers.library.common import LIBRARY_CONFIG_GLOB_PATTERN, LibraryLifecycleState
 from griptape_nodes.retained_mode.managers.library.metadata_loading import is_library_name_registered
@@ -74,6 +76,15 @@ class _Classification:
     raw_register_entry: object = None  # the exact raw libraries_to_register item, for removal
     raw_download_entry: object = None  # the exact raw libraries_to_download item, for removal
     download: LibraryDownload | None = None  # set only when registered_in == "download"
+
+
+@dataclass
+class _DirectoryDeletion:
+    """What step 3 did with the install directory."""
+
+    deleted: bool = False
+    outcome: DeletionOutcome | None = None
+    failure: UninstallLibraryResultFailure | None = None
 
 
 class _ConfigEntryRemoval(Enum):
@@ -169,17 +180,17 @@ class LibraryUninstall(EngineScoped):
             resolved.library_name, resolved.library_path
         )
 
-        directory_deleted, delete_failure = await self._uninstall_delete_directory(
+        deletion = await self._uninstall_delete_directory(
             resolved, config_entry_removed=config_entry_removed, unloaded=unloaded
         )
-        if delete_failure is not None:
-            return delete_failure
+        if deletion.failure is not None:
+            return deletion.failure
 
         return self._uninstall_success(
             resolved,
             unloaded=unloaded,
             config_entry_removed=config_entry_removed,
-            directory_deleted=directory_deleted,
+            deletion=deletion,
             restart_required=restart_required,
         )
 
@@ -226,13 +237,13 @@ class LibraryUninstall(EngineScoped):
 
     async def _uninstall_delete_directory(
         self, resolved: _Resolution, *, config_entry_removed: bool, unloaded: bool
-    ) -> tuple[bool, UninstallLibraryResultFailure | None]:
+    ) -> _DirectoryDeletion:
         """Step 3 (most destructive): delete the install directory, or treat its absence as success."""
         if resolved.install_directory is None:
-            return False, None
+            return _DirectoryDeletion()
         if not await anyio.Path(resolved.install_directory).exists():
             # Already gone is success -- the goal (no install on disk) is met.
-            return True, None
+            return _DirectoryDeletion(deleted=True)
         delete_result = await self.engine.ahandle_request(
             DeleteFileRequest(
                 path=str(resolved.install_directory),
@@ -244,7 +255,7 @@ class LibraryUninstall(EngineScoped):
             # Another uninstall of the same library deleted it between the check above and this
             # request. Same goal state, so report it the same way.
             if not await anyio.Path(resolved.install_directory).exists():
-                return True, None
+                return _DirectoryDeletion(deleted=True)
             # Name only the steps that ran, or troubleshooting looks for an edit that
             # never happened.
             undone = [
@@ -260,10 +271,11 @@ class LibraryUninstall(EngineScoped):
                 f"Attempted to uninstall Library '{resolved.library_name}'. {done_so_far} folder at "
                 f"{resolved.install_directory} could not be deleted: {delete_result.result_details}"
             )
-            return False, UninstallLibraryResultFailure(
-                result_details=details, failure_reason="directory_delete_failed"
+            return _DirectoryDeletion(
+                failure=UninstallLibraryResultFailure(result_details=details, failure_reason="directory_delete_failed")
             )
-        return True, None
+        outcome = delete_result.outcome if isinstance(delete_result, DeleteFileResultSuccess) else None
+        return _DirectoryDeletion(deleted=True, outcome=outcome)
 
     def _uninstall_success(
         self,
@@ -271,7 +283,7 @@ class LibraryUninstall(EngineScoped):
         *,
         unloaded: bool,
         config_entry_removed: bool,
-        directory_deleted: bool,
+        deletion: _DirectoryDeletion,
         restart_required: bool,
     ) -> UninstallLibraryResultSuccess:
         message = f"Successfully uninstalled Library '{resolved.library_name}'."
@@ -294,7 +306,8 @@ class LibraryUninstall(EngineScoped):
             remaining_registrations=resolved.remaining_registrations,
             unloaded=unloaded,
             config_entry_removed=config_entry_removed,
-            directory_deleted=directory_deleted,
+            directory_deleted=deletion.deleted,
+            deletion_outcome=deletion.outcome,
             restart_required=restart_required,
             result_details=ResultDetails(message=message, level=level),
         )

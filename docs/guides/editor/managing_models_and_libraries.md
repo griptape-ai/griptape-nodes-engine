@@ -161,10 +161,12 @@ re-cloning the library.
 ### Removing a library
 
 **Uninstall** on a library's row unregisters it, unloads it from the running
-engine, and sends its folder to the system trash — so you can put it back
-from there if you change your mind. A confirmation names the exact folder
-first, and anything else inside it: some installs hold several libraries in
-one folder, and those go together.
+engine, and sends its folder to the system trash, so you can usually put it
+back if you change your mind. Where the platform has no trash — a headless
+Linux machine, or a network share — the folder is deleted permanently
+instead. A confirmation names the exact folder first, and anything else
+inside it: some installs hold several libraries in one folder, and those go
+together.
 
 Some libraries can't be uninstalled here. The button is greyed out, and
 hovering the row gives the reason:
