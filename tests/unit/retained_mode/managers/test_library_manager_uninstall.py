@@ -123,18 +123,16 @@ def _register_in_registry(name: str) -> None:
     )
 
 
-async def _preview(engine: Engine, library_name: str, manifest: Path) -> PreviewUninstallLibraryResultSuccess:
-    result = await engine.ahandle_request(
-        PreviewUninstallLibraryRequest(library_name=library_name, library_path=str(manifest))
-    )
+async def _preview(engine: Engine, manifest: Path) -> PreviewUninstallLibraryResultSuccess:
+    result = await engine.ahandle_request(PreviewUninstallLibraryRequest(library_path=str(manifest)))
     assert isinstance(result, PreviewUninstallLibraryResultSuccess), result.result_details
     return result
 
 
-async def _uninstall_after_preview(engine: Engine, library_name: str, manifest: Path):  # noqa: ANN202 (either result shape)
+async def _uninstall_after_preview(engine: Engine, manifest: Path):  # noqa: ANN202 (either result shape)
     """Preview then uninstall, as the editor does."""
-    await _preview(engine, library_name, manifest)
-    return await engine.ahandle_request(UninstallLibraryRequest(library_name=library_name, library_path=str(manifest)))
+    await _preview(engine, manifest)
+    return await engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest)))
 
 
 @pytest.fixture(autouse=True)
@@ -162,10 +160,7 @@ class TestResolutionNotFound:
     @pytest.mark.asyncio
     async def test_unknown_library_fails(self, engine: Engine, workspace: Path) -> None:
         result = await engine.ahandle_request(
-            UninstallLibraryRequest(
-                library_name="Nope",
-                library_path=str(workspace / "nope" / "griptape_nodes_library.json"),
-            )
+            UninstallLibraryRequest(library_path=str(workspace / "nope" / "griptape_nodes_library.json"))
         )
 
         assert isinstance(result, UninstallLibraryResultFailure)
@@ -174,23 +169,19 @@ class TestResolutionNotFound:
     @pytest.mark.asyncio
     async def test_preview_of_unknown_library_fails(self, engine: Engine, workspace: Path) -> None:
         result = await engine.ahandle_request(
-            PreviewUninstallLibraryRequest(
-                library_name="Nope", library_path=str(workspace / "nope" / "griptape_nodes_library.json")
-            )
+            PreviewUninstallLibraryRequest(library_path=str(workspace / "nope" / "griptape_nodes_library.json"))
         )
 
         assert isinstance(result, PreviewUninstallLibraryResultFailure)
 
     @pytest.mark.asyncio
-    async def test_name_matching_a_different_copy_is_not_uninstalled(self, engine: Engine, workspace: Path) -> None:
+    async def test_path_naming_no_tracked_copy_is_not_uninstalled(self, engine: Engine, workspace: Path) -> None:
         """`library_path` identifies the copy, so a path naming no tracked install is refused."""
         installed = _write_manifest(workspace / "libs" / "real", "Dup Library")
         _track(engine.library_manager, installed, library_name="Dup Library")
         other_path = workspace / "libs" / "imposter" / "griptape_nodes_library.json"
 
-        result = await engine.ahandle_request(
-            PreviewUninstallLibraryRequest(library_name="Dup Library", library_path=str(other_path))
-        )
+        result = await engine.ahandle_request(PreviewUninstallLibraryRequest(library_path=str(other_path)))
 
         assert isinstance(result, PreviewUninstallLibraryResultFailure)
         assert await anyio.Path(installed).exists()
@@ -211,7 +202,7 @@ class TestBlockedTargets:
         )
         engine.library_manager._library_file_path_to_info[str(manifest)] = library_info
 
-        preview = await _preview(engine, LibraryManager.SANDBOX_LIBRARY_NAME, manifest)
+        preview = await _preview(engine, manifest)
 
         assert isinstance(preview.blocked_by, SandboxLibraryBlocker)
         assert preview.blocked_by.kind == "sandbox_library"
@@ -227,7 +218,7 @@ class TestBlockedTargets:
         monkeypatch.setenv("GTN_CONFIG_LIBRARY__PROVISIONED_BY", "environment")
         engine.config_manager.load_configs()
 
-        result = await _uninstall_after_preview(engine, "Test Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultFailure)
         assert isinstance(result.blocked_by, EnvironmentManagedBlocker)
@@ -271,7 +262,7 @@ class TestBlockedTargets:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [traversal_entry])
         _track(engine.library_manager, manifest, library_name="Nuke Library", registered_path=traversal_entry)
 
-        preview = await _preview(engine, "Nuke Library", manifest)
+        preview = await _preview(engine, manifest)
 
         assert isinstance(preview.blocked_by, UnsafePathBlocker)
         assert preview.blocked_by.path == traversal_entry
@@ -288,7 +279,7 @@ class TestManifestEntry:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Test Library", registered_path=str(manifest))
 
-        preview = await _preview(engine, "Test Library", manifest)
+        preview = await _preview(engine, manifest)
 
         assert preview.install_directory == str(library_dir)
         assert preview.registered_in == "register"
@@ -309,7 +300,7 @@ class TestManifestEntry:
         )
         _register_in_registry("Test Library")
 
-        result = await _uninstall_after_preview(engine, "Test Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.config_entry_removed is True
@@ -329,7 +320,7 @@ class TestManifestEntry:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [relative_entry])
         _track(engine.library_manager, manifest, library_name="Relative Library", registered_path=relative_entry)
 
-        result = await _uninstall_after_preview(engine, "Relative Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.install_directory == str(library_dir)
@@ -348,10 +339,8 @@ class TestManifestEntry:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [])
         _track(engine.library_manager, manifest, library_name="Orphan Library")
 
-        preview = await _preview(engine, "Orphan Library", manifest)
-        result = await engine.ahandle_request(
-            UninstallLibraryRequest(library_name="Orphan Library", library_path=str(manifest))
-        )
+        preview = await _preview(engine, manifest)
+        result = await engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest)))
 
         # The preview says so too, so the editor can disable the control before it is clicked.
         assert isinstance(preview.blocked_by, UnmatchedEntryBlocker)
@@ -375,7 +364,7 @@ class TestDirectoryEntryWithSiblings:
         _track(engine.library_manager, manifest, library_name="Library A", registered_path=str(libs_root))
         _track(engine.library_manager, sibling, library_name="Library B", registered_path=str(libs_root))
 
-        result = await _uninstall_after_preview(engine, "Library A", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.directory_deleted is True
@@ -406,7 +395,7 @@ class TestDirectoryEntryWithSiblings:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(libs_root)])
         _track(engine.library_manager, manifest, library_name="Library A", registered_path=str(libs_root))
 
-        result = await _uninstall_after_preview(engine, "Library A", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.remaining_registrations == []
@@ -424,7 +413,7 @@ class TestDirectoryEntryWithSiblings:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(libs_root)])
         _track(engine.library_manager, manifest, library_name="Library A", registered_path=str(libs_root))
 
-        preview = await _preview(engine, "Library A", manifest)
+        preview = await _preview(engine, manifest)
 
         # The sibling lives in its own folder beside the target, so it is not collateral.
         assert preview.install_directory == str(libs_root / "lib_a")
@@ -446,7 +435,7 @@ class TestDirectoryEntryNamingOneLibrary:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(lib_dir)])
         _track(engine.library_manager, manifest, library_name="My Library", registered_path=str(lib_dir))
 
-        result = await _uninstall_after_preview(engine, "My Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.directory_deleted is True
@@ -466,7 +455,7 @@ class TestDirectoryEntryNamingOneLibrary:
         _track(engine.library_manager, manifest, library_name="Bundle Main", registered_path=str(lib_dir))
         _track(engine.library_manager, nested, library_name="Bundle Extra", registered_path=str(lib_dir))
 
-        result = await _uninstall_after_preview(engine, "Bundle Main", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert not await anyio.Path(lib_dir).exists()
@@ -491,7 +480,7 @@ class TestDownloadProvisionedLibrary:
         )
         _track(engine.library_manager, manifest, library_name="Sample Library", registered_path=str(manifest))
 
-        result = await _uninstall_after_preview(engine, "Sample Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.registered_in == "download"
@@ -528,7 +517,7 @@ class TestUnwritableConfigLayer:
         config.load_configs()
         _track(engine.library_manager, manifest, library_name="Shadowed Library", registered_path=str(manifest))
 
-        preview = await _preview(engine, "Shadowed Library", manifest)
+        preview = await _preview(engine, manifest)
 
         assert isinstance(preview.blocked_by, UnwritableConfigBlocker)
         assert preview.blocked_by.layer == "project"
@@ -557,7 +546,7 @@ class TestUnwritableConfigLayer:
         _track(engine.library_manager, manifest, library_name="Library A", registered_path=str(libs_root))
         _track(engine.library_manager, sibling, library_name="Library B", registered_path=str(libs_root))
 
-        result = await _uninstall_after_preview(engine, "Library A", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.config_entry_removed is False
@@ -574,7 +563,7 @@ class TestUnwritableConfigLayer:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Plain Library", registered_path=str(manifest))
 
-        preview = await _preview(engine, "Plain Library", manifest)
+        preview = await _preview(engine, manifest)
 
         assert preview.blocked_by is None
 
@@ -598,7 +587,7 @@ class TestUnwritableConfigLayer:
         config.load_configs()
         _track(engine.library_manager, mine, library_name="Mine", registered_path=str(mine))
 
-        result = await engine.ahandle_request(UninstallLibraryRequest(library_name="Mine", library_path=str(mine)))
+        result = await engine.ahandle_request(UninstallLibraryRequest(library_path=str(mine)))
 
         assert isinstance(result, UninstallLibraryResultFailure)
         assert isinstance(result.blocked_by, UnwritableConfigBlocker)
@@ -631,7 +620,7 @@ class TestProtectedDirectories:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Workspace Root Library", registered_path=str(manifest))
 
-        result = await _uninstall_after_preview(engine, "Workspace Root Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultFailure)
         assert isinstance(result.blocked_by, UnsafePathBlocker)
@@ -648,7 +637,7 @@ class TestProtectedDirectories:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Libraries Root Library", registered_path=str(manifest))
 
-        result = await _uninstall_after_preview(engine, "Libraries Root Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultFailure)
         assert isinstance(result.blocked_by, UnsafePathBlocker)
@@ -662,7 +651,7 @@ class TestProtectedDirectories:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Ordinary Library", registered_path=str(manifest))
 
-        result = await _uninstall_after_preview(engine, "Ordinary Library", manifest)
+        result = await _uninstall_after_preview(engine, manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert not await anyio.Path(library_dir).exists()
@@ -699,7 +688,7 @@ class TestDuplicateNameCopies:
         )
         _register_in_registry("Dup Library")
 
-        result = await _uninstall_after_preview(engine, "Dup Library", duplicate_manifest)
+        result = await _uninstall_after_preview(engine, duplicate_manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.unloaded is False
@@ -723,7 +712,7 @@ class TestDuplicateNameCopies:
         )
         _register_in_registry("Dup Library")
 
-        result = await _uninstall_after_preview(engine, "Dup Library", loaded_manifest)
+        result = await _uninstall_after_preview(engine, loaded_manifest)
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.unloaded is True
@@ -737,13 +726,11 @@ class TestAlreadyDeletedFolder:
         manifest = _write_manifest(library_dir, "Gone Library")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Gone Library", registered_path=str(manifest))
-        await _preview(engine, "Gone Library", manifest)
+        await _preview(engine, manifest)
         # The user deletes the folder by hand while the confirmation is open.
         shutil.rmtree(library_dir)
 
-        result = await engine.ahandle_request(
-            UninstallLibraryRequest(library_name="Gone Library", library_path=str(manifest))
-        )
+        result = await engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest)))
 
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.directory_deleted is True
@@ -758,10 +745,8 @@ class TestRepeatedUninstall:
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
         _track(engine.library_manager, manifest, library_name="Once Library", registered_path=str(manifest))
 
-        first = await _uninstall_after_preview(engine, "Once Library", manifest)
-        second = await engine.ahandle_request(
-            UninstallLibraryRequest(library_name="Once Library", library_path=str(manifest))
-        )
+        first = await _uninstall_after_preview(engine, manifest)
+        second = await engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest)))
 
         assert isinstance(first, UninstallLibraryResultSuccess), first.result_details
         assert isinstance(second, UninstallLibraryResultFailure)
@@ -769,23 +754,46 @@ class TestRepeatedUninstall:
 
 
 class TestConcurrentUninstalls:
+    """Each step is idempotent, so concurrent uninstalls need no lock between them."""
+
     @pytest.mark.asyncio
-    async def test_two_concurrent_uninstalls_do_not_clobber_each_others_config_write(
-        self, engine: Engine, workspace: Path
-    ) -> None:
+    async def test_two_concurrent_uninstalls_each_remove_their_own_entry(self, engine: Engine, workspace: Path) -> None:
         manifest_a = _write_manifest(workspace / "libs" / "lib_a", "Library A")
         manifest_b = _write_manifest(workspace / "libs" / "lib_b", "Library B")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest_a), str(manifest_b)])
         _track(engine.library_manager, manifest_a, library_name="Library A", registered_path=str(manifest_a))
         _track(engine.library_manager, manifest_b, library_name="Library B", registered_path=str(manifest_b))
         results = await asyncio.gather(
-            engine.ahandle_request(UninstallLibraryRequest(library_name="Library A", library_path=str(manifest_a))),
-            engine.ahandle_request(UninstallLibraryRequest(library_name="Library B", library_path=str(manifest_b))),
+            engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest_a))),
+            engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest_b))),
         )
 
         for result in results:
             assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == []
+
+    @pytest.mark.asyncio
+    async def test_uninstalling_the_same_library_twice_at_once_both_succeed(
+        self, engine: Engine, workspace: Path
+    ) -> None:
+        """A double-click reaches the goal state, so both calls report success, not a failure."""
+        manifest = _write_manifest(workspace / "libs" / "once", "Once Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Once Library", registered_path=str(manifest))
+
+        results = await asyncio.gather(
+            engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest))),
+            engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest))),
+        )
+
+        successes: list[UninstallLibraryResultSuccess] = []
+        for result in results:
+            assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+            successes.append(result)
+        assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == []
+        assert not await anyio.Path(manifest.parent).exists()
+        # Exactly one call did the removing; the other found it already done.
+        assert sum(success.config_entry_removed for success in successes) == 1
 
 
 class TestStructuredVerdictsAreWireReady:

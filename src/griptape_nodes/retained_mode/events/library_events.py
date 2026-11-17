@@ -1445,19 +1445,17 @@ class UnsafePathBlocker:
 
 @dataclass
 class NotFoundBlocker:
-    """No library of this name and manifest path is known to this engine."""
+    """No library is installed at the manifest path the request named."""
 
     kind: Literal["not_found"] = "not_found"
 
 
 @dataclass
 class UnwritableConfigBlocker:
-    """The setting that registers this library is in a config file the engine cannot write.
+    """The setting that registers this library lives in a config file the engine cannot write.
 
-    Project, workspace and environment settings override the user config, and the engine only
-    writes the user config, so the entry would survive the uninstall and the engine would look
-    for a library whose files are gone. Removing it is the owner's to do, in the file that holds
-    it.
+    The entry would survive the uninstall, leaving the engine looking for files that are gone,
+    so whoever owns that file has to remove it there.
 
     Args:
         layer: Which layer supplies it, e.g. "project", "workspace", or "env".
@@ -1471,18 +1469,17 @@ class UnwritableConfigBlocker:
 
 @dataclass
 class UnmatchedEntryBlocker:
-    """Nothing in the config matched this library, so there is no entry to remove.
+    """Nothing in the config matched this library.
 
-    Something registered it that the engine cannot trace back to a setting, so uninstalling
-    would delete the files and leave whatever did that in place.
+    Whatever registered it cannot be traced back to a setting, so an uninstall would delete the
+    files and leave that registration in place.
     """
 
     kind: Literal["unmatched_entry"] = "unmatched_entry"
 
 
-# Why an uninstall cannot proceed, as a discriminated union on `kind`; the editor owns the wording.
-# Not a shared base class: cattrs builds its hook from the declared type, so a base-typed field
-# serializes as the base and drops the `kind` the editor switches on.
+# Why an uninstall cannot proceed, as a union discriminated on `kind`; the editor owns the wording.
+# Not a shared base class: cattrs would serialize a base-typed field as the base and drop `kind`.
 UninstallBlocker = (
     EnvironmentManagedBlocker
     | SandboxLibraryBlocker
@@ -1507,8 +1504,8 @@ class SharedDirectoryEntryRemaining:
     kind: Literal["shared_directory_entry"] = "shared_directory_entry"
 
 
-# What still registers the library after a successful uninstall, so the editor warns rather than
-# reporting it clean. A union of one, for the same serialization reason as `UninstallBlocker`.
+# What still registers the library after a successful uninstall, so the editor can warn. A union
+# of one, for the same serialization reason as `UninstallBlocker`.
 RemainingRegistration = SharedDirectoryEntryRemaining
 
 
@@ -1518,14 +1515,13 @@ class PreviewUninstallLibraryRequest(RequestPayload):
     """Resolve what uninstalling a library would do, without touching disk or config.
 
     Args:
-        library_name: Name of the library to resolve.
         library_path: The manifest path of the copy to resolve, from the engine's own
-            `LoadMetadataForAllLibrariesRequest` response, echoed back.
+            `LoadMetadataForAllLibrariesRequest` response, echoed back. Two installs can share
+            a name, so the path is what picks one.
 
     Results: PreviewUninstallLibraryResultSuccess | PreviewUninstallLibraryResultFailure
     """
 
-    library_name: str
     library_path: str
 
 
@@ -1559,14 +1555,13 @@ class UninstallLibraryRequest(RequestPayload):
     recycle bin where the platform supports one.
 
     Args:
-        library_name: Name of the library to uninstall.
         library_path: The manifest path of the copy to uninstall, from the engine's own
-            `LoadMetadataForAllLibrariesRequest` response, echoed back.
+            `LoadMetadataForAllLibrariesRequest` response, echoed back. Two installs can share
+            a name, so the path is what picks one.
 
     Results: UninstallLibraryResultSuccess | UninstallLibraryResultFailure
     """
 
-    library_name: str
     library_path: str
 
 
@@ -1599,9 +1594,7 @@ class UninstallLibraryResultFailure(ResultPayloadFailure):
     """Uninstall failed.
 
     A refusal sets `blocked_by` and leaves `failure_reason` None: nothing was touched, and the
-    preview reports the same blocker, so the editor can disable the control before the user
-    clicks it. `failure_reason` is for the other kind of failure, where a step ran and failed
-    partway, and has no blocker to carry. Each failure therefore reports itself once.
+    preview reports the same blocker. `failure_reason` is for a step that ran and failed partway.
     """
 
     failure_reason: UninstallFailureReason | None = None

@@ -5,12 +5,11 @@ See `PreviewUninstallLibraryRequest` and `UninstallLibraryRequest` in `library_e
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import logging
 import re
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path, PurePath, PureWindowsPath
 from typing import TYPE_CHECKING
 
@@ -77,6 +76,15 @@ class _Classification:
     download: LibraryDownload | None = None  # set only when registered_in == "download"
 
 
+class _ConfigEntryRemoval(Enum):
+    """What step 1 found when it went to remove the entry."""
+
+    REMOVED = auto()
+    # Another uninstall of this same library removed it first: the goal state, not a failure.
+    ALREADY_ABSENT = auto()
+    WRITE_FAILED = auto()
+
+
 @dataclass
 class _Resolution:
     """Everything `PreviewUninstallLibraryRequest` and `UninstallLibraryRequest` report.
@@ -105,14 +113,11 @@ class _ResolutionError:
 class LibraryUninstall(EngineScoped):
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
-        # Two uninstalls in flight would read the same config array, and the second write
-        # would restore the entry the first just removed.
-        self._uninstall_lock = asyncio.Lock()
         event_manager.register_request_handlers(self)
 
     @handles(PreviewUninstallLibraryRequest)
     async def preview_uninstall_library_request(self, request: PreviewUninstallLibraryRequest) -> ResultPayload:
-        resolved = await self._resolve(request.library_name, request.library_path)
+        resolved = await self._resolve(request.library_path)
         if isinstance(resolved, _ResolutionError):
             return PreviewUninstallLibraryResultFailure(result_details=resolved.details)
 
@@ -136,48 +141,47 @@ class LibraryUninstall(EngineScoped):
 
     @handles(UninstallLibraryRequest)
     async def uninstall_library_request(self, request: UninstallLibraryRequest) -> ResultPayload:
-        async with self._uninstall_lock:
-            resolved = await self._resolve(request.library_name, request.library_path)
-            if isinstance(resolved, _ResolutionError):
-                return UninstallLibraryResultFailure(
-                    result_details=resolved.details,
-                    blocked_by=NotFoundBlocker(),
-                )
-
-            if resolved.blocked_by is not None:
-                details = (
-                    f"Attempted to uninstall Library '{resolved.library_name}'. Refused: "
-                    f"{type(resolved.blocked_by).__name__}."
-                )
-                return UninstallLibraryResultFailure(result_details=details, blocked_by=resolved.blocked_by)
-
-            config_entry_removed, config_failure = self._uninstall_remove_config_entry(resolved)
-            if config_failure is not None:
-                return config_failure
-
-            unloaded, unload_failure = self._uninstall_unload_from_registry(
-                resolved, config_entry_removed=config_entry_removed
-            )
-            if unload_failure is not None:
-                return unload_failure
-
-            restart_required = self.engine.library_manager.reset.reset_requires_restart(
-                resolved.library_name, resolved.library_path
+        resolved = await self._resolve(request.library_path)
+        if isinstance(resolved, _ResolutionError):
+            return UninstallLibraryResultFailure(
+                result_details=resolved.details,
+                blocked_by=NotFoundBlocker(),
             )
 
-            directory_deleted, delete_failure = await self._uninstall_delete_directory(
-                resolved, config_entry_removed=config_entry_removed, unloaded=unloaded
+        if resolved.blocked_by is not None:
+            details = (
+                f"Attempted to uninstall Library '{resolved.library_name}'. Refused: "
+                f"{type(resolved.blocked_by).__name__}."
             )
-            if delete_failure is not None:
-                return delete_failure
+            return UninstallLibraryResultFailure(result_details=details, blocked_by=resolved.blocked_by)
 
-            return self._uninstall_success(
-                resolved,
-                unloaded=unloaded,
-                config_entry_removed=config_entry_removed,
-                directory_deleted=directory_deleted,
-                restart_required=restart_required,
-            )
+        config_entry_removed, config_failure = self._uninstall_remove_config_entry(resolved)
+        if config_failure is not None:
+            return config_failure
+
+        unloaded, unload_failure = self._uninstall_unload_from_registry(
+            resolved, config_entry_removed=config_entry_removed
+        )
+        if unload_failure is not None:
+            return unload_failure
+
+        restart_required = self.engine.library_manager.reset.reset_requires_restart(
+            resolved.library_name, resolved.library_path
+        )
+
+        directory_deleted, delete_failure = await self._uninstall_delete_directory(
+            resolved, config_entry_removed=config_entry_removed, unloaded=unloaded
+        )
+        if delete_failure is not None:
+            return delete_failure
+
+        return self._uninstall_success(
+            resolved,
+            unloaded=unloaded,
+            config_entry_removed=config_entry_removed,
+            directory_deleted=directory_deleted,
+            restart_required=restart_required,
+        )
 
     def _uninstall_remove_config_entry(
         self, resolved: _Resolution
@@ -185,14 +189,16 @@ class LibraryUninstall(EngineScoped):
         """Step 1 (least destructive): remove the config entry, if any names this exact copy."""
         if not resolved.entry_names_deleted_directory:
             return False, None
-        removed = self._remove_config_entry(resolved.classification)
-        if not removed:
+        removal = self._remove_config_entry(resolved.classification)
+        if removal is _ConfigEntryRemoval.WRITE_FAILED:
             details = (
                 f"Attempted to uninstall Library '{resolved.library_name}'. Failed to remove its entry from "
                 f"config; nothing was changed."
             )
             return False, UninstallLibraryResultFailure(result_details=details, failure_reason="config_write_failed")
-        return True, None
+        # ALREADY_ABSENT carries on: the rest of the steps still have work to do, and the result
+        # reports that this call was not the one that removed the entry.
+        return removal is _ConfigEntryRemoval.REMOVED, None
 
     def _uninstall_unload_from_registry(
         self, resolved: _Resolution, *, config_entry_removed: bool
@@ -235,6 +241,10 @@ class LibraryUninstall(EngineScoped):
             )
         )
         if isinstance(delete_result, DeleteFileResultFailure):
+            # Another uninstall of the same library deleted it between the check above and this
+            # request. Same goal state, so report it the same way.
+            if not await anyio.Path(resolved.install_directory).exists():
+                return True, None
             # Name only the steps that ran, or troubleshooting looks for an edit that
             # never happened.
             undone = [
@@ -290,27 +300,27 @@ class LibraryUninstall(EngineScoped):
         )
 
     async def _resolve(  # noqa: PLR0911 (one return per refusal, each checked before the next)
-        self, library_name: str, library_path: str
+        self, library_path: str
     ) -> _Resolution | _ResolutionError:
         """Find the target, classify its registration, and decide whether it is safe to delete.
 
         Shared by preview and uninstall so the two cannot derive different answers.
         """
-        library_info = self._find_library_info(library_name, library_path)
+        library_info = self._find_library_info(library_path)
         if library_info is None:
             details = (
-                f"Attempted to uninstall Library '{library_name}' at '{library_path}'. Failed because no "
-                f"Library with that name is installed there."
+                f"Attempted to uninstall the Library at '{library_path}'. Failed because no Library is installed there."
             )
             return _ResolutionError(details=details)
 
         if library_info.is_sandbox:
-            return self._blocked_resolution(library_name, library_info, blocked_by=SandboxLibraryBlocker())
+            return self._blocked_resolution(library_info, blocked_by=SandboxLibraryBlocker())
 
         managed = self.engine.library_manager.managed_environment
         if managed.provisioned_by_environment():
-            return self._blocked_resolution(library_name, library_info, blocked_by=EnvironmentManagedBlocker())
+            return self._blocked_resolution(library_info, blocked_by=EnvironmentManagedBlocker())
 
+        library_name = _display_name(library_info)
         resolved_library_path = Path(library_info.library_path)
         classification = await self._classify_registration(canonicalize_for_identity(resolved_library_path))
 
@@ -320,7 +330,6 @@ class LibraryUninstall(EngineScoped):
             raw_registered_path = classification.registered_path
             if _path_text_has_traversal_segment(raw_registered_path):
                 return self._blocked_resolution(
-                    library_name,
                     library_info,
                     blocked_by=UnsafePathBlocker(path=raw_registered_path),
                     classification=classification,
@@ -330,7 +339,6 @@ class LibraryUninstall(EngineScoped):
 
         if _unsafe_install_directory(install_directory) or self._is_protected_directory(install_directory):
             return self._blocked_resolution(
-                library_name,
                 library_info,
                 blocked_by=UnsafePathBlocker(path=str(install_directory)),
                 classification=classification,
@@ -342,7 +350,6 @@ class LibraryUninstall(EngineScoped):
         # preview reports it and the editor can disable the control.
         if classification.registered_in is None:
             return self._blocked_resolution(
-                library_name,
                 library_info,
                 blocked_by=UnmatchedEntryBlocker(),
                 classification=classification,
@@ -360,7 +367,6 @@ class LibraryUninstall(EngineScoped):
                 LIBRARIES_TO_DOWNLOAD_KEY if classification.registered_in == "download" else LIBRARIES_TO_REGISTER_KEY
             )
             return self._blocked_resolution(
-                library_name,
                 library_info,
                 blocked_by=UnwritableConfigBlocker(layer=shadowed_by.layer, config_key=config_key),
                 classification=classification,
@@ -443,10 +449,7 @@ class LibraryUninstall(EngineScoped):
     def _is_protected_directory(self, install_directory: Path) -> bool:
         """Whether deleting `install_directory` would take the workspace, libraries root, or home with it."""
         config_mgr = self.engine.config_manager
-        protected = [config_mgr.workspace_path, config_mgr.resolved_libraries_root()]
-        # No home directory resolvable on this machine; the other two still apply.
-        with contextlib.suppress(RuntimeError):
-            protected.append(Path.home())
+        protected = [config_mgr.workspace_path, config_mgr.resolved_libraries_root(), Path.home()]
 
         target = canonicalize_for_identity(install_directory)
         for directory in protected:
@@ -471,26 +474,23 @@ class LibraryUninstall(EngineScoped):
             )
         return resolved_library_path.parent
 
-    def _find_library_info(self, library_name: str, library_path: str) -> LibraryInfo | None:
-        """The tracked copy at `library_path`, when its name matches."""
+    def _find_library_info(self, library_path: str) -> LibraryInfo | None:
+        """The tracked copy at `library_path`."""
         library_manager = self.engine.library_manager
         library_info = library_manager.find_library_info_for_attempted_load(library_path)
-        if library_info is not None and library_info.library_name == library_name:
+        if library_info is not None:
             return library_info
         # The tracked key is the path as discovery recorded it; a client that canonicalized
         # differently (a symlinked or `~`-spelled libraries dir) still names the same file.
         wanted = canonicalize_for_identity(library_path)
         for manifest_path in library_manager.get_libraries_attempted_to_load():
             candidate = library_manager.get_library_info_for_attempted_load(manifest_path)
-            if candidate.library_name != library_name:
-                continue
             if canonicalize_for_identity(candidate.library_path) == wanted:
                 return candidate
         return None
 
     def _blocked_resolution(
         self,
-        library_name: str,
         library_info: LibraryInfo,
         *,
         blocked_by: UninstallBlocker,
@@ -498,7 +498,7 @@ class LibraryUninstall(EngineScoped):
         install_directory: Path | None = None,
     ) -> _Resolution:
         return _Resolution(
-            library_name=library_name,
+            library_name=_display_name(library_info),
             library_path=library_info.library_path,
             install_directory=install_directory,
             classification=classification
@@ -565,22 +565,26 @@ class LibraryUninstall(EngineScoped):
 
         return _Classification(registered_in=None, registered_path=None)
 
-    def _remove_config_entry(self, classification: _Classification) -> bool:
+    def _remove_config_entry(self, classification: _Classification) -> _ConfigEntryRemoval:
         """Remove the exact raw entry `_classify_registration` matched, by equality not index."""
-        config_mgr = self.engine.config_manager
         if classification.registered_in == "download":
-            raw = list(config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]) or [])
-            if classification.raw_download_entry not in raw:
-                return False
-            raw.remove(classification.raw_download_entry)
-            return config_mgr.set_config_value(LIBRARIES_TO_DOWNLOAD_KEY, raw)
-        if classification.registered_in == "register":
-            raw = list(config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) or [])
-            if classification.raw_register_entry not in raw:
-                return False
-            raw.remove(classification.raw_register_entry)
-            return config_mgr.set_config_value(LIBRARIES_TO_REGISTER_KEY, raw)
-        return True
+            config_key = LIBRARIES_TO_DOWNLOAD_KEY
+            raw_entry = classification.raw_download_entry
+        elif classification.registered_in == "register":
+            config_key = LIBRARIES_TO_REGISTER_KEY
+            raw_entry = classification.raw_register_entry
+        else:
+            return _ConfigEntryRemoval.ALREADY_ABSENT
+
+        config_mgr = self.engine.config_manager
+        raw = list(config_mgr.get_config_value(config_key, default=[]) or [])
+        if raw_entry not in raw:
+            return _ConfigEntryRemoval.ALREADY_ABSENT
+
+        raw.remove(raw_entry)
+        if not config_mgr.set_config_value(config_key, raw):
+            return _ConfigEntryRemoval.WRITE_FAILED
+        return _ConfigEntryRemoval.REMOVED
 
     async def _collect_collateral_library_names(
         self, install_directory: Path | None, *, exclude_manifest: Path
@@ -598,6 +602,21 @@ class LibraryUninstall(EngineScoped):
                 continue
             names.append(_read_raw_library_name(manifest_path) or str(manifest_path))
         return names
+
+
+def _display_name(library_info: LibraryInfo) -> str:
+    """What to call this copy in results and messages.
+
+    A copy whose metadata never loaded has no name on record, so fall back to the manifest's own
+    `name`, then to its path.
+    """
+    if library_info.library_name is not None:
+        return library_info.library_name
+    manifest_path = Path(library_info.library_path)
+    raw_name = _read_raw_library_name(manifest_path)
+    if raw_name is not None:
+        return raw_name
+    return str(manifest_path)
 
 
 def _read_raw_library_name(manifest_path: Path) -> str | None:
@@ -626,7 +645,11 @@ _WINDOWS_DRIVE_OR_UNC_PATTERN = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{2})")
 
 
 def _unsafe_install_directory(install_directory: PurePath) -> bool:
-    """Whether `install_directory` must not be deleted: a filesystem root, drive root, or UNC share."""
+    """Whether `install_directory` must not be deleted: a filesystem root, drive root, or network path.
+
+    Every network path is refused, not only a share's root. A delete there cannot reach a
+    recycle bin, so it would be permanent, and the engine cannot tell whose share it is.
+    """
     path_str = str(install_directory)
     backslash_form = path_str.replace("/", "\\")
     if backslash_form.lower().startswith("\\\\?\\unc\\"):

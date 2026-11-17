@@ -1,8 +1,4 @@
-- `UninstallLibraryRequest` and `PreviewUninstallLibraryRequest` remove a node library from the
-  engine: its `libraries_to_register`/`libraries_to_download` entry, its registry load, and its
-  install folder, sent to the recycle bin where the platform supports one. A library the engine
-  cannot fully remove is refused rather than partly uninstalled, and the preview reports that
-  before anything is clicked: one whose entry lives in a project, workspace, or environment
-  config the engine does not write, and one whose registration it cannot find at all. Where a
-  `libraries_to_register` entry names a folder the engine scans, only the library's own folder
-  is removed and the entry stays.
+- `UninstallLibraryRequest` removes an installed node library: it unregisters the library,
+  unloads it, and sends its folder to the recycle bin where the platform supports one.
+  `PreviewUninstallLibraryRequest` reports what would be removed, and says when a library
+  cannot be uninstalled, so the editor can disable the control before anything is clicked.

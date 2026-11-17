@@ -160,7 +160,27 @@ re-cloning the library.
 
 ### Removing a library
 
-The Library Management window itself doesn't delete a library's files from
-disk — for that, plus toggling a library off without removing it, see
+**Uninstall** on a library's row unregisters it, unloads it from the running
+engine, and sends its folder to the system trash — so you can put it back
+from there if you change your mind. A confirmation names the exact folder
+first, and anything else inside it: some installs hold several libraries in
+one folder, and those go together.
+
+Some libraries can't be uninstalled here. The button is greyed out, and
+hovering the row gives the reason:
+
+- The setting that registers the library lives in a project, workspace, or
+    environment config file. The editor only writes your own config, so the
+    entry would outlive the uninstall and the engine would keep looking for
+    files that are gone. Remove it from the file that holds it.
+- Nothing in your config registers the library at all, so there is no entry
+    to remove, and deleting the files would leave whatever did register it
+    pointing at nothing.
+
+An uninstall can also leave a **Libraries To Register** entry naming a folder
+the engine scans rather than the library itself. That entry is what loads the
+libraries beside this one, so it stays, and a message says so afterwards.
+
+To stop loading a library without deleting it, see
 [Toggling and removing libraries](../libraries.md#toggling-and-removing-libraries)
 in the Libraries guide.
