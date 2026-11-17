@@ -467,7 +467,7 @@ class TestImageMetadata:
         engine.context_manager.push_workflow(workflow_name="restored")
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
 
-        result = engine.handle_request(
+        result = engine.current_workflow().handle_request(
             ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=True)
         )
 

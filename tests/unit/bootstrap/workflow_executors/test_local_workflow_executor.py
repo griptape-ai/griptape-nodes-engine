@@ -1,9 +1,11 @@
 """Unit tests for LocalWorkflowExecutor project activation, CLI arguments, and flow input."""
 
+from __future__ import annotations
+
 import os
 from argparse import ArgumentParser
-from collections.abc import Iterator
 from pathlib import Path, PureWindowsPath
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest  # type: ignore[reportMissingImports]
@@ -16,6 +18,11 @@ from griptape_nodes.bootstrap.workflow_executors.local_workflow_executor import 
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import StartNode
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    GetTopLevelFlowRequest,
+)
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
     ActivateWorkspaceProjectResultFailure,
@@ -24,7 +31,14 @@ from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateResultSuccess,
     SetCurrentProjectResultSuccess,
 )
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.serialization.values import encode_value
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 
 # A Windows path that exceeds the legacy MAX_PATH (260 chars).
 # Total length is ~300 characters including the drive letter.
@@ -462,3 +476,29 @@ class TestSetInputForFlow:
 
         values = {call.args[0].parameter_name: call.args[0].value for call in mock_gn.ahandle_request.await_args_list}
         assert values == {"pair": (1, 2), "text": "plain"}
+
+
+class TestSaveFailedWorkflow:
+    @pytest.mark.asyncio
+    async def test_sends_every_request_bound_to_the_open_workflow(self, engine: Engine, tmp_path: Path) -> None:
+        """The executor runs bound to no workflow, as a standalone run does, with its one workflow open."""
+        engine.context_manager.push_workflow(workflow_name="failing")
+        workflow = engine.current_workflow()
+        created = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        assert isinstance(created, CreateFlowResultSuccess), created.result_details
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._save_on_failure_path = str(tmp_path / "failing_failed.py")
+        sent: list[tuple[str, object]] = []
+
+        async def record(request: RequestPayload) -> ResultPayload:
+            sent.append((type(request).__name__, bound_workflow.get()))
+            if isinstance(request, GetTopLevelFlowRequest):
+                return await engine.ahandle_request(request)
+            return MagicMock()
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", side_effect=record):
+            await executor._save_failed_workflow(RuntimeError("boom"))
+
+        assert sent
+        assert sent[0][0] == "GetTopLevelFlowRequest"
+        assert all(binding is workflow for _name, binding in sent)

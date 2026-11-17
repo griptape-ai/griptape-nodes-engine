@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import BaseNode, DataNode
+from griptape_nodes.exe_types.node_types import DataNode
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -393,20 +393,18 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
 
     @pytest.mark.asyncio
-    async def test_an_unbound_request_runs_the_node_of_the_only_open_workflow(self, engine: Engine) -> None:
-        """As the MCP server sends it: no envelope id and no binding."""
-        workflow = _open_workflow(engine)
+    async def test_an_unbound_request_finds_no_node_while_one_is_open(self, engine: Engine) -> None:
+        """As an MCP client that names no workflow sends it: no envelope id and no binding."""
+        _open_workflow(engine)
         node_name = _create_node(engine, _create_canvas(engine), "node")
-        seen: list[WorkflowRuntime | None] = []
-
-        def process(_node: BaseNode) -> None:
-            seen.append(engine.current_workflow_or_none())
+        process = MagicMock()
 
         with patch.object(_ValueNode, "process", process):
             result = await engine.ahandle_request(ExecuteNodeRequest(node_name=node_name, parameter_values={}))
 
-        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
-        assert seen == [workflow]
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "named no workflow" in str(result.result_details)
+        process.assert_not_called()
 
     @pytest.mark.parametrize(
         ("request_payload", "failure_type"),

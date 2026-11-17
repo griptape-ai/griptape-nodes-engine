@@ -303,8 +303,8 @@ class TestWorkflowWorkingDirectory:
     """
 
     def _resolve_outputs(self, engine: Engine) -> Path:
-        """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node would."""
-        result = engine.handle_request(
+        """Resolve `{workflow_dir?:/}outputs/img.png` the way a saving node would, in its workflow."""
+        result = engine.current_workflow().handle_request(
             GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir?:/}outputs/img.png"), variables={})
         )
         assert isinstance(result, GetPathForMacroResultSuccess)
@@ -406,7 +406,7 @@ class TestWorkflowWorkingDirectory:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
 
-                resolved = engine.handle_request(
+                resolved = engine.current_workflow().handle_request(
                     GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
                 )
 
@@ -760,9 +760,12 @@ class TestEnsureWorkflowAndFlowRequest:
             EnsureWorkflowAndFlowRequest(display_name="scratch", flow_name="canvas")
         )
         assert isinstance(first, EnsureWorkflowAndFlowResultSuccess)
+        assert first.workflow_id is not None
 
         # Calling again with different names should be a no-op: existing context wins.
-        second = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="ignored", flow_name="also_ignored"))
+        second = engine.open_workflows.get(first.workflow_id).handle_request(
+            EnsureWorkflowAndFlowRequest(workflow_name="ignored", flow_name="also_ignored")
+        )
 
         assert isinstance(second, EnsureWorkflowAndFlowResultSuccess)
         assert second.workflow_name == first.workflow_name

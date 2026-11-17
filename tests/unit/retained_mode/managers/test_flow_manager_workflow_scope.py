@@ -39,6 +39,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
@@ -71,7 +72,6 @@ def _open_workflow(engine: Engine) -> WorkflowRuntime:
 
 # They answer with no workflow, and use the one they are handed.
 _OPTIONAL_WORKFLOW_REQUESTS = {
-    GetTopLevelFlowRequest,
     ListFlowsInFlowRequest,
     ExtractFlowCommandsFromImageMetadataRequest,
     CancelRunRequest,
@@ -107,7 +107,7 @@ class TestFlowManagerScopes:
 
 
 class TestTopLevelFlowWithNoEnvelopeId:
-    """The editor names no workflow yet, and reads `flow_name=None` as "nothing is loaded"."""
+    """It acts on a workflow, so it answers for the only open one, as a saved workflow file run as a script asks."""
 
     def test_answers_for_the_only_open_workflow(self, engine: Engine) -> None:
         _open_workflow(engine)
@@ -118,18 +118,17 @@ class TestTopLevelFlowWithNoEnvelopeId:
         assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
         assert result.flow_name == flow_name
 
-    def test_answers_none_with_nothing_open(self, engine: Engine) -> None:
+    def test_fails_with_nothing_open(self, engine: Engine) -> None:
         result = engine.event_manager.handle_request(GetTopLevelFlowRequest()).result
 
-        assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
-        assert result.flow_name is None
+        assert isinstance(result, WorkflowNotNamedResultFailure)
 
 
-class TestCancelWithNoEnvelopeId:
-    """Cancelling binds the open workflow it falls back to: nodes' own cancellation reads the binding."""
+class TestCancelBinding:
+    """Cancelling binds the workflow it names: nodes' own cancellation reads the binding."""
 
     @pytest.mark.asyncio
-    async def test_cancelling_every_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+    async def test_cancelling_every_run_binds_the_named_workflow(self, engine: Engine) -> None:
         workflow = _open_workflow(engine)
         seen: list[WorkflowRuntime | None] = []
 
@@ -137,13 +136,17 @@ class TestCancelWithNoEnvelopeId:
             seen.append(engine.current_workflow_or_none())
 
         with patch.object(engine.flow_manager, "cancel_all_runs_in", cancel_all_runs_in):
-            result = (await engine.event_manager.ahandle_request(CancelAllRunsRequest())).result
+            result = (
+                await engine.event_manager.ahandle_request(
+                    CancelAllRunsRequest(), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+                )
+            ).result
 
         assert result.succeeded(), result.result_details
         assert seen == [workflow]
 
     @pytest.mark.asyncio
-    async def test_cancelling_a_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+    async def test_cancelling_a_run_binds_the_named_workflow(self, engine: Engine) -> None:
         workflow = _open_workflow(engine)
         seen: list[WorkflowRuntime | None] = []
 
@@ -152,10 +155,25 @@ class TestCancelWithNoEnvelopeId:
             return True
 
         with patch.object(engine.flow_manager, "cancel_run_in", cancel_run_in):
-            result = (await engine.event_manager.ahandle_request(CancelRunRequest(run_id="run"))).result
+            result = (
+                await engine.event_manager.ahandle_request(
+                    CancelRunRequest(run_id="run"), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+                )
+            ).result
 
         assert result.succeeded(), result.result_details
         assert seen == [workflow]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_with_no_workflow_named_leaves_the_open_ones_running(self, engine: Engine) -> None:
+        _open_workflow(engine)
+        cancel_all_runs_in = MagicMock()
+
+        with patch.object(engine.flow_manager, "cancel_all_runs_in", cancel_all_runs_in):
+            result = (await engine.event_manager.ahandle_request(CancelAllRunsRequest())).result
+
+        assert result.succeeded(), result.result_details
+        cancel_all_runs_in.assert_not_called()
 
 
 class TestHandlersActOnTheWorkflowTheyAreHanded:

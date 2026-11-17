@@ -552,17 +552,18 @@ class TestMetadataInjection:
         provider.collect_metadata_for_write.return_value = metadata
         provider.prepare_content_for_write.return_value = injected_bytes
         with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider) as mock_lookup:
-            result = os_manager.engine.handle_request(request)
+            result = os_manager.engine.current_workflow().handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         mock_lookup.assert_called_once_with("image.png")
         provider.collect_metadata_for_write.assert_called_once_with("image.png", engine.current_workflow())
         provider.prepare_content_for_write.assert_called_once_with(original_bytes, "image.png", metadata)
 
-    def test_metadata_is_collected_for_the_open_workflow_when_the_request_names_none(
-        self, engine: Engine, temp_dir: Path
+    @pytest.mark.parametrize("named", [True, False])
+    def test_metadata_is_collected_for_the_workflow_the_request_names(
+        self, engine: Engine, temp_dir: Path, *, named: bool
     ) -> None:
-        """The embedded metadata describes the workflow the sidecar records, not none."""
+        """The embedded metadata describes the workflow the sidecar records: the named one, or none."""
         workflow = engine.current_workflow()
         seen = []
 
@@ -572,11 +573,18 @@ class TestMetadataInjection:
 
         provider = MagicMock()
         provider.collect_metadata_for_write.side_effect = collect
+        request = WriteFileRequest(file_path=str(temp_dir / "image.png"), content=b"png")
         with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
-            result = engine.handle_request(WriteFileRequest(file_path=str(temp_dir / "image.png"), content=b"png"))
+            if named:
+                result = workflow.handle_request(request)
+            else:
+                result = engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        assert seen == [workflow]
+        if named:
+            assert seen == [workflow]
+        else:
+            assert seen == [None]
 
     def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
         """Test that injection is skipped when skip_metadata_injection=True."""

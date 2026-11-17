@@ -532,13 +532,14 @@ class FlowManager(EngineScoped):
     def on_get_top_level_flow_request_in_workflow(
         self,
         request: GetTopLevelFlowRequest,  # noqa: ARG002 (the request has to be assigned to the method)
-        workflow: WorkflowRuntime | None = None,
+        workflow: WorkflowRuntime,
     ) -> ResultPayload:
-        """Find `workflow`'s top-level flow. With no workflow there is none."""
-        names = {}
-        if workflow is not None:
-            names = workflow.flows.name_to_parent_name
-        for flow_name, parent in names.items():
+        """Find `workflow`'s top-level flow.
+
+        WORKFLOW-scoped so a saved workflow file run as a script, which asks with no workflow named,
+        gets the one it opened.
+        """
+        for flow_name, parent in workflow.flows.name_to_parent_name.items():
             if parent is None:
                 return GetTopLevelFlowResultSuccess(
                     flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
