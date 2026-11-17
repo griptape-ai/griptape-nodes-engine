@@ -19,10 +19,18 @@ import base64
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
-import httpx
-from pydantic_ai.exceptions import ModelRetry
+import httpx2
+from pydantic_ai import RunContext  # noqa: TC002 - pydantic-ai reads the annotation at runtime to find `ctx`
+from pydantic_ai.exceptions import ApprovalRequired, ModelRetry
+
+from griptape_nodes.agents.pydantic_ai.tool_approval import needs_approval
+from griptape_nodes.drivers.cloud_credentials import DEFAULT_CLOUD_BASE_URL, join_cloud_url
+from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_exception
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
+from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
 
 if TYPE_CHECKING:
     from pydantic_ai import Agent
@@ -32,9 +40,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-
-GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
-"""Default Griptape Cloud root. The ``/api/images`` prefix is added here."""
 
 DEFAULT_IMAGE_MODEL = "gpt-image-1-mini"
 DEFAULT_IMAGE_REQUEST_TIMEOUT_SECONDS = 120.0
@@ -64,7 +69,7 @@ class ImageGenerationToolsetConfig:
 
     api_key: str
     model: str = DEFAULT_IMAGE_MODEL
-    base_url: str = GRIPTAPE_CLOUD_BASE_URL
+    base_url: str = DEFAULT_CLOUD_BASE_URL
     image_size: str | None = None
     quality: str | None = None
     background: str | None = None
@@ -86,7 +91,7 @@ class ImageGenerationToolset:
     def __init__(self, config: ImageGenerationToolsetConfig, static_files_manager: StaticFilesManager) -> None:
         self._config = config
         self._static_files_manager = static_files_manager
-        self._base_url = config.base_url.rstrip("/")
+        self._base_url = config.base_url
         self._headers = {"Authorization": f"Bearer {config.api_key}"}
 
     @property
@@ -95,12 +100,15 @@ class ImageGenerationToolset:
 
     def register_on(self, agent: Agent) -> None:
         """Register the image-generation tool on the given Pydantic AI agent."""
-        agent.tool_plain(self.generate_image)
+        agent.tool(self.generate_image)
 
-    async def generate_image(self, prompt: str, negative_prompt: str = "") -> str:
+    async def generate_image(self, ctx: RunContext[Any], prompt: str, negative_prompt: str = "") -> str:
         """Generate an image from a text prompt and return its workspace URL.
 
         Args:
+            ctx: The agent run. Its ``extra_headers`` go on the Cloud request, so
+                the image is billed to the same project as the reply around it,
+                and its ``deps`` say whether the user must approve the call.
             prompt: Text description of the image to generate.
             negative_prompt: Optional description of what to avoid. Sent to the
                 model when non-empty.
@@ -113,6 +121,11 @@ class ImageGenerationToolset:
             msg = "generate_image requires a non-empty `prompt`."
             raise ModelRetry(msg)
 
+        # Checked in the body rather than by wrapping a toolset, because the tool
+        # is registered directly on the agent.
+        if not ctx.tool_call_approved and needs_approval(ctx.deps, [IMAGE_TOOL_NAME]):
+            raise ApprovalRequired
+
         payload: dict[str, object] = {
             "prompts": [prompt],
             "driver_configuration": self._driver_configuration(),
@@ -120,19 +133,24 @@ class ImageGenerationToolset:
         if negative_prompt.strip():
             payload["negative_prompts"] = [negative_prompt]
 
-        url = f"{self._base_url}/api/images/generations"
+        url = join_cloud_url(self._base_url, "/api/images/generations")
         # Recoverable Cloud/parse failures are surfaced as ModelRetry so a single
         # bad image request does not abort the whole agent turn (and discard any
         # state already mutated by earlier tool calls); the model can retry or
         # explain the failure instead.
         try:
-            async with httpx.AsyncClient(timeout=self._config.timeout_seconds) as client:
-                response = await client.post(url, headers=self._headers, json=payload)
+            async with httpx2.AsyncClient(timeout=self._config.timeout_seconds) as client:
+                response = await client.post(url, headers={**_run_headers(ctx), **self._headers}, json=payload)
             response.raise_for_status()
             artifact = response.json()["artifact"]
             image_bytes = base64.b64decode(artifact["value"])
             image_format = artifact.get("format", "png")
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
+            # Retrying a budget refusal is just refused again, so stop instead.
+            refusal = refusal_from_exception(exc, cloud_host=urlsplit(self._base_url).hostname or "")
+            if refusal is not None:
+                logger.error(budget_log_line(refusal))
+                raise BudgetExceededError(describe_budget_refusal(refusal), refusal) from exc
             msg = f"Image generation request to Griptape Cloud failed: {exc}"
             raise ModelRetry(msg) from exc
         except (KeyError, ValueError, TypeError) as exc:
@@ -159,6 +177,12 @@ class ImageGenerationToolset:
             "output_format": self._config.output_format,
         }
         return {key: value for key, value in config.items() if value is not None}
+
+
+def _run_headers(ctx: RunContext[Any]) -> dict[str, str]:
+    """Return the extra headers the agent run carries, or ``{}``."""
+    settings = ctx.model_settings or {}
+    return dict(settings.get("extra_headers") or {})
 
 
 def register_image_tools(

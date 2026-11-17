@@ -1,0 +1,33 @@
+{
+  "name": "Node Timing Demo",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "Griptape",
+    "description": "Demonstrates a library that logs how long every node run takes, including the nodes inside groups and loops.",
+    "library_version": "0.1.0",
+    "engine_version": "0.97.0",
+    "tags": ["demo", "execution-events"]
+  },
+  "categories": [
+    {
+      "timing": {
+        "title": "Timing",
+        "description": "Nodes for trying out the timing library",
+        "color": "border-teal-500",
+        "icon": "Timer"
+      }
+    }
+  ],
+  "advanced_library_path": "advanced_library.py",
+  "nodes": [
+    {
+      "class_name": "WaitNode",
+      "file_path": "nodes.py",
+      "metadata": {
+        "category": "timing",
+        "description": "Waits a set number of seconds, so the timing library has something to time.",
+        "display_name": "Wait"
+      }
+    }
+  ]
+}

@@ -203,7 +203,7 @@ class ParameterTransitionComponent:
     def _capture_connections(self, parameter_name: str) -> GetConnectionsForParameterResultSuccess | None:
         """Fetch the connection lists for a parameter, or None if the query fails."""
         request = GetConnectionsForParameterRequest(parameter_name=parameter_name, node_name=self._node.name)
-        result = self._node.engine.handle_request(request)
+        result = self._node._handle_request_in_workflow(request)
         if isinstance(result, GetConnectionsForParameterResultSuccess):
             return result
         logger.warning(
@@ -217,7 +217,7 @@ class ParameterTransitionComponent:
     def _remove_parameter(self, name: str) -> bool:
         """Dispatch RemoveParameterFromNodeRequest. Returns True on success."""
         request = RemoveParameterFromNodeRequest(parameter_name=name, node_name=self._node.name)
-        result = self._node.engine.handle_request(request)
+        result = self._node._handle_request_in_workflow(request)
         if result.failed():
             logger.error(
                 "Attempted to remove parameter '%s' from node '%s'. Failed because: %s",
@@ -231,7 +231,7 @@ class ParameterTransitionComponent:
     def _add_parameter(self, desired: TransitionParameter) -> bool:
         """Dispatch the caller-supplied add-request factory. Returns True on success."""
         add_request = desired.add_request_factory()
-        result = self._node.engine.handle_request(add_request)
+        result = self._node._handle_request_in_workflow(add_request)
         if result.failed():
             logger.error(
                 "Attempted to add parameter '%s' to node '%s'. Failed because: %s",
@@ -266,7 +266,7 @@ class ParameterTransitionComponent:
             target_node_name=self._node.name,
             target_parameter_name=incoming.target_parameter_name,
         )
-        result = self._node.engine.handle_request(request)
+        result = self._node._handle_request_in_workflow(request)
         if result.failed():
             logger.debug(
                 "Dropped incoming connection %s.%s -> %s.%s during replace because: %s",
@@ -284,7 +284,7 @@ class ParameterTransitionComponent:
             target_node_name=outgoing.target_node_name,
             target_parameter_name=outgoing.target_parameter_name,
         )
-        result = self._node.engine.handle_request(request)
+        result = self._node._handle_request_in_workflow(request)
         if result.failed():
             logger.debug(
                 "Dropped outgoing connection %s.%s -> %s.%s during replace because: %s",

@@ -33,7 +33,7 @@ For example, you can ask it to:
 
 - **"What nodes are in my workflow?"** — it reads the canvas and tells you what's there
 - **"Add a Text Input node and connect it to the Agent"** — it creates and wires the nodes for you
-- **"Run my workflow and tell me what the output was"** — it executes your workflow and reports back
+- **"Run my workflow and tell me what the output was"** — it asks for your [approval](./approvals.md), then runs your workflow and reports back
 - **"Change the prompt on my Agent node to..."** — it updates node parameters directly
 - **"Explain what this workflow does"** — it reads your workflow structure and gives you a plain-language summary
 
@@ -41,9 +41,28 @@ For example, you can ask it to:
 
     Griptape Nodes runs a built-in **MCP server** alongside the engine. MCP (Model Context Protocol) is an open standard that lets AI models call tools — in this case, tools for reading your canvas, creating nodes, running workflows, and more. The agent connects to this server automatically; there's nothing to configure.
 
+## When a budget stops a reply
+
+If your organization has set a spending budget on Griptape Cloud and a reply
+would go over it, the agent stops and says so in the thread, in place of its
+answer:
+
+> Budget stopped this reply. It was blocked by the budget "Marketing Q3".
+> Contact your Griptape administrator.
+
+Replies, and images the agent generates, count against the budgets of the
+project you have open, as well as any budget for your whole organization.
+
+The message names every budget that blocked the reply. Bring those names to
+your Griptape administrator, who can raise or unfreeze them in the Admin
+Dashboard's [Spend & Budgets](../../enterprise/admin_dashboard.md#spend-budgets)
+page. A budget that stops a workflow run is shown differently — see
+[When a budget stops a run](../editor/running_workflows.md#when-a-budget-stops-a-run).
+
 ## What's next
 
 - [Threads](./threads.md) — how conversations are saved and where to find them
+- [Approvals](./approvals.md) — have the agent ask before it runs workflows, generates images, or uses your MCP tools
 - [Personalization](./personalization.md) — customize the agent's tone and context
 - [Skills](./skills.md) — give the agent extra domain knowledge
 - [External Tools (MCP Servers)](./mcp_servers.md) — connect file access, web search, and other tools to the agent

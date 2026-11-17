@@ -109,7 +109,7 @@ class TestSerializeGroupWithChildren:
         ):
             from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
-            return NodeManager._serialize_group_with_children(manager, group, {}, MagicMock())
+            return NodeManager._serialize_group_with_children(manager, MagicMock(), group, {}, MagicMock())
 
     def test_node_names_to_add_cleared_on_group_command(self, engine: Engine) -> None:
         """group_command.create_node_command.node_names_to_add is None after serialization.

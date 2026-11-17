@@ -20,17 +20,23 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
-from griptape_nodes.files.path_utils import derive_registry_key
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
+from griptape_nodes.files.path_utils import (
+    canonicalize_for_identity_preserving_symlinks,
+    derive_registry_key,
+    relative_to_keeping_or_following_links,
+)
 from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowRequest,
     StartLocalSubflowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.flow_events import TRANSIENT_KEY, DeleteFlowRequest
+from griptape_nodes.retained_mode.events.flow_events import (
+    TRANSIENT_KEY,
+    DeleteFlowRequest,
+    ImportWorkflowAsReferencedSubFlowRequest,
+)
 from griptape_nodes.retained_mode.events.node_events import GetFlowForNodeRequest, GetFlowForNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
-    ImportWorkflowAsReferencedSubFlowRequest,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     WorkflowStatus,
 )
@@ -39,8 +45,13 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from griptape_nodes.node_library.workflow_registry import NodeParametersMapping, ParameterMinimalDict
-    from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.node_library.workflow_registry import (
+        NodeParametersMapping,
+        ParameterMinimalDict,
+        WorkflowMetadata,
+        _WorkflowRegistry,
+    )
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -61,9 +72,9 @@ STATUS_PARAMETER_NAMES = frozenset({"was_successful", "result_details"})
 # offer a "view the subflow" affordance during a session.
 SUBFLOW_NAME_KEY = "subflow_name"
 
-# Node-metadata flag the editor uses to recognize a node that runs a workflow. Presence of this key
-# is what makes the editor render the node with its subflow-preview wrapper (see
-# `determineNodeType` in the editor's ConstructNode.ts), which offers a "View Subflow" button.
+# Node-metadata flag the editor uses to recognize a node that runs a workflow. When its value is
+# True, the editor renders the node with its subflow-preview wrapper (see `determineNodeType` in the
+# editor's ConstructNode.ts), which offers a "View Subflow" button. Only the editor reads it.
 WORKFLOW_NODE_KEY = "workflow_node"
 
 # Node-metadata key holding the registry key of the backing workflow. The editor's preview reads
@@ -252,8 +263,13 @@ def pair_shape_nodes(declared_names: Sequence[str], live_names: Sequence[str], r
     return dict(zip(declared_names, live_names, strict=True))
 
 
-def ensure_workflow_registered(workflow_file_path: Path, workflow_metadata: WorkflowMetadata) -> str:
-    """Register `workflow_file_path` in the workflow registry if it is not there already.
+def ensure_workflow_registered(
+    workspace_path: Path,
+    workflow_registry: _WorkflowRegistry,
+    workflow_file_path: Path,
+    workflow_metadata: WorkflowMetadata,
+) -> str:
+    """Register `workflow_file_path` in `workflow_registry` if it is not there already.
 
     Returns the registry key the workflow is available under. Registration is idempotent, and is
     also re-attempted before each run, because the registry is cleared and rebuilt when the
@@ -265,19 +281,31 @@ def ensure_workflow_registered(workflow_file_path: Path, workflow_metadata: Work
     registration and silently hide a workflow the author had listed deliberately.
 
     Raises:
-        KeyError: The key was claimed concurrently.
-        ValueError: The workflow file is no longer on disk.
+        ValueError: The workflow file is no longer on disk, or its path or key was claimed concurrently.
     """
-    registry_key = derive_registry_key(str(workflow_file_path))
-    if WorkflowRegistry.has_workflow_with_name(registry_key):
+    path_for_key = _workspace_relative_workflow_path(workspace_path, workflow_file_path)
+    registry_key = derive_registry_key(path_for_key)
+    if workflow_registry.has_workflow_with_name(registry_key):
         return registry_key
 
-    WorkflowRegistry.generate_new_workflow(
-        registry_key=registry_key,
-        metadata=workflow_metadata,
-        file_path=str(workflow_file_path),
-    )
-    return registry_key
+    return workflow_registry.register_file(path_for_key, workflow_metadata).name
+
+
+def _workspace_relative_workflow_path(workspace_path: Path, workflow_file_path: Path) -> str:
+    """Return the workspace-relative form of a workflow's path, or the path itself if outside it.
+
+    The workspace scan keys workflows by this path, so the same form is needed here or one file is
+    registered twice under two names. A workflow outside the workspace (such as a library's bundled
+    one) keeps its full path.
+
+    The workspace is read on every call, not baked into the node class: the registry is rebuilt
+    when the workspace changes, but the node types a library minted survive that reload.
+    """
+    relative_path = relative_to_keeping_or_following_links(workflow_file_path, workspace_path)
+    if relative_path is None:
+        return str(canonicalize_for_identity_preserving_symlinks(workflow_file_path))
+
+    return str(relative_path)
 
 
 class WorkflowNode(ControlNode):
@@ -301,6 +329,7 @@ class WorkflowNode(ControlNode):
         # subflow it names is transient and never serialized, so any name that reaches us here is
         # stale (or, after a copy/paste, belongs to a different node).
         self.metadata.pop(SUBFLOW_NAME_KEY, None)
+        # The editor reads this key to show the subflow preview and "View Subflow" button.
         self.metadata[WORKFLOW_NODE_KEY] = True
         self._publish_workflow_registry_key()
 
@@ -316,7 +345,7 @@ class WorkflowNode(ControlNode):
 
         self._apply_inputs(subflow_name, live_routes)
 
-        result = await self.engine.ahandle_request(StartLocalSubflowRequest(flow_name=subflow_name))
+        result = await self._ahandle_request_in_workflow(StartLocalSubflowRequest(flow_name=subflow_name))
         if not isinstance(result, StartLocalSubflowResultSuccess):
             msg = (
                 f"Attempted to run the workflow behind node '{self.name}'. "
@@ -335,7 +364,10 @@ class WorkflowNode(ControlNode):
         """
         try:
             self.metadata[WORKFLOW_FILE_VALUE_KEY] = ensure_workflow_registered(
-                self.workflow_file_path, self.workflow_metadata
+                self.engine.config_manager.workspace_path,
+                self.engine.workflow_registry,
+                self.workflow_file_path,
+                self.workflow_metadata,
             )
         except (KeyError, ValueError):
             logger.warning(
@@ -353,12 +385,12 @@ class WorkflowNode(ControlNode):
         """
         tracked = self.metadata.get(SUBFLOW_NAME_KEY)
         if tracked is not None:
-            if _get_flow_or_none(self.engine, tracked) is not None:
+            if _get_flow_or_none(self._require_workflow(), tracked) is not None:
                 return tracked
             # Torn down out from under us (for example when the parent flow was deleted).
             self.metadata.pop(SUBFLOW_NAME_KEY, None)
 
-        flow_result = self.engine.handle_request(GetFlowForNodeRequest(node_name=self.name))
+        flow_result = self._handle_request_in_workflow(GetFlowForNodeRequest(node_name=self.name))
         if not isinstance(flow_result, GetFlowForNodeResultSuccess):
             msg = (
                 f"Attempted to run the workflow behind node '{self.name}'. "
@@ -367,7 +399,7 @@ class WorkflowNode(ControlNode):
             raise RuntimeError(msg)  # noqa: TRY004 - the lookup failed at run time; this is not a type error
 
         registry_key = self._register_workflow()
-        import_result = await self.engine.ahandle_request(
+        import_result = await self._ahandle_request_in_workflow(
             ImportWorkflowAsReferencedSubFlowRequest(
                 workflow_name=registry_key,
                 flow_name=flow_result.flow_name,
@@ -407,7 +439,12 @@ class WorkflowNode(ControlNode):
     def _register_workflow(self) -> str:
         """Return the backing workflow's registry key, registering it if it is not registered yet."""
         try:
-            return ensure_workflow_registered(self.workflow_file_path, self.workflow_metadata)
+            return ensure_workflow_registered(
+                self.engine.config_manager.workspace_path,
+                self.engine.workflow_registry,
+                self.workflow_file_path,
+                self.workflow_metadata,
+            )
         except (KeyError, ValueError) as err:
             msg = (
                 f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
@@ -420,9 +457,9 @@ class WorkflowNode(ControlNode):
         tracked = self.metadata.pop(SUBFLOW_NAME_KEY, None)
         if tracked is None:
             return
-        if _get_flow_or_none(self.engine, tracked) is None:
+        if _get_flow_or_none(self._require_workflow(), tracked) is None:
             return
-        delete_result = self.engine.handle_request(DeleteFlowRequest(flow_name=tracked))
+        delete_result = self._handle_request_in_workflow(DeleteFlowRequest(flow_name=tracked))
         if delete_result.failed():
             logger.warning(
                 "Node '%s' could not clean up its workflow subflow '%s': %s",
@@ -445,7 +482,7 @@ class WorkflowNode(ControlNode):
             WorkflowNodeRoutingError: A declared parameter is not present on the node it was paired
                 with, meaning the loaded copy does not match the workflow's stored shape.
         """
-        flow = self.engine.flow_manager.get_flow_by_name(subflow_name)
+        flow = self.engine.flow_manager.get_flow_by_name_in(self._require_workflow(), subflow_name)
         live_start_nodes = [node.name for node in flow.nodes.values() if isinstance(node, StartNode)]
         live_end_nodes = [node.name for node in flow.nodes.values() if isinstance(node, EndNode)]
 
@@ -493,7 +530,7 @@ class WorkflowNode(ControlNode):
 
     def _apply_inputs(self, subflow_name: str, live_routes: WorkflowNodeLiveRoutes) -> None:
         for surface_name, route in live_routes.inputs.items():
-            set_result = self.engine.handle_request(
+            set_result = self._handle_request_in_workflow(
                 SetParameterValueRequest(
                     parameter_name=route.parameter_name,
                     node_name=route.workflow_node_name,
@@ -510,7 +547,7 @@ class WorkflowNode(ControlNode):
         logger.debug("Node '%s' applied inputs to workflow subflow '%s'.", self.name, subflow_name)
 
     def _collect_outputs(self, subflow_name: str, live_routes: WorkflowNodeLiveRoutes) -> None:
-        flow = self.engine.flow_manager.get_flow_by_name(subflow_name)
+        flow = self.engine.flow_manager.get_flow_by_name_in(self._require_workflow(), subflow_name)
         for surface_name, route in live_routes.outputs.items():
             end_node = flow.nodes[route.workflow_node_name]
             # A node that ran publishes to parameter_output_values; fall back to the stored value
@@ -582,5 +619,5 @@ def _build_surface_parameter(surface_name: str, surface_parameter: WorkflowNodeS
     )
 
 
-def _get_flow_or_none(engine: Engine, flow_name: str) -> ControlFlow | None:
-    return engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+def _get_flow_or_none(workflow: WorkflowRuntime, flow_name: str) -> ControlFlow | None:
+    return workflow.objects.get_as_type(flow_name, ControlFlow)

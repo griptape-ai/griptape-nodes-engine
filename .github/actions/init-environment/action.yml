@@ -18,6 +18,14 @@ runs:
         enable-cache: true
         cache-dependency-glob: "uv.lock"
 
+    # uv prefers .python-version over the interpreter setup-python put on PATH, so a matrix
+    # version only takes effect through UV_PYTHON. Exported to GITHUB_ENV so later `uv run` steps
+    # keep using it instead of rebuilding the venv on the pinned version.
+    - name: Pin uv to the matrix Python version
+      if: matrix.python-version != ''
+      shell: bash
+      run: echo "UV_PYTHON=${{ matrix.python-version }}" >> "$GITHUB_ENV"
+
     - name: Install dependencies
       shell: bash
       run: uv sync --all-extras --all-groups

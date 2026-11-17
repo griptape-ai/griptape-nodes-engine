@@ -27,6 +27,7 @@ class ExecutionStatusComponent:
         parameter_group_initially_collapsed: bool = True,
         result_details_tooltip: str = "Details about the operation result",
         result_details_placeholder: str = "Details on the operation will be presented here.",
+        result_details_allow_variable_substitution: bool = True,
     ) -> None:
         """Initialize the ExecutionStatusComponent and create the parameters immediately.
 
@@ -37,6 +38,8 @@ class ExecutionStatusComponent:
             parameter_group_initially_collapsed: Whether the Status group should start collapsed
             result_details_tooltip: Custom tooltip for result_details parameter
             result_details_placeholder: Custom placeholder text for result_details parameter
+            result_details_allow_variable_substitution: Whether {VAR} tokens in result_details are substituted
+                at execution time
         """
         self._node = node
 
@@ -62,6 +65,7 @@ class ExecutionStatusComponent:
             default_value=None,
             allowed_modes=result_details_modes,
             settable=False,
+            allow_variable_substitution=result_details_allow_variable_substitution,
             ui_options={
                 "multiline": True,
                 "placeholder_text": result_details_placeholder,
@@ -103,7 +107,7 @@ class ExecutionStatusComponent:
         self._update_parameter_value(self._result_details, result_details)
         # Update display label: show warning emoji only on actual failure (not placeholder/initialization messages)
         # While string matching is not the best practice, it's currently the only way to check for placeholder messages.
-        # TODO: use a better approach to check for placeholder messages. https://github.com/griptape-ai/griptape-nodes/issues/3686
+        # TODO: use a better approach to check for placeholder messages. https://github.com/griptape-ai/griptape-nodes-engine/issues/3686
         is_placeholder = result_details in (
             "<Results will appear when the node executes>",
             "Beginning execution...",
@@ -111,6 +115,18 @@ class ExecutionStatusComponent:
         )
         show_warning = not was_successful and not is_placeholder
         self._update_status_group_display_label(show_warning=show_warning)
+
+    def set_was_successful(self, *, was_successful: bool) -> None:
+        """Set whether the operation succeeded, leaving result_details alone.
+
+        For a node whose result_details is an input, such as End Flow: it writes its own message to
+        its output, because set_execution_result would overwrite the input with it.
+
+        Args:
+            was_successful: Whether the operation succeeded
+        """
+        self._update_parameter_value(self._was_successful, was_successful)
+        self._update_status_group_display_label(show_warning=not was_successful)
 
     def clear_execution_status(self, initial_message: str | None = None) -> None:
         """Clear execution status and reset parameters.

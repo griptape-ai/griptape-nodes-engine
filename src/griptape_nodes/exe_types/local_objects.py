@@ -355,12 +355,16 @@ class LocalObjectScope:
         return self._manager().key_held_in_slot(owner=self.owner, source=self.source, slot=slot, value=value)
 
     def drop(self, key: str) -> bool:
-        """Release one object this library is holding. Returns whether it was released."""
+        """Release one object this library is holding. Returns whether it was released.
+
+        The release hook runs now, even while nodes are running, so a library can free a model before
+        loading the next one. Drop only what no running node still uses: the engine cannot tell.
+        """
         # An unhashable key -- the held object itself, passed in place of its key -- would raise out of the
         # map lookup. Nothing was released either way, which is what False already means.
         if not isinstance(key, str):
             return False
-        return self._manager().drop_local_object(key, owner=self.owner)
+        return self._manager().drop_local_object(key, owner=self.owner, defer_during_execution=False)
 
     def _vacate_slot(self, slot: str, *, keeping: str | None = None) -> None:
         """Release whatever this node parked in `slot`, except the entry behind `keeping`.
@@ -376,10 +380,11 @@ class LocalObjectScope:
 
         What a "clear cache" node calls. Scoped to the library rather than the worker: the cache is shared
         with whatever else lives here, and emptying a co-tenant's objects is not this node's business.
+        Release hooks run now, as for `drop`.
         """
         # No library is its own bucket rather than a no-op, so a node outside any library can still clear
         # what it put. Only reachable from tests and embedders; every registered node has a library.
-        return self._manager().drop_objects_for_group(self._library)
+        return self._manager().drop_objects_for_group(self._library, defer_during_execution=False)
 
     def _not_a_key_message(self, key: Any, *, parameter_name: str | None, node_name: str) -> str:
         """Nothing the cache recognises arrived: unwired, or wired to something that is not a reference."""
@@ -573,8 +578,7 @@ def cache_outputs_for_egress(values: Mapping[str, Any], *, node: BaseNode) -> di
     is in the sending process while the node runs elsewhere.
 
     A declared output goes in the cache unless the value is already plain data -- a key for an API token
-    would be unresolvable over there. Everything else passes through exactly as it did before the cache
-    existed, including a value the transport can only manage by stringifying.
+    would be unresolvable over there. Everything else passes through unchanged for the transport to encode.
     """
     cached: dict[str, Any] = {}
     # A copy, because node bodies write their outputs from worker threads and a dict that changes size

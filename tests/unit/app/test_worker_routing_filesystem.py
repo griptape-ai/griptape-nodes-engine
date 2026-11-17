@@ -1,15 +1,13 @@
 """Filesystem requests must not cross the worker boundary.
 
 Forwarding-by-default made "every request a node can issue survives a cattrs round trip" a
-requirement, and the filesystem family does not meet it. Three separate ways:
+requirement, and the filesystem family does not meet it in two ways:
 
 - `content` is `str | bytes`. The wire form base64s bytes into a JSON string and cattrs resolves
   the union back to `str`, so a worker's write landed on disk as mojibake with no error raised
   anywhere. Silent data corruption.
 - A path carrying macro variables is a `MacroPath` wrapping a `ParsedMacro`, which will not
   serialize at all. The worker blocked until the forward timed out.
-- Four failure results declare `SequenceScanFailureReason | FileIOFailureReason`, which cattrs
-  cannot disambiguate, so even the error could not travel.
 
 None of that is a reason to make the wire smarter: the workspace is shared on disk, so a worker's
 own answer was already the correct one. These tests pin the routing decision and the mechanism
@@ -31,11 +29,12 @@ from griptape_nodes.app.worker_routing import (
     LOCAL_ONLY_REQUEST_TYPES,
 )
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.retained_mode.events import artifact_events, os_events
+from griptape_nodes.retained_mode.events import artifact_events, converters, os_events
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+
+converter = converters.engine
 
 # Sanity floor for the derived list; os_events has 18 request types today.
 _MINIMUM_EXPECTED_REQUESTS = 10
@@ -125,13 +124,16 @@ class TestEveryFilesystemRequestHasARoutingDecision:
         else:
             assert request_type in LOCAL_ONLY_REQUEST_TYPES
 
-    def test_opening_a_file_in_the_users_app_is_the_only_forwarded_one(self) -> None:
+    def test_opening_a_file_in_the_users_app_is_the_only_forwarded_kind(self) -> None:
         """It is a side effect, not a filesystem read: it belongs where the user is.
 
         A headless worker subprocess launching a desktop application would be either invisible or
-        wrong, so this one goes to the process sitting next to the person.
+        wrong, so these go to the process sitting next to the person.
         """
-        assert {os_events.OpenAssociatedFileRequest} == _FORWARDING_FILESYSTEM_REQUESTS
+        assert {
+            os_events.OpenAssociatedFileRequest,
+            os_events.LaunchExternalViewerRequest,
+        } == _FORWARDING_FILESYSTEM_REQUESTS
 
 
 class TestEveryMacroPathCarrierSurvivesTheWire:
@@ -156,8 +158,8 @@ class TestEveryMacroPathCarrierSurvivesTheWire:
         )
         macro_path = MacroPath(parsed_macro=ParsedMacro("{outputs}/o_{###}.png"), variables={"v": 1})
 
-        wire = json.loads(json.dumps(converter.unstructure(_minimal_instance(request_type, field_name, macro_path))))
-        restored = getattr(converter.structure(wire, request_type), field_name)
+        sent = json.loads(json.dumps(converter.unstructure(_minimal_instance(request_type, field_name, macro_path))))
+        restored = getattr(converter.structure(sent, request_type), field_name)
 
         assert restored.parsed_macro.template == macro_path.parsed_macro.template
         assert restored.variables == macro_path.variables
@@ -204,44 +206,14 @@ class TestTheWireCannotCarryThese:
 
     def test_bytes_come_back_as_a_corrupted_string(self) -> None:
         original = b"\x89PNG\r\n\x1a\n\x00\xff\xfe"
-        wire = json.loads(
+        sent = json.loads(
             json.dumps(converter.unstructure(os_events.WriteFileRequest(file_path="x.png", content=original)))
         )
 
-        round_tripped = converter.structure(wire, os_events.WriteFileRequest).content
+        round_tripped = converter.structure(sent, os_events.WriteFileRequest).content
 
         assert round_tripped != original, "if bytes now survive, revisit whether writes may forward"
         assert isinstance(round_tripped, str)
-
-    def test_the_sequence_failure_union_cannot_be_structured(self) -> None:
-        """So a worker could not even receive the error, let alone the result."""
-        failure = os_events.ScanSequencesResultFailure(
-            failure_reason=os_events.SequenceScanFailureReason.INVALID_TEMPLATE,
-            result_details="no",
-        )
-        wire = json.loads(json.dumps(converter.unstructure(failure)))
-
-        with pytest.raises(Exception):  # noqa: B017, PT011 - any failure to serialize is the point
-            converter.structure(wire, os_events.ScanSequencesResultFailure)
-
-    def test_the_ambiguous_union_is_still_declared_where_we_think(self) -> None:
-        """If these are ever given a structure hook, the test above stops meaning anything."""
-        annotated = [
-            cls.__name__
-            for cls in vars(os_events).values()
-            if isinstance(cls, type)
-            and dataclasses.is_dataclass(cls)
-            and any(
-                isinstance(f.type, str) and "SequenceScanFailureReason | FileIOFailureReason" in f.type
-                for f in dataclasses.fields(cls)
-            )
-        ]
-        assert sorted(annotated) == [
-            "DeduceSequencesFromFileListResultFailure",
-            "ListDirectoryResultFailure",
-            "ListDirectorySequencesResultFailure",
-            "ScanSequencesResultFailure",
-        ]
 
 
 class TestTheDerivedMembershipIsReviewed:
@@ -273,8 +245,8 @@ class TestTheDerivedMembershipIsReviewed:
             # os_events sequence scanning: these two read the same shared directories.
             "ListDirectorySequencesRequest",
             "ScanSequencesRequest",
-            # No filesystem I/O at all -- it groups a caller-supplied path list. Local only because
-            # its failure union cannot be structured; see category 3 in worker_routing.
+            # No filesystem I/O at all -- it groups a caller-supplied path list, so any process
+            # gives the same answer and forwarding would only add a round trip.
             "DeduceSequencesFromFileListRequest",
             # artifact_events: resolve a provider from a process-local registry while writing into
             # the project's previews directory.

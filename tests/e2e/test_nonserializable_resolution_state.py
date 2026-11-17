@@ -96,8 +96,6 @@ async def test_serializable_false_output_reresolved_on_load(
         StartFlowRequest(
             flow_name=flow_name,
             flow_node_name="Consumer",
-            wait_for_completion=True,
-            completion_timeout_ms=30_000,
         )
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result
@@ -135,8 +133,6 @@ async def test_serializable_false_output_reresolved_on_load(
         StartFlowRequest(
             flow_name=loaded_flow,
             flow_node_name=restored_consumer_name,
-            wait_for_completion=True,
-            completion_timeout_ms=30_000,
         )
     )
     assert isinstance(run_result_2, StartFlowResultSuccess), run_result_2

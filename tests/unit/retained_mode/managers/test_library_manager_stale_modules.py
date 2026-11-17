@@ -68,7 +68,7 @@ def _register_library(manager: LibraryManager, tmp_path: Path, *, problems: list
 
 def _pretend_a_node_module_loaded(manager: LibraryManager) -> None:
     """Record what `_register_stable_module_alias` records when a node module actually imports."""
-    manager._library_to_stable_modules.setdefault(LIBRARY_NAME, set()).add(STABLE_NAMESPACE)
+    manager.module_loading._library_to_stable_modules.setdefault(LIBRARY_NAME, set()).add(STABLE_NAMESPACE)
 
 
 def _import_problem() -> NodeModuleImportProblem:
@@ -86,7 +86,9 @@ def _first_detail_message(result: ResultPayload) -> str:
 
 
 def _unload(manager: LibraryManager) -> None:
-    result = manager.unload_library_from_registry_request(UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME))
+    result = manager.registration.unload_library_from_registry_request(
+        UnloadLibraryFromRegistryRequest(library_name=LIBRARY_NAME)
+    )
     assert result.succeeded()
 
 
@@ -98,8 +100,8 @@ class TestStaleModuleDetection:
         _unload(manager)
 
         # Nothing was imported, so re-registering picks the library up cleanly.
-        assert manager._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is False
-        assert manager.explain_stale_module_failure(LIBRARY_NAME) is None
+        assert manager.catalog._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is False
+        assert manager.catalog.explain_stale_module_failure(LIBRARY_NAME) is None
 
     def test_reloading_after_a_module_loaded_is_remembered(self, engine: Engine, tmp_path: Path) -> None:
         manager = engine.library_manager
@@ -108,8 +110,8 @@ class TestStaleModuleDetection:
 
         _unload(manager)
 
-        assert manager._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is True
-        explanation = manager.explain_stale_module_failure(LIBRARY_NAME)
+        assert manager.catalog._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is True
+        explanation = manager.catalog.explain_stale_module_failure(LIBRARY_NAME)
         assert explanation is not None
         assert "Restart the engine" in explanation
         assert LIBRARY_NAME in explanation
@@ -122,13 +124,13 @@ class TestStaleModuleDetection:
         _register_library(manager, tmp_path)
 
         # Only restarting the process clears cached modules, so re-registering must not clear it.
-        assert manager._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is True
+        assert manager.catalog._was_reloaded_after_its_modules_were_imported(LIBRARY_NAME) is True
 
     def test_an_untouched_library_is_never_blamed(self, engine: Engine) -> None:
         manager = engine.library_manager
 
-        assert manager._was_reloaded_after_its_modules_were_imported("Some Other Library") is False
-        assert manager.explain_stale_module_failure("Some Other Library") is None
+        assert manager.catalog._was_reloaded_after_its_modules_were_imported("Some Other Library") is False
+        assert manager.catalog.explain_stale_module_failure("Some Other Library") is None
 
 
 class TestNodeImportProblemReporting:
@@ -136,8 +138,8 @@ class TestNodeImportProblemReporting:
         manager = engine.library_manager
         _register_library(manager, tmp_path)
 
-        assert manager._library_has_node_import_problems(LIBRARY_NAME) is False
-        assert manager.get_library_name_for_node_type("SomeNode") is None
+        assert manager.catalog._library_has_node_import_problems(LIBRARY_NAME) is False
+        assert manager.catalog.get_library_name_for_node_type("SomeNode") is None
 
     def test_import_problems_are_found_and_attributed(self, engine: Engine, tmp_path: Path) -> None:
         manager = engine.library_manager
@@ -147,11 +149,11 @@ class TestNodeImportProblemReporting:
             problems=[_import_problem()],
         )
 
-        assert manager._library_has_node_import_problems(LIBRARY_NAME) is True
+        assert manager.catalog._library_has_node_import_problems(LIBRARY_NAME) is True
         # A node type whose module failed to import registers nowhere, so the recorded failure is
         # the only thing that can name its library.
-        assert manager.get_library_name_for_node_type("SomeNode") == LIBRARY_NAME
-        assert manager.get_library_name_for_node_type("UnrelatedNode") is None
+        assert manager.catalog.get_library_name_for_node_type("SomeNode") == LIBRARY_NAME
+        assert manager.catalog.get_library_name_for_node_type("UnrelatedNode") is None
 
 
 class TestReloadResultsReportRestart:
@@ -166,14 +168,14 @@ class TestReloadResultsReportRestart:
 
         # The library was reloaded after importing, but its nodes took the new code, so the artist
         # has nothing to do.
-        assert manager._explain_restart_after_reload(LIBRARY_NAME) is None
+        assert manager.catalog.explain_restart_after_reload(LIBRARY_NAME) is None
 
-        update_result = manager._build_library_update_result(
+        update_result = manager.git_operations._build_library_update_result(
             library_name=LIBRARY_NAME, old_version="1.0.0", new_version="2.0.0"
         )
         assert update_result.restart_required is False
 
-        switch_result = manager._build_library_ref_switch_result(
+        switch_result = manager.git_operations._build_library_ref_switch_result(
             library_name=LIBRARY_NAME, old_ref="main", new_ref="dev", old_version="1.0.0", new_version="2.0.0"
         )
         assert switch_result.restart_required is False
@@ -187,7 +189,7 @@ class TestReloadResultsReportRestart:
         _unload(manager)
         _register_library(manager, tmp_path, problems=[_import_problem()])
 
-        update_result = manager._build_library_update_result(
+        update_result = manager.git_operations._build_library_update_result(
             library_name=LIBRARY_NAME, old_version="1.0.0", new_version="2.0.0"
         )
         assert update_result.restart_required is True
@@ -195,7 +197,7 @@ class TestReloadResultsReportRestart:
 
         # Switching a branch or tag reloads through the same path, so it owes the artist the same
         # explanation.
-        switch_result = manager._build_library_ref_switch_result(
+        switch_result = manager.git_operations._build_library_ref_switch_result(
             library_name=LIBRARY_NAME, old_ref="main", new_ref="dev", old_version="1.0.0", new_version="2.0.0"
         )
         assert switch_result.restart_required is True
@@ -208,9 +210,9 @@ class TestReloadResultsReportRestart:
 
         # The library is simply broken: it was never reloaded on top of imported modules, so a
         # restart would change nothing.
-        assert manager._explain_restart_after_reload(LIBRARY_NAME) is None
+        assert manager.catalog.explain_restart_after_reload(LIBRARY_NAME) is None
         assert (
-            manager._build_library_update_result(
+            manager.git_operations._build_library_update_result(
                 library_name=LIBRARY_NAME, old_version="1.0.0", new_version="2.0.0"
             ).restart_required
             is False

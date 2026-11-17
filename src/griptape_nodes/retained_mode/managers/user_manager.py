@@ -7,16 +7,17 @@ to display in the engine and editor.
 from __future__ import annotations
 
 import logging
-import os
 from functools import cached_property
 from http import HTTPStatus
 from typing import TYPE_CHECKING
 
-import httpx
+import httpx2
 
 from griptape_nodes.drivers.cloud_credentials import (
     POLICY_DENIED_HINT,
     is_license_credential,
+    join_cloud_url,
+    resolve_cloud_base_url,
     resolve_cloud_credential,
 )
 from griptape_nodes.retained_mode.events.app_events import OrganizationInfo, UserInfo
@@ -59,11 +60,10 @@ class UserManager:
                 logger.debug("No GT_CLOUD_API_KEY found, skipping user fetch")
                 return None
 
-            base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
-            url = f"{base_url}/api/users"
+            url = join_cloud_url(resolve_cloud_base_url(), "/api/users")
             headers = {"Authorization": f"Bearer {api_key}"}
 
-            response = httpx.get(url, headers=headers, timeout=5.0)
+            response = httpx2.get(url, headers=headers, timeout=5.0)
             response.raise_for_status()
 
             data = response.json()
@@ -79,9 +79,9 @@ class UserManager:
 
             logger.debug("No users found in API response")
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             logger.warning("Failed to fetch user (HTTP %s): %s", e.response.status_code, e)
-        except httpx.RequestError as e:
+        except httpx2.RequestError as e:
             logger.warning("Failed to fetch user (request error): %s", e)
         except Exception as e:
             logger.warning("Failed to fetch user (unexpected error): %s", e)
@@ -106,11 +106,10 @@ class UserManager:
                 logger.debug("No Griptape Cloud credential found, skipping user organization fetch")
                 return None
 
-            base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
-            url = f"{base_url}/api/organizations"
+            url = join_cloud_url(resolve_cloud_base_url(), "/api/organizations")
             headers = {"Authorization": f"Bearer {api_key}"}
 
-            response = httpx.get(url, headers=headers, timeout=5.0)
+            response = httpx2.get(url, headers=headers, timeout=5.0)
             response.raise_for_status()
 
             data = response.json()
@@ -125,12 +124,12 @@ class UserManager:
 
             logger.debug("No organizations found in API response")
 
-        except httpx.HTTPStatusError as e:
+        except httpx2.HTTPStatusError as e:
             if e.response.status_code == HTTPStatus.FORBIDDEN and is_license_credential(api_key):
                 logger.warning("Failed to fetch user organization because %s", POLICY_DENIED_HINT)
             else:
                 logger.warning("Failed to fetch user organization (HTTP %s): %s", e.response.status_code, e)
-        except httpx.RequestError as e:
+        except httpx2.RequestError as e:
             logger.warning("Failed to fetch user organization (request error): %s", e)
         except Exception as e:
             logger.warning("Failed to fetch user organization (unexpected error): %s", e)

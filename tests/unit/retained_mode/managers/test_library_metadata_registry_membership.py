@@ -125,7 +125,9 @@ class TestMetadataReportsRegistryMembership:
 
         with pytest.MonkeyPatch.context() as patcher:
             patcher.setattr(engine.config_manager, "get_config_value", _register_only_config(two_declared_libraries))
-            result = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
+            result = await library_manager.metadata_loading.load_metadata_for_all_libraries_request(
+                LoadMetadataForAllLibrariesRequest()
+            )
 
         assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
         by_name = {entry.library_schema.name: entry for entry in result.successful_libraries}
@@ -148,14 +150,14 @@ class TestMetadataReportsRegistryMembership:
 
         with pytest.MonkeyPatch.context() as patcher:
             patcher.setattr(engine.config_manager, "get_config_value", _register_only_config(two_declared_libraries))
-            metadata = await library_manager.load_metadata_for_all_libraries_request(
+            metadata = await library_manager.metadata_loading.load_metadata_for_all_libraries_request(
                 LoadMetadataForAllLibrariesRequest()
             )
             assert isinstance(metadata, LoadMetadataForAllLibrariesResultSuccess)
 
             for entry in metadata.successful_libraries:
                 name = entry.library_schema.name
-                update_result = await library_manager.check_library_update_request(
+                update_result = await library_manager.git_operations.check_library_update_request(
                     CheckLibraryUpdateRequest(library_name=name)
                 )
                 disowned = isinstance(update_result, CheckLibraryUpdateResultFailure) and (
@@ -180,7 +182,9 @@ class TestMetadataReportsRegistryMembership:
 
         with pytest.MonkeyPatch.context() as patcher:
             patcher.setattr(engine.config_manager, "get_config_value", _register_only_config(copies))
-            result = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
+            result = await library_manager.metadata_loading.load_metadata_for_all_libraries_request(
+                LoadMetadataForAllLibrariesRequest()
+            )
 
         assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
         assert [entry.is_registered for entry in result.successful_libraries] == [True, True]
@@ -194,7 +198,9 @@ class TestMetadataReportsRegistryMembership:
 
         with pytest.MonkeyPatch.context() as patcher:
             patcher.setattr(engine.config_manager, "get_config_value", _register_only_config([manifest]))
-            result = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
+            result = await library_manager.metadata_loading.load_metadata_for_all_libraries_request(
+                LoadMetadataForAllLibrariesRequest()
+            )
 
         assert isinstance(result, LoadMetadataForAllLibrariesResultSuccess)
         entry = result.successful_libraries[0]

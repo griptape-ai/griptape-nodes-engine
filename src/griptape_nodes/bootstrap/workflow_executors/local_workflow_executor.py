@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Any, Self
 from griptape_nodes.bootstrap.workflow_executors.workflow_executor import WorkflowExecutor
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
-from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import EndNode, StartNode
+from griptape_nodes.retained_mode.engine import has_current_engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.project_events import (
+    ActivateWorkspaceProjectRequest,
     GetCurrentProjectRequest,
     GetCurrentProjectResultSuccess,
     GetPathForMacroRequest,
@@ -44,12 +45,18 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.config_manager import ENV_VAR_PREFIX
+from griptape_nodes.serialization.values import decode_value
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
     from types import TracebackType
 
+    from griptape_nodes.drivers.storage import StorageBackend
+
 logger = logging.getLogger(__name__)
+
+STORAGE_BACKEND_ENV_VAR = f"{ENV_VAR_PREFIX}STORAGE_BACKEND"
 
 
 class LocalExecutorError(Exception):
@@ -59,16 +66,18 @@ class LocalExecutorError(Exception):
 class LocalWorkflowExecutor(WorkflowExecutor):
     def __init__(  # noqa: PLR0913
         self,
-        storage_backend: StorageBackend = StorageBackend.LOCAL,
+        storage_backend: StorageBackend | None = None,
         *,
         project_file_path: Path | None = None,
         skip_library_loading: bool = False,
         workflows_to_register: list[str] | None = None,
         save_on_failure_path: str | None = None,
-        pickle_control_flow_result: bool = False,
+        pickle_control_flow_result: bool = False,  # noqa: ARG002 deprecated and ignored
     ):
-        super().__init__(pickle_control_flow_result=pickle_control_flow_result)
-        self._set_storage_backend(storage_backend=storage_backend)
+        super().__init__()
+        # None keeps the configured storage backend.
+        if storage_backend is not None:
+            self._set_storage_backend(storage_backend=storage_backend)
         self._project_file_path = project_file_path
         self._skip_library_loading = skip_library_loading
         self._workflows_to_register = workflows_to_register or []
@@ -78,16 +87,22 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         """Async context manager entry: initialize queue and broadcast app initialization."""
         GriptapeNodes.EventManager().initialize_queue()
 
-        # Activate the user-specified project BEFORE broadcasting AppInitializationComplete.
+        # Activate the project BEFORE broadcasting AppInitializationComplete: the
+        # user-specified one, else the configured one, so a configured project that
+        # can't be activated fails the run instead of falling back to system defaults.
         # At this point ProjectManager._initialization_complete is still False, so the
         # project switch skips the heavy library reload that would otherwise clear the
         # flow/nodes already created at module import time.
         if self._project_file_path is not None:
             await self._load_project(self._project_file_path)
+        else:
+            await self._activate_workspace_project()
 
         await GriptapeNodes.EventManager().abroadcast_app_event(
             AppInitializationComplete(
-                skip_library_loading=self._skip_library_loading, workflows_to_register=self._workflows_to_register
+                skip_library_loading=self._skip_library_loading,
+                workflows_to_register=self._workflows_to_register,
+                defer_pending_library_resets=True,
             )
         )
         return self
@@ -99,18 +114,29 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         exc_tb: TracebackType | None,
     ) -> None:
         """Async context manager exit."""
-        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes/issues/2149
+        # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
         if exc_val is not None and self._save_on_failure_path is not None:
             await self._save_failed_workflow(exc_val)
 
     def _get_workflow_name(self) -> str:
+        """The name a failed workflow's file starts with.
+
+        A saved workflow's registry name. A workflow with no file, such as a library workflow's
+        copy, takes the name its first save would (`suggested_file_stem`), since its
+        "unsaved:<id>" registry name is not a valid file name; "workflow" if that leaves nothing.
+        """
         try:
-            context_manager = GriptapeNodes.ContextManager()
-            return context_manager.get_current_workflow_name()
+            workflow = GriptapeNodes.ContextManager().get_current_workflow()
+            suggested_file_stem = GriptapeNodes.get_instance().workflow_registry.suggested_file_stem(workflow)
         except Exception as e:
             msg = f"Failed to get current workflow from context manager: {e}"
             logger.exception(msg)
             raise LocalExecutorError(msg) from e
+        if workflow.is_saved:
+            return workflow.name
+        if suggested_file_stem is None:
+            return "workflow"
+        return suggested_file_stem
 
     def _load_flow_for_workflow(self) -> str:
         try:
@@ -122,34 +148,46 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             raise LocalExecutorError(msg) from e
 
     def _set_storage_backend(self, storage_backend: StorageBackend) -> None:
-        from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+        """Apply `storage_backend` to this process via its env var, without writing the user's config.
 
-        try:
-            config_manager = ConfigManager()
-            config_manager.set_config_value(
-                key="storage_backend",
-                value=storage_backend,
+        Must run before the engine is built, since the engine picks its storage driver then.
+        """
+        if has_current_engine():
+            logger.warning(
+                "Attempted to use storage backend '%s' for this workflow run. Ignored because the "
+                "engine had already started before the workflow executor was created, so the run "
+                "keeps the storage backend the engine started with.",
+                storage_backend.value,
             )
-        except Exception as e:
-            msg = f"Failed to set storage backend: {e}"
-            logger.exception(msg)
-            raise LocalExecutorError(msg) from e
+            return
+
+        os.environ[STORAGE_BACKEND_ENV_VAR] = storage_backend.value
 
     async def _load_project(self, project_file_path: Path) -> None:
         """Load a project template and set it as the active project."""
         load_result = await GriptapeNodes.ahandle_request(LoadProjectTemplateRequest(project_path=project_file_path))
         if not isinstance(load_result, LoadProjectTemplateResultSuccess):
             msg = f"Attempted to load project template from {project_file_path}. Failed with result: {load_result}"
-            logger.error(msg)
             raise LocalExecutorError(msg)
 
         set_result = await GriptapeNodes.ahandle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
         if set_result.failed():
             msg = f"Attempted to set project {load_result.project_id} as current. Failed with result: {set_result}"
-            logger.error(msg)
             raise LocalExecutorError(msg)
 
         logger.info("Loaded and activated project template from %s", project_file_path)
+
+    async def _activate_workspace_project(self) -> None:
+        """Activate the configured project, raising LocalExecutorError if it cannot be activated."""
+        result = await GriptapeNodes.ahandle_request(ActivateWorkspaceProjectRequest(fail_if_project_file_missing=True))
+        if result.failed():
+            msg = (
+                "Attempted to activate the configured project before running the workflow. "
+                f"Failed because: {result.result_details}"
+            )
+            raise LocalExecutorError(msg)
+
+        logger.debug("Workspace project activation: %s", result.result_details)
 
     def _submit_output(self, output: dict) -> None:
         self.output = output
@@ -162,9 +200,11 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                 param_map: dict | None = flow_input.get(node_name)
                 if param_map is not None:
                     for parameter_name, parameter_value in param_map.items():
+                        # Decoded here, not where the input arrives, so classes from the flow's
+                        # libraries resolve: those libraries are registered by now.
                         set_parameter_value_request = SetParameterValueRequest(
                             parameter_name=parameter_name,
-                            value=parameter_value,
+                            value=decode_value(parameter_value),
                             node_name=node_name,
                         )
                         set_parameter_value_result = await GriptapeNodes.ahandle_request(set_parameter_value_request)
@@ -233,7 +273,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             return True, None
         if type(result_event.payload).__name__ == "ControlFlowCancelledEvent":
             msg = "Control flow cancelled"
-            logger.error(msg)
             return True, LocalExecutorError(msg)
 
         return False, None
@@ -384,7 +423,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         flow_input: Any,
         storage_backend: StorageBackend | None = None,  # noqa: ARG002
         *,
-        pickle_control_flow_result: bool | None = None,
+        pickle_control_flow_result: bool | None = None,  # noqa: ARG002 deprecated and ignored
         **kwargs: Any,
     ) -> None:
         """Executes a local workflow.
@@ -398,8 +437,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             storage_backend: Accepted for compatibility with the base-class run path,
                 but ignored here: the storage backend is applied once at construction
                 via `_set_storage_backend`. Passing it to the run path has no effect.
-            pickle_control_flow_result: Per-call override for the executor's
-                save-time default. None means "use the instance default".
+            pickle_control_flow_result: Deprecated and ignored.
 
         Returns:
             None
@@ -410,10 +448,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         )
 
         # Now send the run command to actually execute it
-        effective_pickle = (
-            pickle_control_flow_result if pickle_control_flow_result is not None else self._pickle_control_flow_result
-        )
-        start_flow_request = StartFlowRequest(flow_name=flow_name, pickle_control_flow_result=effective_pickle)
+        start_flow_request = StartFlowRequest(flow_name=flow_name)
         start_flow_result = await GriptapeNodes.ahandle_request(start_flow_request)
 
         if start_flow_result.failed():

@@ -1,7 +1,7 @@
 import os
 from unittest.mock import Mock, patch
 
-import httpx
+import httpx2
 
 from griptape_nodes.retained_mode.events.app_events import OrganizationInfo, UserInfo
 from griptape_nodes.retained_mode.managers.user_manager import UserManager
@@ -31,7 +31,7 @@ class TestUserManager:
             ]
         }
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
 
@@ -42,7 +42,7 @@ class TestUserManager:
             mock_secrets_manager.get_secret.assert_called_once_with("GT_CLOUD_API_KEY")
 
     def test_user_cached_property(self) -> None:
-        """Test that user property is cached and httpx.get is only called once."""
+        """Test that user property is cached and httpx2.get is only called once."""
         mock_secrets_manager = Mock()
         mock_secrets_manager.get_secret.return_value = "test-api-key"
 
@@ -50,7 +50,7 @@ class TestUserManager:
         mock_response.json.return_value = {"users": [{"user_id": "test-uuid", "email": "cached@example.com"}]}
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
         ) as mock_get:
             user_manager = UserManager(mock_secrets_manager)
 
@@ -66,7 +66,7 @@ class TestUserManager:
             assert user2.id == "test-uuid"
             assert user2.email == "cached@example.com"
 
-            # httpx.get should only be called once due to caching
+            # httpx2.get should only be called once due to caching
             assert mock_get.call_count == 1
 
     def test_user_no_api_key(self) -> None:
@@ -74,7 +74,7 @@ class TestUserManager:
         mock_secrets_manager = Mock()
         mock_secrets_manager.get_secret.return_value = None
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get") as mock_get:
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get") as mock_get:
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
 
@@ -90,9 +90,9 @@ class TestUserManager:
         mock_request = Mock()
         mock_response = Mock()
         mock_response.status_code = 401
-        http_error = httpx.HTTPStatusError("Unauthorized", request=mock_request, response=mock_response)
+        http_error = httpx2.HTTPStatusError("Unauthorized", request=mock_request, response=mock_response)
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", side_effect=http_error):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", side_effect=http_error):
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
 
@@ -104,9 +104,9 @@ class TestUserManager:
         mock_secrets_manager.get_secret.return_value = "test-api-key"
 
         # Create mock RequestError (network error)
-        request_error = httpx.RequestError("Network error")
+        request_error = httpx2.RequestError("Network error")
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", side_effect=request_error):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", side_effect=request_error):
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
 
@@ -120,7 +120,7 @@ class TestUserManager:
         mock_response = Mock()
         mock_response.json.return_value = {"users": []}
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
 
@@ -134,7 +134,7 @@ class TestUserManager:
         mock_response = Mock()
         mock_response.json.return_value = {}
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
 
@@ -152,7 +152,7 @@ class TestUserManager:
         with (
             patch.dict(os.environ, {"GT_CLOUD_BASE_URL": custom_url}),
             patch(
-                "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+                "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
             ) as mock_get,
         ):
             user_manager = UserManager(mock_secrets_manager)
@@ -180,7 +180,7 @@ class TestUserManager:
         with (
             patch.dict(os.environ, env_copy, clear=True),
             patch(
-                "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+                "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
             ) as mock_get,
         ):
             user_manager = UserManager(mock_secrets_manager)
@@ -198,7 +198,7 @@ class TestUserManager:
         mock_secrets_manager.get_secret.return_value = "test-api-key"
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", side_effect=Exception("Unexpected error")
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", side_effect=Exception("Unexpected error")
         ):
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
@@ -214,7 +214,7 @@ class TestUserManager:
         mock_response.json.return_value = {"users": [{"user_id": "test-uuid", "email": "test@example.com"}]}
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
         ) as mock_get:
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
@@ -236,7 +236,7 @@ class TestUserManager:
         mock_response.json.return_value = {"users": [{"user_id": "test-uuid", "email": "test@example.com"}]}
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
         ) as mock_get:
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
@@ -262,7 +262,7 @@ class TestUserManager:
             ]
         }
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             user_info = user_manager.user
 
@@ -287,7 +287,7 @@ class TestUserManager:
             ]
         }
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             org_info = user_manager.user_organization
 
@@ -298,7 +298,7 @@ class TestUserManager:
             mock_secrets_manager.get_secret.assert_any_call("GRIPTAPE_NODES_LICENSE", should_error_on_not_found=False)
 
     def test_user_organization_cached_property(self) -> None:
-        """Test that user_organization property is cached and httpx.get is only called once."""
+        """Test that user_organization property is cached and httpx2.get is only called once."""
         mock_secrets_manager = Mock()
         mock_secrets_manager.get_secret.return_value = "test-api-key"
 
@@ -308,7 +308,7 @@ class TestUserManager:
         }
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
         ) as mock_get:
             user_manager = UserManager(mock_secrets_manager)
 
@@ -324,7 +324,7 @@ class TestUserManager:
             assert org2.id == "test-org-uuid"
             assert org2.name == "Cached Organization"
 
-            # httpx.get should only be called once due to caching
+            # httpx2.get should only be called once due to caching
             assert mock_get.call_count == 1
 
     def test_user_organization_no_api_key(self) -> None:
@@ -332,7 +332,7 @@ class TestUserManager:
         mock_secrets_manager = Mock()
         mock_secrets_manager.get_secret.return_value = None
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get") as mock_get:
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get") as mock_get:
             user_manager = UserManager(mock_secrets_manager)
             org_name = user_manager.user_organization
 
@@ -347,9 +347,9 @@ class TestUserManager:
         mock_request = Mock()
         mock_response = Mock()
         mock_response.status_code = 403
-        http_error = httpx.HTTPStatusError("Forbidden", request=mock_request, response=mock_response)
+        http_error = httpx2.HTTPStatusError("Forbidden", request=mock_request, response=mock_response)
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", side_effect=http_error):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", side_effect=http_error):
             user_manager = UserManager(mock_secrets_manager)
             org_name = user_manager.user_organization
 
@@ -360,9 +360,9 @@ class TestUserManager:
         mock_secrets_manager = Mock()
         mock_secrets_manager.get_secret.return_value = "test-api-key"
 
-        request_error = httpx.RequestError("Network error")
+        request_error = httpx2.RequestError("Network error")
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", side_effect=request_error):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", side_effect=request_error):
             user_manager = UserManager(mock_secrets_manager)
             org_name = user_manager.user_organization
 
@@ -376,7 +376,7 @@ class TestUserManager:
         mock_response = Mock()
         mock_response.json.return_value = {"organizations": []}
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             org_name = user_manager.user_organization
 
@@ -390,7 +390,7 @@ class TestUserManager:
         mock_response = Mock()
         mock_response.json.return_value = {}
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             org_name = user_manager.user_organization
 
@@ -410,7 +410,7 @@ class TestUserManager:
         with (
             patch.dict(os.environ, {"GT_CLOUD_BASE_URL": custom_url}),
             patch(
-                "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+                "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
             ) as mock_get,
         ):
             user_manager = UserManager(mock_secrets_manager)
@@ -440,7 +440,7 @@ class TestUserManager:
         with (
             patch.dict(os.environ, env_copy, clear=True),
             patch(
-                "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+                "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
             ) as mock_get,
         ):
             user_manager = UserManager(mock_secrets_manager)
@@ -459,7 +459,7 @@ class TestUserManager:
         mock_secrets_manager.get_secret.return_value = "test-api-key"
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", side_effect=Exception("Unexpected error")
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", side_effect=Exception("Unexpected error")
         ):
             user_manager = UserManager(mock_secrets_manager)
             org_name = user_manager.user_organization
@@ -477,7 +477,7 @@ class TestUserManager:
         }
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
         ) as mock_get:
             user_manager = UserManager(mock_secrets_manager)
             org_info = user_manager.user_organization
@@ -502,7 +502,7 @@ class TestUserManager:
         }
 
         with patch(
-            "griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response
+            "griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response
         ) as mock_get:
             user_manager = UserManager(mock_secrets_manager)
             org_info = user_manager.user_organization
@@ -529,7 +529,7 @@ class TestUserManager:
             ]
         }
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             user_manager = UserManager(mock_secrets_manager)
             org_info = user_manager.user_organization
 
@@ -552,7 +552,7 @@ class TestUserManagerCredentialScope:
         mock_response = Mock()
         mock_response.json.return_value = {"users": [{"user_id": "u", "email": "e@example.com", "name": "N"}]}
 
-        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx2.get", return_value=mock_response):
             UserManager(mock_secrets_manager).user  # noqa: B018
 
         requested = [call.args[0] for call in mock_secrets_manager.get_secret.call_args_list]

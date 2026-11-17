@@ -76,7 +76,7 @@ gtn self uninstall
 
 Press Enter when it prints `When done, press Enter to exit.` so it can finish removing the executable. It removes:
 
-- The engine's **configuration** and **data** directories, `~/.config/griptape_nodes` and `~/.local/share/griptape_nodes`, including the `.env` file with your API keys and other secrets.
+- The engine's **configuration** and **data** directories, `~/.config/griptape_nodes` and `~/.local/share/griptape_nodes` (or the paths in `GTN_ENGINE_CONFIG_DIR` and `GTN_ENGINE_DATA_DIR` when those are set), including the `.env` file with your API keys and other secrets.
 - The `griptape-nodes` and `gtn` commands, by running `uv tool uninstall griptape-nodes`.
 
 If it prints a **Caveats** section, read it. It lists the configuration files it left alone, the ones inside your workspace and project folders, along with anything it couldn't delete and you should remove by hand.

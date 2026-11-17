@@ -110,8 +110,6 @@ async def test_group_runs_independent_nodes_in_parallel(
             StartFlowRequest(
                 flow_name=parent_flow,
                 flow_node_name=group_result.node_name,
-                wait_for_completion=True,
-                completion_timeout_ms=30000,
             )
         )
         assert isinstance(run_result, StartFlowResultSuccess), run_result

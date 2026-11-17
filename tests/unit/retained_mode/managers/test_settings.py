@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.settings import (
     AppInitializationComplete,
+    DistributedExecutionSettings,
     LibraryDependencyInstallBehavior,
     LibraryDownload,
     LibraryRegistration,
@@ -23,6 +26,10 @@ class TestLibraryRegistration:
         assert config.libraries_to_register == ["griptape_nodes_library.json"]
 
     def test_path_with_worker_mode_override_is_valid(self) -> None:
+        """A config in the wild still carries this key, and `extra="forbid"` would reject an unknown one.
+
+        It no longer decides anything; the field exists so the entry parses.
+        """
         registration = LibraryRegistration.model_validate({"path": "../shared/lib", "worker_mode_override": "WORKER"})
 
         assert registration.path == "../shared/lib"
@@ -36,7 +43,7 @@ class TestLibraryRegistration:
     def test_missing_path_raises(self) -> None:
         # A register entry's only identity is its path; the object form requires it.
         with pytest.raises(ValidationError):
-            LibraryRegistration.model_validate({"worker_mode_override": "WORKER"})
+            LibraryRegistration.model_validate({"enabled": True})
 
 
 class TestLibraryDownload:
@@ -120,3 +127,62 @@ class TestLibraryDependencyInstallBehavior:
 
     def test_default_is_always(self) -> None:
         assert Settings().library.dependency_install_behavior == LibraryDependencyInstallBehavior.ALWAYS
+
+
+class TestRefreshPreviewsOnFileChange:
+    """Previews refresh on file changes unless the user turns it off."""
+
+    def test_default_is_on(self) -> None:
+        assert Settings().refresh_previews_on_file_change is True
+
+    def test_watches_at_most_1000_files_by_default(self) -> None:
+        assert Settings().refresh_previews_max_files == 1000  # noqa: PLR2004
+
+
+class TestRefreshPreviewsMaxFiles:
+    """refresh_previews_max_files falls back to its default instead of failing the whole config."""
+
+    def test_a_whole_number_is_kept(self) -> None:
+        assert Settings.model_validate({"refresh_previews_max_files": 250}).refresh_previews_max_files == 250  # noqa: PLR2004
+
+    @pytest.mark.parametrize("value", ["abc", 0, -5, True, 12.5, None])
+    def test_an_unusable_value_falls_back_to_the_default_with_a_warning(
+        self, value: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from griptape_nodes.retained_mode.managers import settings as settings_module
+
+        settings_module._reported_invalid_settings.discard(("refresh_previews_max_files", repr(value)))
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = Settings.model_validate({"refresh_previews_max_files": value})
+
+        assert result.refresh_previews_max_files == settings_module.DEFAULT_REFRESH_PREVIEWS_MAX_FILES
+        assert "Ignoring refresh_previews_max_files" in caplog.text
+
+    def test_an_environment_value_is_converted(self) -> None:
+        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
+
+        result = Settings.model_validate({"refresh_previews_max_files": "250"}, context={FROM_ENV_CONTEXT: True})
+
+        assert result.refresh_previews_max_files == 250  # noqa: PLR2004
+
+    @pytest.mark.parametrize("value", ["abc", "0", "12.5"])
+    def test_an_unusable_environment_value_is_reported(self, value: str) -> None:
+        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
+
+        with pytest.raises(ValidationError, match="refresh_previews_max_files must be a whole number"):
+            Settings.model_validate({"refresh_previews_max_files": value}, context={FROM_ENV_CONTEXT: True})
+
+
+class TestDistributedExecutionMaxWorkers:
+    """`max_workers` is a limit of at least one worker, or empty for none."""
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_a_limit_below_one_is_rejected(self, value: int) -> None:
+        with pytest.raises(ValidationError):
+            DistributedExecutionSettings.model_validate({"max_workers": value})
+
+    @pytest.mark.parametrize("value", [None, 1, 4])
+    def test_no_limit_or_a_positive_limit_is_accepted(self, value: int | None) -> None:
+        settings = DistributedExecutionSettings.model_validate({"max_workers": value})
+
+        assert settings.max_workers == value

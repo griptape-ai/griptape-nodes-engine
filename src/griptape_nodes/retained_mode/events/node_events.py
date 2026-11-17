@@ -8,6 +8,7 @@ from uuid import uuid4
 from griptape_nodes.exe_types.core_types import NodeMessagePayload
 from griptape_nodes.exe_types.node_types import NodeDependencies, NodeResolutionState
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -20,11 +21,10 @@ from griptape_nodes.retained_mode.events.connection_events import (
     OutgoingConnection,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
-    GetParameterDetailsResultSuccess,
-    GetParameterValueResultSuccess,
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import DisplayValue, ElementDocument
 
 
 class NewPosition(NamedTuple):
@@ -106,6 +106,8 @@ class CreateNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
         specific_library_name: Library that provided this node type
         parent_flow_name: Name of the flow the node was created in
         parent_group_name: Name of the group this node belongs to (None if not in a group)
+        paired_node_name: Name of the node created and paired with this one, such as the End node a
+            loop Start node creates and connects to itself (None if no paired node was created)
     """
 
     node_name: str
@@ -113,6 +115,7 @@ class CreateNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     specific_library_name: str | None = None
     parent_flow_name: str | None = None
     parent_group_name: str | None = None
+    paired_node_name: str | None = None
 
 
 @dataclass
@@ -133,7 +136,7 @@ class CreateNodeGroupRequest:
 
 @dataclass
 @PayloadRegistry.register
-class DeleteNodeRequest(RequestPayload):
+class DeleteNodeRequest(RequestPayload, GraphAccessMixin):
     """Delete a node from a workflow.
 
     Use when: Removing obsolete nodes, cleaning up failed nodes, restructuring workflows,
@@ -353,7 +356,7 @@ class BatchSetNodeMetadataResultFailure(ResultPayloadFailure):
 # ...jumbode?
 @dataclass
 @PayloadRegistry.register
-class GetAllNodeInfoRequest(RequestPayload):
+class GetAllNodeInfoRequest(RequestPayload, GraphAccessMixin):
     """Retrieve comprehensive information about a node in a single call.
 
     Use when: Populating UIs, implementing node inspection/debugging, gathering complete state
@@ -370,12 +373,6 @@ class GetAllNodeInfoRequest(RequestPayload):
 
 
 @dataclass
-class ParameterInfoValue:
-    details: GetParameterDetailsResultSuccess
-    value: GetParameterValueResultSuccess
-
-
-@dataclass
 @PayloadRegistry.register
 class GetAllNodeInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Comprehensive node information retrieved successfully.
@@ -384,7 +381,7 @@ class GetAllNodeInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
         metadata: Node metadata (position, display properties, etc.)
         node_resolution_state: Current execution state
         connections: All incoming and outgoing connections
-        element_id_to_value: Parameter details and values by element ID
+        element_id_to_value: Parameter values by element ID
         root_node_element: Root element information
     """
 
@@ -392,8 +389,8 @@ class GetAllNodeInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     node_resolution_state: str
     locked: bool
     connections: ListConnectionsForNodeResultSuccess
-    element_id_to_value: dict[str, ParameterInfoValue]
-    root_node_element: dict[str, Any]
+    element_id_to_value: dict[str, DisplayValue]
+    root_node_element: ElementDocument
 
 
 @dataclass
@@ -579,6 +576,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         node_name: Name of the node to serialize (None for current context node)
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
+        use_pickling: Deprecated and ignored. The value pool always holds encoded values.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """
@@ -642,13 +640,13 @@ class SerializedSelectedNodesCommands:
     set_parameter_value_commands: dict[
         SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
     ]
-    set_lock_commands_per_node: dict[SerializedNodeCommands.NodeUUID, SetLockNodeStateRequest]
+    set_lock_commands_per_node: dict[SerializedNodeCommands.NodeUUID, SetLockNodeStateRequest | None]
     serialized_connection_commands: list[IndirectConnectionSerialization]
 
 
 @dataclass
 @PayloadRegistry.register
-class SerializeSelectedNodesToCommandsRequest(WorkflowNotAlteredMixin, RequestPayload):
+class SerializeSelectedNodesToCommandsRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
     """Serialize multiple selected nodes into commands.
 
     Use when: Implementing copy/paste, exporting workflow sections, creating templates,
@@ -695,7 +693,7 @@ class SerializeSelectedNodesToCommandsResultFailure(WorkflowNotAlteredMixin, Res
 
 @dataclass
 @PayloadRegistry.register
-class DeserializeSelectedNodesFromCommandsRequest(WorkflowNotAlteredMixin, RequestPayload):
+class DeserializeSelectedNodesFromCommandsRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
     """Recreate nodes from serialized commands.
 
     Use when: Implementing paste functionality, importing configurations, restoring from backups,
@@ -777,7 +775,7 @@ class DeserializeNodeFromCommandsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class DuplicateSelectedNodesRequest(WorkflowNotAlteredMixin, RequestPayload):
+class DuplicateSelectedNodesRequest(WorkflowNotAlteredMixin, RequestPayload, GraphAccessMixin):
     """Duplicate selected nodes with new positions.
 
     Use when: Implementing duplicate functionality, creating multiple instances of same configuration,
@@ -869,7 +867,7 @@ class SendNodeMessageResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetFlowForNodeRequest(RequestPayload):
+class GetFlowForNodeRequest(RequestPayload, GraphAccessMixin):
     """Get the flow name that contains a specific node.
 
     Use when: Need to determine which flow a node belongs to for variable scoping,
@@ -992,7 +990,7 @@ class ResetNodeToDefaultsResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class AddNodesToNodeGroupRequest(RequestPayload):
+class AddNodesToNodeGroupRequest(RequestPayload, GraphAccessMixin):
     """Adds nodes to a NodeGroup.
 
     Use when: Need to add nodes to an existing NodeGroup, building node groups programmatically,
@@ -1039,7 +1037,7 @@ class AddNodesToNodeGroupResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RemoveNodeFromNodeGroupRequest(RequestPayload):
+class RemoveNodeFromNodeGroupRequest(RequestPayload, GraphAccessMixin):
     """Remove nodes from a NodeGroup.
 
     Use when: Need to remove nodes from a NodeGroup, reorganizing workflow structure,
@@ -1086,7 +1084,7 @@ class RemoveNodeFromNodeGroupResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class MoveNodeToNewFlowRequest(RequestPayload):
+class MoveNodeToNewFlowRequest(RequestPayload, GraphAccessMixin):
     """Move a node from one flow to another flow.
 
     Use when: Reorganizing nodes between flows, adding nodes to NodeGroup subflows,
@@ -1134,7 +1132,7 @@ class MoveNodeToNewFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UnresolveNodeRequest(RequestPayload):
+class UnresolveNodeRequest(RequestPayload, GraphAccessMixin):
     """Mark a node UNRESOLVED without resetting its parameter values.
 
     Use when: Forcing a node to re-execute without resetting its parameter values.

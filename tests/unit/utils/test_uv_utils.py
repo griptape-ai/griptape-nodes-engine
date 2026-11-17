@@ -25,7 +25,7 @@ class TestUvUtils:
             dedicated_path.parent.mkdir(parents=True)
             dedicated_path.touch()
 
-            with patch("griptape_nodes.utils.uv_utils.xdg_data_home") as mock_xdg:
+            with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
                 mock_xdg.return_value = Path(temp_dir)
 
                 result = find_uv_bin()
@@ -39,7 +39,7 @@ class TestUvUtils:
             system_uv_path = "/usr/local/bin/uv"
 
             with (
-                patch("griptape_nodes.utils.uv_utils.xdg_data_home") as mock_xdg,
+                patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
                 patch("griptape_nodes.utils.uv_utils.uv.find_uv_bin") as mock_system_uv,
             ):
                 mock_xdg.return_value = Path(temp_dir)
@@ -55,7 +55,7 @@ class TestUvUtils:
         mock_data_home = Path("/mock/data/home")
 
         with (
-            patch("griptape_nodes.utils.uv_utils.xdg_data_home") as mock_xdg,
+            patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
             patch("griptape_nodes.utils.uv_utils.uv.find_uv_bin") as mock_system_uv,
         ):
             mock_xdg.return_value = mock_data_home
@@ -75,7 +75,7 @@ class TestUvUtils:
             dedicated_path.parent.mkdir(parents=True)
             dedicated_path.touch()
 
-            with patch("griptape_nodes.utils.uv_utils.xdg_data_home") as mock_xdg:
+            with patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg:
                 mock_xdg.return_value = Path(temp_dir)
 
                 result = find_uv_bin()
@@ -89,7 +89,7 @@ class TestUvUtils:
             system_uv_path = "/usr/local/bin/uv"
 
             with (
-                patch("griptape_nodes.utils.uv_utils.xdg_data_home") as mock_xdg,
+                patch("griptape_nodes.utils.engine_dirs.xdg_data_home") as mock_xdg,
                 patch("griptape_nodes.utils.uv_utils.uv.find_uv_bin") as mock_system_uv,
             ):
                 mock_xdg.return_value = Path(temp_dir)
@@ -101,7 +101,7 @@ class TestUvUtils:
                 assert result == system_uv_path
 
     @patch("griptape_nodes.utils.uv_utils.uv.find_uv_bin")
-    @patch("griptape_nodes.utils.uv_utils.xdg_data_home")
+    @patch("griptape_nodes.utils.engine_dirs.xdg_data_home")
     def test_find_uv_bin_handles_system_uv_exception(self, mock_xdg: Mock, mock_system_uv: Mock) -> None:
         """Test that find_uv_bin handles exceptions from system UV lookup appropriately."""
         with tempfile.TemporaryDirectory() as temp_dir:

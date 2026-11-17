@@ -8,7 +8,7 @@ legacy-template inactivity, and parent linking.
 import base64
 import io
 import logging
-import pickle
+import pickle  # noqa: TID251 -- asserts the record payload's tagged pickle-v1 format round-trips
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -88,7 +88,7 @@ from griptape_nodes.retained_mode.file_metadata.provenance_record import (
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
-from griptape_nodes.retained_mode.managers.os_manager import FileWriteAttemptResult
+from griptape_nodes.retained_mode.managers.filesystem.file_writing import FileWriteAttemptResult
 from griptape_nodes.retained_mode.managers.provenance_manager import ArtifactWriteFacts, ProvenanceCaptureResult
 
 PROVENANCE_STORE_DIR = "griptape-nodes-provenance"
@@ -388,7 +388,7 @@ class TestFailurePolicies:
             failure_reason=FileIOFailureReason.IO_ERROR,
             error_message=f"Attempted to write to file '{file_path}'. Failed due to: disk full.",
         )
-        with patch.object(type(engine.os_manager), "_attempt_atomic_file_write", return_value=disk_full):
+        with patch.object(type(engine.os_manager.writer), "_attempt_atomic_file_write", return_value=disk_full):
             result = engine.handle_request(
                 WriteFileRequest(file_path=str(file_path), content="new content", provenance=_sample_provenance())
             )
@@ -597,7 +597,7 @@ class TestFaithfulPayload:
         library.register_new_node_type(
             _ProvProbeNode, NodeMetadata(category="t", description="d", display_name="Probe")
         )
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="prov_wf", flow_name="prov_flow"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="prov_wf", flow_name="prov_flow"))
         create_result = engine.handle_request(
             CreateNodeRequest(node_type="_ProvProbeNode", specific_library_name=self._LIBRARY, node_name="Probe_1")
         )
@@ -733,10 +733,8 @@ class TestIngestionCopies:
             artifact = normalize_artifact_input(str(source), ImageUrlArtifact)
 
         assert isinstance(artifact, ImageUrlArtifact)
-        # The copy landed in staticfiles/ ...
-        staticfiles_copies = list(temp_dir.rglob("staticfiles/reference.png"))
-        assert staticfiles_copies
-        # ... and NO record exists anywhere in the store for it.
+        # Normalization keeps the input where it is (no staticfiles upload since the
+        # media-value rework), and NO record exists anywhere in the store for it.
         store = temp_dir / PROVENANCE_STORE_DIR
         ingestion_records = list(store.rglob("*reference.png*/*.yaml")) if store.exists() else []
         assert not ingestion_records
@@ -934,9 +932,9 @@ class TestProducingNodeInference:
     """No attested identity: the resolving-node heuristic fills in, flagged as inferred."""
 
     def test_resolving_node_is_inferred_and_flagged(self, engine: Engine) -> None:
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="inf_wf", flow_name="inf_flow"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="inf_wf", flow_name="inf_flow"))
         try:
-            with patch.object(type(engine.flow_manager), "flow_state", return_value=(set(), ["GhostNode"], set())):
+            with patch.object(type(engine.flow_manager), "flow_state_in", return_value=([], ["GhostNode"], [])):
                 identity = engine.provenance_manager._resolve_producing_node(ProvenanceContent())
         finally:
             engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
@@ -947,9 +945,9 @@ class TestProducingNodeInference:
         assert identity.identity_source == ProducingNodeIdentitySource.INFERRED_RESOLVING_NODE
 
     def test_no_resolving_nodes_means_no_identity(self, engine: Engine) -> None:
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="inf_wf2", flow_name="inf_flow2"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="inf_wf2", flow_name="inf_flow2"))
         try:
-            with patch.object(type(engine.flow_manager), "flow_state", return_value=(set(), [], set())):
+            with patch.object(type(engine.flow_manager), "flow_state_in", return_value=([], [], [])):
                 identity = engine.provenance_manager._resolve_producing_node(ProvenanceContent())
         finally:
             engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

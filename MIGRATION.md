@@ -1,5 +1,135 @@
 # Unreleased
 
+## Execution events name their workflow in `open_workflow_id`
+
+**Request API clients.** `ExecutionEvent` and streamed `ProgressEvent` carried the open workflow
+they belong to in `workflow_id` in 0.107.0 and 0.108.0. They now carry it in `open_workflow_id`,
+the same field a result's envelope uses. Read `open_workflow_id` instead. `workflow_id` is no
+longer sent on these events. `open_workflow_id` is `null` for an event that belongs to no
+workflow, as `workflow_id` was.
+
+## `worker.heartbeat_startup_grace_s` is now `worker.library_load_timeout_s`
+
+Rename the key in any config file or environment that sets it; the environment variable is
+`GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`. The old name is not read, so a setting left behind
+silently reverts to the 600 second default.
+
+What the value bounds is unchanged: how long a worker may take to load its library, covering a node
+waiting for its library's worker and a project switch waiting for each worker to adopt it. It no
+longer delays heartbeat enforcement, which is what the old name suggested. `worker.heartbeat_timeout_s` and `worker.heartbeat_interval_s` own that.
+
+## Libraries no longer choose a worker
+
+Where a library's nodes execute now follows from its dependencies. A library that declared
+`SuggestedWorkerMode(WORKER)`, or that a user set to "Isolated" through `worker_mode_override`, used
+to be hosted whole in a worker process. It now loads into the engine process like any other
+library, and its `pip_dependencies` install into `<library>/.venv`, which sits on the engine's own
+import path. Packages that conflict with the engine's now conflict in that process.
+
+**Library authors.** Move the packages that need isolation into `pip_dependencies_exec`, under
+`metadata.dependencies` in `griptape-nodes-library.json`:
+
+```json
+"dependencies": {
+  "pip_dependencies": ["pillow"],
+  "pip_dependencies_exec": ["torch", "diffusers"]
+}
+```
+
+The library's nodes still load in the engine, so the editor gets their real traits, converters,
+and validators. Only `process`/`aprocess` runs in a worker, against `<library>/.venv-exec`, which is
+resolved over both sets. A node module must stay importable without the execution set, so import
+those packages inside `process`. See
+[How to declare execution dependencies](docs/development/custom_nodes/node_isolation_with_workers.md#how-to-declare-execution-dependencies).
+
+`WorkerModeCompatibility`, `SuggestedWorkerMode`, and the `worker_mode_override` key in
+`libraries_to_register` still parse, so neither old manifests nor old config files fail to load.
+They have no effect. While a library still asks for a worker and declares no
+`pip_dependencies_exec`, loading it logs one INFO line saying so.
+
+**Also removed:**
+
+- The `WORKER_DELEGATED` and `WORKER_PENDING` library lifecycle states.
+- `requires_worker` on a library's diagnostics.
+- `node_schemas` on `ReportLibraryLoadedRequest`, with the `WorkerNodeSchema` and
+    `WorkerParameterSchema` payloads it carried.
+- The strict-mode rules `reentrant-bus-in-init`, `parameter-behaviors-dropped-in-schema`,
+    `connection-hooks-inert-on-worker`, and `value-hooks-execute-only-on-worker`, and the
+    `LOAD_PROBE` scope kind. `parameter-mutation-during-aprocess` is the only rule left.
+- The fitness problems reporting that request handlers and post-dispatch hooks are unsupported in an
+    isolated library. Both now work in every library.
+
+## Parameter values keep their type
+
+**Library authors.** A field of your own request, result, or event payload that holds parameter
+values must be annotated `Value`. A field typed `Any` that holds a griptape object, or any value
+JSON can't represent, now fails to send:
+
+```python
+from griptape_nodes.serialization.values import Value
+
+
+@dataclass
+class ColorizeResultSuccess(ResultPayloadSuccess):
+    image: Value  # was: Any
+```
+
+To make a class you own save, decorate it with `register_value_codec` and
+give it `to_state()` and a `from_state()` classmethod. For a class you cannot edit, pass the
+conversion functions from your library's `before_library_nodes_loaded`:
+
+```python
+import numpy as np
+
+from griptape_nodes.exe_types.core_types import register_value_codec
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+
+
+@register_value_codec
+class Palette:
+    def __init__(self, colors: list[str]) -> None:
+        self.colors = colors
+
+    def to_state(self) -> dict:
+        return {"colors": self.colors}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Palette":
+        return cls(state["colors"])
+
+
+class MyLibrary(AdvancedNodeLibrary):
+    def before_library_nodes_loaded(self, library_data, library) -> None:
+        register_value_codec(
+            np.ndarray,
+            to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
+            from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
+        )
+```
+
+## Events are serialized by converters
+
+**Embedders and request API clients written in Python.** Events and payloads no longer have
+wire-format serialization methods. Use the cattrs converters in
+`griptape_nodes.retained_mode.events.converters` for the message's reader:
+
+```python
+from griptape_nodes.retained_mode.events import converters
+
+converters.client.dumps(event)  # was: event.json()
+converters.engine.unstructure(event)  # was: event.dict()
+converters.engine.dumps(result)  # was: result.strict_json()
+converters.engine.dumps_result(result).text  # was: result.failure_json(error)
+converters.engine.dumps(payload)  # was: payload.to_json()
+converters.engine.structure(data, EventResultSuccess)  # was: EventResultSuccess.from_dict(data)
+```
+
+`engine` preserves parameter types between engine processes; `client` writes plain JSON for
+the editor and other clients. `dumps` raises `EventSerializationError` from `converters`.
+Use `dumps_result(result).text` to send a failure when a result cannot be serialized.
+
+`event.json()` and `event.dict()` raise `TypeError`.
+
 ## `serializable=False` outputs are held in their own process across a worker boundary
 
 `Parameter(serializable=False)` has always kept a value out of saved workflow files. On an **output** it

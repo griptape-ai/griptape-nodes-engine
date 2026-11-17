@@ -109,8 +109,8 @@ class MyNode(DataNode):
 - **[Advanced Libraries](advanced_libraries.md)** — `AdvancedNodeLibrary` lifecycle hooks, library-owned request handlers, and registering node types without listing them in the manifest
 - **[Custom Widgets](custom_widgets.md)** — Custom JavaScript widget components and the widget testbed
 - **[Patterns and Examples](examples.md)** — Advanced patterns from production nodes and quick-reference material
-- **[Node Isolation with Workers](node_isolation_with_workers.md)** — Running a library isolated in a worker subprocess
-- **[Strict Mode Reference](strict_mode.md)** — Strict-mode rules that identify isolation incompatibilities
+- **[Node Isolation with Workers](node_isolation_with_workers.md)** — Running a library's node execution in a worker subprocess
+- **[Strict Mode Reference](strict_mode.md)** — Strict-mode rules checked while a node executes
 - **[Example Control Node](example_control_node.py)** — A complete working example demonstrating best practices for building control nodes
 
 ## Start from the Template Repository

@@ -5,25 +5,15 @@
 from typing import Any
 from unittest.mock import MagicMock
 
+from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, DagNodeCategories, NodeState
-
-
-def _engine_with_connections(connections: MagicMock) -> MagicMock:
-    """Build a stub engine whose flow_manager hands back `connections`.
-
-    DagBuilder resolves connections through its injected engine, so a stub engine replaces what
-    used to be a patch of the process-wide facade.
-    """
-    engine = MagicMock()
-    engine.flow_manager.get_connections.return_value = connections
-    return engine
 
 
 class TestDagNodeCategories:
     """Test cases for the DagNodeCategories seeding contract.
 
-    The classifier (FlowManager.classify_nodes_for_dag) and the queue drainer
+    The classifier (FlowManager.classify_nodes_for_dag_in) and the queue drainer
     (ControlFlowMachine._drain_global_flow_queue) both produce this tuple, and the DAG-seeding
     routine consumes it positionally, so the field order/names are part of the shared contract.
     """
@@ -47,14 +37,14 @@ class TestDagBuilder:
 
     def test_init_creates_empty_dag_builder(self) -> None:
         """Test that initialization creates an empty DAG builder."""
-        dag_builder = DagBuilder()
+        dag_builder = DagBuilder(Connections())
 
         assert len(dag_builder.graphs) == 0
         assert dag_builder.node_to_reference == {}
 
     def test_add_node_creates_dag_node(self) -> None:
         """Test that add_node creates a DagNode with correct initial state."""
-        dag_builder = DagBuilder()
+        dag_builder = DagBuilder(Connections())
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
 
@@ -67,7 +57,7 @@ class TestDagBuilder:
 
     def test_add_node_adds_to_graph(self) -> None:
         """Test that add_node adds node to the internal graph."""
-        dag_builder = DagBuilder()
+        dag_builder = DagBuilder(Connections())
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
 
@@ -80,7 +70,7 @@ class TestDagBuilder:
 
     def test_add_node_duplicate_returns_existing(self) -> None:
         """Test that adding the same node twice returns the existing DagNode."""
-        dag_builder = DagBuilder()
+        dag_builder = DagBuilder(Connections())
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
 
@@ -102,7 +92,7 @@ class TestDagBuilder:
         # The engine reports no connections
         mock_connections = MagicMock()
         mock_connections.get_connected_node.return_value = None
-        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
+        dag_builder = DagBuilder(mock_connections)
 
         added_nodes = dag_builder.add_node_with_dependencies(mock_node)
 
@@ -138,7 +128,7 @@ class TestDagBuilder:
             (upstream_node, MagicMock()),  # downstream_node has upstream dependency
             None,  # upstream_node has no dependencies
         ]
-        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
+        dag_builder = DagBuilder(mock_connections)
 
         added_nodes = dag_builder.add_node_with_dependencies(downstream_node)
 
@@ -153,6 +143,27 @@ class TestDagBuilder:
         # Check that edge was added
         assert default_graph.in_degree("downstream_node") == 1
         assert default_graph.in_degree("upstream_node") == 0
+
+    def test_add_node_with_dependencies_ignores_a_wire_to_itself(self) -> None:
+        """A node fed by its own output (a group's current_item into its new_item_to_add) is not its own dependency."""
+        node = MagicMock(spec=BaseNode)
+        node.name = "group"
+        node.state = MagicMock()
+        node.initialize_spotlight.return_value = MagicMock()
+        mock_param = MagicMock()
+        mock_param.type = "str"
+        node.parameters = [mock_param]
+
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = (node, MagicMock())
+        dag_builder = DagBuilder(mock_connections)
+
+        added_nodes = dag_builder.add_node_with_dependencies(node)
+
+        assert added_nodes == [node]
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert default_graph.in_degree("group") == 0
 
     def test_add_node_with_dependencies_existing_upstream_node(self) -> None:
         """Test adding a node when upstream dependency already exists in DAG."""
@@ -175,7 +186,7 @@ class TestDagBuilder:
 
         mock_connections = MagicMock()
         mock_connections.get_connected_node.return_value = (upstream_node, MagicMock())
-        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
+        dag_builder = DagBuilder(mock_connections)
 
         # Add upstream node first
         dag_builder.add_node(upstream_node)
@@ -237,7 +248,7 @@ class TestDagBuilder:
             return None
 
         mock_connections.get_connected_node.side_effect = mock_get_connected_node
-        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
+        dag_builder = DagBuilder(mock_connections)
 
         # This should not cause infinite recursion due to visited set
         added_nodes = dag_builder.add_node_with_dependencies(node_a)
@@ -249,7 +260,7 @@ class TestDagBuilder:
 
     def test_clear_removes_all_nodes_and_references(self) -> None:
         """Test that clear() removes all nodes and references from the DAG builder."""
-        dag_builder = DagBuilder()
+        dag_builder = DagBuilder(Connections())
 
         # Add some nodes
         mock_node1 = MagicMock(spec=BaseNode)
@@ -275,7 +286,7 @@ class TestDagBuilder:
 
     def test_clear_on_empty_dag_builder(self) -> None:
         """Test that clear() works correctly on an empty DAG builder."""
-        dag_builder = DagBuilder()
+        dag_builder = DagBuilder(Connections())
 
         # Clear should not raise any errors
         dag_builder.clear()
@@ -308,7 +319,7 @@ class TestDagBuilder:
             (upstream_node, MagicMock()),  # downstream has upstream dependency
             None,  # upstream has no dependencies
         ]
-        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
+        dag_builder = DagBuilder(mock_connections)
 
         dag_builder.add_node_with_dependencies(downstream_node)
 
@@ -326,7 +337,7 @@ class TestDagBuilder:
 
     def test_node_state_preservation(self) -> None:
         """Test that DagNode state is preserved correctly."""
-        dag_builder = DagBuilder()
+        dag_builder = DagBuilder(Connections())
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
 
@@ -343,3 +354,29 @@ class TestDagBuilder:
         retrieved_dag_node = dag_builder.node_to_reference["test_node"]
         assert retrieved_dag_node is dag_node
         assert retrieved_dag_node.node_state == NodeState.PROCESSING
+
+    def test_a_node_can_be_added_again_to_a_graph_that_emptied_out(self) -> None:
+        """A node run alongside another run gets a graph named after itself.
+
+        When it finishes, its graph empties and `cleanup_empty_graph_nodes` forgets the graph's
+        nodes, but the empty graph itself stays for the rest of the run. Running the node again
+        must add it to that graph and track it there, not fail on the missing node set.
+        """
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "rerun_node"
+        mock_node.parameters = []
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(mock_connections)
+
+        dag_builder.add_node_with_dependencies(mock_node, "rerun_node")
+        # The node finishes: the run removes it from its graph, which is now empty.
+        dag_builder.graphs["rerun_node"].remove_node("rerun_node")
+        dag_builder.cleanup_empty_graph_nodes("rerun_node")
+
+        added_nodes = dag_builder.add_node_with_dependencies(mock_node, "rerun_node")
+
+        assert added_nodes == [mock_node]
+        assert "rerun_node" in dag_builder.graphs["rerun_node"].nodes()
+        assert dag_builder.graph_to_nodes["rerun_node"] == {"rerun_node"}
+        assert "rerun_node" in dag_builder.node_to_reference

@@ -1,6 +1,7 @@
 from griptape.artifacts import BaseArtifact, TextArtifact
 
 from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
+from griptape_nodes.serialization.values import UndecodedValue
 
 
 class TestHydrateParameterValues:
@@ -54,3 +55,12 @@ class TestHydrateParameterValues:
         hydrated = hydrate_parameter_values(values)
 
         assert hydrated["x"] == bogus
+
+    def test_leaves_undecoded_value_alone(self) -> None:
+        """UndecodedValue is a dict subclass; it must not be run through from_dict."""
+        undecoded = UndecodedValue({"type": "TextArtifact", "value": "hello"}, reason="library not loaded")
+        values = {"out": undecoded}
+
+        hydrated = hydrate_parameter_values(values)
+
+        assert hydrated["out"] is undecoded

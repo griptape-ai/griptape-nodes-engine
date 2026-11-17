@@ -1,6 +1,6 @@
 """MCP (Model Context Protocol) server management events."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
@@ -366,3 +366,47 @@ class GetEnabledMCPServersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSu
 @PayloadRegistry.register
 class GetEnabledMCPServersResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Failed to get enabled MCP servers."""
+
+
+@dataclass
+class LibraryMCPServer:
+    """A loaded library's MCP tools, served at their own address on the engine's MCP server.
+
+    Args:
+        name: The library's name as it appears in the address, such as ``acme_render_tools``.
+            Pass it in ``library_mcp_servers`` to give the chat agent these tools.
+        library_name: The library's display name, such as "Acme Render Tools".
+        url: The address that serves the library's tools, on the port the engine bound.
+        tool_names: The names of the tools the library exposes.
+    """
+
+    name: str
+    library_name: str
+    url: str
+    tool_names: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ListLibraryMCPServersRequest(RequestPayload):
+    """List the loaded libraries that expose tools on the engine's MCP server.
+
+    Use when: Offering library tools to the chat agent, or showing where an external MCP client
+    can reach them.
+
+    Results: ListLibraryMCPServersResultSuccess (with servers) | ListLibraryMCPServersResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListLibraryMCPServersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Library MCP servers listed successfully."""
+
+    servers: list[LibraryMCPServer]
+
+
+@dataclass
+@PayloadRegistry.register
+class ListLibraryMCPServersResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Failed to list library MCP servers."""

@@ -28,6 +28,70 @@ All Parameter attributes:
 - **parent_container_name**: str|None — assigns this parameter as a child of a `ParameterContainer` (i.e. a `ParameterList` or `ParameterDictionary`). Used for list-like ownership.
 - **parent_element_name**: str|None — nests this parameter under a `ParameterGroup` (a UI grouping element). Used for visual grouping in the node UI.
 
+## Parameter Values
+
+Parameter values are serialized when:
+
+- a workflow is saved
+- nodes are copied
+- a workflow is embedded in an exported image
+- a node runs in its library's own process (see [Node Isolation with Workers](node_isolation_with_workers.md))
+- a loop or subflow group runs with an **Execution Environment** other than **Local Execution**
+
+These types serialize as-is:
+
+- `None`, `bool`, `int`, `float`, `str`, and lists and dicts of them
+- tuples, named tuples, sets, `bytes`, and dicts with non-string keys
+- enums, `pathlib` paths, dates and times, `timedelta`, `UUID`, and `Decimal`
+- pydantic models, dataclasses, and attrs classes
+- griptape objects such as artifacts and rulesets
+
+To serialize any other class, decorate it with `register_value_codec` and give it a `to_state()`
+method that returns the types above, and a `from_state()` classmethod that rebuilds the object from
+them. Subclasses are covered too:
+
+```python
+from griptape_nodes.exe_types.core_types import register_value_codec
+
+
+@register_value_codec
+class Palette:
+    def __init__(self, colors: list[str]) -> None:
+        self.colors = colors
+
+    def to_state(self) -> dict:
+        return {"colors": self.colors}
+
+    @classmethod
+    def from_state(cls, state: dict) -> "Palette":
+        return cls(state["colors"])
+```
+
+For a class you cannot edit, such as one from another package, pass the conversion functions
+instead. They cover that exact class, not its subclasses, and only a class with no other way to
+save. Register them from your library's `before_library_nodes_loaded`, so every process that loads
+your library has them:
+
+```python
+import numpy as np
+
+from griptape_nodes.exe_types.core_types import register_value_codec
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+
+
+class MyLibrary(AdvancedNodeLibrary):
+    def before_library_nodes_loaded(self, library_data, library) -> None:
+        register_value_codec(
+            np.ndarray,
+            to_state=lambda array: {"dtype": str(array.dtype), "shape": list(array.shape), "data": array.tobytes()},
+            from_state=lambda state: np.frombuffer(state["data"], state["dtype"]).reshape(state["shape"]),
+        )
+```
+
+A value of any other class is left out when a workflow is saved and when nodes are copied or
+pasted, with a warning in the log that names the node and parameter. Set `serializable=False` on a
+parameter whose value is never meant to be saved, and it is left out without a warning.
+
 ## Traits
 
 Add functionality via `add_trait()`:
@@ -37,7 +101,11 @@ Add functionality via `add_trait()`:
     soft limit: it sizes the slider track, but values typed outside it are accepted rather than rejected.
 - **Button**: `Button(label: str = "", variant=..., size=..., button_link=... | on_click=..., get_button_state=...)`
 - **ColorPicker**: `ColorPicker(format="hex")`
+- **DatePicker**: `DatePicker(include_time: bool = False, min: str | None = None, max: str | None = None)` — the value is
+    an ISO 8601 local date (`2026-10-14`), or date and time (`2026-10-14T09:30`) with `include_time=True`.
 - **FileSystemPicker**: `FileSystemPicker(...)` (file/directory selection UI)
+- **FileFormat**: `FileFormat(kind: FileFormatKind | str)` — marks a format dropdown's choices as file formats of one kind
+    (`image`, `video`, `audio`, `threed`), so a host running the workflow can hide formats it cannot open.
 
 For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
 
@@ -509,6 +577,41 @@ for tool in tools:
 
 **Important behavior note:** `get_parameter_list_value()` flattens nested iterables and **drops falsey items**
 (e.g. `0`, `False`, `""`, empty dicts/lists). If you need to preserve falsey values, use `get_parameter_value()` and handle flattening yourself.
+
+**Converting each item:** pass `item_converters` to change one item at a time, such as turning a file path into an
+artifact. They run on each item whether it is set in its own row or arrives in a whole list over a connection.
+`converters` run on each row, and on a whole list a connection hands the list, but not on a value built from rows.
+
+```python
+from functools import partial
+
+from griptape.artifacts import ImageArtifact, ImageUrlArtifact
+
+from griptape_nodes.utils.artifact_normalization import normalize_artifact_input
+
+ParameterList(
+    name="images",
+    input_types=["ImageUrlArtifact", "list[ImageUrlArtifact]"],
+    tooltip="Images to combine",
+    allowed_modes={ParameterMode.INPUT},
+    item_converters=[
+        partial(normalize_artifact_input, artifact_type=ImageUrlArtifact, accepted_types=(ImageArtifact,))
+    ],
+)
+```
+
+**Rows and whole lists:** a row accepts one item, a `list[...]` of the item type, or an untyped `list`. A row that
+receives a list adds its items to the list, so the list value is the concatenation of its rows, and `max_items` counts
+those items. A row value exceeding `max_items` is refused. Over a connection, it fails the run with an error naming
+the list. When the list's own items may be lists (`list`, `any` or `all`), a list in a row is one item.
+
+**Setting a whole list:** a list nothing is connected to holds its items in rows and has no value of its own: reading
+it builds it from the rows. Setting a whole list, with `SetParameterValueRequest` or with
+`self.set_parameter_value("images", [...])`, replaces the rows with one row per entry. Three writes leave the rows
+alone: one made while the node is running (it is recorded as the node's result), one made while a workflow loads,
+and one made from `before_value_set` or `after_value_set` on the list or one of its rows, which logs a warning.
+Don't rewrite a list from those hooks to convert its items: use `item_converters`. A list fed by a connection to the list itself holds the whole list it was
+handed.
 
 ## Common Parameter Patterns
 

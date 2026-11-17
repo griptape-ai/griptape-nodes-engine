@@ -11,6 +11,9 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
+from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.topics import REQUEST_TOPIC, client_response_topic
+
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import TracebackType
@@ -19,6 +22,10 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import EventRequest
 
 logger = logging.getLogger(__name__)
+
+# How many requests a client remembers having stopped waiting for, so it drops their late replies
+# rather than leaving them to the filters after it, which would take them for unasked results.
+_ABANDONED_REQUESTS_REMEMBERED = 1000
 
 
 @dataclass
@@ -33,7 +40,7 @@ class _PendingRequest:
     # the full payload dict instead of rejecting it with
     # ``Exception(error_msg)``. The default (False) preserves the
     # original "failure -> raised exception" contract that
-    # ``request``/``request_to_orchestrator``/``request_batch`` already
+    # ``request``/``request_from_worker``/``request_batch`` already
     # rely on. The worker fan-out path opts in so the orchestrator can
     # cattrs-structure the failure dict back into a real
     # ``ResultPayloadFailure`` (preserving exception fidelity over the
@@ -59,17 +66,26 @@ class RequestClient:
         client: Client,
         request_topic_fn: Callable[[], str] | None = None,
         response_topic_fn: Callable[[], str] | None = None,
+        *,
+        session_id: str | None = None,
     ) -> None:
         """Initialize request/response client.
 
         Args:
             client: Client instance to use for communication
             request_topic_fn: Function to determine request topic (defaults to "request")
-            response_topic_fn: Function to determine response topic (defaults to "response")
+            response_topic_fn: Function to determine response topic (defaults to this client's own
+                reply topic, so no other client gets its results:
+                `sessions/<session_id>/clients/<client_id>/response`, or `clients/<client_id>/response`
+                while `session_id` is None)
+            session_id: The session this client works in, which puts its reply topic under the
+                session. Set `session_id` once the client learns it, such as after `AppStartSessionRequest`.
         """
         self.client = client
-        self.request_topic_fn = request_topic_fn or (lambda: "request")
-        self.response_topic_fn = response_topic_fn or (lambda: "response")
+        self.client_id = uuid.uuid4().hex
+        self.session_id = session_id
+        self.request_topic_fn = request_topic_fn or (lambda: REQUEST_TOPIC)
+        self.response_topic_fn = response_topic_fn or (lambda: client_response_topic(self.session_id, self.client_id))
 
         # Map of request_id -> pending request where tag identifies the originating worker/caller
         self._pending_requests: dict[str, _PendingRequest] = {}
@@ -82,6 +98,9 @@ class RequestClient:
 
         # Track subscribed response topics
         self._subscribed_response_topics: set[str] = set()
+
+        # Requests this client stopped waiting for, discarded or failed, oldest first. Guarded by self._lock.
+        self._abandoned_request_ids: dict[str, None] = {}
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: register response filter on Client."""
@@ -164,36 +183,35 @@ class RequestClient:
             else:
                 result = await asyncio.wrap_future(response_future)
 
-        except TimeoutError:
-            logger.error("Request %s timed out", request_id)
+        except TimeoutError as e:
             self.discard_request(request_id)
-            raise
+            msg = f"Request {request_id} timed out"
+            raise TimeoutError(msg) from e
 
-        except Exception as e:
-            logger.error("Request %s failed: %s", request_id, e)
+        except Exception:
             self.discard_request(request_id)
             raise
         else:
             logger.debug("Request %s completed successfully", request_id)
             return result
 
-    async def request_to_orchestrator(
+    async def request_from_worker(
         self,
         event_request: EventRequest,
-        orchestrator_request_topic: str,
+        request_topic: str,
         worker_response_topic: str,
         timeout_ms: int | None = None,
     ) -> dict[str, Any]:
-        """Publish an EventRequest to the orchestrator and await its matching EventResult.
+        """Publish a worker's EventRequest to another engine, its orchestrator or its host, and await the EventResult.
 
-        Sets event_request.response_topic to worker_response_topic so the orchestrator
+        Sets event_request.response_topic to worker_response_topic so that engine
         replies on a topic this RequestClient is subscribed to. Tracks the future by
         event_request.request_id (generated if missing), publishes the serialized
-        EventRequest to orchestrator_request_topic, and awaits the matching response.
+        EventRequest to request_topic, and awaits the matching response.
 
         Args:
             event_request: EventRequest wrapping the RequestPayload to forward.
-            orchestrator_request_topic: Topic the orchestrator listens on.
+            request_topic: Topic the engine asked listens on.
             worker_response_topic: Topic this worker listens on for the reply.
             timeout_ms: Optional timeout in milliseconds.
 
@@ -207,6 +225,8 @@ class RequestClient:
             event_request.request_id = str(uuid.uuid4())
         request_id = event_request.request_id
         event_request.response_topic = worker_response_topic
+        # Before tracking, so a request that cannot be sent leaves no pending response behind.
+        payload_dict = json.loads(converters.engine.dumps(event_request))
 
         response_future = await self._track_request(request_id)
 
@@ -214,12 +234,10 @@ class RequestClient:
             await self.client.subscribe(worker_response_topic)
             self._subscribed_response_topics.add(worker_response_topic)
 
-        payload_dict = json.loads(event_request.json())
-
-        logger.debug("Forwarding request %s to orchestrator on %s", request_id, orchestrator_request_topic)
+        logger.debug("Forwarding request %s on %s", request_id, request_topic)
 
         try:
-            await self.client.publish("EventRequest", payload_dict, orchestrator_request_topic)
+            await self.client.publish("EventRequest", payload_dict, request_topic)
 
             if timeout_ms:
                 timeout_sec = timeout_ms / 1000
@@ -227,13 +245,12 @@ class RequestClient:
             else:
                 result = await asyncio.wrap_future(response_future)
 
-        except TimeoutError:
-            logger.error("Forwarded request %s timed out", request_id)
+        except TimeoutError as e:
             self.discard_request(request_id)
-            raise
+            msg = f"Forwarded request {request_id} timed out"
+            raise TimeoutError(msg) from e
 
-        except Exception as e:
-            logger.error("Forwarded request %s failed: %s", request_id, e)
+        except Exception:
             self.discard_request(request_id)
             raise
         else:
@@ -317,8 +334,7 @@ class RequestClient:
                 results = await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
             else:
                 results = await gather
-        except (TimeoutError, Exception) as e:
-            logger.error("Batch request failed: %s", e)
+        except Exception:
             for request_id in request_ids:
                 self.discard_request(request_id)
             raise
@@ -371,6 +387,7 @@ class RequestClient:
             to_fail = [rid for rid, entry in self._pending_requests.items() if entry.tag == tag]
             for rid in to_fail:
                 entry = self._pending_requests.pop(rid)
+                self._remember_abandoned_unlocked(rid)
                 RequestClient._settle(lambda entry=entry: entry.future.set_exception(error))
                 logger.debug("Failed request %s (tag=%s): %s", rid, tag, error)
 
@@ -387,8 +404,15 @@ class RequestClient:
                 logger.debug("Request already completed or unknown: %s", request_id)
                 return
 
+            self._remember_abandoned_unlocked(request_id)
             RequestClient._settle(entry.future.cancel)
             logger.debug("Cancelled request: %s", request_id)
+
+    def _remember_abandoned_unlocked(self, request_id: str) -> None:
+        """Remember a request this client stopped waiting for, forgetting the oldest past the cap. Caller must hold self._lock."""
+        self._abandoned_request_ids[request_id] = None
+        if len(self._abandoned_request_ids) > _ABANDONED_REQUESTS_REMEMBERED:
+            del self._abandoned_request_ids[next(iter(self._abandoned_request_ids))]
 
     async def _track_request(
         self,
@@ -512,8 +536,9 @@ class RequestClient:
         """Attempt to match an incoming message to a pending request.
 
         Registered as a Client message filter so response messages are claimed
-        before reaching the client's message queue. Messages not matched to a
-        pending request return False and are left for queue consumers.
+        before reaching the client's message queue. A late reply to a request this
+        client stopped waiting for is claimed and dropped. Other messages not matched
+        to a pending request return False and are left for queue consumers.
 
         Expects worker/event-bus response format:
           payload["event_type"] in ("EventResultSuccess", "EventResultFailure")
@@ -530,6 +555,10 @@ class RequestClient:
 
         request_id = payload.get("request_id") or ""
         with self._lock:
+            if request_id and request_id in self._abandoned_request_ids:
+                del self._abandoned_request_ids[request_id]
+                logger.debug("Dropping a late reply to request %s, which this client stopped waiting for.", request_id)
+                return True
             if not request_id or request_id not in self._pending_requests:
                 return False
 

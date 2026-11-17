@@ -7,8 +7,7 @@ type in the library without declaring any of them as a `class` statement.
 
 Classes are built on first lookup and cached in module globals, so repeated lookups
 return the same object. That identity matters: the engine caches the resolved class
-per node type, `isinstance` checks compare against it, and pickled parameter values
-in saved workflows reference it by `__module__` + `__qualname__`.
+per node type, and `isinstance` checks compare against it.
 """
 
 from __future__ import annotations
@@ -99,9 +98,9 @@ def _build_node_class(spec: dict[str, Any]) -> type[DataNode]:
             # Set both explicitly. Without `__module__` in this namespace, class creation
             # reads `__name__` from the calling frame's globals, and because DataNode carries
             # ABCMeta that frame is inside the stdlib `abc` module -- the class would claim
-            # `__module__ == "abc"`. Pickled parameter values in saved workflows are restored
-            # by importing `__module__` and looking up `__qualname__` on it, so a wrong
-            # `__module__` breaks reopening any workflow that carries such a value. Pointing
+            # `__module__ == "abc"`. Parameter values in saved workflows are restored
+            # by looking up `__qualname__` in `__module__`, so with a wrong `__module__` such a
+            # value reopens as plain data instead of as its class. Pointing
             # at this module routes that lookup back through `__getattr__`, and the engine
             # registers a stable-namespace alias for this file so it resolves across sessions.
             "__module__": __name__,

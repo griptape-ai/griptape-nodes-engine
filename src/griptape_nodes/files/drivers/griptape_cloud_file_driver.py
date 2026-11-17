@@ -1,11 +1,15 @@
 """File driver for Griptape Cloud asset locations."""
 
 import os
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
-import httpx
+import httpx2
 
-from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import (
+    DEFAULT_CLOUD_BASE_URL,
+    join_cloud_url,
+    resolve_cloud_base_url,
+)
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 
@@ -29,7 +33,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         """
         return 10
 
-    def __init__(self, bucket_id: str, api_key: str, base_url: str = "https://cloud.griptape.ai") -> None:
+    def __init__(self, bucket_id: str, api_key: str, base_url: str = DEFAULT_CLOUD_BASE_URL) -> None:
         """Initialize GriptapeCloudFileDriver.
 
         Args:
@@ -38,24 +42,30 @@ class GriptapeCloudFileDriver(BaseFileDriver):
             base_url: Base URL for Griptape Cloud API (default: https://cloud.griptape.ai)
         """
         self.bucket_id = bucket_id
-        self.api_key = api_key
+        # Its owner sets the current credential here before each use, since a session credential renews.
+        self.api_key: str | None = api_key
         self.base_url = base_url
-        self.headers = {"Authorization": f"Bearer {api_key}"}
+
+    @property
+    def headers(self) -> dict[str, str]:
+        """The headers the next request sends, carrying the current `api_key`."""
+        return {"Authorization": f"Bearer {self.api_key}"}
 
     @classmethod
-    def create_from_env(cls) -> "GriptapeCloudFileDriver | None":
+    def create_from_env(cls, api_key: str | None) -> "GriptapeCloudFileDriver | None":
         """Create driver from environment variables if available.
 
-        Checks for a GT_CLOUD_BUCKET_ID and a Griptape Cloud credential (the
-        license, else GT_CLOUD_API_KEY). If both are present, creates and returns
-        a driver instance.
+        Checks for a GT_CLOUD_BUCKET_ID and the given Griptape Cloud credential.
+        If both are present, creates and returns a driver instance.
+
+        Args:
+            api_key: The Griptape Cloud credential, which the caller resolves.
 
         Returns:
             GriptapeCloudFileDriver instance if credentials available, None otherwise
         """
         bucket_id = os.environ.get("GT_CLOUD_BUCKET_ID")
-        api_key = resolve_cloud_credential()
-        base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
+        base_url = resolve_cloud_base_url()
 
         if bucket_id and api_key:
             return cls(bucket_id, api_key, base_url)
@@ -115,10 +125,10 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.post(api_url, json={"method": "GET"}, headers=self.headers, timeout=timeout)
                 response.raise_for_status()
                 signed_url = response.json()["url"]
@@ -127,7 +137,7 @@ class GriptapeCloudFileDriver(BaseFileDriver):
                 download_response.raise_for_status()
                 return download_response.content
 
-        except httpx.HTTPError as e:
+        except httpx2.HTTPError as e:
             msg = f"Failed to download from cloud storage at {location}: {e}"
             raise RuntimeError(msg) from e
 
@@ -148,14 +158,14 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
-            async with httpx.AsyncClient() as client:
-                # TODO: Standardize timeout values https://github.com/griptape-ai/griptape-nodes/issues/3958
+            async with httpx2.AsyncClient() as client:
+                # TODO: Standardize timeout values https://github.com/griptape-ai/griptape-nodes-engine/issues/3958
                 response = await client.post(api_url, json={"method": "GET"}, headers=self.headers, timeout=10.0)
                 return response.status_code < _HTTP_SUCCESS_THRESHOLD
-        except (httpx.HTTPError, Exception):
+        except (httpx2.HTTPError, Exception):
             return False
 
     def get_size(self, location: str) -> int:
@@ -178,10 +188,10 @@ class GriptapeCloudFileDriver(BaseFileDriver):
         # Extract bucket ID from URL, fallback to configured bucket_id
         bucket_id = self._extract_bucket_id_from_url(location) or self.bucket_id
 
-        api_url = urljoin(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
+        api_url = join_cloud_url(self.base_url, f"/api/buckets/{bucket_id}/asset-urls/{workspace_path}")
 
         try:
-            with httpx.Client() as client:
+            with httpx2.Client() as client:
                 response = client.post(api_url, json={"method": "GET"}, headers=self.headers, timeout=10.0)
                 response.raise_for_status()
                 signed_url = response.json()["url"]
@@ -191,5 +201,5 @@ class GriptapeCloudFileDriver(BaseFileDriver):
                 content_length = head_response.headers.get("content-length")
                 return int(content_length) if content_length else 0
 
-        except (httpx.HTTPError, ValueError, Exception):
+        except (httpx2.HTTPError, ValueError, Exception):
             return 0

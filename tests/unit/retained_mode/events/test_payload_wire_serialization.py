@@ -1,12 +1,7 @@
 """Tests for the event/payload wire-serialization pipeline.
 
-Covers ``retained_mode/events/base_events.py`` (Payload.to_json, the Event envelope classes and
-their ``from_dict``) and ``retained_mode/events/event_converter.py`` (the cattrs converter's
-registered hooks and ``safe_unstructure``). Complements ``test_event_converter.py`` and
-``test_from_dict.py``, which already cover JSON-primitive unions, the exception wire form,
-``SetParameterValueRequest`` structuring, and ``from_dict`` basics -- this file extends into the
-gaps: full round trips, ``ResultDetails``, batches, artifact/pydantic/Path/float/type hooks, the
-``safe_unstructure`` fallback, unknown-type errors, and a registry-wide sweep.
+Covers full round trips, ``ResultDetails``, batches,
+errors for values with no JSON form, unknown-type errors, and a registry-wide sweep.
 """
 
 from __future__ import annotations
@@ -22,10 +17,11 @@ from pathlib import Path
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import pytest
-from griptape.artifacts import TextArtifact
+from griptape.artifacts import ImageUrlArtifact
 
 import griptape_nodes.retained_mode.events as events_pkg
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.agent_events import UpdateAgentProviderRequest
 from griptape_nodes.retained_mode.events.artifact_events import (
     RegisterArtifactProviderRequest,
@@ -36,17 +32,23 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
     Payload,
+    RequestPayload,
     ResultDetail,
     ResultDetails,
+    ResultPayloadSuccess,
     StrictModeViolationDetail,
 )
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
 from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextSuccess
-from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
+from griptape_nodes.retained_mode.events.converters import EventSerializationError
+from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, SequenceScanFailureReason
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateRequest
 from griptape_nodes.retained_mode.events.workflow_events import GetWorkflowMetadataResultSuccess
+from griptape_nodes.serialization.values import Value  # noqa: TC001 cattrs reads annotations at runtime
+
+converter = converters.engine
 
 # --- Populate the full PayloadRegistry without constructing an Engine -------------------------
 #
@@ -271,57 +273,6 @@ class TestSweepCoversTheLargeMajorityOfTheRegistry:
         )
 
 
-# --- Known, deterministic wire round-trip bugs surfaced by the sweep below ---------------------
-
-_TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON = (
-    "API-CONTRACT: event_converter registers an unstructure hook for a bare `type` field (type -> "
-    "'module.Qualname' string) but no matching structure hook, so a value built from to_json() "
-    "cannot be read back with converter.structure(); it raises StructureHandlerNotFoundError. "
-    "Intended: a `type` field survives an unstructure/structure round trip like every other field. "
-    "- see #5437"
-)
-
-_UPDATE_PROVIDER_PAYLOAD_ROUND_TRIP_REASON = (
-    "API-CONTRACT: UpdateAgentProviderRequest.provider is an UpdateProviderPayload pydantic model "
-    "whose optional str fields default to None but are validated by a 'non-empty string if "
-    "provided' validator. Unstructuring with model_dump(mode='json') always emits that None "
-    "default explicitly, and re-structuring the dict with model_validate() treats the explicit "
-    "None as 'provided', so the validator rejects it even though the identical unconstructed "
-    "default was legal. Intended: a payload built with only its own declared defaults survives a "
-    "full wire round trip. - see #5439"
-)
-
-_ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON = (
-    "API-CONTRACT: failure_reason is typed `SequenceScanFailureReason | FileIOFailureReason`, a "
-    "union of two StrEnum types. _is_json_primitive_union only recognizes unions of plain JSON "
-    "primitives, so this union falls through to cattrs' default union dispatch, which has no "
-    "discriminator strategy for two unrelated Enum members and raises StructureHandlerNotFoundError. "
-    "Intended: a failure_reason value from either enum survives an unstructure/structure round "
-    "trip. - see #5438"
-)
-
-_KNOWN_WIRE_ROUND_TRIP_BUGS: dict[str, str] = {
-    "RegisterArtifactProviderRequest": _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON,
-    "RegisterPreviewGeneratorRequest": _TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON,
-    "UpdateAgentProviderRequest": _UPDATE_PROVIDER_PAYLOAD_ROUND_TRIP_REASON,
-    "DeduceSequencesFromFileListResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-    "ListDirectoryResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-    "ListDirectorySequencesResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-    "ScanSequencesResultFailure": _ENUM_UNION_MISSING_STRUCTURE_HOOK_REASON,
-}
-
-
-def _sweep_params() -> list[Any]:
-    params = []
-    for name in _BUILDABLE_PAYLOAD_NAMES:
-        reason = _KNOWN_WIRE_ROUND_TRIP_BUGS.get(name)
-        if reason is None:
-            params.append(pytest.param(name, id=name))
-        else:
-            params.append(pytest.param(name, id=name, marks=pytest.mark.xfail(strict=True, reason=reason)))
-    return params
-
-
 class TestPayloadRegistryDefaultInstanceRoundTrip:
     """Sweep every registered payload type that can be built from its own field defaults.
 
@@ -331,17 +282,16 @@ class TestPayloadRegistryDefaultInstanceRoundTrip:
     construct without inventing real domain objects such as ``Parameter`` or
     ``SerializedFlowCommands`` (see ``_EXCLUDED_PAYLOAD_REASONS`` and
     ``TestSweepExclusionsAreKnownFactoryLimitations`` for the rest). That is still enough surface
-    to catch hooks that are missing for only some field shapes, as the xfails below demonstrate
-    (a bare `type` field, a union of two unrelated Enum types, and a pydantic model with a
-    validated-but-optional field).
+    to catch hooks that are missing for only some field shapes, such as a bare `type` field, a
+    union of two unrelated Enum types, or a pydantic model with a validated-but-optional field.
     """
 
-    @pytest.mark.parametrize("payload_name", _sweep_params())
+    @pytest.mark.parametrize("payload_name", _BUILDABLE_PAYLOAD_NAMES)
     def test_default_instance_round_trips_through_wire_form(self, payload_name: str) -> None:
         payload_cls = _FULL_PAYLOAD_REGISTRY[payload_name]
         instance = _build_default_instance(payload_cls)
 
-        data = json.loads(instance.to_json())
+        data = json.loads(converters.engine.dumps(instance))
         restored = converter.structure(data, payload_cls)
 
         assert restored == instance
@@ -361,7 +311,7 @@ class TestRequestResultPayloadRoundTrip:
             request_id="abc-123",
         )
 
-        data = json.loads(request.to_json())
+        data = json.loads(converters.engine.dumps(request))
         restored = converter.structure(data, CreateConnectionRequest)
 
         assert restored == request
@@ -369,7 +319,7 @@ class TestRequestResultPayloadRoundTrip:
     def test_result_payload_round_trip_preserves_declared_fields(self) -> None:
         result = SetWorkflowContextSuccess(result_details="context set", workflow_name="my_workflow")
 
-        data = json.loads(result.to_json())
+        data = json.loads(converters.engine.dumps(result))
         restored = converter.structure(data, SetWorkflowContextSuccess)
 
         assert restored == result
@@ -387,7 +337,7 @@ class TestRequestResultPayloadRoundTrip:
         assert result.altered_workflow_state is False
         result.altered_workflow_state = True
 
-        data = json.loads(result.to_json())
+        data = json.loads(converters.engine.dumps(result))
         assert data["altered_workflow_state"] is True
 
         restored = converter.structure(data, GetConfigValueResultSuccess)
@@ -400,7 +350,7 @@ class TestResultDetailsWireForm:
     def test_string_shorthand_round_trip(self) -> None:
         result = GetConfigValueResultSuccess(value=1, result_details="just a message")
 
-        data = json.loads(result.to_json())
+        data = json.loads(converters.engine.dumps(result))
         restored = converter.structure(data, GetConfigValueResultSuccess)
 
         assert isinstance(restored.result_details, ResultDetails)
@@ -425,7 +375,7 @@ class TestResultDetailsWireForm:
         )
         result = GetConfigValueResultSuccess(value=1, result_details=details)
 
-        data = json.loads(result.to_json())
+        data = json.loads(converters.engine.dumps(result))
         restored = converter.structure(data, GetConfigValueResultSuccess)
 
         restored_details = restored.result_details
@@ -452,8 +402,8 @@ class TestEventRequestBatchRoundTrip:
             ]
         )
 
-        data = json.loads(json.dumps(batch.dict(), default=str))
-        restored = EventRequestBatch.from_dict(data)
+        data = json.loads(json.dumps(converters.engine.unstructure(batch), default=str))
+        restored = converters.engine.structure(data, EventRequestBatch)
 
         expected_request_count = 2
         assert len(restored.requests) == expected_request_count
@@ -462,20 +412,6 @@ class TestEventRequestBatchRoundTrip:
         assert first.request.category_and_key == "a.b"
         assert isinstance(second.request, CreateConnectionRequest)
         assert second.request.source_parameter_name == "out"
-
-
-class TestSerializableArtifactHook:
-    """SerializableMixin subclasses (griptape artifacts) unstructure via their own to_dict()."""
-
-    def test_artifact_unstructures_via_to_dict_and_restructures_into_the_artifact(self) -> None:
-        artifact = TextArtifact("hold onto this")
-
-        unstructured = converter.unstructure(artifact, TextArtifact)
-        assert unstructured == artifact.to_dict()
-
-        restored = converter.structure(unstructured, TextArtifact)
-        assert isinstance(restored, TextArtifact)
-        assert restored.value == artifact.value
 
 
 class TestPydanticModelFieldHook:
@@ -493,7 +429,7 @@ class TestPydanticModelFieldHook:
         result = GetWorkflowMetadataResultSuccess(result_details="ok", workflow_metadata=metadata)
 
         # json.dumps-able is the contract: a datetime object left in the tree would raise here.
-        wire_json = result.to_json()
+        wire_json = converters.engine.dumps(result)
         data = json.loads(wire_json)
 
         creation_date_on_wire = data["workflow_metadata"]["creation_date"]
@@ -531,18 +467,17 @@ class _PlaceholderProviderClass:
 class TestBareTypeFieldHook:
     """RegisterArtifactProviderRequest.provider_class is a bare `type`, not a dataclass instance."""
 
-    def test_type_field_unstructures_to_dotted_module_and_qualname(self) -> None:
+    def test_type_field_unstructures_to_its_type_name(self) -> None:
         request = RegisterArtifactProviderRequest(provider_class=_PlaceholderProviderClass)
 
-        data = json.loads(request.to_json())
+        data = json.loads(converters.engine.dumps(request))
 
-        assert data["provider_class"] == f"{__name__}._PlaceholderProviderClass"
+        assert data["provider_class"] == f"{__name__}:_PlaceholderProviderClass"
 
-    @pytest.mark.xfail(strict=True, reason=_TYPE_FIELD_MISSING_STRUCTURE_HOOK_REASON)
     def test_type_field_round_trips_back_into_the_original_type(self) -> None:
         request = RegisterArtifactProviderRequest(provider_class=_PlaceholderProviderClass)
 
-        data = json.loads(request.to_json())
+        data = json.loads(converters.engine.dumps(request))
         restored = converter.structure(data, RegisterArtifactProviderRequest)
 
         assert restored.provider_class is _PlaceholderProviderClass
@@ -551,53 +486,165 @@ class TestBareTypeFieldHook:
 class TestPydanticValidatedOptionalFieldRoundTrip:
     """A payload built with only its own defaults must survive a full wire round trip."""
 
-    @pytest.mark.xfail(strict=True, reason=_UPDATE_PROVIDER_PAYLOAD_ROUND_TRIP_REASON)
     def test_default_update_agent_provider_request_round_trips(self) -> None:
         request = UpdateAgentProviderRequest()
 
-        data = json.loads(request.to_json())
+        data = json.loads(converters.engine.dumps(request))
         restored = converter.structure(data, UpdateAgentProviderRequest)
 
         assert restored == request
 
 
-class _RaisesOnUnstructure:
-    """A field value whose custom unstructure hook always raises, to exercise the fallback path."""
+class _NoJsonForm:
+    """A value neither the converter nor JSON knows how to write."""
 
-    def _cattrs_unstructure(self, converter: Any) -> dict[str, Any]:  # noqa: ARG002
-        msg = "this value refuses to serialize"
-        raise RuntimeError(msg)
 
-    def __str__(self) -> str:
-        return "a value that refuses to serialize"
+class _HasToDict:
+    """Not a griptape object, but has the `to_dict()` griptape's JSON encoder patch looks for."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"lossy": True}
 
 
 @dataclasses.dataclass
-class _HasOneBadField:
-    """Local dataclass with one field that raises during unstructure and one that does not."""
-
-    good_field: str
-    bad_field: _RaisesOnUnstructure
+class _PayloadHoldingAnything(RequestPayload):
+    anything: Any = None
 
 
-class TestSafeUnstructureFallback:
-    """safe_unstructure must not let one bad field lose the rest of the object."""
+@dataclasses.dataclass
+class _PayloadHoldingAValue(RequestPayload):
+    value: Value = None
 
-    def test_dataclass_with_one_unserializable_field_keeps_every_other_field(self) -> None:
-        obj = _HasOneBadField(good_field="hello", bad_field=_RaisesOnUnstructure())
 
-        result = safe_unstructure(obj)
+class TestValuesWithNoJsonForm:
+    """A payload holding a value with no JSON form fails to send with an error naming it."""
 
-        assert result["good_field"] == "hello"
-        # The bad field is not lost: the raw value survives even though it could not be unstructured.
-        assert isinstance(result["bad_field"], _RaisesOnUnstructure)
+    def test_to_json_names_the_payload_and_the_type(self) -> None:
+        with pytest.raises(
+            EventSerializationError, match=r"_PayloadHoldingAnything.*'_NoJsonForm' value has no plain-data form"
+        ):
+            converters.engine.dumps(_PayloadHoldingAnything(anything=_NoJsonForm()))
 
-    def test_non_dataclass_falls_back_to_str(self) -> None:
-        obj = _RaisesOnUnstructure()
+    def test_to_dict_is_not_used_as_a_json_form(self) -> None:
+        with pytest.raises(EventSerializationError, match="'_HasToDict' value has no plain-data form"):
+            converters.engine.dumps(_PayloadHoldingAnything(anything=_HasToDict()))
 
-        result = safe_unstructure(obj)
+    def test_event_json_names_the_payload(self) -> None:
+        event = EventRequest(request=_PayloadHoldingAnything(anything=_NoJsonForm()))
 
-        assert result == "a value that refuses to serialize"
+        with pytest.raises(EventSerializationError, match="_PayloadHoldingAnything"):
+            converters.engine.dumps(event)
+
+    def test_griptape_object_outside_a_value_field_names_the_payload_and_the_object(self) -> None:
+        payload = _PayloadHoldingAnything(anything=ImageUrlArtifact("https://example.com/cat.png"))
+
+        with pytest.raises(EventSerializationError, match=r"_PayloadHoldingAnything.*'ImageUrlArtifact'"):
+            converters.engine.dumps(payload)
+
+    def test_value_field_names_the_class_that_has_no_plain_data_form(self) -> None:
+        with pytest.raises(EventSerializationError, match="'_NoJsonForm' value has no plain-data form"):
+            converters.engine.dumps(_PayloadHoldingAValue(value=_NoJsonForm()))
+
+
+@dataclasses.dataclass
+class _ResultHoldingAnything(ResultPayloadSuccess):
+    anything: Any = None
+
+
+class TestUnsendableResults:
+    """A result that cannot be sent is answered with a failure naming why, so the requester hears back."""
+
+    def test_failure_names_the_value(self) -> None:
+        event = EventResultSuccess(
+            request=_PayloadHoldingAnything(request_id="req-1"),
+            result=_ResultHoldingAnything(result_details="ok", anything=_NoJsonForm()),
+            request_id="req-1",
+            engine_id="engine-1",
+        )
+
+        data = json.loads(_failure_dumps(event))
+
+        assert data["event_type"] == "EventResultFailure"
+        assert data["result_type"] == "GenericResultFailure"
+        assert data["request_id"] == "req-1"
+        assert data["engine_id"] == "engine-1"
+        assert (
+            "'_NoJsonForm' value has no plain-data form"
+            in data["result"]["result_details"]["result_details"][0]["message"]
+        )
+
+    def test_failure_reads_back_as_a_failure_for_its_request(self) -> None:
+        event = EventResultSuccess(
+            request=GetConfigValueRequest(category_and_key="workspace_directory"),
+            result=_ResultHoldingAnything(result_details="ok", anything=_NoJsonForm()),
+        )
+
+        restored = converters.engine.structure(json.loads(_failure_dumps(event)), EventResultFailure)
+
+        assert type(restored.request) is GetConfigValueRequest
+        assert not restored.result.succeeded()
+
+    def test_dumps_raises(self) -> None:
+        event = EventResultSuccess(
+            request=_PayloadHoldingAnything(),
+            result=_ResultHoldingAnything(result_details="ok", anything=_NoJsonForm()),
+        )
+
+        with pytest.raises(EventSerializationError, match="_ResultHoldingAnything"):
+            converters.engine.dumps(event)
+
+
+class TestUnreadableRequestFailure:
+    """A request frame the engine could not read is answered from the raw frame, echoing its envelope."""
+
+    def test_echoes_the_envelope_and_names_the_reason(self) -> None:
+        frame = {
+            "request_type": "NoSuchRequest",
+            "request": {"a": 1},
+            "request_id": "req-1",
+            "response_topic": "sessions/s1/clients/c1/response",
+            "open_workflow_id": "wf-1",
+        }
+
+        failure = converters.client.unreadable_request_failure(frame, "it is not a request this engine knows")
+
+        assert failure["event_type"] == "EventResultFailure"
+        assert failure["request_type"] == "NoSuchRequest"
+        assert failure["request"] == {"a": 1}
+        assert failure["result_type"] == "GenericResultFailure"
+        assert failure["request_id"] == "req-1"
+        assert failure["response_topic"] == "sessions/s1/clients/c1/response"
+        assert failure["open_workflow_id"] == "wf-1"
+        assert "not a request this engine knows" in json.dumps(failure["result"])
+
+    def test_drops_routing_fields_that_are_not_strings(self) -> None:
+        failure = converters.client.unreadable_request_failure({"response_topic": 7, "open_workflow_id": []}, "bad")
+
+        assert failure["response_topic"] is None
+        assert failure["open_workflow_id"] is None
+        assert failure["request"] == {}
+
+
+def _failure_dumps(event: EventResultSuccess) -> str:
+    result_json = converters.engine.dumps_result(event)
+    assert result_json.error is not None
+    return result_json.text
+
+
+_FAILURE_REASON: Any = SequenceScanFailureReason | FileIOFailureReason
+
+
+class TestEnumUnionFieldHook:
+    """A field typed as a union of enums reads a bare member value back as the enum that has it."""
+
+    def test_member_of_the_second_enum_structures_as_that_enum(self) -> None:
+        restored = converter.structure(FileIOFailureReason.FILE_NOT_FOUND.value, _FAILURE_REASON)
+
+        assert restored is FileIOFailureReason.FILE_NOT_FOUND
+
+    def test_value_no_enum_has_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="not a member"):
+            converter.structure("no such reason", _FAILURE_REASON)
 
 
 class TestFromDictUnknownPayloadType:
@@ -607,7 +654,7 @@ class TestFromDictUnknownPayloadType:
         data = {"request_type": "TotallyUnknownRequestType", "request": {}}
 
         with pytest.raises(ValueError, match="TotallyUnknownRequestType"):
-            EventRequest.from_dict(data)
+            converters.engine.structure(data, EventRequest)
 
     def test_event_result_success_from_dict_rejects_unregistered_result_type(self) -> None:
         data = {
@@ -618,7 +665,7 @@ class TestFromDictUnknownPayloadType:
         }
 
         with pytest.raises(ValueError, match="TotallyUnknownResultType"):
-            EventResultSuccess.from_dict(data)
+            converters.engine.structure(data, EventResultSuccess)
 
     def test_event_result_failure_from_dict_rejects_unregistered_request_type(self) -> None:
         data = {
@@ -629,4 +676,22 @@ class TestFromDictUnknownPayloadType:
         }
 
         with pytest.raises(ValueError, match="TotallyUnknownRequestType"):
-            EventResultFailure.from_dict(data)
+            converters.engine.structure(data, EventResultFailure)
+
+
+class TestPydanticDumpsRaise:
+    def test_json_raises(self) -> None:
+        event = EventResultSuccess(
+            request=_PayloadHoldingAnything(), result=_ResultHoldingAnything(result_details="ok")
+        )
+
+        with pytest.raises(TypeError, match=r"converters\.client\.dumps"):
+            event.json()
+
+    def test_dict_raises(self) -> None:
+        event = EventResultSuccess(
+            request=_PayloadHoldingAnything(), result=_ResultHoldingAnything(result_details="ok")
+        )
+
+        with pytest.raises(TypeError, match=r"converters\.engine\.unstructure"):
+            event.dict()

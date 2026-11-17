@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
@@ -63,9 +63,9 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_success_result: Any,
     ) -> None:
         """Test that create_signed_upload_url delegates to OSManager with correct policy."""
-        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post:
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
-            mock_os_manager.on_write_file_request.return_value = mock_write_success_result
+            mock_os_manager.engine.handle_request.return_value = mock_write_success_result
             mock_post_response = Mock()
             mock_post_response.raise_for_status.return_value = None
             mock_post_response.json.return_value = {"url": "http://test.com/upload"}
@@ -75,8 +75,8 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             local_storage_driver.create_signed_upload_url(TEST_FILE_PATH, ExistingFilePolicy.FAIL)
 
             # Verify OSManager was called with correct WriteFileRequest
-            mock_os_manager.on_write_file_request.assert_called_once()
-            call_args = mock_os_manager.on_write_file_request.call_args[0][0]
+            mock_os_manager.engine.handle_request.assert_called_once()
+            call_args = mock_os_manager.engine.handle_request.call_args[0][0]
             assert isinstance(call_args, WriteFileRequest)
             # LocalStorageDriver converts relative paths to absolute before calling OSManager
             # resolve_workspace_path normalizes the path by calling .resolve()
@@ -92,9 +92,9 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_success_result: Any,
     ) -> None:
         """Test that create_signed_upload_url uses resolved filename from OSManager."""
-        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post:
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
-            mock_os_manager.on_write_file_request.return_value = mock_write_success_result
+            mock_os_manager.engine.handle_request.return_value = mock_write_success_result
             mock_post_response = Mock()
             mock_post_response.raise_for_status.return_value = None
             mock_post_response.json.return_value = {"url": "http://test.com/upload"}
@@ -115,14 +115,14 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_failure_result: Any,
     ) -> None:
         """Test that create_signed_upload_url raises FileExistsError when WriteFileRequest fails."""
-        mock_os_manager.on_write_file_request.return_value = mock_write_failure_result
+        mock_os_manager.engine.handle_request.return_value = mock_write_failure_result
 
         # Call create_signed_upload_url with FAIL policy on existing file
         with pytest.raises(FileExistsError, match="WriteFileRequest failed"):
             local_storage_driver.create_signed_upload_url(TEST_FILE_PATH, ExistingFilePolicy.FAIL)
 
         # Verify OSManager was called but HTTP request was not made
-        mock_os_manager.on_write_file_request.assert_called_once()
+        mock_os_manager.engine.handle_request.assert_called_once()
 
     def test_create_signed_upload_url_default_overwrite_policy(
         self,
@@ -131,9 +131,9 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         mock_write_success_result: Any,
     ) -> None:
         """Test that create_signed_upload_url defaults to OVERWRITE policy."""
-        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post:
+        with patch("griptape_nodes.drivers.storage.local_storage_driver.httpx2.post") as mock_post:
             # Setup mocks
-            mock_os_manager.on_write_file_request.return_value = mock_write_success_result
+            mock_os_manager.engine.handle_request.return_value = mock_write_success_result
             mock_post_response = Mock()
             mock_post_response.raise_for_status.return_value = None
             mock_post_response.json.return_value = {"url": "http://test.com/upload"}
@@ -143,8 +143,8 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             local_storage_driver.create_signed_upload_url(TEST_FILE_PATH)
 
             # Verify OSManager was called with default OVERWRITE policy
-            mock_os_manager.on_write_file_request.assert_called_once()
-            call_args = mock_os_manager.on_write_file_request.call_args[0][0]
+            mock_os_manager.engine.handle_request.assert_called_once()
+            call_args = mock_os_manager.engine.handle_request.call_args[0][0]
             assert call_args.existing_file_policy == ExistingFilePolicy.OVERWRITE
 
 
@@ -358,7 +358,7 @@ class TestLocalStorageDriverDeleteFile:
         if status_code is None:
             response.raise_for_status.return_value = None
         else:
-            response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            response.raise_for_status.side_effect = httpx2.HTTPStatusError(
                 f"http {status_code}", request=Mock(), response=response
             )
         return Mock(return_value=response)
@@ -367,7 +367,7 @@ class TestLocalStorageDriverDeleteFile:
         driver = LocalStorageDriver(Mock(workspace_path=Path("/workspace")), Mock())
         delete_mock = self._delete_mock(None)
 
-        with patch(f"{self.MODULE}.httpx.delete", delete_mock):
+        with patch(f"{self.MODULE}.httpx2.delete", delete_mock):
             driver.delete_file(Path("artifact_url_storage/abc/video.mp4"))
 
         args, _ = delete_mock.call_args
@@ -376,14 +376,14 @@ class TestLocalStorageDriverDeleteFile:
     def test_absent_file_is_a_no_op(self) -> None:
         driver = LocalStorageDriver(Mock(workspace_path=Path("/workspace")), Mock())
 
-        with patch(f"{self.MODULE}.httpx.delete", self._delete_mock(404)):
+        with patch(f"{self.MODULE}.httpx2.delete", self._delete_mock(404)):
             driver.delete_file(TEST_FILE_PATH)
 
     def test_raises_on_server_error(self) -> None:
         driver = LocalStorageDriver(Mock(workspace_path=Path("/workspace")), Mock())
 
         with (
-            patch(f"{self.MODULE}.httpx.delete", self._delete_mock(500)),
+            patch(f"{self.MODULE}.httpx2.delete", self._delete_mock(500)),
             pytest.raises(RuntimeError, match="Failed to delete file"),
         ):
             driver.delete_file(TEST_FILE_PATH)
@@ -474,3 +474,26 @@ class TestDeterministicUrlVersioning:
         after = driver.create_signed_download_url(served)
 
         assert before == after
+
+
+class TestFingerprintFile:
+    """fingerprint_file is the identity both download URLs and the preview watcher use."""
+
+    def test_reads_inode_size_and_mtime(self, tmp_path: Path) -> None:
+        from griptape_nodes.drivers.storage.local_storage_driver import fingerprint_file
+
+        image = tmp_path / "plate.png"
+        image.write_bytes(b"v1")
+        stat_result = image.stat()
+
+        fingerprint = fingerprint_file(image)
+
+        assert fingerprint is not None
+        assert fingerprint.inode == stat_result.st_ino
+        assert fingerprint.size == stat_result.st_size
+        assert fingerprint.mtime_ns == stat_result.st_mtime_ns
+
+    def test_is_none_for_a_missing_file(self, tmp_path: Path) -> None:
+        from griptape_nodes.drivers.storage.local_storage_driver import fingerprint_file
+
+        assert fingerprint_file(tmp_path / "missing.png") is None

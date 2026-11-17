@@ -417,7 +417,7 @@ async def test_deleting_an_unresolved_node_from_a_control_chain_ends_the_run(
     _configure(engine, "Middle", text="middle", gate_file=middle_gate)
     _configure(engine, "Last", text="last")
 
-    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name, wait_for_completion=True)))
+    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name)))
     await _wait_until_resolving(engine, "Middle")
 
     await _delete_node(engine, flow_name, "Middle")
@@ -473,7 +473,7 @@ async def test_deleting_a_supplier_of_a_later_chain_member_cancels_the_run(
 
     cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
 
-    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name, wait_for_completion=True)))
+    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name)))
 
     await _wait_until_resolved(engine, "Shared")
     await _wait_until_resolving(engine, "First")
@@ -546,7 +546,7 @@ async def test_deleting_a_supplier_a_data_hop_away_from_the_chain_cancels_the_ru
 
     cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
 
-    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name, wait_for_completion=True)))
+    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name)))
 
     await _wait_until_resolving(engine, "First")
 
@@ -619,7 +619,7 @@ async def test_deleting_a_supplier_two_hops_down_the_chain_cancels_the_run(
 
     cancellations = _record_published(engine, monkeypatch, ControlFlowCancelledEvent, lambda _payload: True)
 
-    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name, wait_for_completion=True)))
+    run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=flow_name)))
     await _wait_until_resolving(engine, "First")
 
     dag_nodes = engine.flow_manager.global_dag_builder.node_to_reference

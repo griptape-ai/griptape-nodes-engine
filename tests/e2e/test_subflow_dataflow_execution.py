@@ -99,8 +99,6 @@ async def test_isolated_subflow_runs_data_only_graph(
         StartFlowRequest(
             flow_name=parent_flow,
             flow_node_name="Driver",
-            wait_for_completion=True,
-            completion_timeout_ms=30000,
         )
     )
     assert isinstance(run_result, StartFlowResultSuccess), run_result

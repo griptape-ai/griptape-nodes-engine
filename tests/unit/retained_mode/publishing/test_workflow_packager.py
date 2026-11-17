@@ -1,5 +1,6 @@
 """Tests for WorkflowPackager: library dependency resolution and clean-rebuild publishing."""
 
+import asyncio
 import json
 import logging
 import re
@@ -13,8 +14,8 @@ import pytest
 from dotenv import dotenv_values
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, WorkflowRegistry
-from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, new_workflow_id
+from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
     DeleteFileResultSuccess,
@@ -36,6 +37,7 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     GetAllSecretValuesRequest,
     GetAllSecretValuesResultSuccess,
 )
+from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowProgressEvent
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.publishing import workflow_packager
@@ -80,12 +82,12 @@ def _make_workflow_mock(library_names: list[str]) -> MagicMock:
 
 
 def _make_lib_manager_mock(resolved: list[LibraryNameAndVersion]) -> MagicMock:
-    """Return a LibraryManager mock whose resolve_transitive_library_deps returns `resolved`."""
-    return MagicMock(resolve_transitive_library_deps=lambda _initial: resolved)
+    """Return a LibraryManager mock whose dependencies part resolves transitive library deps to `resolved`."""
+    return MagicMock(dependencies=MagicMock(resolve_transitive_library_deps=lambda _initial: resolved))
 
 
 class TestResolveAllLibraryDeps:
-    """_resolve_all_library_deps delegates to LibraryManager.resolve_transitive_library_deps."""
+    """_resolve_all_library_deps delegates to LibraryDependencies.resolve_transitive_library_deps."""
 
     def test_delegates_to_library_manager(self) -> None:
         """_resolve_all_library_deps returns whatever resolve_transitive_library_deps returns."""
@@ -113,7 +115,7 @@ class TestResolveAllLibraryDeps:
 
         with patch(
             "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
-            return_value=MagicMock(resolve_transitive_library_deps=capture_and_return),
+            return_value=MagicMock(dependencies=MagicMock(resolve_transitive_library_deps=capture_and_return)),
         ):
             packager._resolve_all_library_deps(initial)
 
@@ -2089,9 +2091,9 @@ def _stub_handle_request(monkeypatch: pytest.MonkeyPatch, side_effect: Callable[
 def _stub_complete_file_path(monkeypatch: pytest.MonkeyPatch, resolve: Callable[[str], str]) -> None:
     """Resolve a workflow's registry-relative file path with ``resolve`` instead of the workspace."""
     monkeypatch.setattr(
-        WorkflowRegistry,
+        current_engine().workflow_registry,
         "get_complete_file_path",
-        create_autospec(WorkflowRegistry.get_complete_file_path, side_effect=resolve),
+        create_autospec(current_engine().workflow_registry.get_complete_file_path, side_effect=resolve),
     )
 
 
@@ -2131,4 +2133,42 @@ def _make_packageable_workflow(name: str, file_path: str) -> Workflow:
         engine_version_created_with="0.1.0",
         node_libraries_referenced=[],
     )
-    return Workflow(registry_key=WorkflowRegistry._RegistryKey(), metadata=metadata, file_path=file_path)
+    workflow = Workflow(
+        registry=current_engine().workflow_registry,
+        workflow_id=new_workflow_id(),
+        metadata=metadata,
+        absolute_path=Path(file_path),
+    )
+    # The registry form `file_path` reports, set as the registry would when it registers the entry.
+    workflow._keys = workflow._keys._replace(file_path=file_path)
+    return workflow
+
+
+class TestEmitProgress:
+    def test_progress_names_the_workflow_being_published(self, engine: Engine) -> None:
+        publishing = engine.open_workflow(engine.workflow_registry.register_unsaved("published").workflow_id)
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+
+        with engine.bind_workflow(publishing):
+            WorkflowPackager("published").emit_progress(10.0, "Packaging")
+
+        queued = queue.get_nowait()
+        assert isinstance(queued.wrapped_event.payload, PublishWorkflowProgressEvent)
+        assert queued.wrapped_event.open_workflow_id == publishing.workflow_id
+
+
+class TestCopyTree:
+    @pytest.mark.parametrize("env_dir", [".venv", ".venv-exec", ".venv-dev"])
+    def test_default_exclusions_skip_library_envs(self, engine: Engine, tmp_path: Path, env_dir: str) -> None:  # noqa: ARG002
+        """A library's environment directories stay out of the bundle; its source is copied."""
+        source = tmp_path / "library"
+        (source / env_dir / "lib").mkdir(parents=True)
+        (source / env_dir / "lib" / "pkg.py").write_text("", encoding="utf-8")
+        (source / "node.py").write_text("", encoding="utf-8")
+        destination = tmp_path / "bundle"
+
+        WorkflowPackager.copy_tree(source, destination)
+
+        assert (destination / "node.py").is_file()
+        assert not (destination / env_dir).exists()

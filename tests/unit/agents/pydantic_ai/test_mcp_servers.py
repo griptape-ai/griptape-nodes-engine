@@ -4,7 +4,7 @@ These cover two concerns without spinning up a real MCP server:
 
 * config -> transport mapping in :func:`mcp_server_from_config`, and
 * the combinator composition (optional blocklist filter -> name prefix) in
-  :func:`_compose`.
+  :func:`_compose`, and which builders add the approval gate on top.
 """
 
 from __future__ import annotations
@@ -16,17 +16,22 @@ from typing import Any
 import pytest
 from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic_ai.mcp import MCPToolset
+from pydantic_ai.toolsets.approval_required import ApprovalRequiredToolset
 from pydantic_ai.toolsets.filtered import FilteredToolset
 from pydantic_ai.toolsets.prefixed import PrefixedToolset
 
 from griptape_nodes.agents.pydantic_ai.mcp_servers import (
+    GTN_WORKFLOW_ID_HEADER,
     BuiltMCPServer,
     _blocklist_filter,
     _compose,
     disconnect_transport,
     mcp_server_from_config,
+    require_user_tool_approval,
+    streamable_http_library,
     streamable_http_local,
 )
+from griptape_nodes.servers.mcp import WORKFLOW_ID_HEADER
 
 
 def _mcp_toolset(composed: Any) -> MCPToolset:
@@ -169,12 +174,64 @@ def test_empty_blocklist_is_not_applied() -> None:
     assert not isinstance(composed.wrapped, FilteredToolset)
 
 
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"transport": "stdio", "command": "run"},
+        {"transport": "streamable_http", "url": "http://h/mcp/"},
+        {"transport": "sse", "url": "http://h/sse"},
+    ],
+)
+def test_a_server_built_from_config_has_no_approval_gate(config: dict[str, Any]) -> None:
+    """Node libraries build agents from this, and a node run carries no approval state to gate on."""
+    toolset = _built("svc", config).toolset
+    assert isinstance(toolset, PrefixedToolset)
+    assert not isinstance(toolset, ApprovalRequiredToolset)
+
+
+def test_require_user_tool_approval_gates_on_the_prefixed_toolset() -> None:
+    """The sidebar's gate goes on top of the prefix, where grant keys are built from."""
+    built = _built("svc", {"transport": "stdio", "command": "run"})
+    gated = require_user_tool_approval(built.toolset)
+    assert isinstance(gated, ApprovalRequiredToolset)
+    assert gated.wrapped is built.toolset
+
+
 def test_streamable_http_local_prefixes_with_default_name() -> None:
-    """The engine's own server defaults to the `GriptapeNodes` prefix over streamable HTTP."""
-    composed = streamable_http_local("http://localhost:9/mcp/")
-    assert isinstance(composed, PrefixedToolset)
-    assert composed.prefix == "GriptapeNodes"
+    """The engine's own server uses the `GriptapeNodes` prefix over streamable HTTP, gated."""
+    composed = streamable_http_local("http://localhost:9/mcp/", workflow_id=None)
+    assert isinstance(composed, ApprovalRequiredToolset)
+    assert isinstance(composed.wrapped, PrefixedToolset)
+    assert composed.wrapped.prefix == "GriptapeNodes"
     assert isinstance(_mcp_toolset(composed).client.transport, StreamableHttpTransport)
+
+
+def test_streamable_http_local_names_the_workflow_in_a_header() -> None:
+    """The run's workflow travels as a header the engine's server reads."""
+    composed = streamable_http_local("http://localhost:9/mcp/", workflow_id="abc123")
+    transport = _mcp_toolset(composed).client.transport
+    assert isinstance(transport, StreamableHttpTransport)
+    assert transport.headers == {GTN_WORKFLOW_ID_HEADER: "abc123"}
+
+
+def test_streamable_http_local_without_a_workflow_sends_no_header() -> None:
+    """A run from no workflow names none."""
+    transport = _mcp_toolset(streamable_http_local("http://localhost:9/mcp/", workflow_id=None)).client.transport
+    assert isinstance(transport, StreamableHttpTransport)
+    assert transport.headers == {}
+
+
+def test_streamable_http_library_names_the_workflow_in_a_header() -> None:
+    """A library's tools act on the run's workflow, like the engine's own."""
+    composed = streamable_http_library("acme", "http://localhost:9/mcp/libraries/acme/", frozenset(), workflow_id="abc")
+    transport = _mcp_toolset(composed).client.transport
+    assert isinstance(transport, StreamableHttpTransport)
+    assert transport.headers == {GTN_WORKFLOW_ID_HEADER: "abc"}
+
+
+def test_the_workflow_header_is_the_one_the_engine_server_reads() -> None:
+    """The agent sends the header the engine's MCP server reads."""
+    assert GTN_WORKFLOW_ID_HEADER == WORKFLOW_ID_HEADER
 
 
 def test_blocklist_filter_drops_only_listed_bare_names() -> None:

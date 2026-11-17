@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import logging
 import threading
@@ -11,7 +12,11 @@ from typing import TYPE_CHECKING
 
 from watchfiles import Change, PythonFilter, watch
 
-from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    resolve_cloud_base_url,
+    resolve_cloud_credential,
+)
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -28,6 +33,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowsFromConfigResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -62,10 +68,7 @@ class SyncManager(EngineScoped):
         )
         self._sync_dir.mkdir(parents=True, exist_ok=True)
 
-        event_manager.assign_manager_to_request_type(
-            StartSyncAllCloudWorkflowsRequest,
-            self.on_start_sync_all_cloud_workflows_request,
-        )
+        event_manager.register_request_handlers(self)
 
         event_manager.add_listener_to_app_event(
             AppInitializationComplete,
@@ -126,6 +129,7 @@ class SyncManager(EngineScoped):
 
         return False
 
+    @handles(StartSyncAllCloudWorkflowsRequest)
     def on_start_sync_all_cloud_workflows_request(self, _request: StartSyncAllCloudWorkflowsRequest) -> ResultPayload:
         """Start syncing all cloud workflows to local synced_workflows directory."""
         try:
@@ -158,7 +162,6 @@ class SyncManager(EngineScoped):
             sync_thread.start()
         except Exception as e:
             details = f"Failed to start cloud workflow sync: {e!s}"
-            logger.error(details)
             return StartSyncAllCloudWorkflowsResultFailure(result_details=details)
         else:
             details = f"Started background sync for {len(workflow_files)} workflow files"
@@ -217,7 +220,7 @@ class SyncManager(EngineScoped):
 
         # Get cloud storage configuration from secrets
         bucket_id = secrets_manager.get_secret("GT_CLOUD_BUCKET_ID", should_error_on_not_found=False)
-        base_url = secrets_manager.get_secret("GT_CLOUD_BASE_URL", should_error_on_not_found=False)
+        base_url = resolve_cloud_base_url(secrets_manager)
         api_key = resolve_cloud_credential(secrets_manager)
 
         if not bucket_id:
@@ -275,7 +278,7 @@ class SyncManager(EngineScoped):
 
             local_file_path.write_bytes(file_content)
 
-            logger.info("Successfully downloaded cloud workflow to sync directory: %s", filename)
+            logger.debug("Successfully downloaded cloud workflow to sync directory: %s", filename)
         except Exception as e:
             logger.error("Failed to download cloud workflow '%s': %s", filename, str(e))
             return False
@@ -304,7 +307,7 @@ class SyncManager(EngineScoped):
             filename = file_path.name
             storage_driver.upload_file(Path(filename), file_content)
 
-            logger.info("Successfully uploaded workflow file to cloud: %s", filename)
+            logger.debug("Successfully uploaded workflow file to cloud: %s", filename)
 
         except Exception as e:
             logger.error("Failed to upload workflow file '%s': %s", file_path.name, str(e))
@@ -321,7 +324,7 @@ class SyncManager(EngineScoped):
 
             # Use the storage driver's delete method
             storage_driver.delete_file(Path(filename))
-            logger.info("Successfully deleted workflow file from cloud: %s", filename)
+            logger.debug("Successfully deleted workflow file from cloud: %s", filename)
 
         except Exception as e:
             logger.error("Failed to delete workflow file '%s' from cloud: %s", file_path.name, str(e))
@@ -332,9 +335,7 @@ class SyncManager(EngineScoped):
             sync_dir = self._sync_dir
 
             # Stop any existing watching
-            if self._watch_task and self._watch_task.is_alive():
-                self._watching_stopped.set()
-                self._watch_task.join(timeout=2.0)
+            self._stop_file_watching()
 
             # Reset the stop event for new watching
             self._watching_stopped.clear()
@@ -347,11 +348,21 @@ class SyncManager(EngineScoped):
                 daemon=True,
             )
             self._watch_task.start()
+            # watchfiles keeps running interpreter code on this thread while it watches, so a watch
+            # still running when the interpreter finalizes can crash the process on exit.
+            atexit.register(self._stop_file_watching)
 
             logger.debug("Started watching synced workflows directory: %s", sync_dir)
 
         except Exception as e:
             logger.error("Failed to start file watching: %s", str(e))
+
+    def _stop_file_watching(self) -> None:
+        """Stop the watching thread, if one is running."""
+        atexit.unregister(self._stop_file_watching)
+        if self._watch_task and self._watch_task.is_alive():
+            self._watching_stopped.set()
+            self._watch_task.join(timeout=2.0)
 
     def _watch_files_thread(self, sync_dir: str) -> None:
         """Background thread that watches for file changes using watchfiles."""
@@ -383,13 +394,13 @@ class SyncManager(EngineScoped):
     def _handle_file_change(self, change: Change, path: Path, path_str: str) -> None:
         """Handle a file system change event."""
         if change == Change.added:
-            logger.info("Detected external creation of workflow file: %s", path_str)
+            logger.debug("Detected external creation of workflow file: %s", path_str)
             self._upload_workflow_file(path)
         elif change == Change.modified:
-            logger.info("Detected external modification of workflow file: %s", path_str)
+            logger.debug("Detected external modification of workflow file: %s", path_str)
             self._upload_workflow_file(path)
         elif change == Change.deleted:
-            logger.info("Detected deletion of workflow file: %s", path_str)
+            logger.debug("Detected deletion of workflow file: %s", path_str)
             self._delete_workflow_file(path)
 
     def _download_single_workflow(
@@ -437,7 +448,7 @@ class SyncManager(EngineScoped):
 
         except Exception as e:
             error_msg = str(e)
-            logger.warning("Failed to sync workflow '%s': %s", file_name, error_msg)
+            logger.debug("Failed to sync workflow '%s': %s", file_name, error_msg)
             return file_name, False, error_msg
         else:
             logger.debug("Successfully synced workflow: %s", local_filename)
@@ -451,7 +462,7 @@ class SyncManager(EngineScoped):
         failed_downloads = []
         total_workflows = len(workflow_files)
 
-        logger.info("Starting background sync of %d workflows (sync_id: %s)", total_workflows, sync_id)
+        logger.debug("Starting background sync of %d workflows (sync_id: %s)", total_workflows, sync_id)
 
         # Use thread pool for concurrent downloads
         with ThreadPoolExecutor() as executor:
@@ -492,13 +503,13 @@ class SyncManager(EngineScoped):
 
         # Register workflows from the synced directory
         if synced_workflows:
-            logger.info("Registering %d synced workflows from configuration", len(synced_workflows))
+            logger.debug("Registering %d synced workflows from configuration", len(synced_workflows))
             try:
                 register_request = RegisterWorkflowsFromConfigRequest(config_section=WORKFLOWS_TO_REGISTER_KEY)
                 register_result = self.engine.handle_request(register_request)
 
                 if isinstance(register_result, RegisterWorkflowsFromConfigResultSuccess):
-                    logger.info(
+                    logger.debug(
                         "Successfully registered %d workflows after sync completion: %s",
                         len(register_result.succeeded_workflows),
                         register_result.succeeded_workflows,

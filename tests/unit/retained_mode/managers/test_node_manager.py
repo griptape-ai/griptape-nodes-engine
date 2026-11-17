@@ -18,6 +18,10 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
+from griptape_nodes.serialization.values import UndecodedValue
+
+# Workflow ids in the form the registry mints.
+_ORCHESTRATOR_WORKFLOW_ID = "0577bcf13a9809c5fcc5b68d391658f0"
 
 
 class TestNodeManagerBatchSetNodeMetadata:
@@ -25,6 +29,7 @@ class TestNodeManagerBatchSetNodeMetadata:
 
     def test_batch_set_node_metadata_empty_request_succeeds(self, engine: Engine) -> None:
         """Test that an empty batch request succeeds without errors."""
+        engine.context_manager.push_workflow(workflow_name="workflow")
         # Create an empty batch request
         request = BatchSetNodeMetadataRequest(node_metadata_updates={})
 
@@ -38,6 +43,7 @@ class TestNodeManagerBatchSetNodeMetadata:
 
     def test_batch_set_node_metadata_all_nodes_not_found_fails(self, engine: Engine) -> None:
         """Test that batch update fails when all nodes are not found."""
+        engine.context_manager.push_workflow(workflow_name="workflow")
         # Create request with non-existent nodes
         request = BatchSetNodeMetadataRequest(
             node_metadata_updates={
@@ -91,7 +97,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=MagicMock(),
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         # Should return None (no values to serialize) but preserve resolution
@@ -135,7 +140,6 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         # Resolution should be reset to UNRESOLVED due to serialization failure
@@ -186,14 +190,13 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert not any("Attempted to serialize" in msg for msg in warning_messages)
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
-    def test_serializable_true_param_with_pickle_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_serializable_true_param_with_encode_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         """Genuine serialization failures (serializable=True) must still emit the warning."""
         from unittest.mock import MagicMock
 
@@ -230,11 +233,10 @@ class TestNodeManagerResolutionStateSerialization:
             unique_parameter_uuid_to_values={},
             serialized_parameter_value_tracker=mock_tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("Attempted to serialize set value for parameter 'test_param'" in msg for msg in warning_messages)
+        assert any("Attempted to save the set value of parameter 'test_param'" in msg for msg in warning_messages)
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
 
@@ -282,7 +284,7 @@ class TestSerializeNodeWithoutLibraryMetadata:
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="proxy_workflow", flow_name="proxy_flow"))
+        engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="proxy_workflow", flow_name="proxy_flow"))
 
         node = ErrorProxyNode(
             name="Execute Python",
@@ -296,9 +298,11 @@ class TestSerializeNodeWithoutLibraryMetadata:
         node.metadata.pop("library", None)
         assert "library" not in node.metadata
 
-        engine.object_manager.add_object_by_name(node.name, node)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), node.name, node)
 
-        result = engine.node_manager.on_serialize_node_to_commands(SerializeNodeToCommandsRequest(node_name=node.name))
+        result = engine.node_manager.on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node.name), engine.current_workflow()
+        )
 
         assert isinstance(result, SerializeNodeToCommandsResultSuccess)
         create_command = result.serialized_node_commands.create_node_command
@@ -312,6 +316,7 @@ class TestUnresolveNodeRequest:
     """Tests for the on_unresolve_node_request handler."""
 
     def test_node_not_found_returns_failure(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow(workflow_name="workflow")
         result = engine.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
         assert isinstance(result, UnresolveNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
@@ -321,11 +326,8 @@ class TestUnresolveNodeRequest:
         mock_node.name = "test_node"
         mock_node.state = NodeResolutionState.RESOLVING
         mock_node.parameter_output_values = MagicMock()
-        with patch.object(
-            engine.object_manager,
-            "attempt_get_object_by_name_as_type",
-            return_value=mock_node,
-        ):
+        engine.context_manager.push_workflow(workflow_name="workflow")
+        with patch.object(engine.current_workflow().objects, "get_as_type", return_value=mock_node):
             result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
         assert isinstance(result, UnresolveNodeResultFailure)
@@ -339,17 +341,11 @@ class TestUnresolveNodeRequest:
         mock_node.state = NodeResolutionState.RESOLVED
         mock_node.parameter_output_values = MagicMock()
         mock_connections = MagicMock()
+        engine.context_manager.push_workflow(workflow_name="workflow")
+        workflow = engine.current_workflow()
         with (
-            patch.object(
-                engine.object_manager,
-                "attempt_get_object_by_name_as_type",
-                return_value=mock_node,
-            ),
-            patch.object(
-                engine.flow_manager,
-                "get_connections",
-                return_value=mock_connections,
-            ),
+            patch.object(workflow.objects, "get_as_type", return_value=mock_node),
+            patch.object(workflow.flows, "connections", mock_connections),
         ):
             result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
@@ -366,17 +362,11 @@ class TestUnresolveNodeRequest:
         mock_node.state = NodeResolutionState.UNRESOLVED
         mock_node.parameter_output_values = MagicMock()
         mock_connections = MagicMock()
+        engine.context_manager.push_workflow(workflow_name="workflow")
+        workflow = engine.current_workflow()
         with (
-            patch.object(
-                engine.object_manager,
-                "attempt_get_object_by_name_as_type",
-                return_value=mock_node,
-            ),
-            patch.object(
-                engine.flow_manager,
-                "get_connections",
-                return_value=mock_connections,
-            ),
+            patch.object(workflow.objects, "get_as_type", return_value=mock_node),
+            patch.object(workflow.flows, "connections", mock_connections),
         ):
             result = engine.handle_request(UnresolveNodeRequest(node_name="test_node"))
 
@@ -438,8 +428,9 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {"result": output_value}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
-        obj_mgr.add_object_by_name("test_node", mock_node)
+        obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="result", node_name="test_node")
@@ -468,8 +459,9 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
-        obj_mgr.add_object_by_name("test_node", mock_node)
+        obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="a", node_name="test_node")
@@ -498,8 +490,9 @@ class TestGetParameterValueOutputPriority:
         mock_node.parameter_output_values = {}
         mock_node.get_parameter_by_name.return_value = param
 
+        engine.context_manager.push_workflow(workflow_name="test_workflow")
         obj_mgr = engine.object_manager
-        obj_mgr.add_object_by_name("test_node", mock_node)
+        obj_mgr.add_object_by_name_in(obj_mgr.engine.current_workflow(), "test_node", mock_node)
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="x", node_name="test_node")
@@ -510,7 +503,7 @@ class TestGetParameterValueOutputPriority:
 
 
 class TestNodeManagerCancelExecuteNode:
-    """Tests for the CancelExecuteNodeRequest handler and cancel_worker_execution dispatch."""
+    """Tests for the CancelExecuteNodeRequest handler and cancel_worker_execution_in dispatch."""
 
     @pytest.mark.asyncio
     async def test_handler_no_inflight_returns_success(self, engine: Engine) -> None:
@@ -575,12 +568,13 @@ class TestNodeManagerCancelExecuteNode:
 
     @pytest.mark.asyncio
     async def test_cancel_worker_execution_noop_when_not_tracked(self, engine: Engine) -> None:
-        """cancel_worker_execution is a no-op when the node isn't routed to a worker."""
-        node_manager = engine.node_manager
+        """cancel_worker_execution_in is a no-op when the node isn't routed to a worker."""
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
 
         # Should not raise; there is no entry for "ghost_node" and
         # WorkerManager.forward_event_to_worker should not be invoked.
-        await node_manager.cancel_worker_execution("ghost_node")
+        await engine.node_manager.cancel_worker_execution_in(workflow, "ghost_node")
 
 
 class TestDeserializeNodeFromCommandsRetargetsElementCommands:
@@ -646,11 +640,12 @@ class TestDeserializeNodeFromCommandsRetargetsElementCommands:
             return create_result if req is request.serialized_node_commands.create_node_command else success
 
         mock_node = MagicMock(spec=BaseNode)
-        mock_engine.handle_request.side_effect = fake_handle_request
-        mock_engine.object_manager.attempt_get_object_by_name_as_type.return_value = mock_node
+        workflow = MagicMock()
+        workflow.handle_request.side_effect = fake_handle_request
+        workflow.objects.get_as_type.return_value = mock_node
 
         with patch.object(NodeManager, "_cleanup_node_on_failed_deserialization"):
-            result = manager.on_deserialize_node_from_commands(request)
+            result = manager.on_deserialize_node_from_commands(request, workflow)
 
         assert isinstance(result, DeserializeNodeFromCommandsResultSuccess)
         assert result.node_name == copy_name
@@ -664,6 +659,9 @@ class _GateProbe(BaseNode):
 
     def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
         super().__init__(name=name, metadata=metadata)
+
+    def process(self) -> None:
+        pass
 
 
 class TestNodeInstantiationAuthorizationCheckpoint:
@@ -792,8 +790,9 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             event_manager=engine.event_manager,
         )
 
-    def test_worker_materialize_denied_returns_failure(self, engine: Engine) -> None:
-        """Worker-side construction from caller-supplied metadata is gated by the same checkpoint."""
+    @pytest.mark.asyncio
+    async def test_a_worker_copy_the_policy_denies_is_not_run(self, engine: Engine) -> None:
+        """A worker loads its copy through CreateNode, so caller-supplied metadata meets the same checkpoint."""
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
         from griptape_nodes.retained_mode.events.execution_events import (
             ExecuteNodeRequest,
@@ -809,27 +808,30 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             return None
 
         engine.event_manager.add_authorization_hook(deny)
+        engine.library_manager._is_worker = True
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+            orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
         )
-        result = engine.node_manager._materialize_transient_node_from_metadata(request)
+        result = await engine.ahandle_request(request)
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "Labs nodes are disabled." in str(result.result_details)
 
-    def test_worker_materialize_allows_without_hook(self, engine: Engine) -> None:
-        """With no policy hook the worker path builds the node, matching the no-denial contract."""
-        from griptape_nodes.exe_types.node_types import BaseNode
-        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
+    @pytest.mark.asyncio
+    async def test_a_worker_copy_runs_without_a_policy_hook(self, engine: Engine) -> None:
+        """With no policy hook the worker loads and runs its copy, matching the no-denial contract."""
+        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
 
         self._register()
+        engine.library_manager._is_worker = True
         request = ExecuteNodeRequest(
             node_name="probe-1",
             node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+            orchestrator_workflow_id=_ORCHESTRATOR_WORKFLOW_ID,
         )
-        result = engine.node_manager._materialize_transient_node_from_metadata(request)
-        assert isinstance(result, BaseNode)
-        assert result.name == "probe-1"
+        result = await engine.ahandle_request(request)
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
 
     def test_schema_preview_returns_denied_node_types(self, engine: Engine) -> None:
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
@@ -1173,8 +1175,13 @@ class TestFlowLookupDuringNodeConstruction:
             GetFlowForNodeRequest,
             GetFlowForNodeResultFailure,
         )
+        from tests.workflow_context import unsaved_workflow_open
 
-        with caplog.at_level(_logging.DEBUG), LibraryRegistry.constructing_node():
+        with (
+            unsaved_workflow_open(engine),
+            caplog.at_level(_logging.DEBUG),
+            LibraryRegistry.constructing_node(),
+        ):
             result = engine.handle_request(GetFlowForNodeRequest(node_name="REFERENCE NODE"))
 
         assert isinstance(result, GetFlowForNodeResultFailure)
@@ -1192,8 +1199,9 @@ class TestFlowLookupDuringNodeConstruction:
             GetFlowForNodeRequest,
             GetFlowForNodeResultFailure,
         )
+        from tests.workflow_context import unsaved_workflow_open
 
-        with caplog.at_level(_logging.DEBUG):
+        with unsaved_workflow_open(engine), caplog.at_level(_logging.DEBUG):
             result = engine.handle_request(GetFlowForNodeRequest(node_name="TrulyMissingNode"))
 
         assert isinstance(result, GetFlowForNodeResultFailure)
@@ -1203,3 +1211,25 @@ class TestFlowLookupDuringNodeConstruction:
             if record.levelno >= _logging.ERROR and "TrulyMissingNode" in record.getMessage()
         ]
         assert error_logs
+
+
+class TestApplyHydratedValues:
+    """Values an ExecuteNodeRequest carries are set on the orchestrator's node before it runs."""
+
+    def test_value_this_process_cannot_rebuild_is_set_and_warned(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = MagicMock(spec=BaseNode)
+        node.name = "Worker Node"
+        node.parameter_values = {}
+        node._list_rows = MagicMock()
+        node._list_rows.set_as_rows_if_unconnected.return_value = False
+        undecoded = UndecodedValue({"$type": "other_library.mod:Thing"}, "its library is not loaded here")
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            failure = engine.node_manager._apply_hydrated_values(node, "Worker Node", {"image": undecoded})
+
+        assert failure is None
+        node.set_parameter_value.assert_called_once_with("image", undecoded)
+        assert "'image'" in caplog.text
+        assert "its library is not loaded here" in caplog.text

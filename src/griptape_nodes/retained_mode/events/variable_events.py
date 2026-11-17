@@ -1,8 +1,8 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -11,12 +11,13 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayerKind, VariableScope
+from griptape_nodes.serialization.values import DisplayValue
 
 
 # Variable Events
 @dataclass
 @PayloadRegistry.register
-class CreateVariableRequest(RequestPayload):
+class CreateVariableRequest(RequestPayload, GraphAccessMixin):
     """Create a new variable.
 
     Args:
@@ -32,7 +33,7 @@ class CreateVariableRequest(RequestPayload):
     name: str
     type: str
     is_global: bool = False
-    value: Any = None
+    value: DisplayValue = None
     owning_flow: str | None = None
     initial_setup: bool = False
 
@@ -52,7 +53,7 @@ class CreateVariableResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Get Variable Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableRequest(RequestPayload):
+class GetVariableRequest(RequestPayload, GraphAccessMixin):
     """Get a complete variable by name.
 
     Args:
@@ -86,7 +87,7 @@ class GetVariableResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 # Get Variable Value Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableValueRequest(RequestPayload):
+class GetVariableValueRequest(RequestPayload, GraphAccessMixin):
     """Get the value of a variable by name.
 
     Args:
@@ -108,7 +109,7 @@ class GetVariableValueRequest(RequestPayload):
 class GetVariableValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Variable value retrieved successfully."""
 
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -120,7 +121,7 @@ class GetVariableValueResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
 # Set Variable Value Events
 @dataclass
 @PayloadRegistry.register
-class SetVariableValueRequest(RequestPayload):
+class SetVariableValueRequest(RequestPayload, GraphAccessMixin):
     """Set the value of a variable by name.
 
     Args:
@@ -132,7 +133,7 @@ class SetVariableValueRequest(RequestPayload):
         project_id: Which project's variable layer to consult (None = current project)
     """
 
-    value: Any
+    value: DisplayValue
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
@@ -154,7 +155,7 @@ class SetVariableValueResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Get Variable Type Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableTypeRequest(RequestPayload):
+class GetVariableTypeRequest(RequestPayload, GraphAccessMixin):
     """Get the type of a variable by name.
 
     Args:
@@ -188,7 +189,7 @@ class GetVariableTypeResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
 # Set Variable Type Events
 @dataclass
 @PayloadRegistry.register
-class SetVariableTypeRequest(RequestPayload):
+class SetVariableTypeRequest(RequestPayload, GraphAccessMixin):
     """Set the type of a variable by name.
 
     Args:
@@ -222,7 +223,7 @@ class SetVariableTypeResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Delete Variable Events
 @dataclass
 @PayloadRegistry.register
-class DeleteVariableRequest(RequestPayload):
+class DeleteVariableRequest(RequestPayload, GraphAccessMixin):
     """Delete a variable by name.
 
     Args:
@@ -254,7 +255,7 @@ class DeleteVariableResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Rename Variable Events
 @dataclass
 @PayloadRegistry.register
-class RenameVariableRequest(RequestPayload):
+class RenameVariableRequest(RequestPayload, GraphAccessMixin):
     """Rename a variable by name.
 
     Args:
@@ -288,7 +289,7 @@ class RenameVariableResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
 # Has Variable Events
 @dataclass
 @PayloadRegistry.register
-class HasVariableRequest(RequestPayload):
+class HasVariableRequest(RequestPayload, GraphAccessMixin):
     """Check if a variable exists by name.
 
     Args:
@@ -323,7 +324,7 @@ class HasVariableResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 # List Variables Events
 @dataclass
 @PayloadRegistry.register
-class ListVariablesRequest(RequestPayload):
+class ListVariablesRequest(RequestPayload, GraphAccessMixin):
     """List all variables in the specified scope.
 
     Args:
@@ -362,7 +363,7 @@ class ListVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 # Get Variable Details Events
 @dataclass
 @PayloadRegistry.register
-class GetVariableDetailsRequest(RequestPayload):
+class GetVariableDetailsRequest(RequestPayload, GraphAccessMixin):
     """Get variable details (metadata only, no heavy values).
 
     Args:
@@ -416,7 +417,7 @@ class Substitutable:
     """A single value available for {VAR} substitution.
 
     DEPRECATED with ListSubstitutablesRequest — ListVariablesResultSuccess.layers
-    supersedes source/read_only. TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+    supersedes source/read_only. TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
 
     Attributes:
         name: The token name (what goes inside the braces, e.g. "workspace_dir")
@@ -433,14 +434,14 @@ class Substitutable:
 
 @dataclass
 @PayloadRegistry.register
-class ListSubstitutablesRequest(RequestPayload):
+class ListSubstitutablesRequest(RequestPayload, GraphAccessMixin):
     """DEPRECATED: use ListVariablesRequest instead.
 
     ListVariablesResultSuccess carries per-entry layer provenance (``layers``),
     which supersedes Substitutable's source/read_only metadata: derive the group
     from layer (PROJECT → macro-ish) and read_only from layer + permission.
     Kept as a compatibility shim for GUI versions that still send it.
-    TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete after
+    TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete after
     the GUI migrates (griptape-ai/griptape-vsl-gui#2668).
 
     Args:
@@ -499,12 +500,12 @@ class ListSubstitutablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 @dataclass
 @PayloadRegistry.register
-class ResolveSubstitutionRequest(RequestPayload):
+class ResolveSubstitutionRequest(RequestPayload, GraphAccessMixin):
     """DEPRECATED: use ListVariablesRequest instead.
 
     Same layered walk; build a name→value dict from the result's variables.
     No engine-internal callers remain — kept only for out-of-tree scripts.
-    TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+    TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
 
     When ``names`` is non-empty, looks up each name individually and fails
     (all-or-nothing) if any name is not found in scope.
@@ -529,7 +530,7 @@ class ResolveSubstitutionRequest(RequestPayload):
 class ResolveSubstitutionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Substitution values resolved successfully."""
 
-    variables: dict[str, Any]
+    variables: dict[str, DisplayValue]
 
 
 @dataclass
@@ -542,13 +543,13 @@ class ResolveSubstitutionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
         unresolved: Names that could not be found.
     """
 
-    resolved: dict[str, Any] = field(default_factory=dict)
+    resolved: dict[str, DisplayValue] = field(default_factory=dict)
     unresolved: list[str] = field(default_factory=list)
 
 
 @dataclass
 @PayloadRegistry.register
-class GetVariablesRequest(RequestPayload):
+class GetVariablesRequest(RequestPayload, GraphAccessMixin):
     """Probe specific variable names in scope and report which resolved.
 
     The named companion to ListVariablesRequest: List enumerates everything
@@ -583,7 +584,7 @@ class GetVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         unresolved: probed names that did not resolve. Empty when all names hit.
     """
 
-    variables: dict[str, Any]
+    variables: dict[str, DisplayValue]
     unresolved: list[str] = field(default_factory=list)
 
 
@@ -595,12 +596,12 @@ class GetVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class SetVariablesRequest(RequestPayload):
+class SetVariablesRequest(RequestPayload, GraphAccessMixin):
     """DEPRECATED: no known senders (engine, standard library, and GUI all confirmed clean).
 
     Batch write of multiple variable values atomically (all-or-nothing). Use
     SetVariableValueRequest per variable instead.
-    TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
+    TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5143): delete.
 
     All variable names are validated to exist in scope before any value is
     written. If any variable is not found the entire batch is rejected and
@@ -614,7 +615,7 @@ class SetVariablesRequest(RequestPayload):
         project_id: Which project's variable layer to consult (None = current project)
     """
 
-    variables: dict[str, Any]
+    variables: dict[str, DisplayValue]
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
     project_id: str | None = None

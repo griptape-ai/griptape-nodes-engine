@@ -37,6 +37,11 @@ class TestSliderHardLimits:
 
         validate(param, 5.0)
 
+    def test_none_passes(self, trait: Slider, param: ParameterFloat) -> None:
+        validate = trait.validators_for_trait()[0]
+
+        validate(param, None)
+
     @pytest.mark.parametrize("value", [10.5, -10.5, 1000.0])
     def test_out_of_range_value_raises(self, trait: Slider, param: ParameterFloat, value: float) -> None:
         validate = trait.validators_for_trait()[0]
@@ -70,6 +75,23 @@ class TestSliderSoftLimits:
     def test_range_is_still_reported_for_the_widget(self, trait: Slider) -> None:
         assert trait.min == MIN_VAL
         assert trait.max == MAX_VAL
+
+
+class TestSliderOnNoneDefaultParameter:
+    """A user-defined parameter whose None default means "no value" can be set to None."""
+
+    def test_setting_none_passes_the_validators(self) -> None:
+        param = Parameter(name="multiply", type="float", default_value=None, tooltip="test", user_defined=True)
+        param.add_trait(Slider(min_val=MIN_VAL, max_val=MAX_VAL))
+
+        run_validators(param, None)
+
+    def test_out_of_range_value_is_still_rejected(self) -> None:
+        param = Parameter(name="multiply", type="float", default_value=None, tooltip="test", user_defined=True)
+        param.add_trait(Slider(min_val=MIN_VAL, max_val=MAX_VAL))
+
+        with pytest.raises(ValueError, match=OUT_OF_RANGE_ERROR):
+            run_validators(param, 250.0)
 
 
 class TestParameterNumberSoftLimits:

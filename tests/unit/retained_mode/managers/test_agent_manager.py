@@ -8,16 +8,22 @@ the real config system.
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
+from fastmcp.client.transports import StreamableHttpTransport
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.pydantic_ai.mcp_servers import GTN_WORKFLOW_ID_HEADER
 from griptape_nodes.agents.pydantic_ai.mcp_toolset_cache import MCPToolsetCache
 from griptape_nodes.agents.pydantic_ai.runner import (
     AgentRunResult,
@@ -36,6 +42,7 @@ from griptape_nodes.drivers.cloud_models import (
     ProviderCatalogEntry,
     provider_catalog_entries,
 )
+from griptape_nodes.node_library.advanced_node_library import MCPTool
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -69,6 +76,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ProviderConfig,
     RunAgentRequest,
     RunAgentRequestArtifact,
+    RunAgentResultFailure,
     RunAgentResultSuccess,
     RunRecord,
     ThreadMetadata,
@@ -77,10 +85,18 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderResultSuccess,
     UpdateProviderPayload,
 )
+from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextResultFailure,
+    GetAttributionContextResultSuccess,
+)
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultFailure,
     GetEnabledMCPServersResultSuccess,
+    LibraryMCPServer,
+    ListLibraryMCPServersRequest,
+    ListLibraryMCPServersResultSuccess,
     MCPServerConfig,
 )
 from griptape_nodes.retained_mode.managers.agent_manager import (
@@ -101,6 +117,11 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _run_event_to_payload,
     _RunnerCacheKey,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from griptape_nodes.servers.mcp import LibraryMCPTools
+from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError, refusal_from_body
+from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
+from tests.unit.utils.test_budget_refusal import a_refusal_body
 
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
 
@@ -232,6 +253,78 @@ class TestLookupEnabledMCPServers:
         assert self._manager(engine)._lookup_enabled_mcp_servers() is None
 
 
+@dataclass
+class _ListRendersRequest(RequestPayload):
+    """List renders."""
+
+
+@dataclass
+class _StartRenderRequest(RequestPayload):
+    """Start a render."""
+
+
+_ACME = LibraryMCPTools(
+    library_name="Acme Render Tools",
+    slug="acme_render_tools",
+    tools=[MCPTool(_ListRendersRequest, read_only=True), MCPTool(_StartRenderRequest)],
+)
+
+
+class TestLibraryMCPServers:
+    @staticmethod
+    def _manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
+        manager = AgentManager.__new__(AgentManager)
+        manager._mcp_server_port = 9001
+        monkeypatch.setattr(f"{_AGENT_MANAGER_MODULE}.list_library_mcp_tools", lambda: [_ACME])
+        return manager
+
+    def test_lists_each_library_at_the_bound_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        result = self._manager(monkeypatch).on_handle_list_library_mcp_servers_request(ListLibraryMCPServersRequest())
+
+        assert isinstance(result, ListLibraryMCPServersResultSuccess)
+        assert result.servers == [
+            LibraryMCPServer(
+                name="acme_render_tools",
+                library_name="Acme Render Tools",
+                url="http://localhost:9001/mcp/libraries/acme_render_tools/",
+                tool_names=["_ListRendersRequest", "_StartRenderRequest"],
+            )
+        ]
+
+    def test_builds_a_toolset_per_library_with_its_read_only_tools(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager = self._manager(monkeypatch)
+        built: list[tuple[str, str, frozenset[str], str | None]] = []
+        monkeypatch.setattr(
+            f"{_AGENT_MANAGER_MODULE}.streamable_http_library",
+            lambda name, url, read_only, *, workflow_id: built.append((name, url, read_only, workflow_id)) or name,
+        )
+        workflow = MagicMock(spec=WorkflowRuntime, workflow_id="wf-1")
+
+        toolsets = manager._library_toolsets(["acme_render_tools", "acme_render_tools"], workflow)
+
+        assert toolsets == ["acme_render_tools"]
+        # The library's tools act on the run's workflow, like the engine's own.
+        assert built == [
+            (
+                "acme_render_tools",
+                "http://localhost:9001/mcp/libraries/acme_render_tools/",
+                frozenset({"_ListRendersRequest"}),
+                "wf-1",
+            )
+        ]
+
+    def test_skips_a_library_that_serves_no_tools(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = self._manager(monkeypatch)
+
+        with caplog.at_level(logging.WARNING):
+            toolsets = manager._library_toolsets(["missing"], None)
+
+        assert toolsets == []
+        assert "missing" in caplog.text
+
+
 class TestOnHandleListAgentModelsRequest:
     def test_returns_full_griptape_cloud_catalog(self, agent_manager: AgentManager) -> None:
         result = agent_manager.on_handle_list_agent_models_request(ListAgentModelsRequest())
@@ -333,28 +426,28 @@ class TestRunEventToPayload:
 
 @dataclass
 class _GetRecorder:
-    """Serves queued `httpx.Response`s keyed by URL and records requested URLs."""
+    """Serves queued `httpx2.Response`s keyed by URL and records requested URLs."""
 
-    responses: dict[str, httpx.Response] = field(default_factory=dict)
+    responses: dict[str, httpx2.Response] = field(default_factory=dict)
     requested_urls: list[str] = field(default_factory=list)
 
 
 @pytest.fixture
 def patch_get(monkeypatch: pytest.MonkeyPatch) -> _GetRecorder:
-    """Route `httpx.AsyncClient.get` through a recorder keyed by URL.
+    """Route `httpx2.AsyncClient.get` through a recorder keyed by URL.
 
     Unmapped URLs resolve to a 404 so download-failure paths are exercisable.
     """
     recorder = _GetRecorder()
 
-    async def fake_get(self: httpx.AsyncClient, url: str, **kwargs: object) -> httpx.Response:  # noqa: ARG001
+    async def fake_get(self: httpx2.AsyncClient, url: str, **kwargs: object) -> httpx2.Response:  # noqa: ARG001
         recorder.requested_urls.append(url)
-        request = httpx.Request("GET", url)
-        response = recorder.responses.get(url, httpx.Response(404))
+        request = httpx2.Request("GET", url)
+        response = recorder.responses.get(url, httpx2.Response(404))
         response.request = request
         return response
 
-    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    monkeypatch.setattr(httpx2.AsyncClient, "get", fake_get)
     return recorder
 
 
@@ -382,7 +475,7 @@ class TestComposePrompt:
     @pytest.mark.asyncio
     async def test_image_is_downloaded_and_inlined(self, patch_get: _GetRecorder) -> None:
         url = "http://localhost:9/workspace/cat.png"
-        patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+        patch_get.responses[url] = httpx2.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
 
         result = await _compose_prompt("look", [_image_artifact(url)])
 
@@ -399,7 +492,7 @@ class TestComposePrompt:
         # The persisted form mirrors the live form but carries the source URL as
         # an ImageUrl instead of the inlined bytes, keeping history small.
         url = "http://localhost:9/workspace/cat.png"
-        patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+        patch_get.responses[url] = httpx2.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
 
         result = await _compose_prompt("look", [_image_artifact(url)])
 
@@ -411,7 +504,7 @@ class TestComposePrompt:
         # The wire deserializer hands back RunAgentRequestArtifact instances
         # whose data lives in attributes.
         url = "http://localhost:9/workspace/dog.png"
-        patch_get.responses[url] = httpx.Response(200, content=b"dog", headers={"content-type": "image/png"})
+        patch_get.responses[url] = httpx2.Response(200, content=b"dog", headers={"content-type": "image/png"})
         artifact = RunAgentRequestArtifact(type="ImageUrlArtifact", value=url)
 
         result = await _compose_prompt("who is this", [artifact])
@@ -424,7 +517,7 @@ class TestComposePrompt:
     @pytest.mark.asyncio
     async def test_media_type_falls_back_to_url_extension(self, patch_get: _GetRecorder) -> None:
         url = "http://localhost:9/workspace/cat.jpeg?t=123"
-        patch_get.responses[url] = httpx.Response(
+        patch_get.responses[url] = httpx2.Response(
             200, content=b"jpeg-bytes", headers={"content-type": "application/octet-stream"}
         )
 
@@ -440,7 +533,7 @@ class TestComposePrompt:
     @pytest.mark.asyncio
     async def test_media_type_defaults_to_png_when_unknown(self, patch_get: _GetRecorder) -> None:
         url = "http://localhost:9/workspace/blob"
-        patch_get.responses[url] = httpx.Response(200, content=b"raw")
+        patch_get.responses[url] = httpx2.Response(200, content=b"raw")
 
         result = await _compose_prompt("hi", [_image_artifact(url)])
 
@@ -452,7 +545,7 @@ class TestComposePrompt:
     async def test_failed_download_is_dropped(self, patch_get: _GetRecorder) -> None:
         ok_url = "http://localhost:9/workspace/ok.png"
         bad_url = "http://localhost:9/workspace/missing.png"
-        patch_get.responses[ok_url] = httpx.Response(200, content=b"ok", headers={"content-type": "image/png"})
+        patch_get.responses[ok_url] = httpx2.Response(200, content=b"ok", headers={"content-type": "image/png"})
 
         result = await _compose_prompt("two", [_image_artifact(bad_url), _image_artifact(ok_url)])
 
@@ -501,7 +594,7 @@ class TestRehydrateHistory:
     @pytest.mark.asyncio
     async def test_image_url_is_downloaded_back_to_binary_content(self, patch_get: _GetRecorder) -> None:
         url = "http://localhost:9/workspace/cat.png"
-        patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+        patch_get.responses[url] = httpx2.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
 
         result = await _rehydrate_history(messages)
@@ -564,7 +657,7 @@ class TestRehydrateHistory:
         # keeps its slot and interleaved text stays put; the failed one drops.
         ok_url = "http://localhost:9/workspace/ok.png"
         bad_url = "http://localhost:9/workspace/gone.png"
-        patch_get.responses[ok_url] = httpx.Response(200, content=b"ok", headers={"content-type": "image/png"})
+        patch_get.responses[ok_url] = httpx2.Response(200, content=b"ok", headers={"content-type": "image/png"})
         content = ["before", ImageUrl(url=bad_url), "middle", ImageUrl(url=ok_url), "after"]
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=content)])]
 
@@ -965,7 +1058,7 @@ class TestListProviderModels:
     ) -> None:
         base_url = "http://localhost:11434/v1"
         models_payload = json.dumps({"data": [{"id": "llama3.2"}, {"id": "phi3"}]}).encode()
-        patch_get.responses[f"{base_url}/models"] = httpx.Response(200, content=models_payload)
+        patch_get.responses[f"{base_url}/models"] = httpx2.Response(200, content=models_payload)
 
         result = await providers_manager.on_handle_list_provider_models_request(
             ListProviderModelsRequest(provider="ollama", base_url=base_url)
@@ -981,7 +1074,7 @@ class TestListProviderModels:
     ) -> None:
         base_url = "http://localhost:11434/v1"
         payload = json.dumps({"data": [{"id": "zmodel"}, {"id": "amodel"}, {"id": "mmodel"}]}).encode()
-        patch_get.responses[f"{base_url}/models"] = httpx.Response(200, content=payload)
+        patch_get.responses[f"{base_url}/models"] = httpx2.Response(200, content=payload)
 
         result = await providers_manager.on_handle_list_provider_models_request(
             ListProviderModelsRequest(provider="ollama", base_url=base_url)
@@ -1002,7 +1095,7 @@ class TestListProviderModels:
     @pytest.mark.asyncio
     async def test_http_error_returns_failure(self, providers_manager: AgentManager, patch_get: _GetRecorder) -> None:
         base_url = "http://localhost:11434/v1"
-        patch_get.responses[f"{base_url}/models"] = httpx.Response(401)
+        patch_get.responses[f"{base_url}/models"] = httpx2.Response(401)
 
         result = await providers_manager.on_handle_list_provider_models_request(
             ListProviderModelsRequest(provider="ollama", base_url=base_url)
@@ -1015,12 +1108,12 @@ class TestListProviderModels:
         self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         base_url = "http://localhost:1234/v1"
-        connect_error = httpx.ConnectError("All connection attempts failed")
+        connect_error = httpx2.ConnectError("All connection attempts failed")
 
-        async def raise_connect_error(self: httpx.AsyncClient, url: str, **kwargs: object) -> httpx.Response:  # noqa: ARG001
+        async def raise_connect_error(self: httpx2.AsyncClient, url: str, **kwargs: object) -> httpx2.Response:  # noqa: ARG001
             raise connect_error
 
-        monkeypatch.setattr(httpx.AsyncClient, "get", raise_connect_error)
+        monkeypatch.setattr(httpx2.AsyncClient, "get", raise_connect_error)
 
         result = await providers_manager.on_handle_list_provider_models_request(
             ListProviderModelsRequest(provider="lmstudio", base_url=base_url)
@@ -1040,7 +1133,7 @@ class TestListProviderModels:
     ) -> None:
         base_url = "http://localhost:1234/v1"
         payload = json.dumps({"data": [{"id": "some-model"}]}).encode()
-        patch_get.responses[f"{base_url}/models"] = httpx.Response(200, content=payload)
+        patch_get.responses[f"{base_url}/models"] = httpx2.Response(200, content=payload)
 
         result = await providers_manager.on_handle_list_provider_models_request(
             ListProviderModelsRequest(provider="custom", base_url=base_url, api_key="sk-test")
@@ -1058,7 +1151,7 @@ class TestListProviderModels:
     ) -> None:
         base_url = "http://localhost:11434/v1"
         payload = json.dumps({"data": [{"id": "good"}, {"name": "no-id"}, {}]}).encode()
-        patch_get.responses[f"{base_url}/models"] = httpx.Response(200, content=payload)
+        patch_get.responses[f"{base_url}/models"] = httpx2.Response(200, content=payload)
 
         result = await providers_manager.on_handle_list_provider_models_request(
             ListProviderModelsRequest(provider="ollama", base_url=base_url)
@@ -1076,7 +1169,7 @@ class TestListProviderModels:
 class TestFriendlyListModelsError:
     def test_connect_error_maps_to_friendly_message(self) -> None:
         msg = _friendly_list_models_error(
-            httpx.ConnectError("All connection attempts failed"), "http://localhost:1234/v1"
+            httpx2.ConnectError("All connection attempts failed"), "http://localhost:1234/v1"
         )
 
         assert msg is not None
@@ -1085,19 +1178,19 @@ class TestFriendlyListModelsError:
         assert "running" in msg.lower()
 
     def test_connect_timeout_maps_to_friendly_message(self) -> None:
-        msg = _friendly_list_models_error(httpx.ConnectTimeout("timed out"), "http://localhost:11434/v1")
+        msg = _friendly_list_models_error(httpx2.ConnectTimeout("timed out"), "http://localhost:11434/v1")
 
         assert msg is not None
         assert "http://localhost:11434/v1" in msg
 
     def test_read_timeout_maps_to_friendly_message(self) -> None:
-        msg = _friendly_list_models_error(httpx.ReadTimeout("slow"), "http://host/v1")
+        msg = _friendly_list_models_error(httpx2.ReadTimeout("slow"), "http://host/v1")
 
         assert msg is not None
         assert "didn't respond" in msg
 
     def test_generic_request_error_maps_to_friendly_message(self) -> None:
-        msg = _friendly_list_models_error(httpx.RequestError("dns broke"), "http://host/v1")
+        msg = _friendly_list_models_error(httpx2.RequestError("dns broke"), "http://host/v1")
 
         assert msg is not None
         assert "connect" in msg.lower()
@@ -1110,13 +1203,13 @@ class TestFriendlyListModelsError:
     def test_http_status_error_returns_none(self) -> None:
         # An HTTP status error means the server *answered* — it's reachable, so
         # "is the server running?" would be misleading. Fall back to the raw msg.
-        request = httpx.Request("GET", "http://host/v1/models")
-        response = httpx.Response(500, request=request)
-        status_error = httpx.HTTPStatusError("500", request=request, response=response)
+        request = httpx2.Request("GET", "http://host/v1/models")
+        response = httpx2.Response(500, request=request)
+        status_error = httpx2.HTTPStatusError("500", request=request, response=response)
         assert _friendly_list_models_error(status_error, "http://host/v1") is None
 
     def test_missing_base_url_omits_endpoint(self) -> None:
-        msg = _friendly_list_models_error(httpx.ConnectError("x"), None)
+        msg = _friendly_list_models_error(httpx2.ConnectError("x"), None)
 
         assert msg is not None
         assert "at ''" not in msg
@@ -1171,6 +1264,33 @@ class TestConfigureAgentActiveProvider:
         assert isinstance(result, ConfigureAgentResultSuccess)
         gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
         assert gc.model == "gpt-5"
+
+
+class TestEngineMcpToolset:
+    """Each run reaches the engine's MCP server addressed to the workflow the run was sent from."""
+
+    @staticmethod
+    def _transport(toolset: object) -> StreamableHttpTransport:
+        node: Any = toolset
+        while not isinstance(node, MCPToolset):
+            node = node.wrapped
+        transport = node.client.transport
+        assert isinstance(transport, StreamableHttpTransport)
+        return transport
+
+    def test_names_the_run_workflow_in_the_header(self, providers_manager: AgentManager) -> None:
+        providers_manager._mcp_server_port = 1234
+        workflow = WorkflowRuntime("tab-workflow", MagicMock())
+
+        transport = self._transport(providers_manager._engine_mcp_toolset(workflow))
+
+        assert transport.url == "http://localhost:1234/mcp/"
+        assert transport.headers == {GTN_WORKFLOW_ID_HEADER: "tab-workflow"}
+
+    def test_a_run_from_no_workflow_sends_no_header(self, providers_manager: AgentManager) -> None:
+        providers_manager._mcp_server_port = 1234
+
+        assert self._transport(providers_manager._engine_mcp_toolset(None)).headers == {}
 
 
 class TestBuildRunnerCredential:
@@ -1248,14 +1368,79 @@ class TestExplainAgentRunError:
 
         assert "not entitled" not in message
 
+    def test_budget_refusal_is_explained_as_a_halt(
+        self, providers_manager: AgentManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A chat refusal arrives as a raw 403; the artist should read which budget refused it.
+        exc = ModelHTTPError(status_code=403, model_name="gpt-4o", body=a_refusal_body())
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            message = providers_manager._explain_agent_run_error(exc, "griptape_cloud")
+
+        assert message.startswith(BUDGET_REPLY_HALT_PREFIX)
+        assert "tight" in message
+        assert len(caplog.records) == 1
+
+    def test_a_halt_a_tool_already_worded_is_not_logged_again(
+        self, providers_manager: AgentManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The image tool logs its refusal before raising, and pydantic-ai may wrap what it raised.
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+        halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
+        wrapped = RuntimeError("tool call failed")
+        wrapped.__cause__ = halt
+
+        with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+            message = providers_manager._explain_agent_run_error(wrapped, "griptape_cloud")
+
+        assert message == str(halt)
+        assert caplog.records == []
+
+    @pytest.mark.asyncio
+    async def test_a_budget_halt_is_the_whole_failure_detail(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The editor recognizes a halt by its opening words, so no toast repeats the chat thread.
+        refusal = refusal_from_body(a_refusal_body())
+        assert refusal is not None
+        halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
+
+        async def refused(_request: RunAgentRequest, _workflow: object) -> None:
+            raise halt
+
+        monkeypatch.setattr(providers_manager, "_run_agent", refused)
+
+        result = await providers_manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert isinstance(result.result_details, ResultDetails)
+        assert result.result_details.result_details[0].message == str(halt)
+
+    @pytest.mark.asyncio
+    async def test_any_other_failure_is_framed_as_an_agent_error(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def broken(_request: RunAgentRequest, _workflow: object) -> None:
+            msg = "the provider hung up"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(providers_manager, "_run_agent", broken)
+
+        result = await providers_manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert isinstance(result.result_details, ResultDetails)
+        assert result.result_details.result_details[0].message.startswith("Error running agent: ")
+
 
 _CLOUD_HOST = "cloud.griptape.ai"
 
 
-def _httpx_403(url: str) -> httpx.HTTPStatusError:
-    request = httpx.Request("POST", url)
-    response = httpx.Response(403, request=request)
-    return httpx.HTTPStatusError("Forbidden", request=request, response=response)
+def _httpx_403(url: str) -> httpx2.HTTPStatusError:
+    request = httpx2.Request("POST", url)
+    response = httpx2.Response(403, request=request)
+    return httpx2.HTTPStatusError("Forbidden", request=request, response=response)
 
 
 class TestCloudHttpStatusOf:
@@ -1268,7 +1453,7 @@ class TestCloudHttpStatusOf:
         assert _cloud_http_status_of(exc, _CLOUD_HOST) == HTTPStatus.FORBIDDEN
 
     def test_reads_httpx_status_error(self) -> None:
-        """The image path raises an httpx error, which keeps status on .response."""
+        """The image path raises an httpx2 error, which keeps status on .response."""
         exc = _httpx_403("https://cloud.griptape.ai/api/images/generations")
 
         assert _cloud_http_status_of(exc, _CLOUD_HOST) == HTTPStatus.FORBIDDEN
@@ -1307,6 +1492,49 @@ async def _stub_compose_prompt(text: str, _url_artifacts: list[RunAgentRequestAr
     return ComposedPrompt(live=text, persist=text)
 
 
+async def _no_attribution(_request: object) -> GetAttributionContextResultFailure:
+    """Answer the attribution lookup as when no project is open."""
+    return GetAttributionContextResultFailure(result_details="no project")
+
+
+class TestAttributionHeaders:
+    """A Griptape Cloud chat turn carries the budget attribution header; others don't."""
+
+    @staticmethod
+    def _manager(provider_type: str, answer: object) -> tuple[AgentManager, list[object]]:
+        manager = AgentManager.__new__(AgentManager)
+        manager._active_provider_name = "p"
+        manager._providers = [ProviderConfig(name="p", type=provider_type, model="m")]
+        asked: list[object] = []
+
+        async def ahandle_request(request: object) -> object:
+            asked.append(request)
+            return answer
+
+        manager._engine = SimpleNamespace(ahandle_request=ahandle_request)  # type: ignore[assignment]
+        return manager, asked
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_sends_the_header(self) -> None:
+        answer = GetAttributionContextResultSuccess(header_value="abc", project_chain=["p1"], result_details="ok")
+        manager, _asked = self._manager("griptape_cloud", answer)
+
+        assert await manager._attribution_headers(None) == {"X-Griptape-Attribution": "abc"}
+
+    @pytest.mark.asyncio
+    async def test_failed_lookup_sends_nothing(self) -> None:
+        manager, _asked = self._manager("griptape_cloud", await _no_attribution(None))
+
+        assert await manager._attribution_headers(None) == {}
+
+    @pytest.mark.asyncio
+    async def test_other_providers_are_not_asked(self) -> None:
+        manager, asked = self._manager("openai", None)
+
+        assert await manager._attribution_headers(None) == {}
+        assert asked == []
+
+
 class TestRunAgentResultPayloadContract:
     """`_run_agent`'s three success branches must agree on the payload's keys.
 
@@ -1326,6 +1554,7 @@ class TestRunAgentResultPayloadContract:
         manager = AgentManager.__new__(AgentManager)
         manager._active_runs = {}
         manager._mcp_toolsets = MCPToolsetCache()
+        manager._mcp_server_port = 1234
 
         async def fake_run(*_args: object, **_kwargs: object) -> AgentRunResult:
             return result
@@ -1337,6 +1566,7 @@ class TestRunAgentResultPayloadContract:
         # A non-empty history keeps `is_first_run` False, so the title update is skipped.
         manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
             load_history=lambda _t: [object()],
+            get_thread_metadata=lambda _t: SimpleNamespace(tool_grants=[]),
             update_thread_metadata=lambda _t, **_kw: {},
             append_run_record=lambda thread_id, record: None,  # noqa: ARG005
         )
@@ -1350,6 +1580,11 @@ class TestRunAgentResultPayloadContract:
             # `_run_agent` reads the enabled MCP servers on every run; these
             # tests are about the result payload, so report none configured.
             handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
+            ahandle_request=_no_attribution,
+            # Libraries still loading and no flow open, so the run's instructions carry
+            # neither the node types nor a flow.
+            library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
+            only_open_workflow_or_none=lambda: None,
         )
         return manager
 
@@ -1360,7 +1595,7 @@ class TestRunAgentResultPayloadContract:
     ) -> None:
         manager = self._manager(monkeypatch, result)
 
-        payload = await manager._run_agent(_run_request())
+        payload = await manager._run_agent(_run_request(), None)
 
         assert isinstance(payload, RunAgentResultSuccess)
         assert "truncated" in payload.output, f"the {branch} branch omits `truncated` from its payload"
@@ -1374,12 +1609,17 @@ class TestRunAgentResultPayloadContract:
         """One shape for all outcomes, so the frontend needs no per-branch handling."""
         manager = self._manager(monkeypatch, result)
 
-        payload = await manager._run_agent(_run_request())
+        payload = await manager._run_agent(_run_request(), None)
 
         assert isinstance(payload, RunAgentResultSuccess)
-        assert set(payload.output) == {"text", "message_count", "cancelled", "truncated", "generated_image_urls"}, (
-            f"the {branch} branch's payload keys differ from the other branches'"
-        )
+        assert set(payload.output) == {
+            "text",
+            "message_count",
+            "cancelled",
+            "truncated",
+            "generated_image_urls",
+            "pending_approvals",
+        }, f"the {branch} branch's payload keys differ from the other branches'"
 
     @pytest.mark.asyncio
     async def test_cancelled_run_does_not_append_run_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1389,7 +1629,7 @@ class TestRunAgentResultPayloadContract:
         manager = self._manager(monkeypatch, result)
         manager._thread_storage.append_run_record = lambda thread_id, record: recorded.append(record)  # noqa: ARG005
 
-        await manager._run_agent(_run_request())
+        await manager._run_agent(_run_request(), None)
 
         assert recorded == [], "cancelled run must not record a RunRecord"
 
@@ -1410,7 +1650,7 @@ class TestRunAgentResultPayloadContract:
             provider_name="my-ollama",
             additional_mcp_servers=["brave"],
         )
-        await manager._run_agent(req)
+        await manager._run_agent(req, None)
 
         assert len(recorded) == 1
         r = recorded[0]
@@ -1436,7 +1676,7 @@ class TestRunAgentResultPayloadContract:
             provider_name="my-ollama",
             model_name="gpt-4o",
         )
-        await manager._run_agent(req)
+        await manager._run_agent(req, None)
 
         assert len(recorded) == 1
         assert recorded[0].model == "gpt-4o", "explicit model_name must take precedence over provider default"

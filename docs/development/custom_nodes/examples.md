@@ -518,14 +518,14 @@ class GenerativeNode(DataNode):
             title = self.get_parameter_value("title") or ""
 
             if not style.strip():
-                exceptions.append(ValueError(f"{self.name}: Style required in Custom Mode"))
+                exceptions.append(ValueError("Style required in Custom Mode"))
             if not title.strip():
-                exceptions.append(ValueError(f"{self.name}: Title required in Custom Mode"))
+                exceptions.append(ValueError("Title required in Custom Mode"))
         else:
             # Simple mode just needs prompt
             prompt = self.get_parameter_value("prompt") or ""
             if not prompt.strip():
-                exceptions.append(ValueError(f"{self.name}: Prompt required in Simple Mode"))
+                exceptions.append(ValueError("Prompt required in Simple Mode"))
 
         return exceptions if exceptions else None
 ```
@@ -587,8 +587,7 @@ class MusicGenerationNode(DataNode):
             if len(prompt) > prompt_limit:
                 exceptions.append(
                     ValueError(
-                        f"{self.name}: Prompt exceeds {prompt_limit} character limit for {model} "
-                        f"(current: {len(prompt)} characters)"
+                        f"Prompt exceeds {prompt_limit} character limit for {model} (current: {len(prompt)} characters)"
                     )
                 )
 
@@ -597,8 +596,7 @@ class MusicGenerationNode(DataNode):
             if len(style) > style_limit:
                 exceptions.append(
                     ValueError(
-                        f"{self.name}: Style exceeds {style_limit} character limit for {model} "
-                        f"(current: {len(style)} characters)"
+                        f"Style exceeds {style_limit} character limit for {model} (current: {len(style)} characters)"
                     )
                 )
 
@@ -675,13 +673,18 @@ def _poll_for_completion(self, task_id: str, api_key: str) -> dict[str, Any]:
 
         # Update status parameter with progress
         status_msg = f"Generating... ({attempt + 1}/{self.MAX_POLLING_ATTEMPTS})"
-        self.set_parameter_value("status", status_msg)
+        self.publish_update_to_parameter("status", status_msg)
 
         response = requests.get(query_url, headers=headers, params={"ids": task_id})
         # ... check completion ...
 ```
 
 **Best Practice**: Always provide progress feedback for operations longer than 10 seconds.
+
+Use `publish_update_to_parameter` rather than `set_parameter_value` to report progress. Both record the
+value as something the node produced, on any parameter that has an output, but only
+`publish_update_to_parameter` pushes it to the editor as it happens, which is what makes the status
+visible mid-run.
 
 ## Flexible Artifact Processing
 

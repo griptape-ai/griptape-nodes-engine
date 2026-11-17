@@ -96,6 +96,8 @@ _MIRROR_IGNORE_PATTERNS = [
     # install with host-specific binaries and absolute paths in pyvenv.cfg -- gigabytes that
     # are wrong on any other machine.
     ".venv-exec",
+    # Where node libraries keep their dev tooling, apart from the engine-managed .venv.
+    ".venv-dev",
     ".git",
     "__pycache__",
     ".griptape-nodes-previews",
@@ -272,7 +274,6 @@ def _copy_tree(engine: Engine, source_path: Path, destination_path: Path, ignore
         # the copy request genuinely failed at runtime, so RuntimeError (which
         # the export handler catches) is the right type here.
         msg = f"Attempted to copy tree from '{source_path}' to '{destination_path}'. Failed during package staging."
-        logger.error(msg)
         raise RuntimeError(msg)  # noqa: TRY004
 
 

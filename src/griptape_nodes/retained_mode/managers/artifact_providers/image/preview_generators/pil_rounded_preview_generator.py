@@ -23,6 +23,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
     BaseGeneratorParameters,
     Field,
 )
+from griptape_nodes.utils.async_utils import to_thread
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -160,7 +161,28 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             msg = "Source file is text, not binary image data"
             raise TypeError(msg)
 
-        # Step 3: Process image with PIL
+        # Step 3: Process image with PIL, off the event loop
+        output_bytes = await to_thread(self._render_rounded_preview, image_data)
+
+        # Step 4: Write output file
+        destination_path = str(Path(self.destination_preview_directory) / self.destination_preview_file_name)
+
+        write_request = WriteFileRequest(
+            file_path=destination_path,
+            content=output_bytes,
+            create_parents=True,
+            existing_file_policy=ExistingFilePolicy.OVERWRITE,
+        )
+        write_result = await self.engine.ahandle_request(write_request)
+
+        if not isinstance(write_result, WriteFileResultSuccess):
+            msg = f"Failed to write preview image: {write_result.result_details}"
+            raise OSError(msg)
+
+        return self.destination_preview_file_name
+
+    def _render_rounded_preview(self, image_data: bytes) -> bytes:
+        """Decode, shrink, round the corners of and re-encode the image. CPU-bound, so callers run it off the event loop."""
         with Image.open(BytesIO(image_data)) as raw_img:
             # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
             img = ImageOps.exif_transpose(raw_img)
@@ -193,23 +215,7 @@ class PILRoundedPreviewGenerator(BaseArtifactPreviewGenerator):
             pil_format = "JPEG" if self.preview_format.lower() == "jpg" else self.preview_format.upper()
             final_img.save(output_buffer, format=pil_format)
             output_bytes = output_buffer.getvalue()
-
-        # Step 4: Write output file
-        destination_path = str(Path(self.destination_preview_directory) / self.destination_preview_file_name)
-
-        write_request = WriteFileRequest(
-            file_path=destination_path,
-            content=output_bytes,
-            create_parents=True,
-            existing_file_policy=ExistingFilePolicy.OVERWRITE,
-        )
-        write_result = await self.engine.ahandle_request(write_request)
-
-        if not isinstance(write_result, WriteFileResultSuccess):
-            msg = f"Failed to write preview image: {write_result.result_details}"
-            raise OSError(msg)
-
-        return self.destination_preview_file_name
+        return output_bytes
 
     def _apply_rounded_corners(self, img: Image.Image) -> Image.Image:
         """Apply rounded corners to image using alpha mask.

@@ -76,6 +76,20 @@ Two cases are worth knowing about:
 **Run Workflow** and **Run From Selected** still require an idle
 workflow; they stay disabled until the current run ends.
 
+## Starting a run while another is running
+
+A run started some other way while one is in progress, such as from a
+script or another tool that drives the engine, waits for the run in
+progress to finish and then starts. Several waiting runs start one at a
+time, in the order they were started. **Cancel Run** stops only the run in
+progress; the next waiting run then starts.
+
+A script can see the run in progress and the runs waiting behind it with
+`ListRunsRequest`, withdraw a waiting run with `CancelRunRequest`, which
+takes the run's id from that list, and cancel everything with
+`CancelAllRunsRequest`. The result of a run request also names its run, in
+`run_id`.
+
 ## Stopping a run
 
 While a workflow is running, the same button area shows **Cancel Run** in
@@ -85,6 +99,40 @@ button shows **Cancelling…** while the cancellation request is in flight.
 Canceling a run is also how you get out of the **Cannot Save While Flow is
 Running** dialog (see [Saving](#saving) below) — that dialog offers a
 **Cancel Flow** button that does the same thing.
+
+### When a budget stops a run
+
+If your organization has set a spending budget on Griptape Cloud, a node
+whose call would go over it fails, and the run stops there. A **Run
+blocked** bar appears across the top of the canvas naming the node that was
+stopped and the budget that stopped it:
+
+> Budget stopped this run. 'Generate Poster' was blocked by the budget
+> "Marketing Q3". Contact your Griptape administrator.
+
+Click **✕** on the bar to close it. It also closes on its own when you run
+the workflow again.
+
+A few things worth knowing:
+
+- **A Failure output still works.** If the node's **Failure** output is
+    wired up, the run takes that branch instead of stopping, just as it
+    would for any other error. Use it to fall back to a local model when a
+    budget runs out. Retrying spends nothing new, because the refused call
+    never reached the model.
+- **Work already in flight still costs credits.** Budgets are checked
+    before each call goes out, so a call that was already running when the
+    budget filled up finishes and is billed.
+- **More than one budget can refuse the same call.** When that happens the
+    bar names every one of them, so your administrator can make room in all
+    of them at once.
+
+A budget marked *(frozen)* refuses every call no matter how many credits are
+left, until an administrator lifts the freeze.
+
+Your organization's administrators set, raise and unfreeze budgets in
+[Spend & Budgets](../../enterprise/admin_dashboard.md#spend-budgets) in the
+Admin Dashboard. Bring the budget names from the bar to them.
 
 ## Reading execution state on the canvas
 

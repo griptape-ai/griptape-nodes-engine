@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
 
 
-class ParameterGroup(BaseNodeElement, UIOptionsMixin):
+class ParameterGroup(UIOptionsMixin, BaseNodeElement):
     """UI element for a group of parameters."""
 
     def __init__(
@@ -149,7 +149,7 @@ class ParameterGroup(BaseNodeElement, UIOptionsMixin):
         return super().remove_child(child)
 
 
-class ParameterButtonGroup(BaseNodeElement, UIOptionsMixin):
+class ParameterButtonGroup(UIOptionsMixin, BaseNodeElement):
     """UI element for grouping buttons together in a row (similar to shadcn ButtonGroup).
 
     This class creates a button group container that displays buttons horizontally

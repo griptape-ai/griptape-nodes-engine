@@ -33,7 +33,7 @@ from griptape_nodes.exe_types.node_types import ErrorProxyNode
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.node_library.library_registry import LibraryRegistry
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry, read_workflow_metadata
+from griptape_nodes.node_library.workflow_registry import read_workflow_metadata
 from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -82,7 +82,8 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     MissingCreationDateProblem,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
-from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
+from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -163,16 +164,15 @@ def _library_schema(library_name: str, class_name: str, module_file: str) -> dic
 
 
 @pytest.fixture(autouse=True)
-def _clear_process_global_registries() -> Generator[None, None, None]:
-    """Clear the process-global library and workflow registries around every test in this file.
+def _clear_library_registry() -> Generator[None, None, None]:
+    """Clear the process-global library registry around every test in this file.
 
-    Both keep their state in ``ClassVar`` dicts the engine does not own, so the fixture
-    libraries and saved workflows registered here would otherwise leak into whichever test runs
-    next in the same xdist worker. Sibling files clear ``LibraryRegistry`` the same way.
+    It keeps its state in ``ClassVar`` dicts the engine does not own, so the fixture libraries
+    registered here would otherwise leak into whichever test runs next in the same xdist worker.
+    Sibling files clear it the same way.
     """
     LibraryRegistry._clear()
-    with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-        yield
+    yield
     LibraryRegistry._clear()
 
 
@@ -259,7 +259,7 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
     serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=_FLOW_NAME))
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
-    save_result = engine.workflow_manager._save_workflow_file_inline(
+    save_result = engine.workflow_manager.saver._save_workflow_file_inline(
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,
@@ -270,7 +270,6 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess), save_result
     return f"{file_stem}.py"
@@ -280,7 +279,7 @@ def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_
     """Serialize `flow_name` and write it to `tmp_path` the way SaveWorkflowRequest does."""
     serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
     assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
-    saved = engine.workflow_manager._save_workflow_file_inline(
+    saved = engine.workflow_manager.saver._save_workflow_file_inline(
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialized.serialized_flow_commands,
         file_name=file_stem,
@@ -291,7 +290,6 @@ def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_
         is_template=None,
         branched_from=None,
         workflow_shape=None,
-        pickle_control_flow_result=False,
     )
     assert isinstance(saved, SaveWorkflowFileFromSerializedFlowResultSuccess), saved
     return f"{file_stem}.py"
@@ -326,6 +324,9 @@ def _restart_engine(tmp_path: Path) -> Engine:
 
     Every rebuild in this file goes through here, so no case can accidentally keep the
     modules of a library it means to be missing.
+
+    The workflow registry belongs to the engine, so it comes back empty too. Tests re-register
+    the workflows a restarted editor would find in its workspace.
     """
     reset_root_engine()
     LibraryRegistry._clear()
@@ -348,7 +349,7 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
     engine = _restart_engine(tmp_path)
     _register(engine, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
     if disabled:
-        engine.library_manager._create_library_info_entry(
+        engine.library_manager.discovery._create_library_info_entry(
             str(tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json"),
             is_sandbox=False,
             enabled=False,
@@ -357,7 +358,8 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
 
 
 def _run(engine: Engine, relative_file_path: str) -> Any:
-    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path=relative_file_path))
+    """Run a saved file as node libraries do: into the current workflow, else opened as one."""
+    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path))
 
 
 def _register_workflow(engine: Engine, tmp_path: Path, relative_file_path: str) -> str:
@@ -486,7 +488,7 @@ class TestEveryLibraryUnavailable:
         # One problem per library, not one per node...
         assert {problem.library_name for problem in result.problems} == {_AVAILABLE_LIBRARY, _UNAVAILABLE_LIBRARY}
         # ...and both collate into a single warning, because they are the same problem type.
-        assert len(reopened.workflow_manager.collate_problems_by_type(result.problems)) == 1
+        assert len(collate_problems_by_type(result.problems)) == 1
         assert isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
         # The flow itself is engine-owned, so it is there to hold them.
@@ -762,6 +764,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
 
         # Reopen the host on a fresh engine, library still disabled.
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
         return reopened, _run(reopened, host_path)
 
     def test_the_outer_load_is_flawed_and_names_the_library(self, engine: Engine, tmp_path: Path) -> None:
@@ -791,6 +794,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
         del reopened
 
         with pytest.raises(LocalExecutorError, match="FLAWED"):
@@ -810,6 +814,7 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
 
         queued: list[Any] = []
         with pytest.MonkeyPatch.context() as monkeypatch:
@@ -863,10 +868,11 @@ class TestNestedSubflowProblemsReachTheOuterLoad:
         host_path = _save_flow_as_workflow(building, tmp_path, host_flow.flow_name, "host_workflow")
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
         result = _run(reopened, host_path)
 
         assert [problem.library_name for problem in result.problems] == [_UNAVAILABLE_LIBRARY]
-        collated = reopened.workflow_manager.collate_problems_by_type(result.problems)
+        collated = collate_problems_by_type(result.problems)
         assert len(collated) == 1
         assert "2 libraries" not in collated[0]
 
@@ -898,13 +904,16 @@ class TestConcurrentLoadsDoNotCrossContaminate:
         host_path = _save_host_importing_subflow(tmp_path, building, inner_name)
 
         reopened = _rebuild_engine_without_library(tmp_path, disabled=True)
+        _register_workflow(reopened, tmp_path, inner_path)
 
         async def load_both() -> tuple[Any, Any]:
             return await asyncio.gather(  # type: ignore[return-value]
-                reopened.workflow_manager.run_workflow(relative_file_path=host_path),
-                reopened.workflow_manager.run_workflow(relative_file_path=inner_path),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=host_path, workflow=running),
+                reopened.workflow_manager.runner.run_workflow(relative_file_path=inner_path, workflow=running),
             )
 
+        # The loads build into one open workflow, as a WorkflowNode's do.
+        running = reopened.context_manager.open_workflow(workflow_name="running")
         host_result, sibling_result = asyncio.run(load_both())
 
         # The host's own problem came from its subflow, and it has to survive the sibling load
@@ -925,16 +934,16 @@ class TestConcurrentLoadsDoNotCrossContaminate:
             return [p.library_name for p in problems if isinstance(p, LibraryNotRegisteredProblem)]
 
         async def load_with_subflow() -> list[str]:
-            with WorkflowManager.LoadProblemFrame() as outer:
+            with LoadProblemFrame() as outer:
                 outer.problems.append(LibraryNotRegisteredProblem(library_name="Outer Library"))
                 await asyncio.sleep(0)  # let the sibling open its frame beneath this one
-                with WorkflowManager.LoadProblemFrame() as inner:
+                with LoadProblemFrame() as inner:
                     inner.problems.append(LibraryNotRegisteredProblem(library_name="Subflow Library"))
                     await asyncio.sleep(0)
                 return _library_names(outer.problems)
 
         async def sibling_load() -> list[str]:
-            with WorkflowManager.LoadProblemFrame() as frame:
+            with LoadProblemFrame() as frame:
                 frame.problems.append(LibraryNotRegisteredProblem(library_name="Sibling Library"))
                 await asyncio.sleep(0)
                 await asyncio.sleep(0)
@@ -1020,7 +1029,7 @@ class TestSuppressionIsKeyedToLibraryProblems:
         # Stand in for a future problem type: present, but not about library registration.
         other_problem = MissingCreationDateProblem(default_date="1970-01-01")
         with patch.object(
-            reopened.workflow_manager,
+            reopened.workflow_manager.runner,
             "_ensure_libraries_for_workflow",
             AsyncMock(return_value=[other_problem]),
         ):
@@ -1076,8 +1085,8 @@ class TestRefusedSubflowIsNotOrphaned:
         # request path is unavailable and _load_subflow needs the parent-flow mapping to resolve.
         node = self._node_class_for(tmp_path / relative_path)(name="Wrapper")
         reopened.flow_manager.get_flow_by_name(host_flow.flow_name).add_node(node)
-        reopened.object_manager.add_object_by_name(node.name, node)
-        reopened.node_manager._name_to_parent_flow_name[node.name] = host_flow.flow_name
+        reopened.object_manager.add_object_by_name_in(reopened.current_workflow(), node.name, node)
+        reopened.current_workflow().nodes.name_to_parent_flow_name[node.name] = host_flow.flow_name
 
         flows_before = set(reopened.object_manager.get_filtered_subset(type=ControlFlow))
         for _ in range(3):

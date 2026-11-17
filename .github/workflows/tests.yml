@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.15"]
     steps:
       - name: Checkout actions
         uses: actions/checkout@v7
@@ -41,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.15"]
     defaults:
       run:
         shell: bash
@@ -61,7 +61,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.15"]
     steps:
       - name: Checkout actions
         uses: actions/checkout@v7
@@ -74,7 +74,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.15"]
     defaults:
       run:
         shell: bash
@@ -84,13 +84,13 @@ jobs:
       - name: Init environment
         uses: ./.github/actions/init-environment
       - name: Run integration tests
-        run: uv run pytest tests/integration
+        run: uv run pytest -n auto tests/integration
   e2e-test-ubuntu:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.15"]
     steps:
       - name: Checkout actions
         uses: actions/checkout@v7
@@ -103,7 +103,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.12", "3.15"]
     defaults:
       run:
         shell: bash

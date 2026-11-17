@@ -53,7 +53,10 @@ class Slider(Trait):
             return []
 
         def validate(param: Parameter, value: Any) -> None:
-            if hasattr(value, "__gt__") and hasattr(value, "__lt__") and (value > self.max or value < self.min):
+            # None means "no value", which has no position on the range to check.
+            if value is None:
+                return
+            if value > self.max or value < self.min:
                 msg = (
                     f"Attempted to set '{param.name}' to {value}. "
                     f"Failed because it must be between {self.min} and {self.max}."

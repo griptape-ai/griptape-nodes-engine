@@ -239,4 +239,9 @@ workflow) to all of them at once. Images without embedded metadata are
 always added as plain image nodes, regardless of which option you
 pick.
 
+PNG files exported by Griptape Nodes 0.102.0 or earlier still load, but a
+later release will stop reading them. Export such an image again to keep
+its workflow loadable. A PNG exported by 0.103.0 or later doesn't load its
+workflow in 0.102.0 or earlier.
+
 <!-- screenshot (#5166): the "Workflow found in image" dialog with "Add Nodes from Workflow" selected and the node/library lists expanded -->

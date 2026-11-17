@@ -1,40 +1,89 @@
 """Tests for ContextManager.push_workflow."""
 
-import ast
+import asyncio
 import logging
 import tempfile
+import uuid
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry
-from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.exe_types.core_types import BaseNodeElement, Parameter, ParameterMode
+from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_types import BaseNode, DataNode
+from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+from griptape_nodes.retained_mode.engine import Engine, current_engine, engine_scope
 from griptape_nodes.retained_mode.events.context_events import (
+    EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultFailure,
     SetWorkflowContextFailure,
     SetWorkflowContextRequest,
     SetWorkflowContextSuccess,
 )
+from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+from tests.workflow_context import empty_workflow_registry
+
+
+def _file_path(context_manager: ContextManager) -> str | None:
+    """The current workflow's file path, or None while it is unsaved."""
+    absolute_path = context_manager.get_current_workflow().absolute_path
+    if absolute_path is None:
+        return None
+    return str(absolute_path)
+
+
+def _metadata(name: str) -> WorkflowMetadata:
+    return WorkflowMetadata(
+        name=name,
+        schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+        engine_version_created_with="test",
+        node_libraries_referenced=[],
+        creation_date=datetime.now(UTC),
+    )
 
 
 class TestPushWorkflow:
     """Tests for ContextManager.push_workflow."""
 
     def test_push_workflow_with_name(self, engine: Engine) -> None:
-        """workflow_name is used directly as the registry key."""
+        """A registered name enters that workflow; the context holds its id."""
         context_manager = engine.context_manager
-        result = context_manager.push_workflow(workflow_name="my_workflow")
+        workflow = engine.workflow_registry.register_unsaved("My Workflow")
 
-        assert result == "my_workflow"
-        assert context_manager.get_current_workflow_name() == "my_workflow"
+        result = context_manager.push_workflow(workflow_name=workflow.name)
+
+        assert result == workflow.name
+        assert context_manager.get_current_workflow_id() == workflow.workflow_id
+        assert context_manager.get_current_workflow_name() == workflow.name
 
         context_manager.pop_workflow()
+
+    def test_push_workflow_with_an_unregistered_name_registers_an_unsaved_workflow(self, engine: Engine) -> None:
+        """A name the registry does not hold becomes the display name of a new unsaved workflow."""
+        context_manager = engine.context_manager
+
+        result = context_manager.push_workflow(workflow_name="my_workflow")
+        try:
+            workflow = context_manager.get_current_workflow()
+            assert result == workflow.name
+            assert result.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
+            assert workflow.metadata.name == "my_workflow"
+            assert workflow.listed is False
+        finally:
+            context_manager.pop_workflow()
 
     def test_push_workflow_with_file_path_inside_workspace(self, engine: Engine) -> None:
         """file_path inside workspace produces a workspace-relative registry key."""
@@ -47,14 +96,16 @@ class TestPushWorkflow:
             config_manager.workspace_path = workspace
             try:
                 workflow_file = workspace / "subdir" / "my_flow.py"
+                workflow_file.parent.mkdir()
+                workflow_file.write_text("# stub")
                 result = context_manager.push_workflow(file_path=str(workflow_file))
+                try:
+                    assert result == "subdir/my_flow"
+                    assert context_manager.get_current_workflow_name() == "subdir/my_flow"
+                finally:
+                    context_manager.pop_workflow()
             finally:
                 config_manager.workspace_path = original
-
-        assert result == "subdir/my_flow"
-        assert context_manager.get_current_workflow_name() == "subdir/my_flow"
-
-        context_manager.pop_workflow()
 
     def test_push_workflow_with_file_path_outside_workspace(self, engine: Engine) -> None:
         """file_path outside workspace uses the absolute path as the registry key."""
@@ -67,15 +118,55 @@ class TestPushWorkflow:
             config_manager.workspace_path = workspace
             try:
                 workflow_file = Path(other_dir) / "my_flow.py"
+                workflow_file.write_text("# stub")
                 result = context_manager.push_workflow(file_path=str(workflow_file))
+                try:
+                    expected = (Path(other_dir) / "my_flow").as_posix()
+                    assert result == expected
+                    assert context_manager.get_current_workflow_name() == expected
+                finally:
+                    context_manager.pop_workflow()
             finally:
                 config_manager.workspace_path = original
 
-        expected = (Path(other_dir).resolve() / "my_flow").as_posix()
-        assert result == expected
-        assert context_manager.get_current_workflow_name() == expected
+    def test_push_workflow_by_file_registers_it_unlisted(self, engine: Engine) -> None:
+        """Opening a file the registry does not know registers it, without adding it to the workflow list."""
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
 
-        context_manager.pop_workflow()
+        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as other_dir:
+            original = config_manager.workspace_path
+            config_manager.workspace_path = Path(workspace_dir)
+            try:
+                workflow_file = Path(other_dir) / "my_flow.py"
+                workflow_file.write_text("# stub")
+                name = context_manager.push_workflow(file_path=str(workflow_file))
+                try:
+                    workflow = engine.workflow_registry.find_by_path(workflow_file)
+                    assert workflow is not None
+                    assert workflow.workflow_id == context_manager.get_current_workflow_id()
+                    assert workflow.listed is False
+                    assert name not in engine.workflow_registry.list_workflows()
+                finally:
+                    context_manager.pop_workflow()
+            finally:
+                config_manager.workspace_path = original
+
+    def test_push_workflow_by_a_missing_file_opens_an_unsaved_workflow_in_its_folder(self, engine: Engine) -> None:
+        """A path with no file behind it opens as an unsaved workflow whose folder is the path's."""
+        context_manager = engine.context_manager
+
+        with tempfile.TemporaryDirectory() as other_dir:
+            workflow_file = Path(other_dir).resolve() / "not_written_yet.py"
+            context_manager.push_workflow(file_path=str(workflow_file))
+            try:
+                workflow = context_manager.get_current_workflow()
+                assert not workflow.is_saved
+                assert workflow.metadata.name == "not_written_yet"
+                assert _file_path(context_manager) is None
+                assert context_manager.get_current_workflow().working_directory == str(workflow_file.parent)
+            finally:
+                context_manager.pop_workflow()
 
     def test_push_workflow_retains_file_path_independent_of_workspace(self, engine: Engine) -> None:
         """The pushed file path is retained verbatim and does NOT move with the workspace.
@@ -92,13 +183,14 @@ class TestPushWorkflow:
             config_manager.workspace_path = Path(workspace_dir)
             try:
                 workflow_file = Path(other_dir) / "my_flow.py"
+                workflow_file.write_text("# stub")
                 context_manager.push_workflow(file_path=str(workflow_file))
 
-                assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+                assert _file_path(context_manager) == str(workflow_file)
 
                 # Simulate a project switch: the workspace moves under the open workflow.
                 config_manager.workspace_path = Path(other_dir)
-                assert context_manager.get_current_workflow_file_path() == str(workflow_file)
+                assert _file_path(context_manager) == str(workflow_file)
             finally:
                 config_manager.workspace_path = original
                 context_manager.pop_workflow()
@@ -114,7 +206,7 @@ class TestPushWorkflow:
 
         context_manager.push_workflow(workflow_name="not_registered_anywhere")
         try:
-            assert context_manager.get_current_workflow_file_path() is None
+            assert _file_path(context_manager) is None
         finally:
             context_manager.pop_workflow()
 
@@ -146,31 +238,24 @@ class TestPushWorkflow:
             original = config_manager.workspace_path
             config_manager.workspace_path = workspace
             try:
-                with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+                with empty_workflow_registry(engine):
                     # Registered workspace-RELATIVE, so resolving the key genuinely depends on
                     # which workspace is active.
-                    WorkflowRegistry.generate_new_workflow(
+                    engine.workflow_registry.generate_new_workflow(
                         registry_key="subdir/my_flow", metadata=metadata, file_path="subdir/my_flow.py"
                     )
                     context_manager.push_workflow(workflow_name="subdir/my_flow")
                     try:
                         expected = str(workflow_file.resolve())
-                        assert context_manager.get_current_workflow_file_path() == expected
+                        assert _file_path(context_manager) == expected
 
                         # Simulate a project switch: the key is now meaningless, the path is not.
                         config_manager.workspace_path = Path(other_dir)
-                        assert context_manager.get_current_workflow_file_path() == expected
+                        assert _file_path(context_manager) == expected
                     finally:
                         context_manager.pop_workflow()
             finally:
                 config_manager.workspace_path = original
-
-    def test_get_current_workflow_file_path_requires_a_workflow(self, engine: Engine) -> None:
-        """Asking outside a workflow context is an error, matching get_current_workflow_name."""
-        context_manager = engine.context_manager
-
-        with pytest.raises(context_manager.NoActiveWorkflowError):
-            context_manager.get_current_workflow_file_path()
 
     def test_push_workflow_raises_when_both_provided(self, engine: Engine) -> None:
         """Raises ValueError when both workflow_name and file_path are given."""
@@ -197,14 +282,14 @@ class TestPushWorkflow:
             config_manager.workspace_path = workspace
             try:
                 workflow_file = workspace / "my_workflow.py"
+                workflow_file.write_text("# stub")
                 result = context_manager.push_workflow(file_path=str(workflow_file))
+                context_manager.pop_workflow()
             finally:
                 config_manager.workspace_path = original
 
         assert result == "my_workflow"
         assert "." not in result
-
-        context_manager.pop_workflow()
 
 
 class TestWorkflowWorkingDirectory:
@@ -242,8 +327,8 @@ class TestWorkflowWorkingDirectory:
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
                 # The folder is NOT the registry key: the workflow is still unsaved.
-                assert result.workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
-                assert context_manager.get_current_workflow_file_path() is None
+                assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
+                assert _file_path(context_manager) is None
 
                 assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
             finally:
@@ -267,9 +352,66 @@ class TestWorkflowWorkingDirectory:
             try:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
-                assert context_manager.get_current_workflow_working_directory() is None
+                assert context_manager.get_current_workflow().working_directory is None
 
                 assert self._resolve_outputs(engine) == workspace / "outputs" / "img.png"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_omitting_the_folder_does_not_warn(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+        """A workflow nobody named a folder for still answers `workflow_dir`, so nothing degrades.
+
+        The folder its first save would default to is a prediction rather than a fact, but it is
+        the same place dropping the optional block already sent the file, so a saving node that
+        writes several files no longer pays a warning per file for a path that was never wrong.
+        """
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir).resolve()
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                    resolved = self._resolve_outputs(engine)
+
+                assert resolved == workspace / "outputs" / "img.png"
+                warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+                assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
+            finally:
+                config_manager.workspace_path = original
+                while context_manager.has_current_workflow():
+                    context_manager.pop_workflow()
+
+    def test_required_workflow_dir_resolves_without_a_folder(self, engine: Engine) -> None:
+        """`{workflow_dir}` with no `?` resolves too, rather than failing the whole request.
+
+        A macro that names the directory outright has no degraded form to fall back to, so a
+        library writing to `{workflow_dir}/...` used to be unusable until the first save.
+        """
+        context_manager = engine.context_manager
+        config_manager = engine.config_manager
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir).resolve()
+            original = config_manager.workspace_path
+            config_manager.workspace_path = workspace
+            try:
+                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+                assert isinstance(result, SetWorkflowContextSuccess)
+
+                resolved = engine.handle_request(
+                    GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
+                )
+
+                assert isinstance(resolved, GetPathForMacroResultSuccess)
+                assert resolved.absolute_path == workspace / "notes.txt"
             finally:
                 config_manager.workspace_path = original
                 while context_manager.has_current_workflow():
@@ -296,7 +438,7 @@ class TestWorkflowWorkingDirectory:
                 assert isinstance(result, SetWorkflowContextSuccess)
 
                 expected = workspace / "shots" / "sh020"
-                assert context_manager.get_current_workflow_working_directory() == str(expected)
+                assert context_manager.get_current_workflow().working_directory == str(expected)
                 assert self._resolve_outputs(engine) == expected / "outputs" / "img.png"
             finally:
                 config_manager.workspace_path = original
@@ -328,7 +470,9 @@ class TestWorkflowWorkingDirectory:
 
                 # What the save path does once the workflow gets a file.
                 saved_to = workspace / "elsewhere" / "my_flow.py"
-                context_manager.set_current_workflow_file_path(str(saved_to))
+                saved_to.parent.mkdir()
+                saved_to.write_text("# stub")
+                engine.workflow_registry.set_file_path(context_manager.get_current_workflow(), saved_to)
 
                 assert self._resolve_outputs(engine) == saved_to.parent / "outputs" / "img.png"
             finally:
@@ -425,35 +569,145 @@ class TestWorkflowWorkingDirectory:
                 while context_manager.has_current_workflow():
                     context_manager.pop_workflow()
 
-    def test_get_working_directory_requires_a_workflow(self, engine: Engine) -> None:
-        """Asking outside a workflow context is an error, matching the other context accessors."""
+
+class TestUnsavedWorkflowNames:
+    """An "unsaved:" name the registry does not hold fails like any other name, whatever follows the prefix."""
+
+    @pytest.mark.parametrize("suffix", ["0123456789abcdef0123456789abcdef", str(uuid.UUID(int=1)), "abc-123", ""])
+    def test_an_unregistered_unsaved_name_is_refused(self, engine: Engine, suffix: str) -> None:
+        name = f"unsaved:{suffix}"
+
+        with empty_workflow_registry(engine):
+            result = engine.handle_request(SetWorkflowContextRequest(workflow_name=name))
+
+            assert isinstance(result, SetWorkflowContextFailure)
+            assert not engine.context_manager.has_current_workflow()
+            assert not engine.workflow_registry.has_workflow_with_name(name)
+
+
+class TestSetWorkflowContextUnsavedNames:
+    """A name the registry does not hold fails."""
+
+    def test_a_name_no_workflow_has_fails(self, engine: Engine) -> None:
+        result = engine.handle_request(SetWorkflowContextRequest(workflow_name="shots/sh010_typo"))
+
+        assert isinstance(result, SetWorkflowContextFailure)
+        assert "no workflow with that name is registered" in str(result.result_details)
+        assert not engine.context_manager.has_current_workflow()
+        assert not engine.workflow_registry.has_workflow_with_name("shots/sh010_typo")
+
+    def test_ensure_workflow_and_flow_with_a_name_no_workflow_has_fails(self, engine: Engine) -> None:
+        result = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="shots/sh010_typo"))
+
+        assert isinstance(result, EnsureWorkflowAndFlowResultFailure)
+        assert "no workflow with that name is registered" in str(result.result_details)
+        assert not engine.context_manager.has_current_workflow()
+
+    def test_push_workflow_with_a_dashed_unsaved_name_registers_a_new_workflow(self, engine: Engine) -> None:
         context_manager = engine.context_manager
 
-        with pytest.raises(context_manager.NoActiveWorkflowError):
-            context_manager.get_current_workflow_working_directory()
+        result = context_manager.push_workflow(workflow_name="unsaved:01234567-89ab-cdef-0123-456789abcdef")
+        try:
+            assert result == f"unsaved:{context_manager.get_current_workflow_id()}"
+        finally:
+            context_manager.pop_workflow()
 
 
-class TestGeneratedWorkflowCode:
-    """Tests that generated workflow code uses push_workflow(file_path=__file__)."""
+class TestAdoptOrchestratorWorkflow:
+    PEER_ID = "00000000000000000000000000000abc"
+    LOCAL_ID = "00000000000000000000000000000def"
 
-    def test_generated_code_uses_file_path_not_workflow_name(self, engine: Engine) -> None:
-        """_generate_workflow_run_prerequisite_code emits push_workflow(file_path=__file__)."""
-        from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
-
-        workflow_manager = engine.workflow_manager
-        import_recorder = ImportRecorder()
-        code_blocks = workflow_manager._generate_workflow_run_prerequisite_code(
-            import_recorder=import_recorder,
-            library_names=[],
+    def test_a_stale_entry_kept_for_an_earlier_id_is_replaced_by_the_peers_id(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        workflow_file = tmp_path / "shared.py"
+        workflow_file.write_text("print('body')\n", encoding="utf-8")
+        engine.workflow_registry.register_file(
+            workflow_file, _metadata("shared"), workflow_id=self.LOCAL_ID, listed=False
         )
+        engine.context_manager.adopt_orchestrator_workflow(self.LOCAL_ID, "shared", str(workflow_file), None)
 
-        module = ast.Module(body=[n for n in code_blocks if isinstance(n, ast.stmt)], type_ignores=[])
-        ast.fix_missing_locations(module)
-        source = ast.unparse(module)
+        workflow = engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "shared", str(workflow_file), None)
 
-        assert "push_workflow(file_path=__file__)" in source
-        assert "workflow_name=" not in source
-        assert "workflow_name=" not in source
+        assert workflow is engine.worker_workflows.find(self.PEER_ID)
+        assert engine.worker_workflows.find(self.LOCAL_ID) is None
+        assert engine.workflow_registry.find_by_id(self.LOCAL_ID) is None
+        assert engine.workflow_registry.find_by_path(workflow_file) is engine.workflow_registry.get(self.PEER_ID)
+
+    def test_a_stale_runtime_with_a_node_running_refuses_the_peers_id_and_stays(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """A run from before the peer restarted keeps its runtime and entry; the new id waits for it to end."""
+        workflow_file = tmp_path / "shared.py"
+        workflow_file.write_text("print('body')\n", encoding="utf-8")
+        engine.workflow_registry.register_file(
+            workflow_file, _metadata("shared"), workflow_id=self.LOCAL_ID, listed=False
+        )
+        stale = engine.context_manager.adopt_orchestrator_workflow(self.LOCAL_ID, "shared", str(workflow_file), None)
+
+        with engine.run_in_worker_workflow(stale):
+            with pytest.raises(ContextManager.OrchestratorWorkflowError, match="still running on this worker"):
+                engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "shared", str(workflow_file), None)
+
+            assert engine.worker_workflows.find(self.LOCAL_ID) is stale
+            assert engine.workflow_registry.find_by_path(workflow_file) is engine.workflow_registry.get(self.LOCAL_ID)
+            assert engine.worker_workflows.find(self.PEER_ID) is None
+            assert engine.workflow_registry.find_by_id(self.PEER_ID) is None
+
+        workflow = engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "shared", str(workflow_file), None)
+
+        assert workflow is engine.worker_workflows.find(self.PEER_ID)
+        assert engine.worker_workflows.find(self.LOCAL_ID) is None
+        assert engine.workflow_registry.find_by_id(self.LOCAL_ID) is None
+        assert engine.workflow_registry.find_by_path(workflow_file) is engine.workflow_registry.get(self.PEER_ID)
+
+    def test_a_stale_listed_entry_stays_listed_under_the_peers_id(self, engine: Engine, tmp_path: Path) -> None:
+        """Closing the stale runtime keeps a listed entry, which then moves to the peer's id."""
+        workflow_file = tmp_path / "shared.py"
+        workflow_file.write_text("print('body')\n", encoding="utf-8")
+        engine.workflow_registry.register_file(workflow_file, _metadata("shared"), workflow_id=self.LOCAL_ID)
+        engine.context_manager.adopt_orchestrator_workflow(self.LOCAL_ID, "shared", str(workflow_file), None)
+
+        try:
+            engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "shared", str(workflow_file), None)
+
+            assert engine.workflow_registry.find_by_id(self.LOCAL_ID) is None
+            assert engine.workflow_registry.get(self.PEER_ID).listed
+        finally:
+            engine.sweep_worker_workflows()
+            engine.workflow_registry.remove(self.PEER_ID)
+
+    def test_a_file_another_workflow_is_using_fails_with_that_reason(self, engine: Engine, tmp_path: Path) -> None:
+        holder_file = tmp_path / "taken.py"
+        holder_file.write_text("print('body')\n", encoding="utf-8")
+        peer_file = tmp_path / "taken.txt"
+        peer_file.write_text("print('body')\n", encoding="utf-8")
+        engine.workflow_registry.register_file(holder_file, _metadata("taken"), workflow_id=self.LOCAL_ID, listed=False)
+
+        try:
+            with pytest.raises(ContextManager.OrchestratorWorkflowError) as exc_info:
+                engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "taken", str(peer_file), None)
+        finally:
+            engine.workflow_registry.remove(self.LOCAL_ID)
+
+        assert "another workflow is already using that file" in str(exc_info.value)
+
+    def test_a_workflow_name_without_an_id_fails(self, engine: Engine) -> None:
+        """A peer older than workflow ids sends only a name; running in no workflow would lose its paths."""
+        engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, f"unsaved:{self.PEER_ID}", None, None)
+
+        with pytest.raises(ContextManager.OrchestratorWorkflowError) as exc_info:
+            engine.context_manager.adopt_orchestrator_workflow(None, "shots/sh010", None, None)
+
+        assert "different version" in str(exc_info.value)
+        assert engine.worker_workflows.holds(self.PEER_ID)
+
+    def test_no_workflow_fails(self, engine: Engine) -> None:
+        """The worker builds its copy of the node in the orchestrator's workflow, so it needs one."""
+        with pytest.raises(ContextManager.OrchestratorWorkflowError, match="no workflow was open"):
+            engine.context_manager.adopt_orchestrator_workflow(None, None, None, None)
+
+        assert engine.worker_workflows.all_kept() == []
 
 
 class TestEnsureWorkflowAndFlowRequest:
@@ -477,11 +731,13 @@ class TestEnsureWorkflowAndFlowRequest:
         assert not context_manager.has_current_flow()
 
         result = context_manager.on_ensure_workflow_and_flow_request(
-            EnsureWorkflowAndFlowRequest(workflow_name="my_workflow", flow_name="my_flow")
+            EnsureWorkflowAndFlowRequest(display_name="my_workflow", flow_name="my_flow")
         )
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess)
-        assert result.workflow_name == "my_workflow"
+        assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
+        assert result.workflow_id == context_manager.get_current_workflow_id()
+        assert context_manager.get_current_workflow().metadata.name == "my_workflow"
         assert result.flow_name == "my_flow"
         assert result.created_workflow is True
         assert result.created_flow is True
@@ -501,17 +757,16 @@ class TestEnsureWorkflowAndFlowRequest:
 
         # Bootstrap once.
         first = context_manager.on_ensure_workflow_and_flow_request(
-            EnsureWorkflowAndFlowRequest(workflow_name="scratch", flow_name="canvas")
+            EnsureWorkflowAndFlowRequest(display_name="scratch", flow_name="canvas")
         )
         assert isinstance(first, EnsureWorkflowAndFlowResultSuccess)
 
         # Calling again with different names should be a no-op: existing context wins.
-        second = context_manager.on_ensure_workflow_and_flow_request(
-            EnsureWorkflowAndFlowRequest(workflow_name="ignored", flow_name="also_ignored")
-        )
+        second = engine.handle_request(EnsureWorkflowAndFlowRequest(workflow_name="ignored", flow_name="also_ignored"))
 
         assert isinstance(second, EnsureWorkflowAndFlowResultSuccess)
-        assert second.workflow_name == "scratch"
+        assert second.workflow_name == first.workflow_name
+        assert second.workflow_id == first.workflow_id
         assert second.flow_name == "canvas"
         assert second.created_workflow is False
         assert second.created_flow is False
@@ -519,7 +774,6 @@ class TestEnsureWorkflowAndFlowRequest:
         self._cleanup(engine)
 
     def test_auto_generates_workflow_name_when_none_given(self, engine: Engine) -> None:
-        from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
         from griptape_nodes.retained_mode.events.context_events import (
             EnsureWorkflowAndFlowRequest,
             EnsureWorkflowAndFlowResultSuccess,
@@ -531,9 +785,420 @@ class TestEnsureWorkflowAndFlowRequest:
         result = context_manager.on_ensure_workflow_and_flow_request(EnsureWorkflowAndFlowRequest())
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess)
-        assert result.workflow_name.startswith(WorkflowRegistry.UNSAVED_KEY_PREFIX)
-        assert WorkflowRegistry.has_workflow_with_name(result.workflow_name)
+        assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
+        assert engine.workflow_registry.has_workflow_with_name(result.workflow_name)
         assert result.created_workflow is True
         assert result.created_flow is True
 
         self._cleanup(engine)
+
+
+def _scan_into(engine: Engine, workspace: Path) -> None:
+    """Point `engine` at `workspace` and register the workflows in it, as an engine process does at start."""
+    engine.config_manager.workspace_path = workspace
+    with engine_scope(engine):
+        asyncio.run(engine.workflow_manager.refresh_workflow_registry(workflows_to_register=[str(workspace)]))
+
+
+_RECORDING_LIBRARY_NAME = "workflow-context-recording-library"
+
+
+class _RecordsWorkflowContextNode(DataNode):
+    """Outputs the workflow context it ran in."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        for output_name in ("workflow_id", "file_path"):
+            self.add_parameter(
+                Parameter(name=output_name, type="str", tooltip="", allowed_modes={ParameterMode.OUTPUT})
+            )
+
+    def process(self) -> None:
+        context_manager = current_engine().context_manager
+        self.parameter_output_values["workflow_id"] = context_manager.get_current_workflow_id()
+        self.parameter_output_values["file_path"] = _file_path(context_manager)
+
+
+@contextmanager
+def _recording_library() -> Iterator[None]:
+    """Register `_RecordsWorkflowContextNode` in a library. LibraryRegistry is process-global, so it is cleared around it."""
+    LibraryRegistry._clear()
+    schema = LibrarySchema(
+        name=_RECORDING_LIBRARY_NAME,
+        library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+        metadata=LibraryMetadata(
+            author="test",
+            description="Workflow context fixtures",
+            library_version="1.0.0",
+            engine_version="1.0.0",
+            tags=[],
+        ),
+        categories=[],
+        nodes=[],
+    )
+    library = LibraryRegistry.generate_new_library(library_data=schema)
+    library.register_new_node_type(
+        _RecordsWorkflowContextNode,
+        NodeMetadata(category="test", description="", display_name=_RecordsWorkflowContextNode.__name__),
+    )
+    try:
+        yield
+    finally:
+        LibraryRegistry._clear()
+
+
+class TestRunningANodeForAnotherEngineProcess:
+    """An orchestrator and a worker are separate engines: each gives the files it scans ids of its own."""
+
+    def test_the_worker_takes_the_orchestrators_id_for_the_file_and_runs_the_node_in_it(self, tmp_path: Path) -> None:
+        workspace = tmp_path.resolve() / "workspace"
+        workflow_file = workspace / "shot.py"
+        workflow_file.parent.mkdir()
+        workflow_file.write_text(
+            "# /// script\n"
+            "# [tool.griptape-nodes]\n"
+            '# name = "Shot"\n'
+            f'# schema_version = "{WorkflowMetadata.LATEST_SCHEMA_VERSION}"\n'
+            '# engine_version_created_with = "0.0.0"\n'
+            "# node_libraries_referenced = []\n"
+            "# ///\n",
+            encoding="utf-8",
+        )
+        orchestrator = Engine()
+        worker = Engine()
+        _scan_into(orchestrator, workspace)
+        _scan_into(worker, workspace)
+        orchestrator_entry = orchestrator.workflow_registry.find_by_path(workflow_file)
+        worker_entry = worker.workflow_registry.find_by_path(workflow_file)
+        assert orchestrator_entry is not None
+        assert worker_entry is not None
+        assert worker_entry.workflow_id != orchestrator_entry.workflow_id
+
+        request = ExecuteNodeRequest(
+            node_name="node",
+            node_metadata={"node_type": _RecordsWorkflowContextNode.__name__, "library": _RECORDING_LIBRARY_NAME},
+            orchestrator_workflow_id=orchestrator_entry.workflow_id,
+            workflow_name=orchestrator_entry.name,
+            workflow_file_path=str(workflow_file),
+        )
+
+        with (
+            _recording_library(),
+            engine_scope(worker),
+            patch.object(worker.library_manager, "_is_worker", new=True),
+        ):
+            result = asyncio.run(worker.node_manager.on_execute_node_request(request))
+
+        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
+        assert result.parameter_output_values == {
+            "workflow_id": orchestrator_entry.workflow_id,
+            "file_path": str(workflow_file),
+        }
+        rekeyed = worker.workflow_registry.find_by_path(workflow_file)
+        assert rekeyed is worker.workflow_registry.get(orchestrator_entry.workflow_id)
+        assert rekeyed is not None
+        assert rekeyed.listed
+        assert worker.workflow_registry.find_by_id(worker_entry.workflow_id) is None
+        # The orchestrator's registry is its own: nothing the worker did reached it.
+        assert orchestrator.workflow_registry.find_by_path(workflow_file) is orchestrator_entry
+
+    def test_a_rescan_on_the_worker_keeps_the_entry_of_the_workflow_it_keeps_a_runtime_for(
+        self, tmp_path: Path
+    ) -> None:
+        """The scan does not find a file outside the workspace, but the worker still runs that workflow's nodes."""
+        workspace = tmp_path.resolve() / "workspace"
+        workspace.mkdir()
+        workflow_file = tmp_path.resolve() / "elsewhere" / "shot.py"
+        workflow_file.parent.mkdir()
+        workflow_file.write_text("print('body')\n", encoding="utf-8")
+        worker = Engine()
+        worker.context_manager.adopt_orchestrator_workflow("orchestrator-id", "shot", str(workflow_file), None)
+
+        _scan_into(worker, workspace)
+
+        assert worker.workflow_registry.is_open("orchestrator-id")
+        assert worker.workflow_registry.find_by_path(workflow_file) is worker.workflow_registry.get("orchestrator-id")
+
+
+WAIT_SECONDS = 5
+
+
+class FlowStackFixtures:
+    """Fixtures that build ParentFlow with two children, FA and FB, and ParentFlow as the shared current flow."""
+
+    @pytest.fixture
+    def flows(self, engine: Engine) -> Generator[dict[str, ControlFlow]]:
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.context_manager.push_workflow("flow_stack_wf")
+        result = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="ParentFlow", set_as_new_context=True)
+        )
+        assert isinstance(result, CreateFlowResultSuccess)
+        for name in ("FA", "FB"):
+            child = engine.handle_request(
+                CreateFlowRequest(parent_flow_name="ParentFlow", flow_name=name, set_as_new_context=False)
+            )
+            assert isinstance(child, CreateFlowResultSuccess)
+        created: dict[str, ControlFlow] = {}
+        for name in ("ParentFlow", "FA", "FB"):
+            flow = engine.current_workflow().objects.get_as_type(name, ControlFlow)
+            assert flow is not None
+            created[name] = flow
+        yield created
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    def shared_stack_names(self, engine: Engine) -> list[str]:
+        workflow_stack = engine.context_manager._current_context()
+        return [flow_state._flow.name for flow_state in workflow_stack._flow_stack]
+
+
+class TestTaskLocalFlowStack(FlowStackFixtures):
+    """Tests for ContextManager.task_local_flow_stack."""
+
+    def test_snapshot_keeps_the_existing_flows_visible(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:
+        with engine.current_workflow().context.task_local_flow_stack():
+            assert engine.context_manager.get_current_flow() is flows["ParentFlow"]
+
+    def test_pushes_and_pops_leave_the_shared_stack_untouched(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        before = self.shared_stack_names(engine)
+
+        with engine.current_workflow().context.task_local_flow_stack():
+            context_manager.push_flow(flows["FA"])
+            assert context_manager.get_current_flow() is flows["FA"]
+            assert self.shared_stack_names(engine) == before
+            assert context_manager.pop_flow() is flows["FA"]
+            assert context_manager.pop_flow() is flows["ParentFlow"]
+            assert not context_manager.has_current_flow()
+            with pytest.raises(context_manager.EmptyStackError):
+                context_manager.pop_flow()
+
+        assert self.shared_stack_names(engine) == before
+        assert context_manager.get_current_flow() is flows["ParentFlow"]
+
+    def test_task_local_stack_is_invisible_outside_the_block(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+
+        with engine.current_workflow().context.task_local_flow_stack():
+            context_manager.push_flow(flows["FA"])
+
+        assert context_manager.get_current_flow() is flows["ParentFlow"]
+
+    def test_node_stacks_are_not_shared_with_the_shared_stack(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        node = Mock(spec=BaseNode)
+        node.name = "SomeNode"
+
+        with engine.current_workflow().context.task_local_flow_stack():
+            context_manager.push_node(node)
+            assert context_manager.has_current_node()
+
+        assert not context_manager.has_current_node()
+        assert flows["ParentFlow"] is context_manager.get_current_flow()
+
+    def test_nodes_and_elements_push_and_pop_inside_the_block(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        node = Mock(spec=BaseNode)
+        node.name = "SomeNode"
+        element = Mock(spec=BaseNodeElement)
+
+        with engine.current_workflow().context.task_local_flow_stack():
+            assert context_manager.get_current_flow() is flows["ParentFlow"]
+            assert not context_manager.has_current_node()
+            context_manager.push_node(node)
+            assert not context_manager.has_current_element()
+            context_manager.push_element(element)
+
+            assert context_manager.has_current_node()
+            assert context_manager.has_current_element()
+            assert context_manager.get_current_node() is node
+            assert context_manager.get_current_element() is element
+            assert context_manager.pop_element() is element
+            assert not context_manager.has_current_element()
+            assert context_manager.pop_node() is node
+            assert not context_manager.has_current_node()
+
+        shared_flow_state = engine.context_manager._current_context()._flow_stack[-1]
+        assert shared_flow_state._node_stack == []
+
+    def test_snapshot_copies_node_and_element_stacks(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:
+        context_manager = engine.context_manager
+        node = Mock(spec=BaseNode)
+        node.name = "SharedNode"
+        element = Mock(spec=BaseNodeElement)
+        extra_element = Mock(spec=BaseNodeElement)
+        extra_node = Mock(spec=BaseNode)
+        extra_node.name = "ExtraNode"
+        context_manager.push_node(node)
+        context_manager.push_element(element)
+
+        with engine.current_workflow().context.task_local_flow_stack():
+            assert context_manager.get_current_flow() is flows["ParentFlow"]
+            assert context_manager.get_current_node() is node
+            assert context_manager.get_current_element() is element
+            context_manager.push_element(extra_element)
+            context_manager.push_node(extra_node)
+            assert context_manager.get_current_node() is extra_node
+
+        assert context_manager.get_current_node() is node
+        assert context_manager.get_current_element() is element
+        shared_flow_state = engine.context_manager._current_context()._flow_stack[-1]
+        assert len(shared_flow_state._node_stack) == 1
+        assert shared_flow_state._node_stack[0]._element_stack == [element]
+
+    def test_exiting_a_flow_context_restores_the_stack_it_entered_with(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        before = self.shared_stack_names(engine)
+
+        with engine.current_workflow().context.task_local_flow_stack():
+            with context_manager.flow(flows["FA"]):
+                # A bare push, as CreateFlowRequest(set_as_new_context=True) does.
+                context_manager.push_flow(flows["FB"])
+            assert context_manager.get_current_flow() is flows["ParentFlow"]
+            assert self.shared_stack_names(engine) == before
+
+    def test_flow_context_without_a_task_local_stack_pops_the_shared_stack(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+
+        with context_manager.flow(flows["FA"]):
+            assert self.shared_stack_names(engine) == ["ParentFlow", "FA"]
+
+        assert self.shared_stack_names(engine) == ["ParentFlow"]
+
+
+class TestConcurrentTaskLocalFlowStacks(FlowStackFixtures):
+    """Concurrent tasks with task-local flow stacks do not see each other's flows."""
+
+    @pytest.mark.asyncio
+    async def test_interleaved_tasks_each_keep_their_own_flow(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        before = self.shared_stack_names(engine)
+        entered = {"FA": asyncio.Event(), "FB": asyncio.Event()}
+        created = {"FA": asyncio.Event(), "FB": asyncio.Event()}
+        created_parents: dict[str, str | None] = {}
+
+        async def run_task(own: str, other: str) -> None:
+            with engine.current_workflow().context.task_local_flow_stack(), engine.context_manager.flow(flows[own]):
+                entered[own].set()
+                await asyncio.wait_for(entered[other].wait(), WAIT_SECONDS)
+                assert engine.context_manager.get_current_flow() is flows[own]
+
+                result = engine.handle_request(
+                    CreateFlowRequest(parent_flow_name=None, flow_name=f"{own}_child", set_as_new_context=False)
+                )
+                assert isinstance(result, CreateFlowResultSuccess)
+                created_parents[own] = engine.flow_manager.get_parent_flow_in(
+                    engine.current_workflow(), result.flow_name
+                )
+
+                created[own].set()
+                await asyncio.wait_for(created[other].wait(), WAIT_SECONDS)
+                assert engine.context_manager.get_current_flow() is flows[own]
+
+        await asyncio.gather(run_task("FA", "FB"), run_task("FB", "FA"))
+
+        assert created_parents == {"FA": "FA", "FB": "FB"}
+        assert self.shared_stack_names(engine) == before
+
+
+class TestFlowContext(FlowStackFixtures):
+    """Tests for ContextManager.FlowContext."""
+
+    def test_shared_exit_pops_only_the_top_flow(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:
+        context_manager = engine.context_manager
+
+        with context_manager.flow(flows["FA"]):
+            context_manager.push_flow(flows["FB"])
+
+        assert self.shared_stack_names(engine) == ["ParentFlow", "FA"]
+
+    def test_entering_without_a_workflow_names_the_flow(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:
+        context_manager = engine.context_manager
+        flow = flows["FA"]
+        context_manager.pop_workflow()
+
+        with pytest.raises(context_manager.NoActiveWorkflowError, match="'FA'"), context_manager.flow(flow):
+            pytest.fail("should not enter")
+
+
+class TestNestedAndSpawnedTaskLocalStacks(FlowStackFixtures):
+    """Task-local flow stacks nest, and a spawned task's pushes stay in its own context."""
+
+    def test_nested_task_local_stacks_restore_each_level(self, engine: Engine, flows: dict[str, ControlFlow]) -> None:
+        context_manager = engine.context_manager
+        before = self.shared_stack_names(engine)
+
+        with engine.current_workflow().context.task_local_flow_stack(), context_manager.flow(flows["FA"]):
+            with engine.current_workflow().context.task_local_flow_stack():
+                assert context_manager.get_current_flow() is flows["FA"]
+                with context_manager.flow(flows["FB"]):
+                    # A bare push, as CreateFlowRequest(set_as_new_context=True) does.
+                    context_manager.push_flow(flows["FA"])
+                    assert self.shared_stack_names(engine) == before
+                assert context_manager.get_current_flow() is flows["FA"]
+            assert context_manager.get_current_flow() is flows["FA"]
+            assert self.shared_stack_names(engine) == before
+
+        assert context_manager.get_current_flow() is flows["ParentFlow"]
+        assert self.shared_stack_names(engine) == before
+
+    def test_a_second_task_local_block_after_the_first_starts_clean(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+
+        for _ in range(2):
+            with engine.current_workflow().context.task_local_flow_stack():
+                assert context_manager.get_current_flow() is flows["ParentFlow"]
+                context_manager.push_flow(flows["FA"])
+
+        assert self.shared_stack_names(engine) == ["ParentFlow"]
+
+    def test_exception_in_the_block_still_resets_the_task_local_stack(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        before = self.shared_stack_names(engine)
+
+        def fail_inside_block() -> None:
+            with engine.current_workflow().context.task_local_flow_stack():
+                context_manager.push_flow(flows["FA"])
+                msg = "boom"
+                raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            fail_inside_block()
+
+        assert self.shared_stack_names(engine) == before
+
+    @pytest.mark.asyncio
+    async def test_spawned_task_push_does_not_reach_the_parent(
+        self, engine: Engine, flows: dict[str, ControlFlow]
+    ) -> None:
+        context_manager = engine.context_manager
+        before = self.shared_stack_names(engine)
+        seen_in_child: list[ControlFlow] = []
+
+        async def child() -> None:
+            context_manager.push_flow(flows["FB"])
+            seen_in_child.append(context_manager.get_current_flow())
+
+        with engine.current_workflow().context.task_local_flow_stack(), context_manager.flow(flows["FA"]):
+            await asyncio.create_task(child())
+            assert context_manager.get_current_flow() is flows["FA"]
+
+        assert seen_in_child == [flows["FB"]]
+        assert self.shared_stack_names(engine) == before

@@ -12,41 +12,67 @@ thing that should read it. Everything else receives its dependencies.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import semver
 
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
+from griptape_nodes.node_library.workflow_registry import _WorkflowRegistry
+from griptape_nodes.retained_mode.engine_lifecycle import EngineLifecycle
+from griptape_nodes.retained_mode.engine_transports import EngineNotFoundError
 from griptape_nodes.retained_mode.events.app_events import (
+    AppInitializationComplete,
     EngineHeartbeatRequest,
     EngineHeartbeatResultFailure,
     EngineHeartbeatResultSuccess,
     GetEngineVersionRequest,
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
+    OpenWorkflowInfo,
+    WorkflowClosedEvent,
+    WorkflowOpenedEvent,
 )
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     GriptapeNodeEvent,
     ResultPayloadFailure,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
-    CancelFlowRequest,
+    CancelAllRunsRequest,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.binding import (
+    NO_WORKFLOW,
+    NoWorkflow,
+    WorkflowNotNamedError,
+    WorkflowNotOpenError,
+    bound_workflow,
+)
+from griptape_nodes.retained_mode.runtime.open_workflow_set import (
+    NoOpenWorkflowError,
+    OpenWorkflowError,
+    OpenWorkflowSet,
+)
+from griptape_nodes.retained_mode.runtime.read_observer import observe_read_without_workflow
+from griptape_nodes.retained_mode.runtime.worker_workflow_set import WorkerWorkflowSet
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
+    from griptape_nodes.retained_mode.engine_transports import EngineTransports
     from griptape_nodes.retained_mode.events.base_events import (
         AppPayload,
         RequestPayload,
@@ -58,10 +84,12 @@ if TYPE_CHECKING:
         ArbitraryCodeExecManager,
     )
     from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+    from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+    from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
-    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
     from griptape_nodes.retained_mode.managers.manifest_manager import ManifestManager
@@ -91,6 +119,7 @@ if TYPE_CHECKING:
     )
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -111,6 +140,33 @@ _root_engine: Engine | None = None
 # the building thread reaches the guard in `current_engine` instead of deadlocking.
 _root_engine_lock = threading.RLock()
 _root_engine_building = False
+
+
+@dataclass(frozen=True)
+class WorkerProcess:
+    """What makes an engine a library's worker process. Set only by the worker's entry point.
+
+    Attributes:
+        engine_id: The ID the engine that started this worker minted for the spawn. Held in memory
+            only, and not an address: nothing reaches the worker by it.
+        read_secret: Reads a secret from that engine, which answers every secret the worker asks for.
+            The worker's own environment and `.env` files are never read.
+    """
+
+    engine_id: str
+    read_secret: Callable[[str], str | None]
+
+
+@dataclass
+class OpeningWorkflow:
+    """A workflow `Engine.opening_workflow` opened to build into, which clients hear of once it is built."""
+
+    workflow: WorkflowRuntime
+    abandoned: bool = False
+
+    def abandon(self) -> None:
+        """Close the workflow when the block ends, instead of telling clients it opened."""
+        self.abandoned = True
 
 
 class EngineScoped:
@@ -171,17 +227,30 @@ class Engine:
     _artifact_manager: ArtifactManager
     _provenance_manager: ProvenanceManager
     _manifest_manager: ManifestManager
+    _budget_manager: BudgetManager
+    _diagnostics_manager: DiagnosticsManager
     _worker_manager: WorkerManager
+    _lifecycle: EngineLifecycle
+    _workflow_registry: _WorkflowRegistry
+    _open_workflows: OpenWorkflowSet
+    _worker_workflows: WorkerWorkflowSet
 
-    def __init__(self) -> None:  # noqa: PLR0915
+    def __init__(self, *, worker: WorkerProcess | None = None) -> None:  # noqa: PLR0915
+        """Build an engine and its managers.
+
+        Args:
+            worker: Set only by a library's worker process. See `WorkerProcess`.
+        """
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
         from griptape_nodes.retained_mode.managers.agent_manager import AgentManager
         from griptape_nodes.retained_mode.managers.arbitrary_code_exec_manager import (
             ArbitraryCodeExecManager,
         )
         from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager
+        from griptape_nodes.retained_mode.managers.budget_manager import BudgetManager
         from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
         from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+        from griptape_nodes.retained_mode.managers.diagnostics_manager import DiagnosticsManager
         from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
         from griptape_nodes.retained_mode.managers.event_manager import EventManager
         from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
@@ -197,6 +266,7 @@ class Engine:
         from griptape_nodes.retained_mode.managers.os_manager import OSManager
         from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
         from griptape_nodes.retained_mode.managers.provenance_manager import ProvenanceManager
+        from griptape_nodes.retained_mode.managers.read_through_secrets_manager import ReadThroughSecretsManager
         from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
         from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
         from griptape_nodes.retained_mode.managers.session_manager import SessionManager
@@ -216,11 +286,27 @@ class Engine:
             WorkflowManager,
         )
 
+        # Workflow ids live only as long as this engine, so clients compare this to notice a
+        # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
+        self._engine_run_id = uuid.uuid4().hex
+        self._open_workflows = OpenWorkflowSet(self)
+        # Each open workflow still being built, which clients have not been told of, set once its
+        # build ends. See `opening_workflow`.
+        self._opening_workflows: dict[WorkflowRuntime, asyncio.Event] = {}
+        # Always empty on the orchestrator. See `run_in_worker_workflow`.
+        self._worker_workflows = WorkerWorkflowSet(self)
         self._event_manager = EventManager(engine=self)
         self._resource_manager = ResourceManager(self._event_manager, engine=self)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
+        # Before OSManager, which resolves the Griptape Cloud credential through it as it builds.
+        if worker is None:
+            self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
+        else:
+            self._secrets_manager = ReadThroughSecretsManager(
+                self._config_manager, self._event_manager, read_secret=worker.read_secret
+            )
         self._os_manager = OSManager(self._event_manager, engine=self)
-        self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
+        self._workflow_registry = _WorkflowRegistry(self._config_manager, is_workflow_open=self._holds_workflow)
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
         self._flow_manager = FlowManager(self._event_manager, engine=self)
@@ -238,8 +324,12 @@ class Engine:
         )
         self._agent_manager = AgentManager(self._static_files_manager, self._event_manager, engine=self)
         self._version_compatibility_manager = VersionCompatibilityManager(self._event_manager, engine=self)
-        self._engine_identity_manager = EngineIdentityManager(self._event_manager)
-        self._session_manager = SessionManager(self._engine_identity_manager, self._event_manager)
+        self._engine_identity_manager = EngineIdentityManager(
+            self._event_manager, worker_engine_id=worker.engine_id if worker else None
+        )
+        self._session_manager = SessionManager(
+            self._engine_identity_manager, self._event_manager, worker=worker is not None
+        )
         self._mcp_manager = MCPManager(self._event_manager, self._config_manager)
         self._sync_manager = SyncManager(self._event_manager, self._config_manager, engine=self)
         self._user_manager = UserManager(self._secrets_manager)
@@ -249,10 +339,17 @@ class Engine:
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
         self._provenance_manager = ProvenanceManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
+        self._budget_manager = BudgetManager(self._event_manager, engine=self)
+        self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
+        # Attached by the app; None while this engine cannot reach other engines.
+        self._engine_transports: EngineTransports | None = None
+        self._lifecycle = EngineLifecycle(self)
+        self._event_manager.add_listener_to_app_event(
+            AppInitializationComplete, self._lifecycle.on_app_initialization_complete
+        )
 
         # Assign handlers now that these are created.
-        self._event_manager.assign_manager_to_request_type(GetEngineVersionRequest, self.handle_engine_version_request)
-        self._event_manager.assign_manager_to_request_type(EngineHeartbeatRequest, self.handle_engine_heartbeat_request)
+        self._event_manager.register_request_handlers(self)
 
     @property
     def event_manager(self) -> EventManager:
@@ -367,8 +464,37 @@ class Engine:
         return self._manifest_manager
 
     @property
+    def budget_manager(self) -> BudgetManager:
+        return self._budget_manager
+
+    @property
+    def diagnostics_manager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
+
+    @property
     def worker_manager(self) -> WorkerManager:
         return self._worker_manager
+
+    @property
+    def lifecycle(self) -> EngineLifecycle:
+        return self._lifecycle
+
+    @property
+    def workflow_registry(self) -> _WorkflowRegistry:
+        return self._workflow_registry
+
+    @property
+    def open_workflows(self) -> OpenWorkflowSet:
+        return self._open_workflows
+
+    @property
+    def worker_workflows(self) -> WorkerWorkflowSet:
+        return self._worker_workflows
+
+    @property
+    def engine_run_id(self) -> str:
+        """Id minted when this engine started, never saved. A new one means workflow ids from before name nothing."""
+        return self._engine_run_id
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
     # PascalCase accessors on the result. `GriptapeNodes()` hands back an `Engine`, so
@@ -456,6 +582,12 @@ class Engine:
     def ManifestManager(self) -> ManifestManager:
         return self._manifest_manager
 
+    def BudgetManager(self) -> BudgetManager:
+        return self._budget_manager
+
+    def DiagnosticsManager(self) -> DiagnosticsManager:
+        return self._diagnostics_manager
+
     def WorkerManager(self) -> WorkerManager:
         return self._worker_manager
 
@@ -473,12 +605,13 @@ class Engine:
             if request.broadcast_result and not event_mgr.should_suppress_event(result_event):
                 event_mgr.put_event(GriptapeNodeEvent(wrapped_event=result_event))
         except Exception as e:
+            # Log the type and ID, never the request itself: its repr includes every field, and a
+            # SetSecretValueRequest carries the secret value. The traceback says what failed.
             logger.exception(
-                "Unhandled exception while processing request of type %s. "
-                "Consider saving your work and restarting the engine if issues persist."
-                "Request: %s",
+                "Unhandled exception while processing request of type %s (request_id: %s). "
+                "Consider saving your work and restarting the engine if issues persist.",
                 type(request).__name__,
-                request,
+                request.request_id,
             )
             return ResultPayloadFailure(
                 exception=e, result_details=f"Unhandled exception while processing {type(request).__name__}: {e}"
@@ -486,26 +619,30 @@ class Engine:
         else:
             return result_event.result
 
-    async def ahandle_request(self, request: RequestPayload) -> ResultPayload:
+    async def ahandle_request(
+        self, request: RequestPayload, *, result_context: ResultContext | None = None
+    ) -> ResultPayload:
         """Asynchronous request handler.
 
         Args:
             request: The request payload to handle.
+            result_context: The request envelope's fields, such as the `open_workflow_id` it runs
+                in (see `EventManager.ahandle_request`).
         """
         event_mgr = self._event_manager
 
         try:
-            result_event = await event_mgr.ahandle_request(request=request)
+            result_event = await event_mgr.ahandle_request(request=request, result_context=result_context)
             # Only queue result event if broadcasting is enabled and not suppressed
             if request.broadcast_result and not event_mgr.should_suppress_event(result_event):
                 await event_mgr.aput_event(GriptapeNodeEvent(wrapped_event=result_event))
         except Exception as e:
+            # Same as handle_request: the request's repr can include a secret value.
             logger.exception(
-                "Unhandled exception while processing async request of type %s. "
-                "Consider saving your work and restarting the engine if issues persist."
-                "Request: %s",
+                "Unhandled exception while processing async request of type %s (request_id: %s). "
+                "Consider saving your work and restarting the engine if issues persist.",
                 type(request).__name__,
-                request,
+                request.request_id,
             )
             return ResultPayloadFailure(
                 exception=e, result_details=f"Unhandled exception while processing async {type(request).__name__}: {e}"
@@ -525,63 +662,405 @@ class Engine:
     def get_engine_id(self) -> str | None:
         return self._engine_identity_manager.active_engine_id
 
-    def clear_current_workflow_data(self) -> None:  # noqa: C901
-        """Tear down the active workflow: cancel running flows, delete its orphan flows, then pop it.
+    @property
+    def can_reach_other_engines(self) -> bool:
+        """Whether the app gave this engine a way to reach other engines."""
+        return self._engine_transports is not None
 
-        Requires an active workflow on the ContextManager stack. Order matters:
-        `on_delete_flow_request` pushes a flow context via `ContextManager().flow(...)`,
-        which raises `NoActiveWorkflowError` if the workflow has already been popped.
-        So we delete flows first and pop the workflow last.
+    def attach_engine_transports(self, engine_transports: EngineTransports) -> None:
+        """Give this engine the app's transport to other engines. The app attaches it at startup."""
+        self._engine_transports = engine_transports
+        engine_transports.on_engine_lost(self._on_engine_lost)
+
+    async def request(
+        self,
+        engine_id: str,
+        request: RequestPayload,
+        *,
+        timeout_s: float | None,
+        open_workflow_id: str | None = None,
+        origin_engine_id: str | None = None,
+    ) -> ResultPayload:
+        """Send `request` to the engine `engine_id`, wherever it runs, and return its result.
+
+        The app finds that engine and chooses how to reach it. `open_workflow_id` and
+        `origin_engine_id` go on the request's envelope (see `EngineTransports.request`).
+
+        Raises:
+            EngineNotFoundError: The engine cannot be reached, did not answer within `timeout_s`,
+                or this engine has no way to reach other engines.
         """
-        context_manager = self._context_manager
-        if not context_manager.has_current_workflow():
+        if self._engine_transports is None:
+            msg = f"Attempted to reach engine {engine_id}. Failed because this engine has no connections to other engines."
+            raise EngineNotFoundError(msg)
+        return await self._engine_transports.request(
+            engine_id,
+            request,
+            timeout_s=timeout_s,
+            open_workflow_id=open_workflow_id,
+            origin_engine_id=origin_engine_id,
+        )
+
+    @contextmanager
+    def bind_workflow(self, workflow: WorkflowRuntime | NoWorkflow) -> Iterator[None]:
+        """Act on `workflow`, or on no workflow, for the duration of the block and in tasks it spawns."""
+        token = bound_workflow.set(workflow)
+        try:
+            yield
+        finally:
+            bound_workflow.reset(token)
+
+    @contextmanager
+    def run_in_worker_workflow(self, workflow: WorkflowRuntime) -> Iterator[None]:
+        """Run a worker's node in the runtime it keeps for the node's orchestrator workflow.
+
+        Binds `workflow` for the block, so the node's context, paths and imports resolve against the
+        workflow the orchestrator has open, and keeps `sweep_worker_workflows` from closing it while
+        the node runs.
+        """
+        with self._worker_workflows.running(workflow), self.bind_workflow(workflow):
+            yield
+
+    def close_worker_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Forget a runtime this worker kept for an orchestrator workflow, and the registry entry made for it.
+
+        Only an unlisted entry was made for it; a listed one came from this engine's scan and stays.
+        Does nothing for a runtime already forgotten.
+        """
+        if not self._worker_workflows.close(workflow):
+            return
+        entry = self._workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None and not entry.listed:
+            self._workflow_registry.remove(workflow.workflow_id)
+
+    def sweep_worker_workflows(self, workflow_id: str | None = None) -> int:
+        """Close the runtimes this worker keeps that no node is running in, and return how many.
+
+        For when the orchestrator tears a workflow down: only the runtime kept for `workflow_id`,
+        or, when it names none, every idle runtime. A node still running keeps its runtime until a
+        later sweep.
+        """
+        idle = self._worker_workflows.idle()
+        if workflow_id is not None:
+            idle = [workflow for workflow in idle if workflow.workflow_id == workflow_id]
+        for workflow in idle:
+            self.close_worker_workflow(workflow)
+        return len(idle)
+
+    def current_workflow(self) -> WorkflowRuntime:
+        """The open workflow the current work acts on, for writes and runs that need one.
+
+        The workflow the current work is bound to, else the engine's only open workflow.
+
+        Raises:
+            NoOpenWorkflowError: The work is bound to no workflow, or is unbound and none is open.
+            WorkflowNotOpenError: The work is bound to a workflow that has closed.
+            WorkflowNotNamedError: The work is unbound and several workflows are open.
+        """
+        workflow = self.current_workflow_or_none()
+        if workflow is None:
+            msg = "Attempted to change the open workflow. Failed because no workflow is open. Open or create a workflow first."
+            raise NoOpenWorkflowError(msg)
+        return workflow
+
+    def current_workflow_or_none(self) -> WorkflowRuntime | None:
+        """Like `current_workflow`, but None when there is none, for reads that find nothing without one.
+
+        A worker opens no workflow, so unbound work there finds none: its node work is bound to the
+        runtime it keeps for the node's workflow (`run_in_worker_workflow`).
+
+        Raises:
+            WorkflowNotOpenError: The work is bound to a workflow that has closed.
+            WorkflowNotNamedError: The work is unbound and several workflows are open.
+        """
+        bound = bound_workflow.get()
+        if bound is NO_WORKFLOW:
+            observe_read_without_workflow(self, "read the current workflow")
+            return None
+        if bound is not None and bound.closed:
+            msg = (
+                f"Attempted to act on workflow '{bound.workflow_id}'. Failed because the workflow was closed. "
+                "Reopen the workflow and try again."
+            )
+            raise WorkflowNotOpenError(msg)
+        if bound is not None:
+            return bound
+
+        open_workflows = self._open_workflows.all_open()
+        if len(open_workflows) > 1:
+            msg = (
+                f"Attempted to find the workflow to act on. Failed because {len(open_workflows)} workflows are "
+                "open and the request did not name one."
+            )
+            raise WorkflowNotNamedError(msg)
+        if not open_workflows:
+            return None
+        return open_workflows[0]
+
+    def bound_live_workflow_or_none(self) -> WorkflowRuntime | None:
+        """The workflow the current work is bound to, while it is still open here or kept by this worker.
+
+        Unlike `current_workflow_or_none`, it never falls back to the only open workflow, so it never
+        raises however many are open. A binding to a workflow closed since it was made finds none.
+        """
+        bound = bound_workflow.get()
+        if bound is None or bound is NO_WORKFLOW:
+            return None
+        if self._open_workflows.is_open(bound.workflow_id) and self._open_workflows.get(bound.workflow_id) is bound:
+            return bound
+        if self._worker_workflows.find(bound.workflow_id) is bound:
+            return bound
+        return None
+
+    def open_workflow(self, workflow_id: str) -> WorkflowRuntime:
+        """Open the registered workflow with this id, tell every client, and return its empty runtime.
+
+        To build into the workflow before clients hear of it, open it with `opening_workflow`.
+
+        Raises:
+            OpenWorkflowError: That workflow, or another one, is already open.
+        """
+        with self.opening_workflow(workflow_id) as opening:
+            pass
+        return opening.workflow
+
+    @contextmanager
+    def opening_workflow(self, workflow_id: str) -> Iterator[OpeningWorkflow]:
+        """Open the registered workflow with this id to build into, telling every client once the block ends.
+
+        Every open goes through here, and every close through `_tear_down_workflow`, so clients hear of
+        each workflow with one `WorkflowOpenedEvent` and one `WorkflowClosedEvent`. Clients hear of
+        the workflow once the block ends, so none reads it half built. A block that raises, or calls
+        `OpeningWorkflow.abandon`, closes the workflow again, and clients never hear of it. If that
+        close fails, the workflow stays open as it is, and clients are told of it. Until the block
+        ends, another open of the workflow waits for its build with `wait_for_opening`.
+
+        Raises:
+            OpenWorkflowError: That workflow, or another one, is already open.
+        """
+        opening = OpeningWorkflow(workflow=self._open_workflows.open(workflow_id))
+        self._opening_workflows[opening.workflow] = asyncio.Event()
+        try:
+            yield opening
+        except BaseException:
+            self._finish_opening(opening.workflow, keep=False)
+            raise
+        self._finish_opening(opening.workflow, keep=not opening.abandoned)
+
+    def is_opening(self, workflow: WorkflowRuntime) -> bool:
+        """Whether an `opening_workflow` block is still building `workflow`."""
+        return workflow in self._opening_workflows
+
+    async def wait_for_opening(self, workflow: WorkflowRuntime) -> None:
+        """Wait until the `opening_workflow` block building `workflow` ends, if one is under way."""
+        build_ended = self._opening_workflows.get(workflow)
+        if build_ended is not None:
+            await build_ended.wait()
+
+    def open_workflow_infos(self) -> list[OpenWorkflowInfo]:
+        """What clients are told of every open workflow, in the order they were opened.
+
+        Leaves out a workflow still building, which clients hear of once its build ends.
+        """
+        return [
+            self.open_workflow_info(workflow)
+            for workflow in self._open_workflows.all_open()
+            if not self.is_opening(workflow)
+        ]
+
+    def open_workflow_info(self, workflow: WorkflowRuntime) -> OpenWorkflowInfo:
+        """What clients are told of an open workflow."""
+        entry = self.workflow_registry.get(workflow.workflow_id)
+        file_path = None
+        if entry.absolute_path is not None:
+            file_path = str(entry.absolute_path)
+        # Every client shows `display_name`, so a workflow with no name gets one here, not in each client.
+        display_name = (entry.metadata.name or "").strip()
+        if not display_name and entry.absolute_path is not None:
+            display_name = entry.absolute_path.stem
+        if not display_name:
+            display_name = "Untitled"
+        return OpenWorkflowInfo(
+            workflow_id=workflow.workflow_id,
+            name=entry.name,
+            display_name=display_name,
+            workflow_file_path=file_path,
+            is_saved=file_path is not None,
+            has_active_flow=workflow.context.has_current_flow(),
+        )
+
+    def close_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Close an open workflow, tearing down everything it holds, here and in the workers.
+
+        Cancels its run and resets its run state, deletes its flows (and with them their nodes)
+        through the normal delete path, then forgets its runtime, which takes its context stack and
+        queued UI changes with it, forgets an unsaved workflow's registry entry, and releases the
+        held objects this process kept for it. The workers hold their own: this is sync, so telling
+        them is scheduled on the engine loop
+        (`WorkerManager.schedule_local_object_teardown`). `aclose_workflow` awaits it instead.
+
+        The flows are deleted while the workflow is still open, because deleting one enters its
+        context. A teardown that raises leaves the workflow open, rather than dropping live nodes
+        without deleting them. The workers are told either way, as nothing retries the close.
+
+        Raises:
+            OpenWorkflowError: That runtime is not open, or its teardown failed.
+        """
+        self._raise_if_not_open(workflow)
+        try:
+            self._tear_down_workflow(workflow)
+        finally:
+            self._worker_manager.schedule_local_object_teardown(workflow.workflow_id)
+
+    async def aclose_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Close an open workflow like `close_workflow`, awaiting its run's cancel and the workers' release.
+
+        Raises:
+            OpenWorkflowError: That runtime is not open, or its teardown failed.
+        """
+        self._raise_if_not_open(workflow)
+        try:
+            await self._cancel_workflow_runs(workflow)
+            self._tear_down_workflow(workflow)
+        finally:
+            await self._worker_manager.broadcast_local_object_teardown(workflow.workflow_id)
+
+    async def aclose_all_workflows(self) -> None:
+        """Close every open workflow, release the held objects kept for no workflow, and tell the workers to release everything.
+
+        Raises:
+            OpenWorkflowError: A workflow's teardown failed. It and the ones after it stay open.
+        """
+        try:
+            for workflow in self._open_workflows.all_open():
+                await self._cancel_workflow_runs(workflow)
+                self._tear_down_workflow(workflow)
+            dropped = self._resource_manager.drop_all_local_objects()
+            if dropped:
+                logger.debug("Released %d held object(s) kept for no workflow while closing every workflow.", dropped)
+        finally:
+            await self._worker_manager.broadcast_local_object_teardown(None)
+
+    def clear_current_workflow_data(self) -> None:
+        """Close the current workflow (see `close_workflow`).
+
+        Raises:
+            RuntimeError: No workflow is current.
+        """
+        workflow = self.current_workflow_or_none()
+        if workflow is None:
             msg = "Cannot clear current workflow data without an active workflow context."
             raise RuntimeError(msg)
+        self.close_workflow(workflow)
 
-        # Cancel any running flow so the delete path doesn't race with execution.
-        flow_manager = self._flow_manager
-        for flow_name in self._object_manager.get_filtered_subset(type=ControlFlow):
-            if flow_manager.check_for_existing_running_flow():
-                self.handle_request(CancelFlowRequest(flow_name=flow_name))
+    def _raise_if_not_open(self, workflow: WorkflowRuntime) -> None:
+        if self._open_workflows.get(workflow.workflow_id) is not workflow:
+            msg = f"Attempted to close workflow '{workflow.workflow_id}'. Failed because it is not open."
+            raise OpenWorkflowError(msg)
 
-        # Delete all orphan (top-level) flows. We can't rely on
-        # `ListFlowsInCurrentContextRequest` here because the caller may only have a
-        # workflow on the context stack (no child flow), and that request requires a
-        # current flow. Instead, repeatedly find a flow with no parent and delete it;
-        # `on_delete_flow_request` cascades into its children and nodes.
-        more_flows = True
-        while more_flows:
-            flows = self._object_manager.get_filtered_subset(type=ControlFlow)
-            found_orphan = False
-            for flow_name in flows:
-                parent = flow_manager.get_parent_flow(flow_name)
-                if not parent:
-                    self.handle_request(DeleteFlowRequest(flow_name=flow_name))
-                    found_orphan = True
-                    break
-            if not flows or not found_orphan:
-                more_flows = False
+    async def _cancel_workflow_runs(self, workflow: WorkflowRuntime) -> None:
+        """Turn away `workflow`'s waiting runs and cancel its run in progress, awaiting its nodes.
 
-        # Drain this workflow's context substack before popping the workflow itself.
-        while context_manager.has_current_flow():
-            while context_manager.has_current_node():
-                while context_manager.has_current_element():
-                    context_manager.pop_element()
-                context_manager.pop_node()
-            context_manager.pop_flow()
-        context_manager.pop_workflow()
+        Best-effort: a node that refuses to cancel must not block the teardown. A driver still
+        parked holds its machine until it wakes and abandons the run; harmless, because the
+        teardown drops the machine it holds.
+        """
+        # Bound while nodes cancel, since their own cancellation code reads the bound workflow.
+        with self.bind_workflow(workflow):
+            try:
+                await self._flow_manager.cancel_all_runs_in(workflow)
+            except Exception as e:
+                # Cancelling the run in progress awaits its nodes' own cancellation, which can raise anything.
+                logger.warning("Could not cancel the running workflow before closing it. Continuing anyway: %s", e)
 
-        # Every key referring to a held object lived on a node just deleted, so each entry would hold
-        # what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
-        #
-        # Here rather than in the clear-all-object-state handler because this is the chokepoint every
-        # teardown shares: deleting the open workflow reaches this without going through that handler.
-        # This covers only the objects in this process; ObjectManager and WorkflowManager tell the
-        # workers about theirs.
-        dropped = self._resource_manager.drop_all_local_objects()
+    def _tear_down_workflow(self, workflow: WorkflowRuntime) -> None:
+        """Stop `workflow`'s run, delete its flows, close it, and release the held objects kept for it.
+
+        Raises:
+            OpenWorkflowError: A flow could not be deleted, or objects remained after its flows were.
+                The workflow stays open.
+        """
+        with self.bind_workflow(workflow):
+            # Runs still waiting or going (a sync close, or an async cancel that failed) are cancelled
+            # here, the waiting ones first so none starts against the flows being deleted. The reset
+            # after it drops the run's bookkeeping, so it must not run ahead of the cancel: the flow
+            # would look idle and the cancel would be skipped.
+            self.handle_request(CancelAllRunsRequest())
+            self._flow_manager.reset_global_execution_state()
+            self._delete_workflow_flows(workflow)
+        if len(workflow.objects) > 0:
+            msg = (
+                f"Attempted to close workflow '{workflow.workflow_id}'. Failed because {len(workflow.objects)} "
+                "object(s) remained after its flows were deleted."
+            )
+            raise OpenWorkflowError(msg)
+        self._open_workflows.close(workflow)
+        if workflow not in self._opening_workflows:
+            self._event_manager.put_event(AppEvent(payload=WorkflowClosedEvent(workflow_id=workflow.workflow_id)))
+
+        # An unsaved workflow's graph lived only in the runtime just closed, so there is nothing left to reopen.
+        entry = self._workflow_registry.find_by_id(workflow.workflow_id)
+        if entry is not None and not entry.is_saved:
+            self._workflow_registry.remove(workflow.workflow_id)
+
+        # Every key referring to a held object kept for it lived on a node just deleted, so each entry
+        # would hold what it holds -- a multi-gigabyte pipeline -- until something else cleared it.
+        dropped = self._resource_manager.drop_objects_for_workflow(workflow.workflow_id)
         if dropped:
-            logger.debug("Released %d held object(s) while tearing down the workflow.", dropped)
+            logger.debug("Released %d held object(s) while closing the workflow.", dropped)
 
+    def _finish_opening(self, workflow: WorkflowRuntime, *, keep: bool) -> None:
+        """End `opening_workflow`'s block, then wake anything waiting for the build of `workflow`.
+
+        Without `keep`, closes it unannounced. Tells clients of it if it is still open after that. A
+        workflow already closed, such as by the file building it, is left as it is.
+        """
+        try:
+            if not keep and not workflow.closed:
+                self.close_workflow(workflow)
+        except OpenWorkflowError as err:
+            logger.warning(
+                "Attempted to close workflow '%s' after it failed to build. Failed, so it stays open: %s",
+                workflow.workflow_id,
+                err,
+            )
+        finally:
+            build_ended = self._opening_workflows.pop(workflow)
+            if not workflow.closed:
+                opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
+                self._event_manager.put_event(AppEvent(payload=opened_event))
+            build_ended.set()
+
+    def _delete_workflow_flows(self, workflow: WorkflowRuntime) -> None:
+        """Delete `workflow`'s flows, which deletes their nodes.
+
+        Deletes a flow with no parent until none is left; `on_delete_flow_request` cascades into
+        its children and nodes. `ListFlowsInCurrentContextRequest` can't be used: the workflow may
+        have no current flow, and that request requires one.
+
+        Raises:
+            OpenWorkflowError: A flow could not be deleted.
+        """
+        flow_manager = self._flow_manager
+        deleted: set[str] = set()
+        while True:
+            flows = workflow.objects.get_filtered_subset(type=ControlFlow)
+            orphan = next((name for name in flows if not flow_manager.get_parent_flow_in(workflow, name)), None)
+            if orphan is None:
+                return
+            failure = None
+            if orphan in deleted:
+                failure = "it was still there after it was deleted"
+            else:
+                result = workflow.handle_request(DeleteFlowRequest(flow_name=orphan))
+                if result.failed():
+                    failure = str(result.result_details)
+            if failure is not None:
+                msg = f"Attempted to close the workflow. Failed because flow '{orphan}' could not be deleted: {failure}"
+                raise OpenWorkflowError(msg)
+            deleted.add(orphan)
+
+    @handles(GetEngineVersionRequest)
     def handle_engine_version_request(self, request: GetEngineVersionRequest) -> ResultPayload:  # noqa: ARG002
         try:
             engine_ver = semver.VersionInfo.parse(engine_version)
@@ -593,9 +1072,9 @@ class Engine:
             )
         except Exception as err:
             details = f"Attempted to get engine version. Failed due to '{err}'."
-            logger.error(details)
             return GetEngineVersionResultFailure(result_details=details)
 
+    @handles(EngineHeartbeatRequest)
     def handle_engine_heartbeat_request(self, request: EngineHeartbeatRequest) -> ResultPayload:
         """Handle engine heartbeat requests.
 
@@ -622,10 +1101,12 @@ class Engine:
                 engine_os=self._os_manager.platform_name(),
                 engine_id=self._engine_identity_manager.active_engine_id,
                 session_id=self._session_manager.active_session_id,
+                clients=self._session_manager.clients,
+                engine_run_id=self._engine_run_id,
                 timestamp=datetime.now(tz=UTC).isoformat(),
                 user=user,
                 user_organization=user_organization,
-                is_initializing=self._library_manager.is_initializing(),
+                is_initializing=self._lifecycle.is_initializing(),
                 # Set on worker processes (injected at spawn by WorkerManager), unset on the
                 # orchestrator. Lets a discovery client tell workers apart and nest them.
                 orchestrator_engine_id=os.getenv("GTN_ORCHESTRATOR_ENGINE_ID"),
@@ -635,8 +1116,28 @@ class Engine:
             )
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
-            logger.error(details)
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
+
+    async def _on_engine_lost(self, engine_id: str) -> None:
+        """Settle what a lost engine left behind, on the engine loop.
+
+        The transport reports a lost connection from its own loop, but the worker state this changes is
+        written by request handlers on the engine loop.
+        """
+        engine_loop = self._event_manager.event_loop
+        if engine_loop is None:
+            await self._worker_manager.on_engine_lost(engine_id)
+            return
+        await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self._worker_manager.on_engine_lost(engine_id), engine_loop)
+        )
+
+    def _holds_workflow(self, workflow_id: str) -> bool:
+        """Whether the workflow with this id is open here, or is one a worker keeps a runtime for.
+
+        The registry protects these entries from rescans and reindexing.
+        """
+        return self._open_workflows.is_open(workflow_id) or self._worker_workflows.holds(workflow_id)
 
     def _get_instance_info(self) -> dict[str, str | None]:
         """Get instance information from environment variables.
@@ -655,35 +1156,32 @@ class Engine:
         return instance_info
 
     def _get_current_workflow_info(self) -> dict[str, Any]:
-        """Get information about the currently loaded workflow.
+        """The heartbeat's workflow fields: every open workflow, and the current one when exactly one is open.
 
-        Returns workflow name, file path, and status information if available.
+        What the engine has open, not the current workflow: the heartbeat is a host request bound
+        to no workflow, and a worker's runtimes never show here. With several open, none of them is
+        the current one, as in the app's engine registry record and the diagnostics.
         """
-        workflow_info = {
+        workflow_info: dict[str, Any] = {
             "current_workflow": None,
             "workflow_file_path": None,
             "has_active_flow": False,
+            "open_workflows": [],
         }
 
         try:
-            context_manager = self._context_manager
-
-            # Check if there's an active workflow
-            if context_manager.has_current_workflow():
-                workflow_name = context_manager.get_current_workflow_name()
-                workflow_info["current_workflow"] = workflow_name
-                workflow_info["has_active_flow"] = context_manager.has_current_flow()
-
-                # Get workflow file path from registry (None for unsaved workflows).
-                if WorkflowRegistry.has_workflow_with_name(workflow_name):
-                    workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
-                    if workflow.file_path is not None:
-                        absolute_path = WorkflowRegistry.get_complete_file_path(workflow.file_path)
-                        workflow_info["workflow_file_path"] = absolute_path
-
+            open_workflows = self.open_workflow_infos()
         except Exception as err:
             logger.warning("Failed to get current workflow info: %s", err)
+            return workflow_info
+        workflow_info["open_workflows"] = open_workflows
+        if len(open_workflows) != 1:
+            return workflow_info
 
+        (current,) = open_workflows
+        workflow_info["current_workflow"] = current.name
+        workflow_info["workflow_file_path"] = current.workflow_file_path
+        workflow_info["has_active_flow"] = current.has_active_flow
         return workflow_info
 
 
@@ -694,8 +1192,6 @@ def current_engine() -> Engine:
     threaded through -- the `GriptapeNodes` facade, saved workflow files, and node
     libraries.
     """
-    global _root_engine, _root_engine_building  # noqa: PLW0603
-
     scoped = _scoped_engine.get()
     if scoped is not None:
         return scoped
@@ -713,12 +1209,33 @@ def current_engine() -> Engine:
                 "passed to it."
             )
             raise RuntimeError(msg)
-        _root_engine_building = True
-        try:
-            _root_engine = Engine()
-        finally:
-            _root_engine_building = False
-        return _root_engine
+        return _build_root_engine(Engine)
+
+
+def build_root_engine(*, worker: WorkerProcess) -> Engine:
+    """Build the process root engine with options a lazily built one cannot take.
+
+    For a process entry point that must configure its engine before anything uses it, such as a
+    library's worker process. Raises if the root engine already exists.
+    """
+    with _root_engine_lock:
+        if _root_engine is not None or _root_engine_building:
+            msg = "Attempted to build the process root engine. Failed because it was already built."
+            raise RuntimeError(msg)
+        return _build_root_engine(lambda: Engine(worker=worker))
+
+
+def _build_root_engine(build: Callable[[], Engine]) -> Engine:
+    """Build and store the root engine with `build`. Caller holds `_root_engine_lock`."""
+    global _root_engine, _root_engine_building  # noqa: PLW0603
+
+    _root_engine_building = True
+    try:
+        engine = build()
+    finally:
+        _root_engine_building = False
+    _root_engine = engine
+    return engine
 
 
 def has_current_engine() -> bool:

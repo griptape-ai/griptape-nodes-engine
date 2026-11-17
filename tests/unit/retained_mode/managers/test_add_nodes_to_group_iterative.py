@@ -139,7 +139,7 @@ class _ConcreteSubflowGroup(SubflowNodeGroup):
 
 def _register(obj: BaseNode, engine: Engine) -> None:
     """Register a node-like object in the ObjectManager so handle_request can find it."""
-    engine.object_manager.add_object_by_name(obj.name, obj)
+    engine.object_manager.add_object_by_name_in(engine.current_workflow(), obj.name, obj)
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ class TestAddNodesToGroupIterativePath:
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
-        engine.object_manager.add_object_by_name(flow.name, flow)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)
 
     def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:
@@ -380,7 +380,7 @@ class TestRemoveNodesFromGroupIterativePath:
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
-        engine.object_manager.add_object_by_name(flow.name, flow)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)
 
     def _build_grouped_pair(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode, _ConcreteSubflowGroup]:
@@ -504,7 +504,7 @@ class TestPlainNodeGroupDoesNotTether:
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
-        engine.object_manager.add_object_by_name(flow.name, flow)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)
 
     def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:
@@ -573,7 +573,7 @@ class TestCrossGroupMoveKeepsTetheredCompanion:
         self.engine = engine
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
-        engine.object_manager.add_object_by_name(flow.name, flow)
+        engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
         engine.context_manager.push_flow(flow)
 
     def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:

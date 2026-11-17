@@ -18,6 +18,28 @@ When the engine starts, it logs the actual bound address, for example:
 INFO MCP server listening at http://127.0.0.1:8125/mcp/
 ```
 
+## Library tools
+
+Some node libraries provide their own MCP tools (see
+[`get_mcp_tools`](../../development/custom_nodes/advanced_libraries.md#get_mcp_tools)). These
+tools aren't served at the main address above. The editor's chat agent picks them up without
+any setup (see [Library tools](../agent/mcp_servers.md#library-tools)).
+
+To use one library's tools, add its address to your client as a separate server. The address
+ends with the library's name in lowercase, with underscores in place of spaces and punctuation.
+For a library named "Acme Render Tools":
+
+```
+http://localhost:8125/mcp/libraries/acme_render_tools/
+```
+
+Or, to get the engine's tools and some libraries' tools from one server, add the libraries to the
+main address, separated by commas. For "Acme Render Tools" and "Paint & Composite Tools":
+
+```
+http://localhost:8125/mcp/?libraries=acme_render_tools,paint_composite_tools
+```
+
 ## Overrides
 
 The host and port are controlled by environment variables:
@@ -82,6 +104,24 @@ Create `.vscode/mcp.json` in your workspace, or open the user file via **MCP: Op
 
 Note that VS Code uses `servers` (not `mcpServers`) and `"type": "http"`.
 
+### Name a workflow in the configuration
+
+To point a client at one workflow, add its id as an `X-Griptape-Workflow-Id` header. See [Choose the workflow](#choose-the-workflow). In Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "griptape-nodes": {
+      "type": "streamable-http",
+      "url": "http://localhost:8125/mcp/",
+      "headers": { "X-Griptape-Workflow-Id": "<workflow id>" }
+    }
+  }
+}
+```
+
+Cursor and VS Code take the same `headers` object beside `url`.
+
 ### Claude Desktop
 
 Claude Desktop's `claude_desktop_config.json` only supports `stdio` servers. To connect to a remote/HTTP MCP server, either:
@@ -118,6 +158,40 @@ npx -y @modelcontextprotocol/inspector
 ```
 
 Paste `http://localhost:8125/mcp/` into the URL field and pick **Streamable HTTP** as the transport. If the connection fails with `TypeError: NetworkError when attempting to fetch resource`, it's almost always CORS: the engine's MCP server does not currently emit `Access-Control-Allow-Origin` headers, so cross-origin browser fetches are blocked. Use the CLI command above instead, or run the inspector with browser security relaxed.
+
+## Choose the workflow
+
+Tool calls that build or change a workflow act on one open workflow. A client names it in one of two ways:
+
+- **A header.** Send the workflow's id in an `X-Griptape-Workflow-Id` header. Every tool call acts on that workflow, including each request inside `EventRequestBatch`. A workflow keeps its id when it is saved. `ListOpenWorkflowsRequest` lists every open workflow with its id.
+- **The session's own workflow.** A client that sends no header can open a workflow with `OpenWorkflowRequest`. Name an open workflow's `workflow_id` to work in it: it comes back with `already_open` set and nothing about it changes. Name none, with `create_flow` set to `true`, to start a new one. Later calls in the same MCP session act on that workflow. Any call that reports the workflow it opened in `open_workflow` does the same, such as `SetWorkflowContextRequest`, or `EnsureWorkflowAndFlowRequest` when it opens one.
+
+When the workflow a call acts on isn't open, such as after its tab was closed, the call fails with `WorkflowNotOpenResultFailure`. Its `open_workflows` lists the workflows that are open, so you can open one of them with `OpenWorkflowRequest`. A session keeps naming its own workflow after it closes, so every call fails this way until the session opens another, unless the session closed it itself with `CloseWorkflowRequest` or `ClearAllObjectStateRequest`. To close a workflow, send `CloseWorkflowRequest` with its `workflow_id`. It closes that workflow whichever one the header or the session names. A call with neither a header nor a workflow of its session's own acts on the workflow that's open in the engine.
+
+## Parameter values
+
+Parameter and flow variable values arrive as plain JSON. Values of types JSON lacks arrive as
+their closest JSON form: tuples and sets as lists, enums as their value, paths as text, and
+artifacts and other objects as their fields:
+
+```json
+{"type": "ImageUrlArtifact", "value": "https://example.com/cat.png"}
+```
+
+Send values back as plain JSON too. Two kinds of dict arrive wrapped instead, and go back as they
+arrived. A dict with its own `"$type"` key is wrapped so the key isn't read as a type. A dict
+whose keys would collide as text, such as `1` and `"1"`, arrives as key-value pairs so no entry is
+lost:
+
+```json
+{"$type": "builtins:dict", "$value": {"$type": "app.bsky.feed.post", "text": "hi"}}
+{"$type": "builtins:dict", "$value": [[1, "a"], ["1", "b"]]}
+```
+
+A value that can't be written as JSON, such as an open file, is sent as its Python `str()` in
+fields that only show it, for example
+`"<_io.TextIOWrapper name='notes.txt' mode='r' encoding='UTF-8'>"`. Anywhere else the result
+can't be sent, and the request gets a failure whose message names the value instead.
 
 ## Install the workflow-construction skill
 

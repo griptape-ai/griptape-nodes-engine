@@ -10,7 +10,7 @@ class TestNodeParamSplit:
         assert param == "my_param"
 
     def test_node_name_contains_dot(self) -> None:
-        # Regression: https://github.com/griptape-ai/griptape-nodes/issues/4545
+        # Regression: https://github.com/griptape-ai/griptape-nodes-engine/issues/4545
         # Node names like "FLUX.2 Image Generation" must split on the final '.' only.
         node, param = node_param_split("FLUX.2 Image Generation.file_destination")
         assert node == "FLUX.2 Image Generation"

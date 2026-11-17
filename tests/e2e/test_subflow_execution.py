@@ -9,7 +9,7 @@ This guards the serialization/deserialization path exercised by
 NodeExecutor._extract_parameter_output_values and
 NodeExecutor._apply_parameter_values_to_node - the code fixed in
 fix/subprocess-cattrs-bytes-deserialization - without requiring the cloud
-WebSocket relay that the Private Execution (SubprocessWorkflowExecutor) path needs.
+WebSocket relay that the Isolated Execution (SubprocessWorkflowExecutor) path needs.
 """
 
 from __future__ import annotations
@@ -108,7 +108,7 @@ def _generate_subflow_workflow_source(engine: Engine, library_json: Path) -> str
         node_libraries_referenced=list(serialize_result.serialized_flow_commands.node_dependencies.libraries),
         workflow_shape=None,
     )
-    return engine.workflow_manager._generate_workflow_file_content(
+    return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
     )
@@ -143,6 +143,7 @@ def _ensure_workflow_context() -> None:
 
 
 async def _e2e_run() -> None:
+    _E2EGriptapeNodes.ContextManager().push_workflow(file_path=__file__)
     await build_workflow()  # noqa: F821 - defined by the generated workflow source above
     _ensure_workflow_context()
     workflow_executor = _E2ELocalWorkflowExecutor(

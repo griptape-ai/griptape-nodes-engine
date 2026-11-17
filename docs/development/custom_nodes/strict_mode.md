@@ -1,6 +1,6 @@
 # Strict Mode Reference
 
-> For when and how to run your library isolated in a worker
+> For when and how to isolate your library's node execution in a worker
 > subprocess in the first place, see
 > [Node Isolation with Workers](node_isolation_with_workers.md). This
 > page is the rule catalog that catches isolation incompatibilities.
@@ -18,16 +18,19 @@ editor instead of a silent no-op, deadlock, or a stack trace that names
 the wrong layer.
 
 Strict mode is always on. There is no config flag, env var, or runtime
-toggle. Severity is picked per-rule: correctness rules fail execution;
-ergonomics rules emit a warning.
+toggle. Severity is picked per-rule: correctness rules fail execution
+anywhere; ergonomics rules warn on the orchestrator and fail the node on
+a worker, unless the rule opts out of that escalation.
 
 ## How it surfaces
 
 Violations attach to the `ResultDetails` on the outgoing
 `ResultPayload`. In the editor, the node's output panel shows the rule
-id, severity, and remediation. On the worker side, correctness
-violations elevate a successful `ExecuteNodeResultSuccess` to an
-`ExecuteNodeResultFailure`; ergonomics violations stay non-fatal.
+id, severity, and remediation. On the worker side, anything that resolves
+to ERROR elevates a successful `ExecuteNodeResultSuccess` to an
+`ExecuteNodeResultFailure` — which covers the escalating ergonomics rules
+as well as the correctness ones, so every rule in the catalog below
+fails a node there.
 
 Violations are also logged through the `griptape_nodes.strict_mode`
 logger. Set it to `WARNING` or lower to see every violation in the
@@ -39,80 +42,75 @@ Each rule is either a **correctness** rule (fails on both orchestrator
 and worker) or an **ergonomics** rule (warns on orchestrator, escalates
 to a failure on the worker unless the rule opts out).
 
-### Correctness rules (fail execution)
+Rules are checked while a node executes, while a node is created or has
+its saved state applied (a workflow load, a paste, or a worker loading
+its copy), and when an edit runs a node's `after_value_set` or a
+connection hook. A violation outside a node's execution is logged and,
+for a load, attached to the result of the request that loaded the node.
 
-#### `reentrant-bus-in-init`
+A node that triggers none of these rules behaves the same in a worker as
+it does in-process. See
+[Node Isolation with Workers](node_isolation_with_workers.md#the-rules-that-keep-a-worker-identical-to-running-in-process).
 
-A node issued an event-bus request from inside its `__init__`. The
-worker library probe runs `__init__` to extract a schema; re-entering
-the bus there deadlocks the worker.
+### `parameter-mutation-during-aprocess`
 
-**Remediation**: move the call into `aprocess` (or a lifecycle hook
-that runs after construction).
+An ergonomics rule. A node called `add_parameter` or
+`remove_parameter_element` during `aprocess`. On the worker, these
+mutations apply to the worker's copy of the node and do not sync back to
+the orchestrator.
 
-### Ergonomics rules (warnings)
-
-#### `parameter-behaviors-dropped-in-schema`
-
-A `Parameter` attached `converters`, `validators`, or `traits` that
-are not captured in the worker schema. The orchestrator stub cannot
-re-run those behaviors, so UI-side behavior diverges from worker-side
-execution.
-
-**Remediation**: re-run the converter / validator logic inside
-`process` so the worker still applies it to the actual value, or
-accept the divergence as orchestrator-only UI sugar. Note that
-moving the logic into `process` loses the inline editor-side
-validation feedback — the user only sees a failure when the node
-executes.
-
-#### `parameter-mutation-during-aprocess`
-
-A node called `add_parameter` or `remove_parameter_element` during
-`aprocess`. On the worker, these mutations apply to the transient
-node instance and do not sync back to the orchestrator.
-
-Hydration-time mutations made from `before_value_set` /
-`after_value_set` (the standard dynamic-parameter pattern) do
-**not** trip this rule.
+Mutations made from `before_value_set` / `after_value_set` (the standard
+dynamic-parameter pattern) do **not** trip this rule. Those hooks run on
+the orchestrator as values are edited, and the worker's copy receives the
+parameters they added.
 
 **Remediation**: emit an `AddParameterToNodeRequest` or
 `RemoveParameterFromNodeRequest` so the mutation propagates to the
 authoritative orchestrator-side node.
 
-#### `connection-hooks-inert-on-worker`
+### `graph-access-while-loading`
 
-A node class in a worker-hosted library overrides one or more
-connection lifecycle hooks (`allow_incoming_connection`,
-`before_incoming_connection`, `after_incoming_connection`, their
-outgoing counterparts, or the `_removed` variants). Connections are
-orchestrator-owned state, so these hooks are invoked on the
-orchestrator -- where a worker-hosted library is represented by a
-synthesized stub class that does not carry the override. The
-author's code never runs, silently.
+An ergonomics rule. While a node was having its saved state applied —
+in `before_value_set` or `set_parameter_value` with `initial_setup`, or
+as its creation set its state — it sent a request that reads or changes
+connections, its flow or flow variables, or another node. The graph
+around a loading node is incomplete: a workflow load makes connections
+before values, a paste after them, and a worker's copy of the node has no
+connections or other nodes at all. So the answer depends on how the node
+was loaded. `__init__` is not checked: a node is in no flow during
+`__init__` however it is created, so the answer there is the same
+everywhere.
 
-Fires once per node class at library load, during the worker's
-schema probe. Hooks implemented by engine-owned bases and components
-are not flagged; the rule targets code the library author can
-change.
+**Remediation**: while `initial_setup` is set, change the node itself
+(its parameters, types and visibility) and leave connections and other
+nodes alone; the loader makes the connections. Do the graph work when the
+value is edited instead.
 
-**Remediation**: dynamic parameters driven by connections are not
-supported for isolated libraries. Run the library in Shared mode, or
-remove the override.
+### `state-read-bypassing-requests`
 
-#### `value-hooks-execute-only-on-worker`
+An ergonomics rule. While a node ran, it reached for a manager through
+`GriptapeNodes` (for example `GriptapeNodes.ConfigManager()`) instead of
+asking with a request. In-process the manager's answer is right, so this
+only warns. In a worker the manager holds that process's own copy of the
+state, so the access is refused.
 
-A node class in a worker-hosted library overrides `before_value_set`
-/ `after_value_set`. For an isolated library these hooks fire only
-during execute-time input hydration, on the transient worker-side
-node: transforming an incoming value still works, but the hooks do
-not run when a value changes in the editor, and any parameter-list
-mutation they make is discarded with the transient node.
+**Remediation**: use `GriptapeNodes.handle_request(...)` with the
+matching request, which gives the same answer in-process and in a worker.
 
-Fires once per node class at library load, during the worker's
-schema probe. Hooks implemented by engine-owned bases and components
-are not flagged.
+### `state-outside-parameters`
 
-**Remediation**: keep value hooks to value transformation. If the
-node needs editor-time reactivity (adjusting parameters as values
-change), run the library in Shared mode.
+An ergonomics rule. A node's `after_value_set` or connection hook added
+or replaced an attribute on the node. `after_value_set` doesn't run when
+a node loads, so a reopened workflow never has that attribute, and
+neither hook runs for a worker's copy of the node, which has no
+connections. Anything that reads the attribute behaves differently there.
+
+Attributes are compared by identity before and after the hook, so a
+change made in place (appending to a list the node already holds) is not
+seen. Attributes every node has from `BaseNode` are not checked. A node
+class that keeps an attribute outside its parameters on purpose, because
+nothing that runs the node reads it, can list it in
+`attributes_outside_parameters`.
+
+**Remediation**: keep the state in a parameter (hidden if it isn't for
+the user), or derive it from the node's values where it is needed.

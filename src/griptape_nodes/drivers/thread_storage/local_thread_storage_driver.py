@@ -5,7 +5,7 @@ Each thread lives in three files inside ``threads_directory``:
   * ``thread_{id}.json``       - the message history, encoded by
     :class:`pydantic_ai.messages.ModelMessagesTypeAdapter`.
   * ``thread_{id}.meta.json``  - a small metadata dict (title, timestamps,
-    archived flag, optional ``local_id``).
+    archived flag, optional ``local_id``, optional ``tool_grants``).
   * ``thread_{id}.runs.json``  - per-run provider/model records; absent until
     the first run completes (old threads without this file are unaffected).
 
@@ -20,11 +20,11 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from pydantic_ai.messages import ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelMessagesTypeAdapter, ModelRequest
 
 from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import BaseThreadStorageDriver
 from griptape_nodes.retained_mode.events.agent_events import RunRecord, ThreadMetadata
@@ -102,6 +102,7 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
             archived=meta.get("archived", False),
             local_id=meta.get("local_id"),
             runs=self._load_runs(thread_id),
+            tool_grants=list(meta.get("tool_grants", [])),
         )
 
     def list_threads(self) -> list[ThreadMetadata]:
@@ -121,6 +122,7 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
                     message_count=meta.get("message_count", 0),
                     archived=meta.get("archived", False),
                     local_id=meta.get("local_id"),
+                    tool_grants=list(meta.get("tool_grants", [])),
                 ),
             )
 
@@ -186,7 +188,8 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
             return []
 
     def save_history(self, thread_id: str, messages: list[ModelMessage]) -> None:
-        atomic_write_bytes(self._history_path(thread_id), ModelMessagesTypeAdapter.dump_json(list(messages)))
+        saved = [_without_instructions(message) for message in messages]
+        atomic_write_bytes(self._history_path(thread_id), ModelMessagesTypeAdapter.dump_json(saved))
         meta = self._read_meta(thread_id)
         now = datetime.now(UTC).isoformat()
         meta.setdefault("created_at", now)
@@ -226,3 +229,15 @@ class LocalThreadStorageDriver(BaseThreadStorageDriver):
             logger.exception("Failed to preserve corrupt thread history at %s.", path)
             return path
         return backup_path
+
+
+def _without_instructions(message: ModelMessage) -> ModelMessage:
+    """``message`` without the instructions it was sent with.
+
+    Every run builds its instructions afresh, node catalog and canvas included, and a
+    request's saved copy is never sent again, so keeping it only makes the file grow
+    by the full instructions on every model request.
+    """
+    if not isinstance(message, ModelRequest) or message.instructions is None:
+        return message
+    return replace(message, instructions=None)

@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, NamedTuple
 import pytest
 import yaml
 
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
@@ -92,7 +91,7 @@ def package_bundle(
         save_result = engine.handle_request(SaveWorkflowRequest(file_name=workflow_name))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result
 
-        workflow = WorkflowRegistry.get_workflow_by_name(save_result.workflow_name)
+        workflow = engine.workflow_registry.get_workflow_by_name(save_result.workflow_name)
         bundle_dir = tmp_path / "bundle"
         packaged = WorkflowPackager(save_result.workflow_name).package_to_folder(bundle_dir, workflow)
         return BundleOnDisk(directory=bundle_dir, packaged=packaged)

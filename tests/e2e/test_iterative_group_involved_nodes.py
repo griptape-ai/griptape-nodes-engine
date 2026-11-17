@@ -49,7 +49,7 @@ pytestmark = pytest.mark.timeout(300, method="thread")
 FIXTURE_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "iterative_group_library"
 FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.json"
 FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "iterative_group_nodes.py"
-# `flow_manager._validate_and_get_multi_node_library_info` resolves the packaged flow's
+# `flow_manager.packaging._validate_and_get_multi_node_library_info` resolves the packaged flow's
 # StartFlow/EndFlow endpoints from a library with exactly this name.
 LIBRARY_NAME = "Griptape Nodes Library"
 
@@ -168,8 +168,6 @@ async def test_running_group_stays_involved(
             StartFlowRequest(
                 flow_name=parent_flow,
                 flow_node_name=group_result.node_name,
-                wait_for_completion=True,
-                completion_timeout_ms=60000,
             )
         )
     assert isinstance(run_result, StartFlowResultSuccess), run_result

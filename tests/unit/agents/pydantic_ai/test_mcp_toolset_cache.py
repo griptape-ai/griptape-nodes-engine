@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 from fastmcp.client.transports import StdioTransport
+from pydantic_ai import FunctionToolset
+from pydantic_ai.toolsets.approval_required import ApprovalRequiredToolset
 
 from griptape_nodes.agents.pydantic_ai import mcp_servers
 from griptape_nodes.agents.pydantic_ai.mcp_servers import BuiltMCPServer
@@ -50,7 +52,7 @@ def _stub_builder(built: list[_StubTransport]) -> Any:
         # the config it was actually launched from.
         transport = _StubTransport(tag=f"{name}:{''.join(config.get('args') or [])}")
         built.append(transport)
-        return BuiltMCPServer(toolset=object(), transport=transport)  # type: ignore[arg-type]
+        return BuiltMCPServer(toolset=FunctionToolset(), transport=transport)
 
     return build
 
@@ -349,6 +351,20 @@ class TestRetainOnly:
         await cache.retain_only([])
 
         assert transports[0].disconnected
+
+
+class TestApprovalGate:
+    """The builder leaves servers ungated, so the sidebar's cache is what gates them."""
+
+    @pytest.mark.asyncio
+    async def test_every_leased_toolset_requires_approval(self, transports: list[_StubTransport]) -> None:
+        cache = MCPToolsetCache()
+
+        async with await cache.acquire([_config("alpha"), _config("beta")]) as lease:
+            assert len(lease.toolsets) == 2  # noqa: PLR2004
+            assert all(isinstance(toolset, ApprovalRequiredToolset) for toolset in lease.toolsets)
+
+        assert len(transports) == 2  # noqa: PLR2004
 
 
 class TestUnbuildableServers:

@@ -1,0 +1,337 @@
+"""Tests for the cattrs converter's structure/unstructure hooks."""
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, NamedTuple
+
+import pytest
+from griptape.artifacts import ImageUrlArtifact
+
+from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException, RequestPayload
+from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
+from griptape_nodes.retained_mode.events.library_events import DiscoveredLibrary
+from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeRequest, SetParameterValueRequest
+from griptape_nodes.serialization.hooks import _is_json_primitive_union
+from griptape_nodes.serialization.values import Value, ValueEncodeError, dump_json
+
+converter = converters.engine
+
+
+class _UnresolvableHints(NamedTuple):
+    """Like a NamedTuple naming a type imported only under TYPE_CHECKING."""
+
+    message: str
+    problem: "_NotImported | None"  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+
+
+@dataclass
+class _RequestsPayload:
+    requests: "list[RequestPayload]" = field(default_factory=list)
+
+
+@dataclass
+class _UnregisteredRequest(RequestPayload):
+    pass
+
+
+@dataclass
+class _ValuePayload:
+    """String annotations, as in event modules that use ``from __future__ import annotations``."""
+
+    value: "Value" = None
+    by_name: "dict[str, Value]" = field(default_factory=dict)
+    items: "list[Value]" = field(default_factory=list)
+    maybe: "Value | None" = None
+
+
+class TestValueFields:
+    """Fields annotated ``Value`` cross the wire as tagged plain data and come back as values."""
+
+    def test_value_fields_round_trip_through_json(self) -> None:
+        artifact = ImageUrlArtifact("https://example.com/a.png", name="a")
+        payload = _ValuePayload(value=(1, 2), by_name={"image": artifact}, items=[b"x"], maybe={1: "one"})
+
+        sent = json.loads(json.dumps(converter.unstructure(payload)))
+        restored = converter.structure(sent, _ValuePayload)
+
+        assert restored.value == (1, 2)
+        assert type(restored.by_name["image"]) is ImageUrlArtifact
+        assert restored.by_name["image"].to_dict() == artifact.to_dict()
+        assert restored.items == [b"x"]
+        assert restored.maybe == {1: "one"}
+
+    def test_value_fields_are_tagged_on_the_wire(self) -> None:
+        sent = converter.unstructure(_ValuePayload(value=(1, 2)))
+
+        assert sent["value"] == {"$type": "builtins:tuple", "$value": [1, 2]}
+
+
+class TestIsJsonPrimitiveUnion:
+    """Test the _is_json_primitive_union predicate."""
+
+    def test_matches_union_of_json_primitives(self) -> None:
+        assert _is_json_primitive_union(str | int | float | bool | dict | list | None) is True
+
+    def test_matches_partial_union(self) -> None:
+        assert _is_json_primitive_union(dict | list | None) is True
+
+    def test_matches_two_member_union(self) -> None:
+        assert _is_json_primitive_union(dict | list) is True
+
+    def test_rejects_non_union(self) -> None:
+        assert _is_json_primitive_union(str) is False
+
+    def test_rejects_union_with_non_primitive(self) -> None:
+        assert _is_json_primitive_union(str | bytes) is False
+
+
+class TestJsonPrimitiveUnionStructuring:
+    """Test that the converter structures JSON-primitive Union types correctly."""
+
+    @pytest.fixture
+    def union_type(self) -> Any:
+        return str | int | float | bool | dict | list | None
+
+    def test_structure_str(self, union_type: type) -> None:
+        assert converter.structure("hello", union_type) == "hello"
+
+    def test_structure_int(self, union_type: type) -> None:
+        value = 42
+        assert converter.structure(value, union_type) == value
+
+    def test_structure_float(self, union_type: type) -> None:
+        value = 3.14
+        assert converter.structure(value, union_type) == value
+
+    def test_structure_bool(self, union_type: type) -> None:
+        assert converter.structure(True, union_type) is True
+
+    def test_structure_none(self, union_type: type) -> None:
+        assert converter.structure(None, union_type) is None
+
+    def test_structure_list(self, union_type: type) -> None:
+        assert converter.structure([1, 2, 3], union_type) == [1, 2, 3]
+
+    def test_structure_dict(self, union_type: type) -> None:
+        assert converter.structure({"key": "value"}, union_type) == {"key": "value"}
+
+    def test_structure_nested_dict(self, union_type: type) -> None:
+        value = {"outer": {"inner": [1, 2, 3]}}
+        assert converter.structure(value, union_type) == value
+
+
+class TestSetParameterValueRequestStructuring:
+    """Test that SetParameterValueRequest structures correctly with complex values."""
+
+    def test_structure_with_dict_value(self) -> None:
+        data = {
+            "node_name": "Load Image",
+            "parameter_name": "image",
+            "value": {"url": "http://example.com/image.jpg", "width": 100},
+        }
+        result = converter.structure(data, SetParameterValueRequest)
+
+        assert result.node_name == "Load Image"
+        assert result.parameter_name == "image"
+        assert result.value == {"url": "http://example.com/image.jpg", "width": 100}
+
+    def test_structure_with_list_value(self) -> None:
+        data = {
+            "node_name": "MyNode",
+            "parameter_name": "items",
+            "value": [1, 2, 3],
+        }
+        result = converter.structure(data, SetParameterValueRequest)
+
+        assert result.value == [1, 2, 3]
+
+    def test_structure_with_string_value(self) -> None:
+        data = {
+            "node_name": "MyNode",
+            "parameter_name": "name",
+            "value": "hello",
+        }
+        result = converter.structure(data, SetParameterValueRequest)
+
+        assert result.value == "hello"
+
+    def test_structure_with_none_value(self) -> None:
+        data = {
+            "node_name": "MyNode",
+            "parameter_name": "name",
+            "value": None,
+        }
+        result = converter.structure(data, SetParameterValueRequest)
+
+        assert result.value is None
+
+    def test_from_dict_with_image_artifact_value(self) -> None:
+        """Reproduce the exact payload that triggered the original bug."""
+        data = {
+            "event_type": "EventRequest",
+            "request_type": "SetParameterValueRequest",
+            "request_id": "bd1743f3-7508-429f-bad1-55cd47e9e181",
+            "response_topic": "sessions/abc123/response",
+            "request": {
+                "node_name": "Load Image",
+                "parameter_name": "image",
+                "value": {
+                    "value": "http://localhost:8124/workspace/inputs/IMG_0798.jpeg",
+                    "width": 3024,
+                    "height": 4032,
+                    "name": "IMG_0798.jpeg",
+                    "type": "ImageUrlArtifact",
+                    "meta": {
+                        "created_at": "2026-04-14T20:12:28.745Z",
+                        "content_hash": "",
+                        "size_bytes": 7996029,
+                        "format": "JPEG",
+                    },
+                },
+            },
+        }
+        event = converters.engine.structure(data, EventRequest)
+
+        assert isinstance(event.request, SetParameterValueRequest)
+        assert event.request.node_name == "Load Image"
+        assert event.request.parameter_name == "image"
+        assert isinstance(event.request.value, dict)
+        assert event.request.value["type"] == "ImageUrlArtifact"
+        expected_width = 3024
+        assert event.request.value["width"] == expected_width
+
+
+class TestExceptionWireForm:
+    """Round-trip coverage for the Exception <-> dict converter pair.
+
+    The unstructure hook emits ``{type, message, traceback}`` and the
+    structure hook rebuilds those into ``ForwardedException``'s
+    ``original_type`` / message / ``original_traceback`` slots. Both
+    halves are load-bearing for the orchestrator-side
+    ``[<type>] ... Worker traceback: ...`` rendering in
+    ``NodeExecutor._format_node_failure_message``.
+    """
+
+    @staticmethod
+    def _raise_and_capture(exc: Exception) -> Exception:
+        try:
+            raise exc  # noqa: TRY301
+        except Exception as e:
+            return e
+
+    def test_unstructure_raised_exception_carries_type_message_and_traceback(self) -> None:
+        e = self._raise_and_capture(ValueError("boom"))
+        payload = converter.unstructure(e, Exception)
+
+        assert payload["type"] == "builtins.ValueError"
+        assert payload["message"] == "boom"
+        assert payload["traceback"] is not None
+        assert "ValueError: boom" in payload["traceback"]
+
+    def test_unstructure_unraised_exception_has_null_traceback(self) -> None:
+        # An exception that was constructed but never raised has
+        # ``__traceback__ is None``; the wire form preserves type and
+        # message but the traceback slot is null.
+        payload = converter.unstructure(ValueError("never raised"), Exception)
+
+        assert payload["type"] == "builtins.ValueError"
+        assert payload["message"] == "never raised"
+        assert payload["traceback"] is None
+
+    def test_round_trip_yields_forwarded_exception_with_worker_fields(self) -> None:
+        e = self._raise_and_capture(RuntimeError("worker boom"))
+        payload = converter.unstructure(e, Exception)
+        rebuilt = converter.structure(payload, Exception)
+
+        assert isinstance(rebuilt, ForwardedException)
+        assert str(rebuilt) == "worker boom"
+        assert rebuilt.original_type == "builtins.RuntimeError"
+        assert rebuilt.original_traceback is not None
+        assert "RuntimeError: worker boom" in rebuilt.original_traceback
+
+    def test_structure_tolerates_non_dict_payload(self) -> None:
+        # Old persisted events on disk may carry a bare-string
+        # ``exception`` field; refusing to structure them would abort
+        # deserialization of the whole enclosing event.
+        rebuilt = converter.structure("legacy stringified error", Exception)
+
+        assert isinstance(rebuilt, ForwardedException)
+        assert str(rebuilt) == "legacy stringified error"
+        assert rebuilt.original_type is None
+        assert rebuilt.original_traceback is None
+
+
+class TestDeprecatedSafeUnstructure:
+    """Node libraries still import ``safe_unstructure`` from the old module path."""
+
+    def test_warns_and_unstructures(self) -> None:
+        with pytest.warns(DeprecationWarning, match="encode_value"):
+            assert safe_unstructure({"a": [1]}) == {"a": [1]}
+
+
+class TestDumpJson:
+    """Converter output with an object the converter passed through unchanged."""
+
+    def test_names_the_type_json_has_no_form_for(self) -> None:
+        with pytest.raises(ValueEncodeError, match="'_Handle' value has no plain-data form"):
+            dump_json({"handle": _Handle()})
+
+    def test_ignores_to_dict(self) -> None:
+        """Griptape's process-wide ``JSONEncoder.default`` would send this through its ``to_dict()``."""
+        with pytest.raises(ValueEncodeError, match="'_HasToDict' value has no plain-data form"):
+            dump_json({"thing": _HasToDict()})
+
+
+class _Handle:
+    pass
+
+
+class _HasToDict:
+    def to_dict(self) -> dict[str, Any]:
+        return {"lossy": True}
+
+
+class TestNamedTupleFields:
+    """NamedTuples in modules using ``from __future__ import annotations`` structure by their field types."""
+
+    def test_fields_structure_as_their_types(self) -> None:
+        library = DiscoveredLibrary(path=Path("/libraries/one.json"), is_sandbox=False)
+
+        restored = converter.structure(json.loads(json.dumps(converter.unstructure(library))), DiscoveredLibrary)
+
+        assert restored == library
+        assert type(restored.path) is type(library.path)
+
+    def test_unresolvable_hints_fall_back_to_runtime_values(self) -> None:
+        issue = _UnresolvableHints("m", None)
+
+        data = converter.unstructure(issue)
+
+        assert data == ("m", None)
+        assert converter.structure(list(data), _UnresolvableHints) == issue
+
+
+class TestRequestFields:
+    """A field typed ``RequestPayload`` carries each request with its registered name."""
+
+    def test_each_request_comes_back_as_its_own_type(self) -> None:
+        payload = _RequestsPayload(
+            requests=[
+                AddParameterToNodeRequest(parameter_name="speed", node_name="A"),
+                SetParameterValueRequest(parameter_name="speed", node_name="A", value=(1, "b")),
+            ]
+        )
+
+        data = json.loads(json.dumps(converter.unstructure(payload)))
+
+        assert [item["request_type"] for item in data["requests"]] == [
+            "AddParameterToNodeRequest",
+            "SetParameterValueRequest",
+        ]
+        assert converter.structure(data, _RequestsPayload) == payload
+
+    def test_unregistered_request_fails_to_send(self) -> None:
+        with pytest.raises(ValueEncodeError, match="not registered"):
+            converter.unstructure(_RequestsPayload(requests=[_UnregisteredRequest()]))

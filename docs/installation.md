@@ -121,6 +121,8 @@ Your installation is now complete and you're ready to proceed to creating your f
 
 <!-- screenshot: the editor after the engine connects, showing Create from scratch and the sample workflows -->
 
+To load the editor from your own machine instead, see [Running the Editor Locally](guides/local_editor.md).
+
 ## Activating with a License
 
 Organizations can run Griptape Nodes on license keys instead of individual Griptape accounts. If your organization admin sent you a license key, you don't need to sign up for anything:

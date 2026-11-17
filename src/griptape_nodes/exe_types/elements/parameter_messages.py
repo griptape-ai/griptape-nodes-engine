@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
 
 
-class ParameterMessage(BaseNodeElement, UIOptionsMixin):
+class ParameterMessage(UIOptionsMixin, BaseNodeElement):
     """Represents a UI message element, such as a warning or informational text."""
 
     # Define default titles as a class-level constant

@@ -74,6 +74,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointAttribute,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -112,15 +113,9 @@ class AccessManager(EngineScoped):
     def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(QueryModelAccessRequest, self.on_query_model_access_request)
-            event_manager.assign_manager_to_request_type(
-                QueryModelAccessForNodeRequest, self.on_query_model_access_for_node_request
-            )
-            event_manager.assign_manager_to_request_type(
-                QueryModelAccessForCatalogRequest, self.on_query_model_access_for_catalog_request
-            )
-            event_manager.assign_manager_to_request_type(QueryCodecAccessRequest, self.on_query_codec_access_request)
+            event_manager.register_request_handlers(self)
 
+    @handles(QueryModelAccessRequest)
     def on_query_model_access_request(self, request: QueryModelAccessRequest) -> ResultPayload:
         """Bare form. Hook sees `ID` (the model id) per candidate; no `NODE_TYPE`, no catalog enrichment."""
         verdicts = self._evaluate(
@@ -134,6 +129,7 @@ class AccessManager(EngineScoped):
             result_details=f"Evaluated {len(verdicts)} candidate model(s).",
         )
 
+    @handles(QueryModelAccessForNodeRequest)
     def on_query_model_access_for_node_request(self, request: QueryModelAccessForNodeRequest) -> ResultPayload:
         """Node-attributed. Engine derives candidates from declarations unless caller overrides."""
         try:
@@ -160,6 +156,7 @@ class AccessManager(EngineScoped):
             result_details=f"Evaluated {len(verdicts)} model(s) for '{request.node_type}'.",
         )
 
+    @handles(QueryCodecAccessRequest)
     def on_query_codec_access_request(self, request: QueryCodecAccessRequest) -> ResultPayload:
         """Per-codec offer query. Hook sees `ID` (the codec) plus optional `CONTAINER_FORMAT`.
 
@@ -202,6 +199,7 @@ class AccessManager(EngineScoped):
             result_details=f"Evaluated {len(verdicts)} candidate codec(s) for '{request.direction}'.",
         )
 
+    @handles(QueryModelAccessForCatalogRequest)
     def on_query_model_access_for_catalog_request(self, request: QueryModelAccessForCatalogRequest) -> ResultPayload:
         """Catalog-scoped. Hook sees `ID` (the model id) plus enrichment when the id resolves.
 

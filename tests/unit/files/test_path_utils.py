@@ -12,6 +12,7 @@ from griptape_nodes.files.path_utils import (
     _apply_windows_long_path_prefix,
     canonicalize_expanded_for_identity,
     canonicalize_for_identity,
+    canonicalize_for_identity_preserving_symlinks,
     canonicalize_for_io,
     canonicalize_to_posix,
     decompose_source_path,
@@ -23,6 +24,7 @@ from griptape_nodes.files.path_utils import (
     parse_file_uri,
     parse_static_server_url,
     path_needs_expansion,
+    relative_to_keeping_or_following_links,
     resolve_file_path,
     resolve_path_safely,
     sanitize_path_string,
@@ -1052,6 +1054,57 @@ class TestParseStaticServerUrl:
         result = parse_static_server_url("http://localhost:8124/workspace/", self.WORKSPACE)
         assert result is None
 
+    def test_maps_external_url_to_absolute_posix_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/Desktop/cat.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/Desktop/cat.png")
+
+    def test_maps_external_url_to_windows_drive_path(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/C:/Users/artist/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("C:/Users/artist/cat.png")
+
+    def test_maps_external_url_to_unc_path(self) -> None:
+        """`LocalStorageDriver` builds a UNC path's URL as `/external//server/share/...`."""
+        result = parse_static_server_url(
+            "http://localhost:8124/external//server/share/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("//server/share/cat.png")
+
+    def test_keeps_hash_in_external_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/Users/artist/shot#1.png?v=1",
+            self.WORKSPACE,
+        )
+        assert result == Path("/Users/artist/shot#1.png")
+
+    def test_keeps_semicolon_in_filename(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/renders/clip;v2.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "renders" / "clip;v2.mp4"
+
+    def test_external_path_containing_workspace_segment(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/external/mnt/workspace/cat.png",
+            self.WORKSPACE,
+        )
+        assert result == Path("/mnt/workspace/cat.png")
+
+    def test_external_posix_dir_with_colon_is_not_a_drive(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/x:foo/bar.png", self.WORKSPACE)
+        assert result == Path("/x:foo/bar.png")
+
+    def test_rejects_localhost_url_with_empty_external_remainder(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/external/", self.WORKSPACE)
+        assert result is None
+
     def test_rejects_127_0_0_1(self) -> None:
         """Only the `localhost` spelling is recognized, matching StaticServerFileDriver."""
         result = parse_static_server_url("http://127.0.0.1:8124/workspace/clip.mp4", self.WORKSPACE)
@@ -1435,6 +1488,142 @@ class TestCanonicalizeForIdentity:
 
         result = canonicalize_for_identity(link)
         assert result == target.resolve()
+
+
+class TestCanonicalizeForIdentityPreservingSymlinks:
+    """Tests for canonicalize_for_identity_preserving_symlinks."""
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_a_link_keeps_its_own_path(self, tmp_path: Path) -> None:
+        """A link is named by where it sits, not by what it points at."""
+        target = tmp_path / "outside" / "real.txt"
+        target.parent.mkdir()
+        target.touch()
+        link = tmp_path / "inside" / "link.txt"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        assert canonicalize_for_identity_preserving_symlinks(link) == link
+
+    def test_expands_tilde(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows
+
+        result = canonicalize_for_identity_preserving_symlinks("~/project.yml")
+
+        assert result == tmp_path / "project.yml"
+
+    def test_anchors_relative_to_base(self, tmp_path: Path) -> None:
+        result = canonicalize_for_identity_preserving_symlinks("sub/file.txt", base=tmp_path)
+
+        assert result == tmp_path / "sub" / "file.txt"
+
+    def test_normalizes_dot_and_dotdot(self, tmp_path: Path) -> None:
+        result = canonicalize_for_identity_preserving_symlinks(f"{tmp_path}/a/../b/./c.txt")
+
+        assert result == tmp_path / "b" / "c.txt"
+
+    def test_matches_canonicalize_for_identity_when_no_links_are_involved(self, tmp_path: Path) -> None:
+        """The two agree on any path with no link along it; only symlink handling differs."""
+        target = tmp_path / "sub" / "project.yml"
+
+        assert canonicalize_for_identity_preserving_symlinks(target) == canonicalize_for_identity(target)
+
+    def test_carries_no_windows_long_path_prefix(self, tmp_path: Path) -> None:
+        """Unlike canonicalize_for_io the result is fit to be a key, so it keeps no prefix."""
+        result = canonicalize_for_identity_preserving_symlinks(tmp_path / "file.txt")
+
+        assert not str(result).startswith("\\\\?\\")
+
+
+class TestRelativeToKeepingOrFollowingLinks:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        root = tmp_path / "root"
+        root.mkdir()
+        return root
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_file_in_linked_subfolder_is_inside_by_the_link(self, root: Path, tmp_path: Path) -> None:
+        """A file reached through a link inside the root is named by the link."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (root / "link").symlink_to(elsewhere, target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "link" / "f.py", root)
+
+        assert result == Path("link/f.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_file_under_the_real_location_of_a_linked_root(self, root: Path, tmp_path: Path) -> None:
+        """A file under the real location of a root reached through a link is inside."""
+        linked_root = tmp_path / "linked_root"
+        linked_root.symlink_to(root, target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "sub" / "f.py", linked_root)
+
+        assert result == Path("sub/f.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_file_really_inside_but_reached_through_a_link_elsewhere(self, root: Path, tmp_path: Path) -> None:
+        """A link outside the root that points into it still finds the file inside."""
+        (root / "sub").mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "link").symlink_to(root / "sub", target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(outside / "link" / "f.py", root)
+
+        assert result == Path("sub/f.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_linked_folder_above_the_root_does_not_hide_a_file_really_inside(self, tmp_path: Path) -> None:
+        """Both sides are followed together, so a link above the root cannot make them disagree."""
+        real = tmp_path / "real"
+        (real / "ws" / "libs" / "mylib").mkdir(parents=True)
+        linked_parent = tmp_path / "linked"
+        linked_parent.symlink_to(real, target_is_directory=True)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "lib").symlink_to(real / "ws" / "libs" / "mylib", target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(elsewhere / "lib" / "f.py", linked_parent / "ws")
+
+        assert result == Path("libs/mylib/f.py")
+
+    def test_file_outside_the_root_returns_none(self, root: Path, tmp_path: Path) -> None:
+        """A file outside the root, links or not, has no relative path."""
+        assert relative_to_keeping_or_following_links(tmp_path / "other" / "f.py", root) is None
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_dot_dot_after_a_link_is_removed_as_text(self, root: Path, tmp_path: Path) -> None:
+        """`link/../x.py` is `x.py` in the root, because `..` goes before any link is followed."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (root / "link").symlink_to(elsewhere, target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "link" / ".." / "x.py", root)
+
+        assert result == Path("x.py")
+
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
+    def test_dot_dot_after_a_link_cannot_escape_the_root(self, root: Path) -> None:
+        """`link/../../x.py` is outside the root, because `..` goes before any link is followed.
+
+        Following `link` (to `a/b`) first would make it `<root>/x.py`, inside the root.
+        """
+        (root / "a" / "b").mkdir(parents=True)
+        (root / "link").symlink_to(root / "a" / "b", target_is_directory=True)
+
+        result = relative_to_keeping_or_following_links(root / "link" / ".." / ".." / "x.py", root)
+
+        assert result is None
+
+    def test_relative_path_anchors_to_base(self, root: Path) -> None:
+        """A relative path is taken from `base`, not from the working directory."""
+        result = relative_to_keeping_or_following_links("sub/f.py", root, base=root)
+
+        assert result == Path("sub/f.py")
 
 
 class TestCanonicalizeExpandedForIdentity:

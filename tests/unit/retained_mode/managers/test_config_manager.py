@@ -17,6 +17,7 @@ from griptape_nodes.retained_mode.events.config_events import (
     GetConfigLayersRequest,
     GetConfigLayersResultSuccess,
     GetConfigValueRequest,
+    GetConfigValueResultFailure,
     GetConfigValueResultSuccess,
     SetConfigCategoryRequest,
     SetConfigCategoryResultSuccess,
@@ -86,10 +87,10 @@ class TestConfigManager:
 
     def test_load_config_from_env_vars_nested_path(self) -> None:
         """A `__` separator maps to a nested dict, and the value is coerced to the field's type."""
-        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
             manager = ConfigManager()
             env_config = manager._load_config_from_env_vars()
-            assert env_config == {"worker": {"heartbeat_timeout_s": 30.0}}
+            assert env_config == {"worker": {"library_load_timeout_s": 30.0}}
 
     def test_load_config_from_env_vars_three_level_path(self) -> None:
         """A three-level `__` path (app_events -> on_app_initialization_complete -> requires_engine) works."""
@@ -296,7 +297,7 @@ class TestConfigManager:
     def test_load_config_from_env_vars_unknown_nested_key_rejected(self, caplog: pytest.LogCaptureFixture) -> None:
         """A sub-key a declared nested model doesn't recognize is rejected, not kept as a raw string.
 
-        `WorkerSettings` has no `heartbeat_timeout` field, only `heartbeat_timeout_s`, and being a
+        `WorkerSettings` has no `library_load_timeout` field, only `library_load_timeout_s`, and being a
         strict model it drops an unrecognized sub-key from `model_dump()` rather than keeping it.
         That absence after validation is unambiguous: a free-form path, an entry in a
         mapping-valued setting, or one riding Settings' own `extra="allow"`, is retained through
@@ -334,11 +335,11 @@ class TestConfigManager:
         pipeline (`load_configs()` -> `merged_config` / `get_config_value()`) that value actually
         has to travel through, proving it lands typed rather than as the raw string.
         """
-        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
             manager = ConfigManager()
             manager.load_configs()
 
-            value = manager.get_config_value("worker.heartbeat_timeout_s")
+            value = manager.get_config_value("worker.library_load_timeout_s")
             assert value == 30.0  # noqa: PLR2004
             assert isinstance(value, float)
 
@@ -352,28 +353,28 @@ class TestConfigManager:
         with tempfile.TemporaryDirectory() as temp_dir:
             project_dir = Path(temp_dir)
             (project_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"worker": {"heartbeat_timeout_s": 99.0}})
+                json.dumps({"worker": {"library_load_timeout_s": 99.0}})
             )
 
-            with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+            with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
                 manager = ConfigManager()
                 manager.load_project_config(project_dir)
 
-                assert manager.get_config_value("worker.heartbeat_timeout_s") == 30.0  # noqa: PLR2004
+                assert manager.get_config_value("worker.library_load_timeout_s") == 30.0  # noqa: PLR2004
 
     def test_nested_env_var_does_not_clobber_sibling_defaults(self) -> None:
         """Setting one leaf under a parent must not blank out its siblings.
 
         `merge_dicts` overlays a nested dict onto the existing one rather than replacing the
-        parent wholesale, so with only `heartbeat_timeout_s` exported, `heartbeat_interval_s`
+        parent wholesale, so with only `library_load_timeout_s` exported, `command_prefix`
         must still resolve to `WorkerSettings`'s own default.
         """
-        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
             manager = ConfigManager()
             manager.load_configs()
 
-            assert manager.get_config_value("worker.heartbeat_timeout_s") == 30.0  # noqa: PLR2004
-            assert manager.get_config_value("worker.heartbeat_interval_s") == 5.0  # noqa: PLR2004
+            assert manager.get_config_value("worker.library_load_timeout_s") == 30.0  # noqa: PLR2004
+            assert manager.get_config_value("worker.command_prefix") == []
 
     def test_flat_and_nested_worker_env_vars_together_nested_wins(self, caplog: pytest.LogCaptureFixture) -> None:
         """A flat GTN_CONFIG_WORKER cannot clobber GTN_CONFIG_WORKER__X, in either order.
@@ -383,8 +384,8 @@ class TestConfigManager:
         regardless of `os.environ` iteration order, and the prefix filter never has to weigh in.
         """
         for env in (
-            {"GTN_CONFIG_WORKER": "x", "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"},
-            {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30", "GTN_CONFIG_WORKER": "x"},
+            {"GTN_CONFIG_WORKER": "x", "GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"},
+            {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30", "GTN_CONFIG_WORKER": "x"},
         ):
             caplog.clear()
             with patch.dict(os.environ, env, clear=True):
@@ -392,7 +393,7 @@ class TestConfigManager:
                     manager = ConfigManager()
                     env_config = manager._load_config_from_env_vars()
 
-                assert env_config == {"worker": {"heartbeat_timeout_s": 30.0}}
+                assert env_config == {"worker": {"library_load_timeout_s": 30.0}}
                 warnings = [
                     record for record in caplog.records if "is not a valid value for the 'worker'" in record.message
                 ]
@@ -415,8 +416,11 @@ class TestConfigManager:
                 {"agent": {"system_prompt": "hi"}},
             ),
             (
-                {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30", "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S__": "99"},
-                {"worker": {"heartbeat_timeout_s": 30.0}},
+                {
+                    "GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30",
+                    "GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S__": "99",
+                },
+                {"worker": {"library_load_timeout_s": 30.0}},
             ),
         ]
         for env, want in cases:
@@ -590,29 +594,29 @@ class TestConfigManager:
         self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A flat dotted key configures nothing, so loading the file warns with the nested form."""
-        isolate_user_config.write_text(json.dumps({"worker.heartbeat_timeout_s": 45}), encoding="utf-8")
+        isolate_user_config.write_text(json.dumps({"worker.library_load_timeout_s": 45}), encoding="utf-8")
 
         with patch.dict(os.environ, {}, clear=True):
             with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
                 manager = ConfigManager()
 
-            assert manager.get_config_value("worker.heartbeat_timeout_s") != 45  # noqa: PLR2004
-            warnings = [record for record in caplog.records if "worker.heartbeat_timeout_s" in record.message]
+            assert manager.get_config_value("worker.library_load_timeout_s") != 45  # noqa: PLR2004
+            warnings = [record for record in caplog.records if "worker.library_load_timeout_s" in record.message]
             assert len(warnings) == 1
-            assert '{"worker": {"heartbeat_timeout_s": "..."}}' in warnings[0].message
+            assert '{"worker": {"library_load_timeout_s": "..."}}' in warnings[0].message
 
     def test_dotted_key_warning_logged_once_per_file_and_key(
         self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Reloading configs, as a project switch does, doesn't re-warn about the same key."""
-        isolate_user_config.write_text(json.dumps({"worker.heartbeat_timeout_s": 45}), encoding="utf-8")
+        isolate_user_config.write_text(json.dumps({"worker.library_load_timeout_s": 45}), encoding="utf-8")
 
         with patch.dict(os.environ, {}, clear=True):
             with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
                 manager = ConfigManager()
                 manager.load_configs()
 
-            warnings = [record for record in caplog.records if "worker.heartbeat_timeout_s" in record.message]
+            warnings = [record for record in caplog.records if "worker.library_load_timeout_s" in record.message]
             assert len(warnings) == 1
 
     def test_dotted_key_below_top_level_does_not_warn(
@@ -2143,14 +2147,14 @@ class TestConfigProvenance:
         this variable", so a reconstructed name sends the user after a variable that does not exist
         and, if they set it, a key the engine refuses as unknown.
         """
-        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
             manager = ConfigManager()
-            source = manager.value_source("worker.heartbeat_timeout_s")
-            category_source = manager.category_sources("worker")["worker.heartbeat_timeout_s"]
+            source = manager.value_source("worker.library_load_timeout_s")
+            category_source = manager.category_sources("worker")["worker.library_load_timeout_s"]
 
         assert source.layer == "env"
-        assert source.env_var == "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S"
-        assert category_source.env_var == "GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S"
+        assert source.env_var == "GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S"
+        assert category_source.env_var == "GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S"
 
     def test_value_source_runtime_pin_wins_over_config_files(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """A project's workspace pin owns `workspace_directory`, and no file holds it.
@@ -2349,7 +2353,7 @@ class TestConfigProvenance:
         No single variable owns the category, so `env_var` is None and a caller falls back to
         naming the layer alone.
         """
-        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30"}, clear=True):
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
             source = ConfigManager().value_source("worker")
 
         assert source.layer == "env"
@@ -2380,7 +2384,7 @@ class TestConfigProvenance:
 
     def test_config_layers_reports_env_vars_under_their_real_names_and_raw_values(self) -> None:
         """`values` cannot express a nested variable's name, so `env_vars` carries it verbatim."""
-        env = {"GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S": "30", "GTN_CONFIG_LOG_LEVEL": "DEBUG"}
+        env = {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30", "GTN_CONFIG_LOG_LEVEL": "DEBUG"}
         with patch.dict(os.environ, env, clear=True):
             layers = {layer.layer: layer for layer in ConfigManager().config_layers()}
 
@@ -2630,6 +2634,26 @@ class TestConfigProvenance:
         assert editable_result.source.layer == "user"
         assert editable_result.editable is True
 
+    def test_get_config_value_request_returns_a_none_default(self, isolate_user_config: Path) -> None:  # noqa: ARG002
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="library.sandbox_enabled")
+            )
+
+        assert isinstance(result, GetConfigValueResultSuccess)
+        assert result.value is None
+        assert result.source.layer == "default"
+
+    def test_get_config_value_request_fails_for_an_unknown_key(self, isolate_user_config: Path) -> None:  # noqa: ARG002
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            result = manager.on_handle_get_config_value_request(
+                GetConfigValueRequest(category_and_key="library.no_such_setting")
+            )
+
+        assert isinstance(result, GetConfigValueResultFailure)
+
     def test_get_config_value_request_editable_is_leaf_aware_for_a_category(
         self, tmp_path: Path, isolate_user_config: Path
     ) -> None:
@@ -2639,7 +2663,7 @@ class TestConfigProvenance:
         category as locked disables a control the engine would have accepted, and contradicts
         the write path, which reports success for exactly that write.
         """
-        self._write_layer_config(tmp_path, {"worker": {"heartbeat_timeout_s": 99.0}})
+        self._write_layer_config(tmp_path, {"worker": {"library_load_timeout_s": 99.0}})
 
         with patch.dict(os.environ, {}, clear=True):
             manager = ConfigManager()
@@ -2650,7 +2674,7 @@ class TestConfigProvenance:
             )
             # A sibling leaf the project does not own is still the user's to set.
             sibling_write = manager.on_handle_set_config_value_request(
-                SetConfigValueRequest(category_and_key="worker", value={"heartbeat_interval_s": 30.0})
+                SetConfigValueRequest(category_and_key="worker", value={"command_prefix": ["env-tool", "--"]})
             )
             untouched_category = manager.on_handle_get_config_value_request(
                 GetConfigValueRequest(category_and_key="library")
@@ -2665,7 +2689,7 @@ class TestConfigProvenance:
         # The contradiction the leaf-aware read removes: this write really does take effect.
         assert isinstance(sibling_write, SetConfigValueResultSuccess)
         assert sibling_write.applied is True
-        assert json.loads(isolate_user_config.read_text())["worker"] == {"heartbeat_interval_s": 30.0}
+        assert json.loads(isolate_user_config.read_text())["worker"] == {"command_prefix": ["env-tool", "--"]}
 
     def test_set_config_value_request_reports_value_the_settings_model_rejects(self, isolate_user_config: Path) -> None:
         """A write no layer shadows can still fail to take effect, and must not report otherwise.
@@ -2790,7 +2814,7 @@ class TestConfigProvenance:
         The two leaf walks deliberately read an empty dict differently: nothing can have
         diverged, but the category is still not the user's to set.
         """
-        self._write_layer_config(tmp_path, {"worker": {"heartbeat_timeout_s": 99.0}})
+        self._write_layer_config(tmp_path, {"worker": {"library_load_timeout_s": 99.0}})
 
         with patch.dict(os.environ, {}, clear=True):
             manager = ConfigManager()

@@ -30,6 +30,20 @@ removed.
 To go back to the standard behavior for everything, click **Reset all**.
 Every feature returns to its default, which is almost always off.
 
+### Turning all beta features off at once
+
+The **Enable beta features** switch turns every beta feature off in one
+step, including editor, engine, and library features. You'll find it at
+the top of the **Beta Features** page, and in the popover that opens
+when you click the flask icon in the editor's header.
+
+Turning the switch off doesn't forget your choices. Each feature keeps
+the setting you gave it, and turning the switch back on restores them
+all. While the switch is off, every beta feature is off, including the
+few that are on by default. Use this when something behaves
+unexpectedly and you want to rule out beta features without changing
+each one.
+
 ### Nodes already on the canvas
 
 A library feature that adds or hides settings on a node shows the change
@@ -88,6 +102,18 @@ Only `true` or `false` counts. Any other value, such as `"yes"`, is
 ignored with a warning in the engine log, and the feature uses its
 default. A mistake here never affects your other settings.
 
+The **Enable beta features** switch is saved as `enabled` in the same
+`beta_features` section. Only `false` turns everything off. If it's
+missing or set to anything else, each feature follows its own setting:
+
+```json
+{
+    "beta_features": {
+        "enabled": false
+    }
+}
+```
+
 You can also turn a feature on for a single session with an
 environment variable. Put the feature's id, in capitals, after
 `GTN_CONFIG_BETA_FEATURES__`:
@@ -101,6 +127,12 @@ library's key in capitals, two underscores, and the feature's id:
 
 ```bash
 GTN_CONFIG_LIBRARY_BETA_FEATURES__ACME_IMAGE_TOOLS__SHARPEN_AFTER_UPSCALE=true gtn
+```
+
+To turn every beta feature off for a single session:
+
+```bash
+GTN_CONFIG_BETA_FEATURES__ENABLED=false gtn
 ```
 
 The feature and library names used above are examples. To add beta

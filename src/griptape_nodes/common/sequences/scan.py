@@ -6,7 +6,7 @@ lists the resolved directory via `ListDirectoryRequest`, hands the filenames
 to `fileseq.findSequencesInList`, applies subset clipping and the chosen
 missing-item policy, and returns a `ScanOutcome` carrying the inferred
 sequences plus diagnostic flags. The intended caller is
-`OSManager.on_scan_sequences_request`; other callers are welcome but should
+`FileSequences.on_scan_sequences_request`; other callers are welcome but should
 prefer dispatching the bus request unless they have a strong reason to
 bypass the worker-thread / async-dispatch path.
 
@@ -351,7 +351,7 @@ def _coerce_target_pattern(
     """
     if isinstance(pattern, FileSequence):
         return pattern
-    token_count = _count_sequence_tokens(pattern)
+    token_count = count_sequence_tokens(pattern)
     if token_count > 1:
         msg = (
             f"Attempted to parse fileseq template {pattern!r}. "
@@ -384,10 +384,12 @@ def _coerce_target_pattern(
 _TOKEN_PATTERN = re.compile(r"#+|%0?\d*d|@+|\$F\d*")
 
 
-def _count_sequence_tokens(pattern: str) -> int:
+def count_sequence_tokens(pattern: str) -> int:
     """Return the number of sequence tokens in `pattern`.
 
-    Used to reject multi-token templates before they reach fileseq.
+    Used to reject multi-token templates before they reach fileseq. Pure
+    string matching, no filesystem I/O -- safe to call outside the
+    `ScanSequencesRequest` bus (unlike the scanning functions in this module).
     """
     return len(_TOKEN_PATTERN.findall(pattern))
 

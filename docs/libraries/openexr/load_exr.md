@@ -51,12 +51,17 @@ Dynamic groups are also populated after the scan:
     outputs (hidden for single-part files; channels appear directly in the
     Channels group instead).
 - **Channels** — one `EXRChannelArtifact` per raw channel with name, pixel
-    type, and sampling (single-part files only).
+    type, and sampling (single-part files only). Channels are grouped by layer,
+    with `R`, `G`, `B`, `A` first within each layer (matching
+    [Display EXR Channel](display_exr_channel.md)) rather than the file's
+    alphabetical order.
 
 ## Tips & pitfalls
 
 - **Pixel types may read as approximate in header-only mode.** Set the `openexr.header_only` setting to `false` if you need accurate per-channel pixel types; the cost is loading pixel data into memory at scan time.
 - **Multi-part files hide the flat Channels group.** For multi-part renders, per-channel outputs live inside each part's group instead.
+- **For a quick look, use [Read EXR](read_exr.md).** It outputs a viewable image directly, without a separate display node.
+- **For frame sequences, use [Load EXR Sequence](load_exr_sequence.md).** It outputs one part descriptor per frame.
 - **Downstream nodes load pixels lazily.** The display and save nodes read pixel data themselves from the descriptor artifacts, so a header-only scan doesn't limit what you can do downstream.
 
 ## See also

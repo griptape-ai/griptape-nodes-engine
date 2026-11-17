@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+
+from griptape_nodes.serialization.values import DisplayValue
 
 
 class VariableScope(StrEnum):
@@ -50,7 +51,7 @@ class FlowVariable:
     name: str
     owning_flow_name: str | None  # None for global variables
     type: str
-    value: Any
+    value: DisplayValue
     permission: VariablePermission = VariablePermission.READ_WRITE
 
 

@@ -8,7 +8,6 @@ deferred loader and imports on first use, so a broken node is not reported until
 from __future__ import annotations
 
 import importlib
-import pickle
 import sys
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -26,12 +25,15 @@ from griptape_nodes.node_library.library_registry import (
 from griptape_nodes.retained_mode.events.library_events import (
     DescribeNodeTypeRequest,
     DescribeNodeTypeResultSuccess,
+    ListNodeTypesInLibraryRequest,
+    ListNodeTypesInLibraryResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_module_import_problem import (
     NodeModuleImportProblem,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LibrarySettings
+from griptape_nodes.serialization.type_names import resolve_type_name
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -151,7 +153,7 @@ class TestEagerLoading:
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
 
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=False
         )
 
@@ -170,7 +172,7 @@ class TestLazyLoading:
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
 
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 
@@ -195,7 +197,7 @@ class TestShouldLazyLoadNodes:
             patch.object(manager, "_is_worker", True),
             patch.object(config_mgr, "get_config_value", return_value=True),
         ):
-            assert manager._should_lazy_load_nodes() is False
+            assert manager.module_loading.should_lazy_load_nodes() is False
 
     def test_orchestrator_honors_setting_enabled(self, engine: Engine) -> None:
         manager = engine.library_manager
@@ -204,7 +206,7 @@ class TestShouldLazyLoadNodes:
             patch.object(manager, "_is_worker", False),
             patch.object(config_mgr, "get_config_value", return_value=True),
         ):
-            assert manager._should_lazy_load_nodes() is True
+            assert manager.module_loading.should_lazy_load_nodes() is True
 
     def test_orchestrator_honors_setting_disabled(self, engine: Engine) -> None:
         manager = engine.library_manager
@@ -213,7 +215,7 @@ class TestShouldLazyLoadNodes:
             patch.object(manager, "_is_worker", False),
             patch.object(config_mgr, "get_config_value", return_value=False),
         ):
-            assert manager._should_lazy_load_nodes() is False
+            assert manager.module_loading.should_lazy_load_nodes() is False
 
 
 class TestMultipleNodesPerFile:
@@ -231,7 +233,7 @@ class TestMultipleNodesPerFile:
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
 
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 
@@ -255,11 +257,11 @@ class TestDescribeNodeTypeWithLazyImportFailure:
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 
-        result = manager.describe_node_type_request(
+        result = manager.catalog.describe_node_type_request(
             DescribeNodeTypeRequest(node_type="BrokenNode", library=schema.name)
         )
 
@@ -268,11 +270,43 @@ class TestDescribeNodeTypeWithLazyImportFailure:
         assert result.parameters == []
 
 
+class TestListNodeTypesMetadataUnderLazyLoading:
+    def test_metadata_lists_lazy_nodes_without_importing_their_modules(self, engine: Engine, tmp_path: Path) -> None:
+        manager = engine.library_manager
+        marker = tmp_path / "import_count.txt"
+        (tmp_path / "siblings.py").write_text(_SIBLINGS_SOURCE.format(marker=str(marker)))
+        (tmp_path / "broken_node.py").write_text(_BROKEN_NODE_SOURCE)
+        schema = _schema(
+            "Lazy Listed Library",
+            [
+                NodeDefinition(class_name="SiblingA", file_path="siblings.py", metadata=_node_metadata("A")),
+                NodeDefinition(class_name="BrokenNode", file_path="broken_node.py", metadata=_node_metadata("Broken")),
+            ],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        info = _library_info(schema, tmp_path)
+        manager.module_loading.attempt_load_nodes_from_library(
+            library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
+        )
+
+        result = manager.catalog.on_list_node_types_in_library_request(
+            ListNodeTypesInLibraryRequest(library=schema.name, include_metadata=True)
+        )
+
+        assert isinstance(result, ListNodeTypesInLibraryResultSuccess), result.result_details
+        assert result.node_metadata is not None
+        assert list(result.node_metadata) == ["SiblingA", "BrokenNode"]
+        # Neither module ran: the siblings file never wrote its marker, and the broken file's
+        # missing import never raised.
+        assert not marker.exists()
+        assert not any(isinstance(p, NodeModuleImportProblem) for p in info.problems)
+
+
 class TestStableNamespaceImportUnderLazyLoading:
     """Lazily registered node files must be importable via their stable namespace.
 
     Saved workflows reference library classes through
-    ``griptape_nodes.node_libraries.<lib>.<file>`` imports and pickled values. With lazy
+    ``griptape_nodes.node_libraries.<lib>.<file>`` imports and saved values' type tags. With lazy
     loading nothing is in ``sys.modules`` at registration time, so these imports resolve
     through the StableNamespaceImportFinder meta-path hook instead.
     """
@@ -301,7 +335,7 @@ class TestStableNamespaceImportUnderLazyLoading:
         schema = _write_library(tmp_path)
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
         return manager, schema
@@ -318,14 +352,12 @@ class TestStableNamespaceImportUnderLazyLoading:
         library = LibraryRegistry.get_library("Lazy Flag Test Library")
         assert library.get_node_class("GoodNode") is module.GoodNode
 
-    def test_unpickle_resolves_stable_namespace_reference(self, engine: Engine, tmp_path: Path) -> None:
+    def test_type_name_resolves_stable_namespace_reference(self, engine: Engine, tmp_path: Path) -> None:
         self._register_lazy_library(engine, tmp_path)
         assert self.GOOD_STABLE_NAMESPACE not in sys.modules
 
-        # A GLOBAL-opcode pickle referencing the stable namespace, as found inside saved
-        # workflow parameter values. Unpickling must import the module on demand.
-        payload = f"c{self.GOOD_STABLE_NAMESPACE}\nGoodNode\n.".encode()
-        node_class = pickle.loads(payload)  # noqa: S301 - crafted in-test payload
+        # Saved parameter values name their class by stable namespace in their "$type" tag.
+        node_class = resolve_type_name(f"{self.GOOD_STABLE_NAMESPACE}:GoodNode")
 
         assert node_class.__name__ == "GoodNode"
 
@@ -347,7 +379,7 @@ class TestStableNamespaceImportUnderLazyLoading:
     def test_unregistered_library_is_no_longer_importable(self, engine: Engine, tmp_path: Path) -> None:
         manager, schema = self._register_lazy_library(engine, tmp_path)
 
-        manager._unregister_all_stable_module_aliases_for_library(schema.name)
+        manager.module_loading.unregister_all_stable_module_aliases_for_library(schema.name)
 
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(self.GOOD_STABLE_NAMESPACE)
@@ -365,7 +397,7 @@ class TestStableNamespaceImportUnderLazyLoading:
         )
         library = LibraryRegistry.generate_new_library(library_data=schema)
         info = _library_info(schema, tmp_path)
-        manager._attempt_load_nodes_from_library(
+        manager.module_loading.attempt_load_nodes_from_library(
             library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
         )
 

@@ -74,9 +74,8 @@ class BaseNodeElement:
         and reports every change recorded since the last flush.
         """
         self._changes[key] = value
-        # Only when attached to a node and not already in the list (avoids duplicate events).
-        if self._node_context is not None and self not in self._node_context._tracked_parameters:
-            self._node_context._tracked_parameters.append(self)
+        if self._node_context is not None:
+            self._node_context.queue_element_change(self)
 
     # --- Badge (discoverable by all subclasses) ---
     # Message types for frontend: clear_badge, get_badge, set_badge, clear_badge_display
@@ -125,11 +124,10 @@ class BaseNodeElement:
 
     def _emit_alter_element_event_if_possible(self) -> None:
         """Emit an AlterElementEvent if we have node context and the necessary dependencies."""
-        if self._node_context is None:
+        if self._node_context is None or not self._node_context.broadcasts_events:
             return
 
         # Imported here to avoid circular dependencies: the event modules reach the element tree.
-        from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 
         event_data = {
@@ -145,9 +143,7 @@ class BaseNodeElement:
                 self._changes[key] = complete_dict[key]
 
         event_data.update(self._changes)
-        event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
-        )
+        event = self._node_context.execution_event(AlterElementEvent(element_details=event_data))
         # This is an element, not a node, so the engine comes from the node it belongs to.
         self._node_context.engine.event_manager.put_event(event)
         self._changes.clear()
@@ -183,17 +179,20 @@ class BaseNodeElement:
         if child._parent is not None:
             child._parent.remove_child(child)
         child._parent = self
-        # Propagate node context to children
-        child._node_context = self._node_context
         self._children.append(child)
 
-        # Also propagate to any existing children of the child
-        for grandchild in child.find_elements_by_type(BaseNodeElement, find_recursively=True):
-            grandchild._node_context = self._node_context
+        # Propagate node context to the child and all of its descendants
+        for element in [child, *child.find_elements_by_type(BaseNodeElement, find_recursively=True)]:
+            element._node_context = self._node_context
+            if self._node_context is not None:
+                element._on_node_attached()
 
         # Emit event if we have node context
         if self._node_context is not None:
             self._node_context._emit_parameter_lifecycle_event(child)
+
+    def _on_node_attached(self) -> None:
+        """Hook run when this element joins a node. Subclasses and mixins override it."""
 
     def remove_child(self, child: BaseNodeElement | str) -> None:
         """Remove a child element from the hierarchy.

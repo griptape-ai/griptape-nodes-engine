@@ -5,7 +5,7 @@ This is the mechanism behind the stale-library report. Three facts combine:
 1. `libraries_to_register` lives at
    `app_events.on_app_initialization_complete.libraries_to_register` -- a *nested*,
    *list-valued* key. `_load_config_from_env_vars` can reach a nested key via a `__`
-   path separator (e.g. `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S`), but a list-valued
+   path separator (e.g. `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`), but a list-valued
    setting has no string representation the `Settings` model accepts, so any value
    supplied for `libraries_to_register` is rejected and dropped. No `GTN_CONFIG_*`
    variable can set or shadow it.
@@ -292,7 +292,9 @@ class TestDropoutProducesTheReportedErrors:
             )
         )
 
-        booted = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
+        booted = await library_manager.metadata_loading.load_metadata_for_all_libraries_request(
+            LoadMetadataForAllLibrariesRequest()
+        )
         assert isinstance(booted, LoadMetadataForAllLibrariesResultSuccess)
         assert {entry.library_schema.name for entry in booted.successful_libraries} == {REGISTERED_LIBRARY}
 
@@ -300,7 +302,9 @@ class TestDropoutProducesTheReportedErrors:
         config_manager.clear_project_layers()
         config_manager.load_configs()
 
-        after = await library_manager.load_metadata_for_all_libraries_request(LoadMetadataForAllLibrariesRequest())
+        after = await library_manager.metadata_loading.load_metadata_for_all_libraries_request(
+            LoadMetadataForAllLibrariesRequest()
+        )
         assert isinstance(after, LoadMetadataForAllLibrariesResultSuccess)
         advertised = {entry.library_schema.name for entry in after.successful_libraries}
 
@@ -319,6 +323,8 @@ class TestDropoutProducesTheReportedErrors:
         # And the registry still holds only what boot loaded, so every follow-up check
         # fails with the error the user saw.
         for orphan in ORPHANED_LIBRARIES:
-            result = await library_manager.check_library_update_request(CheckLibraryUpdateRequest(library_name=orphan))
+            result = await library_manager.git_operations.check_library_update_request(
+                CheckLibraryUpdateRequest(library_name=orphan)
+            )
             assert isinstance(result, CheckLibraryUpdateResultFailure)
             assert "no Library with that name was registered" in str(result.result_details)

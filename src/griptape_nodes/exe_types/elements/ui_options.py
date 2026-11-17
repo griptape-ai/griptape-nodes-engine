@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger("griptape_nodes")
+
+
+class UIOptionConflict(NamedTuple):
+    """A constructor argument that disagreed with the element's ``ui_options``."""
+
+    param_name: str
+    param_value: Any
+    dict_value: Any
 
 
 class UIOptionsMixin:
@@ -19,7 +27,8 @@ class UIOptionsMixin:
     ) -> None:
         """Validate that explicit parameter doesn't conflict with ui_options dict.
 
-        Logs a warning if there's a conflict and the ui_options value will be used.
+        Logs a warning if there's a conflict and the ui_options value will be used. The warning
+        waits until the element belongs to a node (see ``report_ui_option_conflicts``).
 
         Args:
             ui_options_dict: The ui_options dictionary to check
@@ -30,22 +39,54 @@ class UIOptionsMixin:
             return
 
         dict_value = ui_options_dict[param_name]
+        if param_value == dict_value:
+            return
 
-        if param_value != dict_value:
-            # Get element name for better error messages
-            element_name = getattr(self, "name", None)
-            class_name = self.__class__.__name__
+        conflict = UIOptionConflict(param_name=param_name, param_value=param_value, dict_value=dict_value)
+        pending = getattr(self, "_pending_ui_option_conflicts", None)
+        if pending is None:
+            pending = []
+            self._pending_ui_option_conflicts = pending
+        pending.append(conflict)
+        self.report_ui_option_conflicts()
 
-            # Build element part
-            if element_name:
-                element_part = f"{class_name} '{element_name}'"
-            else:
-                element_part = class_name
+    def _on_node_attached(self) -> None:
+        self.report_ui_option_conflicts()
 
+    def report_ui_option_conflicts(self) -> None:
+        """Log conflicts found at construction once the element belongs to a node.
+
+        Elements are usually built before they are added to a node, so a conflict waits here
+        until the warning can name the node and the library that defined it.
+        """
+        node = getattr(self, "_node_context", None)
+        pending = getattr(self, "_pending_ui_option_conflicts", None)
+        if node is None or not pending:
+            return
+
+        self._pending_ui_option_conflicts = []
+        element_name = getattr(self, "name", None)
+        class_name = self.__class__.__name__
+        if element_name:
+            element_part = f"{class_name} '{element_name}'"
+        else:
+            element_part = class_name
+
+        node_type = node.metadata.get("node_type") or node.__class__.__name__
+        library_name = node.metadata.get("library")
+        if library_name:
+            node_part = f"Node '{node.name}' ({node_type} from library '{library_name}')"
+            contact = f"Please contact the author of library '{library_name}' to fix this issue."
+        else:
+            node_part = f"Node '{node.name}' ({node_type})"
+            contact = "Please contact the library author to fix this issue."
+
+        for conflict in pending:
             msg = (
-                f"{element_part}: Conflicting values for '{param_name}'. "
-                f'Explicit parameter {param_name}={param_value!r} conflicts with ui_options["{param_name}"]={dict_value!r}. '
-                f"The value from ui_options will be used. Please contact the library author to fix this issue."
+                f"{node_part}, {element_part}: Conflicting values for '{conflict.param_name}'. "
+                f"Explicit parameter {conflict.param_name}={conflict.param_value!r} conflicts with "
+                f'ui_options["{conflict.param_name}"]={conflict.dict_value!r}. '
+                f"The value from ui_options will be used. {contact}"
             )
             logger.warning(msg)
 

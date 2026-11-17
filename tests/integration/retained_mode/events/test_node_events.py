@@ -5,6 +5,7 @@ from unittest.mock import ANY
 
 import pytest  # type: ignore[reportMissingImports]
 
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventResultSuccess
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
@@ -33,7 +34,7 @@ class TestNodeEvents:
 
         assert isinstance(result, GetAllNodeInfoResultSuccess)
 
-        assert EventResultSuccess(request=request, result=result).dict() == {
+        assert converters.engine.unstructure(EventResultSuccess(request=request, result=result)) == {
             "request": {"request_id": None, "node_name": "RunAgentNode_1"},
             "result": {
                 "metadata": {

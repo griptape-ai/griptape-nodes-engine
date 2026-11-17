@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import griptape_nodes
 from griptape_nodes.exe_types.core_types import Trait
 from griptape_nodes.traits.slider import Slider
 from griptape_nodes.traits.trait_resolver import resolve_trait
@@ -76,11 +77,11 @@ class TestABrokenTraitModuleDoesNotFailTheLoad:
     def test_a_module_that_raises_on_import_warns_instead_of_propagating(
         self, caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        (tmp_path / "exploding_trait_module.py").write_text('raise RuntimeError("library blew up on import")')
-        monkeypatch.syspath_prepend(str(tmp_path))
+        (tmp_path / "_exploding_trait_module.py").write_text('raise RuntimeError("library blew up on import")')
+        monkeypatch.setattr(griptape_nodes, "__path__", [*griptape_nodes.__path__, str(tmp_path)])
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            resolved = resolve_trait("Slider", "exploding_trait_module")
+            resolved = resolve_trait("Slider", "griptape_nodes._exploding_trait_module")
 
         assert resolved is None
         assert "library blew up on import" in caplog.text
@@ -88,16 +89,32 @@ class TestABrokenTraitModuleDoesNotFailTheLoad:
     def test_a_missing_dependency_is_reported(
         self, caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        module_name = "trait_module_with_missing_dependency"
         dependency_name = "dependency_that_does_not_exist"
-        (tmp_path / f"{module_name}.py").write_text(f"import {dependency_name}\n")
-        monkeypatch.syspath_prepend(str(tmp_path))
+        (tmp_path / "_trait_module_with_missing_dependency.py").write_text(f"import {dependency_name}\n")
+        monkeypatch.setattr(griptape_nodes, "__path__", [*griptape_nodes.__path__, str(tmp_path)])
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            resolved = resolve_trait("Slider", module_name)
+            resolved = resolve_trait("Slider", "griptape_nodes._trait_module_with_missing_dependency")
 
         assert resolved is None
         assert dependency_name in caplog.text
+
+    def test_a_module_outside_griptape_is_not_imported(
+        self, caplog: pytest.LogCaptureFixture, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Saved data names the module, so loading it must not run an arbitrary installed module."""
+        marker = tmp_path / "marker.txt"
+        (tmp_path / "untrusted_trait_module.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        sys.modules.pop("untrusted_trait_module", None)
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            resolved = resolve_trait("Slider", "untrusted_trait_module")
+
+        assert resolved is None
+        assert not marker.exists()
+        assert "untrusted_trait_module" not in sys.modules
+        assert "untrusted_trait_module" in caplog.text
 
     def test_a_missing_module_resolves_to_nothing_quietly(self, caplog: pytest.LogCaptureFixture) -> None:
         """The caller reports the trait it could not restore, so this stays quiet."""

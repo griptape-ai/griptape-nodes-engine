@@ -13,6 +13,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketBaseMixin
+from griptape_nodes.retained_mode.topics import session_response_topic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -50,7 +51,7 @@ class SubprocessWebSocketListenerMixin(SubprocessWebSocketBaseMixin):
 
     async def _start_websocket_listener(self) -> None:
         """Start WebSocket client and listener background task."""
-        logger.info("Starting WebSocket listener for session %s", self._session_id)
+        logger.debug("Starting WebSocket listener for session %s", self._session_id)
 
         await self._start_websocket_client()
 
@@ -58,12 +59,12 @@ class SubprocessWebSocketListenerMixin(SubprocessWebSocketBaseMixin):
             msg = "WebSocket client failed to initialize"
             raise RuntimeError(msg)
 
-        topic = f"sessions/{self._session_id}/response"
+        topic = session_response_topic(self._session_id)
         await self._ws_client.subscribe(topic)
 
         self._create_websocket_task(self._ws_listen_loop())
 
-        logger.info("WebSocket listener started for session %s", self._session_id)
+        logger.debug("WebSocket listener started for session %s", self._session_id)
 
     async def _ws_listen_loop(self) -> None:
         """Background task to process incoming messages."""
@@ -108,12 +109,12 @@ class SubprocessWebSocketListenerMixin(SubprocessWebSocketBaseMixin):
 
     async def _stop_websocket_listener(self) -> None:
         """Stop the listener task and close client."""
-        logger.info("Stopping WebSocket listener for session %s", self._session_id)
+        logger.debug("Stopping WebSocket listener for session %s", self._session_id)
 
         await self._stop_websocket_task()
         await self._stop_websocket_client()
 
-        logger.info("WebSocket listener stopped for session %s", self._session_id)
+        logger.debug("WebSocket listener stopped for session %s", self._session_id)
 
     async def _handle_subprocess_event(self, event: dict) -> None:
         """Handle subprocess-specific events.

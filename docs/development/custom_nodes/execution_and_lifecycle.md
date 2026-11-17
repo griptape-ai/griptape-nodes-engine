@@ -11,7 +11,11 @@ All callbacks are overridable:
 - **after_incoming_connection_removed**, **after_outgoing_connection_removed**: Handle disconnection
 - **before_value_set**: Return modified value before setting
 - **after_value_set**: React to parameter value changes
-- **validate_before_workflow_run**, **validate_before_node_run**: Return list[Exception]|None
+- **validate_before_workflow_run**, **validate_before_node_run**: Return list[Exception]|None.
+    `validate_before_workflow_run` runs before any connection has delivered a value, so a connected input
+    may still hold its default there. Check whether a parameter is connected before reporting it as
+    missing; `validate_empty_parameter(..., skip_if_connected=True)` does. `validate_before_node_run`
+    runs after the node's inputs have arrived.
 - **on_griptape_event**: Handle workflow events
 - **initialize_spotlight**: Setup spotlight functionality
 - **get_next_control_output**: Return Parameter|None for control flow
@@ -67,7 +71,7 @@ class MyAsyncNode(ControlNode):
         except Exception as e:
             self._set_safe_defaults()
             self._log(f"Processing failed: {e}")
-            raise RuntimeError(f"{self.name}: {e}") from e
+            raise
 
     async def _submit_task(self, client: httpx.AsyncClient, api_key: str) -> str:
         response = await client.post(
@@ -141,7 +145,7 @@ class MyBlockingNode(ControlNode):
         except Exception as e:
             self._set_safe_defaults()
             self._log(f"Processing failed: {e}")
-            raise RuntimeError(f"{self.name}: {str(e)}") from e
+            raise
 ```
 
 **Key Points:**
@@ -149,6 +153,20 @@ class MyBlockingNode(ControlNode):
 - `process()` returns `AsyncResult | None` and yields a callable
 - Each yielded callable runs synchronously on a background thread; the generator resumes with its return value
 - Fine for existing synchronous code (`requests`, blocking SDKs), but prefer `aprocess()` for new integrations
+
+### Starting Your Own Threads
+
+The engine knows which workflow a node runs in from the context of the code that runs it. `aprocess()`, yielded callables, and `asyncio.to_thread` carry that context along. A thread you start yourself doesn't: `threading.Thread`, a `ThreadPoolExecutor`, and `loop.run_in_executor` begin with an empty context. Code in such a thread can't find the node's workflow, so workflow-relative paths such as `{workflow_dir}` and `{outputs}` fail to resolve.
+
+Prefer `asyncio.to_thread`. When you need your own thread or pool, run each task inside its own copy of the current context:
+
+```python
+import contextvars
+from concurrent.futures import ThreadPoolExecutor
+
+with ThreadPoolExecutor() as pool:
+    futures = [pool.submit(contextvars.copy_context().run, render_frame, frame) for frame in frames]
+```
 
 ### Polling Pattern for Long-Running Tasks
 
@@ -390,7 +408,7 @@ def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact, para
         # Validate size
         size_mb = len(image_bytes) / (1024 * 1024)
         if size_mb >= 20:
-            exceptions.append(ValueError(f"{self.name}: {param_name} size must be < 20MB (current: {size_mb:.1f}MB)"))
+            exceptions.append(ValueError(f"{param_name} size must be < 20MB (current: {size_mb:.1f}MB)"))
 
         # Validate format and dimensions
         try:
@@ -400,16 +418,12 @@ def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact, para
             img = Image.open(BytesIO(image_bytes))
 
             if img.format not in ["JPEG", "PNG", "WEBP"]:
-                exceptions.append(
-                    ValueError(f"{self.name}: {param_name} format must be JPG, PNG, or WebP (current: {img.format})")
-                )
+                exceptions.append(ValueError(f"{param_name} format must be JPG, PNG, or WebP (current: {img.format})"))
 
             width, height = img.size
             short_edge = min(width, height)
             if short_edge <= 300:
-                exceptions.append(
-                    ValueError(f"{self.name}: {param_name} short edge must be > 300px (current: {short_edge}px)")
-                )
+                exceptions.append(ValueError(f"{param_name} short edge must be > 300px (current: {short_edge}px)"))
         except ImportError:
             self._log("PIL not available for validation")
         except Exception as e:
@@ -490,15 +504,15 @@ def validate_before_node_run(self) -> list[Exception] | None:
     # Example: 10s only for specific model/resolution
     if duration == 10:
         if model != "AdvancedModel":
-            exceptions.append(ValueError(f"{self.name}: 10s duration only supported by AdvancedModel"))
+            exceptions.append(ValueError("10s duration only supported by AdvancedModel"))
         elif resolution == "4K":
-            exceptions.append(ValueError(f"{self.name}: 10s duration not supported with 4K resolution"))
+            exceptions.append(ValueError("10s duration not supported with 4K resolution"))
 
     # Model-specific parameter requirements
     if model in ["ModelB", "ModelC"]:
         required_param = self.get_parameter_value("required_for_model_b_c")
         if not required_param:
-            exceptions.append(ValueError(f"{self.name}: Parameter required for {model}"))
+            exceptions.append(ValueError(f"Parameter required for {model}"))
 
     return exceptions if exceptions else None
 ```

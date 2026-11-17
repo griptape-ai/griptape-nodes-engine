@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
+    GraphAccessMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -14,6 +15,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.connection_events import IncomingConnection, OutgoingConnection
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.serialization.values import DisplayValue, ElementDocument, Value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,6 +28,15 @@ class AddParameterToNodeRequest(RequestPayload):
 
     Use when: Dynamically adding inputs/outputs to nodes, customizing node interfaces,
     building configurable nodes. Supports type validation, tooltips, and mode restrictions.
+
+    Also adds an item slot to a ParameterList input (e.g. `items` on CreateImageList,
+    `input_images` on image generators). These lists start with no slots. A single item
+    connects to a slot, not to the list; a source that already outputs a list can connect to the
+    list itself. Pass only node_name and
+    parent_container_name=<list name>; the slot copies the list's type and modes, and its
+    generated name comes back as parameter_name (`<list name>_ParameterListUniqueParamID_<hex>`).
+    Use that name as the target of CreateConnectionRequest or SetParameterValueRequest.
+    Add one slot per item.
 
     Args:
         node_name: Name of the node to add parameter to (None for current context)
@@ -48,6 +59,7 @@ class AddParameterToNodeRequest(RequestPayload):
         initial_setup: Skip setup work when loading from file
         settable: Whether parameter can be set directly by the user or not
         allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
+        serializable: Whether the parameter's value is saved with the workflow
 
     Results: AddParameterToNodeResultSuccess (with parameter name) | AddParameterToNodeResultFailure
     """
@@ -55,7 +67,7 @@ class AddParameterToNodeRequest(RequestPayload):
     # If node name is None, use the Current Context
     node_name: str | None = None
     parameter_name: str | None = None
-    default_value: Any | None = None
+    default_value: Value = None
     tooltip: str | list[dict] | None = None
     tooltip_as_input: str | list[dict] | None = None
     tooltip_as_property: str | list[dict] | None = None
@@ -70,6 +82,7 @@ class AddParameterToNodeRequest(RequestPayload):
     is_user_defined: bool = field(default=True)
     settable: bool = field(default=True)
     allow_variable_substitution: bool = field(default=True)
+    serializable: bool = field(default=True)
     parent_container_name: str | None = None
     parent_element_name: str | None = None
     traits: list[dict[str, Any]] | None = None
@@ -111,7 +124,7 @@ class AddParameterToNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class RemoveParameterFromNodeRequest(RequestPayload):
+class RemoveParameterFromNodeRequest(RequestPayload, GraphAccessMixin):
     """Remove a parameter from a node.
 
     Use when: Cleaning up unused parameters, dynamically restructuring node interfaces,
@@ -247,7 +260,7 @@ class SetParameterValueRequest(RequestPayload):
     """
 
     parameter_name: str
-    value: str | int | float | bool | dict | list | None
+    value: DisplayValue
     # If node name is None, use the Current Context
     node_name: str | None = None
     data_type: str | None = None
@@ -271,7 +284,7 @@ class SetParameterValueResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess)
         data_type: The determined data type of the value
     """
 
-    finalized_value: Any
+    finalized_value: DisplayValue
     data_type: str
 
 
@@ -330,7 +343,7 @@ class GetParameterDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
     type: str
     input_types: list[str]
     output_type: str
-    default_value: Any | None
+    default_value: DisplayValue
     tooltip: str | list[dict]
     tooltip_as_input: str | list[dict] | None
     tooltip_as_property: str | list[dict] | None
@@ -388,7 +401,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     type: str | None = None
     input_types: list[str] | None = None
     output_type: str | None = None
-    default_value: Any | None = None
+    default_value: Value = None
     clear_default_value: bool = False
     tooltip: str | list[dict] | None = None
     tooltip_as_input: str | list[dict] | None = None
@@ -491,7 +504,7 @@ class GetParameterValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
     input_types: list[str]
     type: str
     output_type: str
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -506,7 +519,7 @@ class OnParameterValueChanged(WorkflowAlteredMixin, ResultPayloadSuccess):
     node_name: str
     parameter_name: str
     data_type: str
-    value: Any
+    value: DisplayValue
 
 
 @dataclass
@@ -577,7 +590,7 @@ class GetNodeElementDetailsRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class GetNodeElementDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    element_details: dict[str, Any]
+    element_details: ElementDocument
 
 
 @dataclass
@@ -590,7 +603,7 @@ class GetNodeElementDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 @dataclass
 @PayloadRegistry.register
 class AlterElementEvent(ExecutionPayload):
-    element_details: dict[str, Any]
+    element_details: ElementDocument
 
 
 @dataclass
@@ -646,7 +659,7 @@ class RenameParameterResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class GetConnectionsForParameterRequest(RequestPayload):
+class GetConnectionsForParameterRequest(RequestPayload, GraphAccessMixin):
     """Get connections for a specific parameter on a node.
 
     Use when: Checking if a parameter is connected, getting connection details for a parameter,

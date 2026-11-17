@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.elements.parameter import Parameter
 
 
-# TODO: https://github.com/griptape-ai/griptape-nodes/issues/858
+# TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/858
 
 
 @dataclass(eq=False)

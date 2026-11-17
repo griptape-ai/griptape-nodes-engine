@@ -97,9 +97,7 @@ def loop_and_sink_flow(
 
 async def _run(engine: Engine, flow_name: str) -> dict[str, NodeResolutionState]:
     """Run the flow to completion and return each node's final resolution state."""
-    await engine.ahandle_request(
-        StartFlowRequest(flow_name=flow_name, wait_for_completion=True, completion_timeout_ms=30000)
-    )
+    await engine.ahandle_request(StartFlowRequest(flow_name=flow_name))
     flow = engine.flow_manager.get_flow_by_name(flow_name)
     return {name: engine.node_manager.get_node_by_name(name).state for name in flow.nodes}
 

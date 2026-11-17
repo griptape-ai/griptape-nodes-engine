@@ -36,14 +36,16 @@ import pytest_asyncio
 
 from griptape_nodes.api_client.request_client import RequestClient
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import GetEngineVersionRequest
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultFailure,
     EventResultSuccess,
 )
-from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+
+converter = converters.engine
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -102,7 +104,7 @@ class FakeBrokerClient:
             result = await current_engine().ahandle_request(request)
             event_cls = EventResultSuccess if result.succeeded() else EventResultFailure
             reply = event_cls(request=request, request_id=request_id, result=result)
-            reply_payload = json.loads(reply.json())
+            reply_payload = json.loads(converters.engine.dumps(reply))
             broker_loop.call_soon_threadsafe(
                 lambda: broker_loop.create_task(self._deliver(reply_payload)),
             )

@@ -4,7 +4,8 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION, PRIVATE_EXECUTION
+from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LOCAL_EXECUTION
+from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
     ExecutionEvent,
@@ -14,6 +15,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowResolvedEvent,
     GriptapeEvent,
     NodeFinishProcessEvent,
+    NodeProcessOutcome,
     NodeResolvedEvent,
     NodeStartProcessEvent,
 )
@@ -139,7 +141,7 @@ class SubflowExecutionComponent:
             value: The new value of the parameter
         """
         if parameter.name == "execution_environment":
-            if value in {LOCAL_EXECUTION, PRIVATE_EXECUTION}:
+            if value in {LOCAL_EXECUTION, ISOLATED_EXECUTION}:
                 self._node.hide_parameter_by_name("publishing_progress")
                 self._node.hide_parameter_by_name("publishing_target_link")
             else:
@@ -148,7 +150,7 @@ class SubflowExecutionComponent:
         if parameter.name == "publishing_target_link":
             if value and self._node.get_parameter_value("execution_environment") not in {
                 LOCAL_EXECUTION,
-                PRIVATE_EXECUTION,
+                ISOLATED_EXECUTION,
             }:
                 self._node.show_parameter_by_name("publishing_target_link")
             else:
@@ -174,7 +176,7 @@ class SubflowExecutionComponent:
             return None
 
         payload = event.get("payload", {})
-        return ExecutionEvent.from_dict(data=payload)
+        return converters.engine.structure(payload, ExecutionEvent)
 
     def handle_publishing_event(self, event: dict) -> None:
         """Handle events from SubprocessWorkflowPublisher.
@@ -216,7 +218,7 @@ class SubflowExecutionComponent:
         payload = event.get("payload", {})
         result_data = payload.get("result", {})
 
-        event_result = EventResultSuccess.from_dict(data=payload)
+        event_result = converters.engine.structure(payload, EventResultSuccess)
         if isinstance(event_result.result, PublishWorkflowResultSuccess):
             publish_workflow_result_success = event_result.result
             target_link = (
@@ -283,7 +285,11 @@ class SubflowExecutionComponent:
         return f"Starting: {payload.node_name}"
 
     def _format_node_finish_process(self, payload: NodeFinishProcessEvent) -> str:
-        """Format a NodeFinishProcessEvent."""
+        """Format a NodeFinishProcessEvent, saying how the node's run ended when the event knows."""
+        if payload.outcome == NodeProcessOutcome.FAILED:
+            return f"Failed: {payload.node_name}"
+        if payload.outcome == NodeProcessOutcome.CANCELLED:
+            return f"Cancelled: {payload.node_name}"
         return f"Finished: {payload.node_name}"
 
     def _format_node_resolved(self, payload: NodeResolvedEvent) -> str:

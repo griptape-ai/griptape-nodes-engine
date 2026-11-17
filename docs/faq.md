@@ -81,7 +81,7 @@ Press **y** to install the Advanced Media Library, or **n** to skip installation
 
 Version 0.64.0 removed deprecated nodes from the Advanced Media Library. These nodes were previously marked for deprecation and have been replaced with more flexible alternatives.
 
-If you have workflows that use deprecated nodes, please refer to the [MIGRATION.md](https://github.com/griptape-ai/griptape-nodes/blob/main/MIGRATION.md) guide. This comprehensive guide provides:
+If you have workflows that use deprecated nodes, please refer to the [MIGRATION.md](https://github.com/griptape-ai/griptape-nodes-engine/blob/main/MIGRATION.md) guide. This comprehensive guide provides:
 
 - A complete list of removed nodes and their replacements
 - Step-by-step migration instructions
@@ -132,7 +132,7 @@ If you're interested in testing out unreleased features, you can install the pre
 
 If you use Griptape Nodes Desktop, switch the **Release Channel** to **Nightly** in [App Settings](guides/desktop/app_settings.md#release-channels). Nightly builds are published daily and bundle pre-release engine and editor builds along with the app. You can switch back to **Stable** at any time, without reinstalling.
 
-If you install the engine yourself, the pre-release engine is published to the [latest](https://github.com/griptape-ai/griptape-nodes/releases/tag/latest) tag twice a day.
+If you install the engine yourself, the pre-release engine is published to the [latest](https://github.com/griptape-ai/griptape-nodes-engine/releases/tag/latest) tag twice a day.
 
 To switch to the pre-release update channel, run the following commands:
 

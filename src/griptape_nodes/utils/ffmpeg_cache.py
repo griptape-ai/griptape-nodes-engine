@@ -31,7 +31,8 @@ import logging
 from pathlib import Path
 
 import static_ffmpeg.run
-from xdg_base_dirs import xdg_data_home
+
+from griptape_nodes.utils.engine_dirs import engine_data_dir
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -41,7 +42,7 @@ _redirect_installed = False
 def install_ffmpeg_cache_redirect(configured_directory: str) -> None:
     """Redirect `static_ffmpeg`'s cache to the configured (or default) directory, once per process.
 
-    Mirrors `install_file_url_support`: the redirect mutates process-wide state, so it is
+    The redirect mutates process-wide state, so it is
     installed once and subsequent calls are no-ops. The first caller's configuration wins;
     building further engines in the same process must not move the cache out from under
     callers that already resolved ffmpeg.
@@ -70,7 +71,7 @@ def resolve_ffmpeg_directory(configured_directory: str) -> Path:
     Returns:
         The directory that should hold `lock.file` and the `bin/<platform>/` tree.
     """
-    default_directory = xdg_data_home() / "griptape_nodes" / "ffmpeg"
+    default_directory = engine_data_dir() / "ffmpeg"
 
     if not configured_directory:
         return default_directory

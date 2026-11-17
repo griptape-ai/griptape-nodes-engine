@@ -50,7 +50,9 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and start WebSocket connection."""
         GriptapeNodes.EventManager().initialize_queue()
-        await GriptapeNodes.EventManager().abroadcast_app_event(AppInitializationComplete())
+        await GriptapeNodes.EventManager().abroadcast_app_event(
+            AppInitializationComplete(defer_pending_library_resets=True)
+        )
 
         logger.info("Setting up publishing session %s", self._session_id)
         GriptapeNodes.SessionManager().save_session(self._session_id)
@@ -75,7 +77,7 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
         workflow_path: str,
         publisher_name: str,
         published_workflow_file_name: str,
-        **kwargs: Any,
+        **kwargs: Any,  # noqa: ARG002 callers may still pass the deprecated pickle_control_flow_result
     ) -> None:
         """Run the publish operation with WebSocket event emission enabled.
 
@@ -89,7 +91,6 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
                 workflow_path=workflow_path,
                 publisher_name=publisher_name,
                 published_workflow_file_name=published_workflow_file_name,
-                **kwargs,
             )
         except Exception as e:
             msg = f"Unexpected error during publish: {e}"
@@ -104,18 +105,15 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
         workflow_path: str,
         publisher_name: str,
         published_workflow_file_name: str,
-        **kwargs: Any,
     ) -> None:
         """Internal async run method with event queue monitoring and websocket integration."""
         # Load the workflow into memory
         await self.aprepare_workflow_for_run(flow_input={}, workflow_path=workflow_path)
 
-        pickle_control_flow_result = kwargs.get("pickle_control_flow_result", False)
         publish_workflow_request = PublishWorkflowRequest(
             workflow_name=workflow_name,
             publisher_name=publisher_name,
             published_workflow_file_name=published_workflow_file_name,
-            pickle_control_flow_result=pickle_control_flow_result,
         )
 
         # Send the publish request async (fire and forget pattern)
@@ -134,13 +132,13 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
                     msg = f"Failed to publish workflow: {publish_result.result_details}"
                     logger.error(msg)
                     event_result_failure = EventResultFailure(request=publish_workflow_request, result=publish_result)
-                    self.send_event("failure_result", event_result_failure.json())
+                    self._send_result("failure_result", event_result_failure)
                     is_publish_finished = True
                     error = LocalPublisherError(msg)
                 else:
                     logger.info("Published workflow successfully")
                     event_result_success = EventResultSuccess(request=publish_workflow_request, result=publish_result)
-                    self.send_event("success_result", event_result_success.json())
+                    self._send_result("success_result", event_result_success)
                     is_publish_finished = True
                     # Add a dummy event to wake up the loop now that publishing is done
                     event_queue = GriptapeNodes.EventManager().event_queue
@@ -186,7 +184,7 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
                     if isinstance(wrapped_event, ExecutionEvent) and isinstance(
                         wrapped_event.payload, PublishWorkflowProgressEvent
                     ):
-                        self.send_event("execution_event", wrapped_event.json())
+                        self._send_event("execution_event", wrapped_event)
                         logger.debug(
                             "Emitted progress event: %.1f%% - %s",
                             wrapped_event.payload.progress,

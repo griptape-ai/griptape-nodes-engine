@@ -65,7 +65,7 @@ class BaseGeneratorParameters(BaseModel):
     """
 
     model_config = ConfigDict(
-        extra="ignore",  # TODO: Change to "forbid" after https://github.com/griptape-ai/griptape-nodes/issues/3980
+        extra="ignore",  # TODO: Change to "forbid" after https://github.com/griptape-ai/griptape-nodes-engine/issues/3980
         validate_assignment=True,  # Validate on attribute assignment
         str_strip_whitespace=True,  # Clean string inputs
     )

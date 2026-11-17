@@ -6,19 +6,23 @@ These tests cover small, near-pure helpers that decide loop control flow:
   PackageNodesAsSerializedFlowResultSuccess.
 * ``_get_iteration_control_action`` - determine BREAK/SKIP/ADD for both the
   legacy BaseIterativeEndNode path and the BaseIterativeNodeGroup path.
+* ``_get_control_source_that_reached_end`` / ``_forget_control_source_that_reached_end`` -
+  read and clear the body exit that handed control to the packaged End node.
 * ``_check_control_source_fired`` - decide whether a (source_node, source_param)
-  pair has fired its control output.
-* ``_find_source_for_control_param`` - return the first source for a given
-  control parameter name, or None.
+  pair is the exit that handed control to the packaged End node.
 * ``_format_loop_failure_message`` / ``_format_iteration_failure_lines`` - compose
   the artist-facing error naming which iterations failed and why.
 * ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
   creations from reaching editors.
+* ``_passthrough_connections_between`` / ``_handle_empty_loop_body`` - an item wired straight
+  from the loop's start node into the end node's ``new_item_to_add``.
+* ``_extract_iteration_results_from_subprocess`` - a failed isolated or publisher iteration
+  keeps its place in the results as None.
 """
 
 import logging
 from typing import Any, cast
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -26,12 +30,23 @@ from griptape_nodes.common.node_executor import IterationControlAction, Iteratio
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.flow_events import (
+    OriginalNodeParameter,
+    PackagedNodeParameterMapping,
+    PassthroughConnection,
+)
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     ListConnectionsForNodeResultSuccess,
     NodeDependencies,
     SerializedNodeCommands,
 )
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+
+def _workflow_of(executor: NodeExecutor) -> WorkflowRuntime:
+    """A workflow whose requests go to the executor's engine."""
+    return WorkflowRuntime("wf", executor.engine)
 
 
 def _make_executor() -> NodeExecutor:
@@ -55,6 +70,24 @@ def _make_package_result(
     end_mapping.parameter_mappings = end_param_mappings or {}
     package_result.parameter_name_mappings = [start_mapping, end_mapping]
     return package_result
+
+
+def _make_end_node_mapping(
+    parameter_mappings: dict[str, OriginalNodeParameter] | None = None,
+) -> PackagedNodeParameterMapping:
+    return PackagedNodeParameterMapping(node_name="EndPkg", parameter_mappings=parameter_mappings or {})
+
+
+def _make_end_node(*, entered_on: str | None) -> MagicMock:
+    """Mock packaged End node whose recorded entry is the named control input, or None."""
+    end_node = MagicMock()
+    if entered_on is None:
+        end_node._entry_control_parameter = None
+        return end_node
+    entry_parameter = MagicMock()
+    entry_parameter.name = entered_on
+    end_node._entry_control_parameter = entry_parameter
+    return end_node
 
 
 class TestGetNodeParameterMappings:
@@ -110,12 +143,12 @@ class TestGetIterationControlAction:
 
         # _find_sources_for_control_param returns the direct source for each connection
         # _check_control_source_fired is keyed on the source_node_name returned
-        def fake_find_sources(incoming: list, param_name: str) -> list[tuple[str, str]]:
+        def fake_find_sources(_workflow: WorkflowRuntime, incoming: list, param_name: str) -> list[tuple[str, str]]:
             return [
                 (c.source_node_name, c.source_parameter_name) for c in incoming if c.target_parameter_name == param_name
             ]
 
-        def fake_check_fired(source: tuple[str, str] | None, _mappings: dict) -> bool:
+        def fake_check_fired(source: tuple[str, str] | None, _source_that_reached_end: Any) -> bool:
             if source is None:
                 return False
             return check_fired_returns.get(source[0], False)
@@ -123,11 +156,13 @@ class TestGetIterationControlAction:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
         with (
             patch.object(NodeExecutor, "_find_sources_for_control_param", side_effect=fake_find_sources),
+            patch.object(NodeExecutor, "_get_control_source_that_reached_end", return_value=None),
             patch.object(NodeExecutor, "_check_control_source_fired", side_effect=fake_check_fired),
         ):
-            return executor._get_iteration_control_action(end_node, {})
+            return executor._get_iteration_control_action(end_node, _make_end_node_mapping(), {})
 
     def test_returns_add_when_no_connections(self) -> None:
         end_node = MagicMock(spec=BaseIterativeEndNode)
@@ -188,120 +223,109 @@ class TestGetIterationControlAction:
         mock_engine = cast("MagicMock", executor.engine)
         # Return a non-success result from handle_request
         mock_engine.handle_request.return_value = MagicMock(spec=object)  # not ListConnectionsForNodeResultSuccess
-        result = executor._get_iteration_control_action(end_node, {})
+        result = executor._get_iteration_control_action(end_node, _make_end_node_mapping(), {})
         assert result == IterationControlAction.ADD
 
 
 class TestCheckControlSourceFired:
-    """_check_control_source_fired matches a node's next control output to a parameter."""
-
-    @staticmethod
-    def _make_source_node(*, next_control_output: Any, params: dict[str, Any] | None = None) -> Any:
-        node = MagicMock()
-        node.get_next_control_output.return_value = next_control_output
-        params = params or {}
-        node.get_parameter_by_name.side_effect = params.get
-        return node
+    """_check_control_source_fired matches a connection source to the exit that reached End."""
 
     def test_returns_false_when_source_is_none(self) -> None:
-        assert _make_executor()._check_control_source_fired(None, {}) is False
+        reached = OriginalNodeParameter(node_name="Src", parameter_name="out")
+        assert _make_executor()._check_control_source_fired(None, reached) is False
 
-    def test_returns_false_when_source_node_not_in_mappings(self) -> None:
-        result = _make_executor()._check_control_source_fired(("SrcOrig", "out"), {})
-        assert result is False
+    def test_returns_false_when_control_never_reached_end(self) -> None:
+        assert _make_executor()._check_control_source_fired(("Src", "out"), None) is False
 
-    def test_returns_false_when_node_manager_raises_value_error(self) -> None:
+    def test_returns_true_when_source_is_the_exit_that_reached_end(self) -> None:
+        reached = OriginalNodeParameter(node_name="Src", parameter_name="out")
+        assert _make_executor()._check_control_source_fired(("Src", "out"), reached) is True
+
+    def test_returns_false_for_another_output_of_the_same_node(self) -> None:
+        reached = OriginalNodeParameter(node_name="Src", parameter_name="other")
+        assert _make_executor()._check_control_source_fired(("Src", "out"), reached) is False
+
+    def test_returns_false_for_the_same_output_name_on_another_node(self) -> None:
+        reached = OriginalNodeParameter(node_name="Other", parameter_name="out")
+        assert _make_executor()._check_control_source_fired(("Src", "out"), reached) is False
+
+
+class TestGetControlSourceThatReachedEnd:
+    """_get_control_source_that_reached_end reads the packaged End node's recorded entry."""
+
+    def test_returns_none_when_end_node_not_in_mappings(self) -> None:
+        mapping = _make_end_node_mapping()
+        assert (
+            _make_executor()._get_control_source_that_reached_end(WorkflowRuntime("wf", MagicMock()), mapping, {})
+            is None
+        )
+
+    def test_returns_none_when_node_manager_raises_value_error(self) -> None:
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.side_effect = ValueError("not found")
-        result = executor._check_control_source_fired(
-            ("SrcOrig", "out"),
-            {"SrcOrig": "Src_inst1"},
+        mock_engine.node_manager.get_node_by_name_in.side_effect = ValueError("not found")
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
         )
-        assert result is False
-
-    def test_returns_false_when_node_manager_returns_none(self) -> None:
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = None
-        result = executor._check_control_source_fired(
-            ("SrcOrig", "out"),
-            {"SrcOrig": "Src_inst1"},
-        )
-        assert result is False
-
-    def test_returns_false_when_no_next_control_output(self) -> None:
-        node = self._make_source_node(next_control_output=None)
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
-        result = executor._check_control_source_fired(
-            ("SrcOrig", "out"),
-            {"SrcOrig": "Src_inst1"},
-        )
-        assert result is False
-
-    def test_returns_true_when_next_control_output_matches_parameter(self) -> None:
-        target_param = MagicMock()
-        target_param.name = "out"
-        node = self._make_source_node(
-            next_control_output=target_param,
-            params={"out": target_param},
-        )
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
-        result = executor._check_control_source_fired(
-            ("SrcOrig", "out"),
-            {"SrcOrig": "Src_inst1"},
-        )
-        assert result is True
-
-    def test_returns_false_when_next_control_output_is_a_different_parameter(self) -> None:
-        wrong_param = MagicMock(name="wrong")
-        target_param = MagicMock(name="target")
-        node = self._make_source_node(
-            next_control_output=wrong_param,
-            params={"out": target_param},
-        )
-        executor = _make_executor()
-        mock_engine = cast("MagicMock", executor.engine)
-        mock_engine.node_manager.get_node_by_name.return_value = node
-        result = executor._check_control_source_fired(
-            ("SrcOrig", "out"),
-            {"SrcOrig": "Src_inst1"},
-        )
-        assert result is False
-
-
-class TestFindSourceForControlParam:
-    """_find_source_for_control_param returns the first source from the multi-source helper."""
-
-    def test_returns_first_source_when_multiple_present(self) -> None:
-        executor = _make_executor()
-        with patch.object(
-            NodeExecutor,
-            "_find_sources_for_control_param",
-            return_value=[("A", "out"), ("B", "out")],
-        ) as mock_multi:
-            result = executor._find_source_for_control_param([], "break_loop")
-
-        assert result == ("A", "out")
-        mock_multi.assert_called_once_with([], "break_loop")
-
-    def test_returns_none_when_no_sources(self) -> None:
-        executor = _make_executor()
-        with patch.object(NodeExecutor, "_find_sources_for_control_param", return_value=[]):
-            result = executor._find_source_for_control_param([], "break_loop")
-
         assert result is None
+
+    def test_returns_none_when_control_never_entered_end(self) -> None:
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name_in.return_value = _make_end_node(entered_on=None)
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
+        )
+        assert result is None
+
+    def test_returns_none_when_end_entered_on_an_input_with_no_body_source(self) -> None:
+        # The while path wires the Start node straight to End's exec_in, which maps to no body exit.
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name_in.return_value = _make_end_node(entered_on="exec_in")
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
+        )
+        assert result is None
+
+    def test_returns_the_body_exit_the_entry_input_maps_to(self) -> None:
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name_in.return_value = _make_end_node(entered_on="Cond_True")
+        mapping = _make_end_node_mapping({"Cond_True": OriginalNodeParameter(node_name="Cond", parameter_name="True")})
+        result = executor._get_control_source_that_reached_end(
+            _workflow_of(executor), mapping, {"EndPkg": "EndPkg_inst1"}
+        )
+        assert result == OriginalNodeParameter(node_name="Cond", parameter_name="True")
+        mock_engine.node_manager.get_node_by_name_in.assert_called_once_with(ANY, "EndPkg_inst1")
+
+
+class TestForgetControlSourceThatReachedEnd:
+    """_forget_control_source_that_reached_end clears End's recorded entry before a pass."""
+
+    def test_clears_the_end_nodes_entry(self) -> None:
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        end_node = _make_end_node(entered_on="Cond_True")
+        mock_engine.node_manager.get_node_by_name_in.return_value = end_node
+        executor._forget_control_source_that_reached_end(
+            _workflow_of(executor), _make_end_node_mapping(), {"EndPkg": "EndPkg_inst1"}
+        )
+        end_node.set_entry_control_parameter.assert_called_once_with(None)
+
+    def test_does_nothing_when_end_node_not_in_mappings(self) -> None:
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        executor._forget_control_source_that_reached_end(_workflow_of(executor), _make_end_node_mapping(), {})
+        mock_engine.node_manager.get_node_by_name_in.assert_not_called()
 
 
 class TestGetIterationControlActionEndToEnd:
     """Real name-matching tests for _get_iteration_control_action.
 
-    _find_source_for_control_param and _check_control_source_fired are NOT mocked,
-    so a regression in parameter-name matching will fail these tests.
+    _find_sources_for_control_param, _get_control_source_that_reached_end and
+    _check_control_source_fired are NOT mocked, so a regression in parameter-name
+    matching will fail these tests.
     """
 
     @staticmethod
@@ -323,38 +347,29 @@ class TestGetIterationControlActionEndToEnd:
         end_node: Any,
         connections: list[Any],
         node_name_mappings: dict[str, str],
-        deserialized_nodes: dict[str, Any],
+        entered_on: str | None,
     ) -> IterationControlAction:
         """Run _get_iteration_control_action with only the engine mocked.
 
-        _find_source_for_control_param and _check_control_source_fired execute
-        against real logic so that parameter-name matching is exercised.
+        The packaged End node maps its CondNode_orig_exec_out input to CondNode_orig.exec_out
+        and records ``entered_on`` as the input control reached it on.
         """
         connections_result = self._make_connections_result(connections)
         executor = _make_executor()
         mock_engine = cast("MagicMock", executor.engine)
+        deserialized_nodes = {"EndPkg_inst1": _make_end_node(entered_on=entered_on)}
 
-        def fake_get_node(name: str) -> Any:
-            return deserialized_nodes.get(name)
+        # Canvas lookups of the body's source nodes get a plain node; only End's entry matters.
+        def fake_get_node(_workflow: WorkflowRuntime, name: str) -> Any:
+            return deserialized_nodes.get(name, MagicMock())
 
         mock_engine.handle_request.return_value = connections_result
-        mock_engine.node_manager.get_node_by_name.side_effect = fake_get_node
-        return executor._get_iteration_control_action(end_node, node_name_mappings)
-
-    def _make_deserialized_node_firing(self, param_name: str) -> MagicMock:
-        """Return a mock deserialized node whose get_next_control_output fires the named param."""
-        fired_param = MagicMock()
-        fired_param.name = param_name
-        node = MagicMock()
-        node.get_next_control_output.return_value = fired_param
-        node.get_parameter_by_name.side_effect = lambda n: fired_param if n == param_name else None
-        return node
-
-    def _make_deserialized_node_not_firing(self) -> MagicMock:
-        """Return a mock deserialized node whose get_next_control_output returns None."""
-        node = MagicMock()
-        node.get_next_control_output.return_value = None
-        return node
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        mock_engine.node_manager.get_node_by_name_in.side_effect = fake_get_node
+        end_node_mapping = _make_end_node_mapping(
+            {"CondNode_orig_exec_out": OriginalNodeParameter(node_name="CondNode_orig", parameter_name="exec_out")}
+        )
+        return executor._get_iteration_control_action(end_node, end_node_mapping, node_name_mappings)
 
     def test_legacy_break_detected_via_real_name_matching(self) -> None:
         """BREAK is detected through real connection/name resolution for a legacy end node."""
@@ -363,11 +378,7 @@ class TestGetIterationControlActionEndToEnd:
         connections = [
             self._make_connection(target_param="break_loop", source_node="CondNode_orig", source_param="exec_out"),
         ]
-        node_name_mappings = {"CondNode_orig": "CondNode_inst1"}
-        deserialized_nodes = {
-            "CondNode_inst1": self._make_deserialized_node_firing("exec_out"),
-        }
-        result = self._run_real(end_node, connections, node_name_mappings, deserialized_nodes)
+        result = self._run_real(end_node, connections, {"EndPkg": "EndPkg_inst1"}, "CondNode_orig_exec_out")
         assert result == IterationControlAction.BREAK
 
     def test_legacy_skip_detected_via_real_name_matching(self) -> None:
@@ -377,11 +388,7 @@ class TestGetIterationControlActionEndToEnd:
         connections = [
             self._make_connection(target_param="skip_iteration", source_node="CondNode_orig", source_param="exec_out"),
         ]
-        node_name_mappings = {"CondNode_orig": "CondNode_inst1"}
-        deserialized_nodes = {
-            "CondNode_inst1": self._make_deserialized_node_firing("exec_out"),
-        }
-        result = self._run_real(end_node, connections, node_name_mappings, deserialized_nodes)
+        result = self._run_real(end_node, connections, {"EndPkg": "EndPkg_inst1"}, "CondNode_orig_exec_out")
         assert result == IterationControlAction.SKIP
 
     def test_wrong_parameter_name_does_not_trigger_break(self) -> None:
@@ -392,22 +399,27 @@ class TestGetIterationControlActionEndToEnd:
             # Misspelled control param — should NOT match break_loop
             self._make_connection(target_param="break_loooop", source_node="CondNode_orig", source_param="exec_out"),
         ]
-        node_name_mappings = {"CondNode_orig": "CondNode_inst1"}
-        deserialized_nodes = {
-            "CondNode_inst1": self._make_deserialized_node_firing("exec_out"),
-        }
-        result = self._run_real(end_node, connections, node_name_mappings, deserialized_nodes)
+        result = self._run_real(end_node, connections, {"EndPkg": "EndPkg_inst1"}, "CondNode_orig_exec_out")
         assert result == IterationControlAction.ADD
 
-    def test_node_not_in_mappings_does_not_trigger_break(self) -> None:
-        """If the source node is missing from node_name_mappings, no BREAK fires."""
+    def test_break_not_triggered_when_control_never_reached_end(self) -> None:
+        """A break source that is wired but was not the exit taken does NOT trigger BREAK."""
         end_node = MagicMock(spec=BaseIterativeEndNode)
         end_node.name = "EndLoop"
         connections = [
             self._make_connection(target_param="break_loop", source_node="CondNode_orig", source_param="exec_out"),
         ]
-        # CondNode_orig is NOT in node_name_mappings
-        result = self._run_real(end_node, connections, {}, {})
+        result = self._run_real(end_node, connections, {"EndPkg": "EndPkg_inst1"}, None)
+        assert result == IterationControlAction.ADD
+
+    def test_end_node_not_in_mappings_does_not_trigger_break(self) -> None:
+        """If the packaged End node is missing from node_name_mappings, no BREAK fires."""
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="break_loop", source_node="CondNode_orig", source_param="exec_out"),
+        ]
+        result = self._run_real(end_node, connections, {}, "CondNode_orig_exec_out")
         assert result == IterationControlAction.ADD
 
 
@@ -622,3 +634,151 @@ class TestSilencePackagedNodeCreationBroadcasts:
         package_result = _make_package_result_with_nodes(0)
         NodeExecutor._silence_packaged_node_creation_broadcasts(package_result)
         assert package_result.serialized_flow_commands.serialized_node_commands == []
+
+
+def _make_connection(source_node: MagicMock, source_param: str, target_node: MagicMock, target_param: str) -> MagicMock:
+    conn = MagicMock()
+    conn.source_node = source_node
+    conn.source_parameter.name = source_param
+    conn.source_parameter.output_type = "str"
+    conn.target_node = target_node
+    conn.target_parameter.name = target_param
+    return conn
+
+
+def _make_loop_pair() -> tuple[MagicMock, MagicMock]:
+    """Mock legacy start/end nodes iterating three items."""
+    start_node = MagicMock()
+    start_node.name = "LoopStart"
+    start_node._get_iteration_items.return_value = ["a", "b", "c"]
+    start_node.get_all_iteration_values.return_value = [0, 1, 2]
+    start_node._get_total_iterations.return_value = 3
+    end_node = MagicMock(spec=BaseIterativeEndNode)
+    end_node.name = "LoopEnd"
+    end_node.start_node = start_node
+    return start_node, end_node
+
+
+class TestPassthroughConnectionsBetween:
+    """Data wires from one unpackaged node to another become packager passthroughs."""
+
+    def test_returns_data_wires_between_the_two_nodes(self) -> None:
+        start_node, end_node = _make_loop_pair()
+        body = MagicMock()
+        body.name = "Body"
+        connections = MagicMock()
+        connections.get_all_outgoing_connections.return_value = [
+            _make_connection(start_node, "current_item", end_node, "new_item_to_add"),
+            _make_connection(start_node, "current_item", body, "text"),
+        ]
+
+        passthroughs = NodeExecutor._passthrough_connections_between(
+            connections, start_node, end_node, "new_item_to_add"
+        )
+
+        assert passthroughs == [
+            PassthroughConnection(
+                source_node_name="LoopStart",
+                source_parameter_name="current_item",
+                target_node_name="LoopEnd",
+                target_parameter_name="new_item_to_add",
+            )
+        ]
+
+    def test_skips_the_tether_and_control_wires(self) -> None:
+        start_node, end_node = _make_loop_pair()
+        connections = MagicMock()
+        connections.get_all_outgoing_connections.return_value = [
+            _make_connection(start_node, "loop", end_node, "from_start"),
+            _make_connection(start_node, "exec_out", end_node, "add_item"),
+        ]
+
+        assert NodeExecutor._passthrough_connections_between(connections, start_node, end_node, "new_item_to_add") == []
+
+    def test_same_node_returns_its_self_wires(self) -> None:
+        group = MagicMock()
+        group.name = "Group"
+        child = MagicMock()
+        connections = MagicMock()
+        connections.get_all_outgoing_connections.return_value = [
+            _make_connection(group, "current_item", group, "new_item_to_add"),
+            _make_connection(group, "current_item", child, "text"),
+        ]
+
+        passthroughs = NodeExecutor._passthrough_connections_between(connections, group, group, "new_item_to_add")
+
+        assert [(p.source_parameter_name, p.target_node_name) for p in passthroughs] == [("current_item", "Group")]
+
+
+class TestHandleEmptyLoopBody:
+    """An empty loop body collects only an item wired straight from the start node."""
+
+    @staticmethod
+    def _setup(source_param: str | None) -> tuple[NodeExecutor, MagicMock, MagicMock]:
+        """Loop pair whose end node's new_item_to_add is wired from the start node's source_param, or from nothing."""
+        start_node, end_node = _make_loop_pair()
+        start_node._get_current_item_value.side_effect = lambda: ["a", "b", "c"][start_node._current_iteration_count]
+        start_node.get_current_index.side_effect = lambda: start_node._current_iteration_count
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.outgoing_connections = []
+        if source_param is not None:
+            conn = MagicMock()
+            conn.target_node_name = end_node.name
+            conn.target_parameter_name = "new_item_to_add"
+            conn.source_parameter_name = source_param
+            connections_result.outgoing_connections = [conn]
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        start_node._require_workflow.return_value = _workflow_of(executor)
+        return executor, start_node, end_node
+
+    @pytest.mark.asyncio
+    async def test_collects_start_node_item_for_every_iteration(self) -> None:
+        executor, start_node, end_node = self._setup("current_item")
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == ["a", "b", "c"]
+        end_node._output_results_list.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_collects_index_values(self) -> None:
+        executor, start_node, end_node = self._setup("index")
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_collects_nothing_when_item_is_not_wired_from_start(self) -> None:
+        executor, start_node, end_node = self._setup(None)
+
+        await executor._handle_empty_loop_body(start_node, end_node)
+
+        assert end_node._results_list == []
+        end_node._output_results_list.assert_called_once()
+
+
+class TestExtractIterationResultsFromSubprocess:
+    """A failed isolated or publisher iteration keeps its place in the results as None."""
+
+    def test_failed_iterations_become_none(self) -> None:
+        _, end_node = _make_loop_pair()
+        executor = _make_executor()
+        connections_result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        connections_result.incoming_connections = []
+        cast("MagicMock", executor.engine).handle_request.return_value = connections_result
+        end_node._require_workflow.return_value = _workflow_of(executor)
+        iteration_outputs: list[tuple[int, bool, dict[str, Any] | None]] = [
+            (0, True, {}),
+            (1, False, None),
+            (2, True, {}),
+        ]
+
+        with patch.object(NodeExecutor, "_extract_parameter_output_values", return_value={}):
+            results, successful, _ = executor._extract_iteration_results_from_subprocess(
+                iteration_outputs, cast("Any", _make_package_result()), end_node
+            )
+
+        assert successful == [0, 2]
+        assert results == {1: None}

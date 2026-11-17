@@ -55,6 +55,19 @@ def test_save_and_load_history_round_trips(storage: LocalThreadStorageDriver) ->
     assert any(isinstance(p, TextPart) and p.content == "Hello!" for p in reloaded[1].parts)
 
 
+def test_saved_history_leaves_out_instructions(storage: LocalThreadStorageDriver) -> None:
+    """Each run sends its own instructions, so a request's saved copy is dropped."""
+    thread_id, _ = storage.create_thread()
+    request = ModelRequest(parts=[UserPromptPart(content="hi")], instructions="a long catalog")
+
+    storage.save_history(thread_id, [request, ModelResponse(parts=[TextPart(content="hello")])])
+
+    loaded = storage.load_history(thread_id)
+    assert isinstance(loaded[0], ModelRequest)
+    assert loaded[0].instructions is None
+    assert loaded[0].parts == request.parts
+
+
 def test_image_url_in_user_prompt_round_trips(storage: LocalThreadStorageDriver) -> None:
     """A user prompt carrying an ImageUrl reference survives save/load intact."""
     thread_id, _ = storage.create_thread()
@@ -154,7 +167,13 @@ def test_update_thread_metadata_rename(storage: LocalThreadStorageDriver) -> Non
 def test_append_run_record_appears_in_get_thread_metadata(storage: LocalThreadStorageDriver) -> None:
     """append_run_record persists a RunRecord that get_thread_metadata returns."""
     thread_id, _ = storage.create_thread(title="conversation")
-    record = RunRecord(message_index=1, provider_name="griptape_cloud", model="claude-sonnet-5", mcp_servers=["brave"])
+    record = RunRecord(
+        message_index=1,
+        provider_name="griptape_cloud",
+        model="claude-sonnet-5",
+        mcp_servers=["brave"],
+        library_mcp_servers=["acme_render_tools"],
+    )
     storage.append_run_record(thread_id, record)
 
     thread = storage.get_thread_metadata(thread_id)

@@ -268,9 +268,16 @@ class VersionCompatibilityManager(EngineScoped):
         return version_issues
 
     async def check_workflow_version_compatibility(
-        self, workflow_metadata: WorkflowMetadata
+        self, workflow_metadata: WorkflowMetadata, *, registered_libraries: list[str] | None = None
     ) -> list[WorkflowVersionCompatibilityIssue]:
-        """Check a workflow for version compatibility issues."""
+        """Check a workflow for version compatibility issues.
+
+        Args:
+            workflow_metadata: The workflow metadata to check.
+            registered_libraries: Pre-fetched registered-library names. Pass this when the
+                caller is scanning many workflows in one pass and already fetched the list
+                once, so this doesn't re-fetch it per workflow.
+        """
         version_issues: list[WorkflowVersionCompatibilityIssue] = []
 
         # Run all discovered workflow compatibility checks
@@ -280,12 +287,16 @@ class VersionCompatibilityManager(EngineScoped):
                 version_issues.extend(issues)
 
         # Check for deprecated nodes in the workflow
-        version_issues.extend(await self._check_workflow_for_deprecated_nodes(workflow_metadata))
+        version_issues.extend(
+            await self._check_workflow_for_deprecated_nodes(
+                workflow_metadata, registered_libraries=registered_libraries
+            )
+        )
 
         return version_issues
 
     async def _check_workflow_for_deprecated_nodes(  # noqa: C901
-        self, workflow_metadata: WorkflowMetadata
+        self, workflow_metadata: WorkflowMetadata, *, registered_libraries: list[str] | None = None
     ) -> list[WorkflowVersionCompatibilityIssue]:
         """Check a workflow for deprecated nodes.
 
@@ -294,12 +305,13 @@ class VersionCompatibilityManager(EngineScoped):
         """
         issues: list[WorkflowVersionCompatibilityIssue] = []
 
-        list_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
+        if registered_libraries is None:
+            list_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
 
-        if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
-            return issues
+            if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
+                return issues
 
-        registered_libraries = list_result.libraries
+            registered_libraries = list_result.libraries
 
         for library_name_and_node_type in workflow_metadata.node_types_used:
             library_name = library_name_and_node_type.library_name
@@ -312,7 +324,9 @@ class VersionCompatibilityManager(EngineScoped):
 
             # Get library metadata to get version
             library_metadata_request = GetLibraryMetadataRequest(library=library_name)
-            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
+            library_metadata_result = self.engine.library_manager.catalog.get_library_metadata_request(
+                library_metadata_request
+            )
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 # Should not happen since we verified library exists, but handle gracefully
@@ -329,7 +343,7 @@ class VersionCompatibilityManager(EngineScoped):
 
             # Check if node type exists in library (silent check - no error logging)
             list_node_types_request = ListNodeTypesInLibraryRequest(library=library_name)
-            list_node_types_result = self.engine.library_manager.on_list_node_types_in_library_request(
+            list_node_types_result = self.engine.library_manager.catalog.on_list_node_types_in_library_request(
                 list_node_types_request
             )
 
@@ -354,7 +368,7 @@ class VersionCompatibilityManager(EngineScoped):
 
             # Get node metadata from library (we know the node exists now)
             node_metadata_request = GetNodeMetadataFromLibraryRequest(library=library_name, node_type=node_type)
-            node_metadata_result = self.engine.library_manager.get_node_metadata_from_library_request(
+            node_metadata_result = self.engine.library_manager.catalog.get_node_metadata_from_library_request(
                 node_metadata_request
             )
 

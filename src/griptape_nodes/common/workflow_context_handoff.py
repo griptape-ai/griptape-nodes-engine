@@ -1,10 +1,10 @@
 """One engine's workflow context, in a form another engine can adopt.
 
-No worker-side path pushes the workflow stack, so a worker answers "there isn't one" to every
-workflow question, and it does so silently: `workflow_dir` raises, the default `{outputs}` situation
-marks the reference optional (`{workflow_dir?:/}outputs`), the raise is swallowed, and the path
-degrades to workspace-relative. The worker then writes real files where the orchestrator does not
-read, with no error at the divergence.
+A worker opens no workflow of its own. Without the orchestrator's context it would answer "there
+isn't one" to every workflow question, and silently: `workflow_dir` raises, the default `{outputs}`
+situation marks the reference optional (`{workflow_dir?:/}outputs`), the raise is swallowed, and the
+path degrades to workspace-relative. The worker would then write real files where the orchestrator
+does not read, with no error at the divergence.
 
 The orchestrator lends its CONTEXT rather than any value derived from it, so everything derived is
 answered by the adopting engine's normal code paths and no new handoff is needed per value.
@@ -16,13 +16,15 @@ from typing import NamedTuple
 
 
 class WorkflowContextSnapshot(NamedTuple):
-    """A workflow context in the three fields `ContextManager.WorkflowContextState` keeps.
+    """A workflow context: the workflow's id, plus what its registry entry answers for name, file and folder.
 
-    `name` None means the lending engine had no current workflow, and the adopting engine must then
-    have none either. Both engines degrading a path the same way is correct; disagreeing is the bug
-    this exists to prevent.
+    The adopting engine registers the workflow under the same id with those three, so its registry
+    answers like the lender's. The lender always sends the id of the workflow the node runs in. The
+    fields default to None so the adopting engine can refuse a snapshot without an id, which only a
+    lender running a different version sends, rather than run the node in no workflow.
     """
 
+    workflow_id: str | None = None
     name: str | None = None
     file_path: str | None = None
     working_directory: str | None = None

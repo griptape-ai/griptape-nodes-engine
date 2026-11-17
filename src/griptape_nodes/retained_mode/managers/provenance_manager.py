@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import base64
 import logging
-import pickle
+import pickle  # noqa: TID251 -- records carry the tagged pickle-v1 payload format; migration to serialization.commands tracked in PR #5658
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -111,8 +111,8 @@ from griptape_nodes.retained_mode.file_metadata.provenance_record import (
     load_record_yaml,
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
-    _collect_parameter_values,
     _collect_workflow_info,
+    _parameter_values_of,
 )
 from griptape_nodes.utils.version_utils import get_current_version
 
@@ -798,8 +798,11 @@ class ProvenanceManager(EngineScoped):
         context_manager = self.engine.context_manager
         if not context_manager.has_current_flow():
             return None
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
+            return None
         flow = context_manager.get_current_flow()
-        _, resolving_nodes, _ = self.engine.flow_manager.flow_state(flow)
+        _, resolving_nodes, _ = self.engine.flow_manager.flow_state_in(workflow, flow)
         if not resolving_nodes:
             return None
         node_name = resolving_nodes[0]
@@ -846,7 +849,14 @@ class ProvenanceManager(EngineScoped):
         if producing_node is not None:
             # Preview: the LOSSY display projection (existing safe_unstructure
             # path, honoring exclude_from_metadata). Never the truth.
-            collection = _collect_parameter_values(producing_node.name, self.engine)
+            try:
+                node_for_preview = self.engine.object_manager.attempt_get_object_by_name_as_type(
+                    producing_node.name, BaseNode
+                )
+            except Exception as e:
+                logger.warning("Failed to get node '%s' for parameter collection: %s", producing_node.name, e)
+                node_for_preview = None
+            collection = _parameter_values_of(producing_node.name, node_for_preview)
             if collection is not None:
                 parameters_preview = collection.values or None
                 parameters_omitted = collection.omitted or None
@@ -900,7 +910,7 @@ class ProvenanceManager(EngineScoped):
             workflow_name = context_manager.get_current_workflow_name()
         except Exception:
             return None
-        info = _collect_workflow_info(workflow_name)
+        info = _collect_workflow_info(self.engine, workflow_name)
         flow_name: str | None = None
         if context_manager.has_current_flow():
             try:

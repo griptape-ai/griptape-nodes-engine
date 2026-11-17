@@ -1,8 +1,7 @@
 """A node that consumes its own library's request handler.
 
 Dispatch from `process()`, never from `__init__`. A node constructor that sends a request
-trips the `reentrant-bus-in-init` strict-mode rule, and it can deadlock against handlers
-that await engine startup.
+can deadlock against handlers that await engine startup.
 """
 
 from __future__ import annotations

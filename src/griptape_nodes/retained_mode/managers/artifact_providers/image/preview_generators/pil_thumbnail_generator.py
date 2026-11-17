@@ -23,6 +23,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
     BaseGeneratorParameters,
     Field,
 )
+from griptape_nodes.utils.async_utils import to_thread
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -134,17 +135,7 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
             msg = "Source file is text, not binary image data"
             raise TypeError(msg)
 
-        with Image.open(BytesIO(image_data)) as raw_img:
-            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
-            img = ImageOps.exif_transpose(raw_img)
-            # Calculate thumbnail size (preserves aspect ratio, fits within max dimensions)
-            # Access validated parameters via self.params - fully type-safe
-            img.thumbnail((self.params.max_width, self.params.max_height), Image.Resampling.LANCZOS)
-
-            # Save to BytesIO
-            output_buffer = BytesIO()
-            img.save(output_buffer, format=self.preview_format.upper())
-            output_bytes = output_buffer.getvalue()
+        output_bytes = await to_thread(self._render_thumbnail, image_data)
 
         # Construct full path for writing
         destination_path = str(Path(self.destination_preview_directory) / self.destination_preview_file_name)
@@ -163,3 +154,18 @@ class PILThumbnailGenerator(BaseArtifactPreviewGenerator):
             raise OSError(msg)
 
         return self.destination_preview_file_name
+
+    def _render_thumbnail(self, image_data: bytes) -> bytes:
+        """Decode, shrink and re-encode the image. CPU-bound, so callers run it off the event loop."""
+        with Image.open(BytesIO(image_data)) as raw_img:
+            # Apply EXIF orientation so rotated images (e.g. phone photos) display correctly
+            img = ImageOps.exif_transpose(raw_img)
+            # Calculate thumbnail size (preserves aspect ratio, fits within max dimensions)
+            # Access validated parameters via self.params - fully type-safe
+            img.thumbnail((self.params.max_width, self.params.max_height), Image.Resampling.LANCZOS)
+
+            # Save to BytesIO
+            output_buffer = BytesIO()
+            img.save(output_buffer, format=self.preview_format.upper())
+            output_bytes = output_buffer.getvalue()
+        return output_bytes

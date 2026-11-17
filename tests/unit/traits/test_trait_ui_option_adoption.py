@@ -167,6 +167,31 @@ class TestAdoptingKeysAnOlderSaveStored:
         assert parameter.ui_options["button_label"] == "Stop"
 
 
+class TestAdoptingSyncedParameters:
+    def test_the_written_list_lands_on_the_trait(self) -> None:
+        trait = Widget("editor", "widgets", synced_parameters=["left"])
+        parameter = Parameter(name="p", type="dict", tooltip="t", traits={trait})
+
+        parameter.ui_options = {"synced_parameters": ["left", "top"]}
+
+        assert trait.synced_parameters == ["left", "top"]
+
+    def test_a_list_written_to_a_widget_that_had_none_is_adopted(self) -> None:
+        trait = Widget("editor", "widgets")
+        parameter = Parameter(name="p", type="dict", tooltip="t", traits={trait})
+
+        parameter.ui_options = {"synced_parameters": ["left"]}
+
+        assert trait.synced_parameters == ["left"]
+
+    def test_the_written_list_is_saved_as_trait_state(self) -> None:
+        parameter = Parameter(name="p", type="dict", tooltip="t", traits={Widget("editor", "widgets")})
+
+        parameter.ui_options = {"synced_parameters": ["left"]}
+
+        assert parameter.trait_states()[0]["trait_state"]["synced_parameters"] == ["left"]
+
+
 class _RenderOnlyTrait(Trait):
     """Renders a key with no way to read it back, as a third-party trait might."""
 

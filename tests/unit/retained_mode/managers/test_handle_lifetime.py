@@ -11,7 +11,6 @@ connection goes and can still run with what it has.
 """
 
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -108,8 +107,8 @@ def flow_name(engine: Engine) -> str:
 def _add[NodeT: BaseNode](engine: Engine, node: NodeT, flow_name: str) -> NodeT:
     """Register a hand-built node the way CreateNodeRequest does, with no library to create it from."""
     engine.flow_manager.get_flow_by_name(flow_name).add_node(node)
-    engine.object_manager.add_object_by_name(node.name, node)
-    engine.node_manager._name_to_parent_flow_name[node.name] = flow_name
+    engine.object_manager.add_object_by_name_in(engine.current_workflow(), node.name, node)
+    engine.current_workflow().nodes.name_to_parent_flow_name[node.name] = flow_name
     return node
 
 
@@ -408,7 +407,6 @@ class TestSaving:
             unique_parameter_uuid_to_values=uuid_to_values,
             serialized_parameter_value_tracker=tracker,
             create_node_request=create_node_request,
-            workflow_manager=MagicMock(),
         )
 
         assert saved is None
@@ -430,7 +428,6 @@ class TestSaving:
             create_node_request=CreateNodeRequest(
                 node_type="_Producer", node_name="Producer", resolution=NodeResolutionState.RESOLVED.value
             ),
-            workflow_manager=MagicMock(),
         )
 
         assert saved is not None
@@ -465,13 +462,13 @@ class TestTheRealRunPathReleases:
     def test_a_fresh_node_instance_reparking_the_same_slot_displaces(self, engine: Engine) -> None:  # noqa: ARG002 (the store the fixture builds is the subject)
         """Worker semantics: the previous run's object is displaced by slot, wherever it lives.
 
-        The transient node is rebuilt every execution, but the store is process-level.
+        A worker loads a new copy of the node for every execution, but the store is process-level.
         """
         first_run = _Producer(name="Producer")
         first_run.parameter_output_values["latent"] = Held("first")
         _egress(first_run)
 
-        # ExecuteNodeRequest carries local_object_source, and the worker's transient node adopts it. That
+        # ExecuteNodeRequest carries local_object_source, and the worker's copy of the node adopts it. That
         # is what makes the identity stable across instances; a node that mints its own is a different node.
         second_run = _Producer(name="Producer")
         second_run.local_object_source = first_run.local_object_source
@@ -668,6 +665,16 @@ class TestAHookRunsOncePerObject:
 
         assert producer.released == ["shared"]
 
+    def test_popping_the_workflow_releases_what_its_nodes_hold(self, engine: Engine, flow_name: str) -> None:
+        """Closing the workflow by popping it is a teardown too, not a drop of live nodes."""
+        producer = _add(engine, _Producer(name="Producer"), flow_name)
+        producer.parameter_output_values["latent"] = Held("shared")
+        _egress(producer)
+
+        engine.context_manager.pop_workflow()
+
+        assert producer.released == ["shared"]
+
     def test_deleting_a_node_leaves_its_library_cached_copy_usable(self, engine: Engine, flow_name: str) -> None:
         """The parked entry goes with the node; the cache entry is the library's.
 
@@ -828,7 +835,6 @@ class TestSavingAndPublishing:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            workflow_manager=MagicMock(),
             serialize_all_parameter_values=publishing,
         )
 
@@ -866,18 +872,17 @@ class TestAKeyThatReachedASerializableParameter:
             unique_parameter_uuid_to_values=captured,
             serialized_parameter_value_tracker=SerializedParameterValueTracker(),
             create_node_request=request,
-            workflow_manager=MagicMock(),
         )
 
         assert saved is None
         assert captured == {}
         assert request.resolution == NodeResolutionState.UNRESOLVED.value
 
-    def test_the_serializer_reads_the_stored_key(self, engine: Engine, flow_name: str) -> None:
-        """The serialization helper reads values to hash them; it must see keys, never objects.
+    def test_the_flow_result_reads_the_stored_key(self, engine: Engine, flow_name: str) -> None:
+        """A finished flow's result carries keys, never objects.
 
-        Through an input value specifically: the helper takes output values from the dict directly, so only
-        the input path goes through an accessor and can translate.
+        Through an input value specifically: output values come from the dict directly, so only the input
+        path goes through an accessor and can translate.
         """
         producer = _add(engine, _Producer(name="Producer"), flow_name)
         producer.parameter_output_values["latent"] = Held("pipeline")
@@ -885,7 +890,7 @@ class TestAKeyThatReachedASerializableParameter:
         consumer = _add(engine, _Consumer(name="Consumer"), flow_name)
         consumer.set_parameter_value("latent", key)
 
-        read = engine.node_manager._get_parameter_value_for_serialization(consumer, "latent")
+        read = engine.node_manager.result_parameter_values(consumer)["latent"]
 
         assert read == key
 

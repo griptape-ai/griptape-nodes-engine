@@ -7,14 +7,18 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import urlparse
 
 from griptape_nodes.utils.file_utils import find_file_in_directory
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -150,12 +154,17 @@ def parse_git_url_with_ref(url_with_ref: str) -> GitUrlWithRef:
                 return GitUrlWithRef(url=f"{parts[0]}:{path_parts[0]}", ref=path_parts[1])
         return GitUrlWithRef(url=url_with_ref, ref=None)
 
-    # For HTTPS/HTTP URLs and shorthand, split on last @
-    if "@" in url_with_ref:
-        # Use rsplit to split from the right, so we get the last @ (in case of user:pass@host format)
-        parts = url_with_ref.rsplit("@", 1)
-        if len(parts) == 2:  # noqa: PLR2004
-            return GitUrlWithRef(url=parts[0], ref=parts[1])
+    # Only look for @ref in the path so user:pass@host userinfo isn't mistaken for a ref.
+    path_start = 0
+    if "://" in url_with_ref:
+        authority_start = url_with_ref.index("://") + 3
+        path_start = url_with_ref.find("/", authority_start)
+        if path_start == -1:
+            return GitUrlWithRef(url=url_with_ref, ref=None)
+
+    at_index = url_with_ref.rfind("@", path_start)
+    if at_index != -1:
+        return GitUrlWithRef(url=url_with_ref[:at_index], ref=url_with_ref[at_index + 1 :])
 
     return GitUrlWithRef(url=url_with_ref, ref=None)
 
@@ -297,10 +306,21 @@ _GIT_MISSING_MESSAGE = (
 # thread until the engine is restarted.
 _GIT_TIMEOUT_SECONDS = 600
 
+# Repository-local git config key naming the tag a detached-HEAD library follows.
+_TRACKED_TAG_CONFIG_KEY = "griptape-nodes.trackedTag"
+
+# Reflog subject git writes for a checkout, e.g. "checkout: moving from main to stable"
+# or "checkout: moving from 1a2b3c to refs/tags/stable".
+_CHECKOUT_REFLOG_PATTERN = re.compile(r"^checkout: moving from \S+ to (?P<target>\S+)$")
+
 # Transports a library URL is allowed to use. Anything outside this list, notably a
 # "<helper>::<url>" spelling that makes git exec a git-remote-<helper> binary, is refused
 # before a connection is attempted.
 _GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
+
+# Submodule URLs come from the library, so they cannot use `file` to read repositories from the
+# user's disk. GIT_ALLOW_PROTOCOL would otherwise override git's default block.
+_GIT_SUBMODULE_ALLOWED_PROTOCOLS = "git:http:https:ssh"
 
 # git reads "<helper>::<address>" as a request to exec git-remote-<helper>, and the built-in
 # `ext` helper hands its address to a shell. The prefix is anchored and excludes "/", ":" and
@@ -308,7 +328,7 @@ _GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 _REMOTE_HELPER_URL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*::")
 
 
-def _git_env() -> dict[str, str]:
+def _git_env(allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS) -> dict[str, str]:
     """Build the environment for a git subprocess.
 
     The engine runs headless, so git must never block on an interactive credential
@@ -323,7 +343,7 @@ def _git_env() -> dict[str, str]:
     return {
         **os.environ,
         "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ALLOW_PROTOCOL": _GIT_ALLOWED_PROTOCOLS,
+        "GIT_ALLOW_PROTOCOL": allowed_protocols,
     }
 
 
@@ -383,7 +403,9 @@ def _git_os_error(cwd: Path | None, error: OSError) -> GitError:
     return GitError(msg)
 
 
-def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+def _git(
+    args: list[str], cwd: Path | None, allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS
+) -> subprocess.CompletedProcess[str]:
     """Run a git command to completion without inspecting its exit code.
 
     Raises:
@@ -395,7 +417,7 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(  # noqa: S603
             ["git", *args],  # noqa: S607
             cwd=cwd,
-            env=_git_env(),
+            env=_git_env(allowed_protocols),
             stdin=subprocess.DEVNULL,
             capture_output=True,
             # git writes paths, refs, and messages as UTF-8 regardless of the process locale,
@@ -423,6 +445,7 @@ def _run_git(
     error_msg: str,
     cwd: Path | None = None,
     error_cls: type[GitError] = GitError,
+    allowed_protocols: str = _GIT_ALLOWED_PROTOCOLS,
 ) -> str:
     """Run a git command and return its stripped stdout.
 
@@ -431,6 +454,7 @@ def _run_git(
         error_msg: Prefix for the raised exception's message. git's stderr is appended to it.
         cwd: Directory to run the command in.
         error_cls: Exception type to raise when the command fails.
+        allowed_protocols: Transports git may use, as a GIT_ALLOW_PROTOCOL list.
 
     Returns:
         str: The command's stdout, stripped.
@@ -441,7 +465,7 @@ def _run_git(
         GitRepositoryError: If cwd is not a directory.
         GitError: If git times out or cannot be run for any other reason.
     """
-    result = _git(args, cwd)
+    result = _git(args, cwd, allowed_protocols)
     if result.returncode != 0:
         msg = f"{error_msg}: {result.stderr.strip()}"
         raise error_cls(msg)
@@ -507,12 +531,75 @@ def _current_branch(library_path: Path) -> str | None:
 def _tag_at_head(library_path: Path) -> str | None:
     """Name of a tag pointing at HEAD, or None when HEAD isn't tagged.
 
-    Reports the first name git lists when several tags share the commit.
+    Several tags often share a commit: right after a release, ``stable`` and ``nightly``
+    both point at it. git lists them alphabetically, so the first name says nothing about
+    which one the library follows. Prefer the newest tag checkout in HEAD's reflog, and fall
+    back to the first listed tag only when the reflog names none of them.
     """
-    tags = _try_git(["tag", "--points-at", "HEAD"], library_path)
-    if not tags:
+    tags_output = _try_git(["tag", "--points-at", "HEAD"], library_path)
+    if not tags_output:
         return None
-    return tags.splitlines()[0].strip()
+    tags = [tag.strip() for tag in tags_output.splitlines() if tag.strip()]
+
+    reflog_tag = _last_checked_out_tag(library_path, tags)
+    if reflog_tag is not None:
+        return reflog_tag
+
+    return tags[0]
+
+
+def _last_checked_out_tag(library_path: Path, candidate_tags: list[str]) -> str | None:
+    """Newest tag among candidate_tags that HEAD's reflog shows being checked out, or None."""
+    reflog = _try_git(["reflog", "show", "--format=%gs", "HEAD"], library_path)
+    if not reflog:
+        return None
+
+    for subject in reflog.splitlines():
+        match = _CHECKOUT_REFLOG_PATTERN.match(subject.strip())
+        if match is None:
+            continue
+        target = match.group("target").removeprefix("refs/tags/")
+        if target in candidate_tags:
+            return target
+    return None
+
+
+def _tracked_tag(library_path: Path) -> str | None:
+    """The tag recorded by ``_remember_tracked_tag``, or None when none is recorded or it no longer exists."""
+    tracked_tag = _try_git(["config", "--get", _TRACKED_TAG_CONFIG_KEY], library_path)
+    if not tracked_tag or not _ref_exists(library_path, f"refs/tags/{tracked_tag}"):
+        return None
+    return tracked_tag
+
+
+def _followed_tag(library_path: Path) -> str | None:
+    """Name of the tag the checkout follows, or None when it follows none.
+
+    On a detached HEAD the recorded tag wins even when it no longer points at HEAD: a fetch
+    that moved it followed by a failed checkout leaves HEAD behind, at a commit carrying only
+    unrelated tags or none. Reporting and updating both resolve through here so they agree.
+    """
+    if _current_branch(library_path) is None:
+        tracked_tag = _tracked_tag(library_path)
+        if tracked_tag is not None:
+            return tracked_tag
+    return _tag_at_head(library_path)
+
+
+def _remember_tracked_tag(library_path: Path, tag_name: str, error_cls: type[GitError]) -> None:
+    """Record tag_name as the tag this checkout follows, so updates keep following it.
+
+    The reflog alone can't hold this: a checkout that doesn't move HEAD writes no entry,
+    and entries expire, so a library that rarely changes would lose its channel.
+
+    Call only after the checkout succeeds, so a failed checkout keeps following the old tag.
+    """
+    _run_git(
+        ["config", _TRACKED_TAG_CONFIG_KEY, tag_name],
+        error_msg=f"Failed to record tracked tag {tag_name} at {library_path}",
+        cwd=library_path,
+        error_cls=error_cls,
+    )
 
 
 def _ref_exists(library_path: Path, ref: str) -> bool:
@@ -543,7 +630,7 @@ def _describe_head(library_path: Path) -> str | None:
     if branch is not None:
         return branch
 
-    return _tag_at_head(library_path) or head_sha
+    return _followed_tag(library_path) or head_sha
 
 
 def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
@@ -611,13 +698,13 @@ def get_current_ref(library_path: Path) -> str | None:
 
 
 def get_current_tag(library_path: Path) -> str | None:
-    """Get the current tag name if HEAD is pointing to a tag.
+    """Get the name of the tag the checkout follows.
 
     Args:
         library_path: The path to the library directory.
 
     Returns:
-        str | None: The current tag name if found, None if not on a tag or not a git repository.
+        str | None: The followed tag name if found, None if not on a tag or not a git repository.
 
     Raises:
         GitNotFoundError: If git is not installed.
@@ -628,17 +715,20 @@ def get_current_tag(library_path: Path) -> str | None:
     if _head_commit_sha(library_path) is None:
         return None
 
-    return _tag_at_head(library_path)
+    return _followed_tag(library_path)
 
 
 def is_on_tag(library_path: Path) -> bool:
-    """Check if HEAD is currently pointing to a tag.
+    """Check whether the checkout follows a tag.
+
+    A followed tag need not point at HEAD: a fetch that moved it followed by a failed
+    checkout leaves HEAD behind while the checkout still follows the tag.
 
     Args:
         library_path: The path to the library directory.
 
     Returns:
-        bool: True if HEAD is on a tag, False otherwise.
+        bool: True if the checkout follows a tag, False otherwise.
     """
     return get_current_tag(library_path) is not None
 
@@ -702,13 +792,83 @@ def has_uncommitted_changes(library_path: Path) -> bool:
         msg = f"Cannot check status: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
+    # reset --hard cannot remove untracked submodule files, so treating them as edits would block updates.
     status = _run_git(
-        ["status", "--porcelain"],
+        ["status", "--porcelain", "--ignore-submodules=untracked"],
         error_msg=f"Failed to check git status at {library_path}",
         cwd=library_path,
         error_cls=GitRepositoryError,
     )
     return bool(status)
+
+
+def _update_submodules(library_path: Path, *, error_msg: str, error_cls: type[GitError], force: bool = False) -> None:
+    """Check out every submodule at the commit HEAD records, cloning any that are missing.
+
+    reset and checkout move submodule pointers without touching the submodule trees, which then
+    read as uncommitted changes on the next update. A no-op for repositories without submodules.
+    """
+    args = ["submodule", "update", "--init", "--recursive"]
+    if force:
+        args.append("--force")
+    _run_git(
+        args,
+        error_msg=error_msg,
+        cwd=library_path,
+        error_cls=error_cls,
+        allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
+    )
+
+
+def _realign_submodules(library_path: Path) -> None:
+    """Realign submodules that are behind the commits recorded by HEAD, so they don't read as edits.
+
+    Only submodules whose current commit is an ancestor of the recorded commit are moved. A
+    divergent or ahead checkout may contain user work and remains for the status check to report.
+    """
+    root = get_git_repository_root(library_path)
+    if root is None:
+        return
+
+    stale_paths = [path for path in _moved_submodule_paths(root) if _submodule_is_behind(root, path)]
+    if not stale_paths:
+        return
+
+    try:
+        _run_git(
+            ["--literal-pathspecs", "submodule", "update", "--recursive", "--", *stale_paths],
+            error_msg="Could not realign submodules",
+            cwd=root,
+            allowed_protocols=_GIT_SUBMODULE_ALLOWED_PROTOCOLS,
+        )
+    except GitError as e:
+        logger.debug("Leaving submodules at %s as they are: %s", root, e)
+
+
+def _moved_submodule_paths(root: Path) -> list[str]:
+    """Return paths, relative to root, of submodules not at the commit HEAD records."""
+    status = _try_git(["submodule", "status"], root)
+    if not status:
+        return []
+
+    paths = []
+    for line in status.splitlines():
+        # `git submodule status` prefixes moved submodules with "+" and may append "(<describe>)".
+        if not line.startswith("+"):
+            continue
+        _sha, _, rest = line[1:].partition(" ")
+        if rest.endswith(")") and " (" in rest:
+            rest = rest.rsplit(" (", 1)[0]
+        paths.append(rest)
+    return paths
+
+
+def _submodule_is_behind(root: Path, path: str) -> bool:
+    """Return whether the checkout is an ancestor of the submodule commit recorded by HEAD."""
+    recorded = _try_git(["rev-parse", f"HEAD:{path}"], root)
+    if recorded is None:
+        return False
+    return _try_git(["merge-base", "--is-ancestor", "HEAD", recorded], root / path) is not None
 
 
 def _resolve_update_upstream(library_path: Path) -> str:
@@ -763,6 +923,7 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     """
     upstream = _resolve_update_upstream(library_path)
 
+    _realign_submodules(library_path)
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
             msg = f"Cannot update library at {library_path}: You have uncommitted changes. Use overwrite_existing=True to discard them."
@@ -773,6 +934,12 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
     error_msg = f"Git error during update at {library_path}"
     _run_git(["fetch", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
     _run_git(["reset", "--hard", upstream], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _update_submodules(
+        library_path,
+        error_msg=f"Updated {library_path} but could not fetch or check out its submodules",
+        error_cls=GitPullError,
+        force=overwrite_existing,
+    )
 
     logger.debug("Successfully updated library at %s to match remote %s", library_path, upstream)
 
@@ -805,6 +972,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
         msg = f"No origin remote found for repository at {library_path}"
         raise GitPullError(msg)
 
+    _realign_submodules(library_path)
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
             msg = f"Cannot update library at {library_path}: You have uncommitted changes. Use overwrite_existing=True to discard them."
@@ -827,6 +995,13 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
     if overwrite_existing:
         checkout.insert(1, "--force")
     _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _remember_tracked_tag(library_path, tag_name, GitPullError)
+    _update_submodules(
+        library_path,
+        error_msg=f"Updated {library_path} to tag {tag_name} but could not fetch or check out its submodules",
+        error_cls=GitPullError,
+        force=overwrite_existing,
+    )
 
     logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
 
@@ -898,6 +1073,11 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
 
     if _ref_exists(library_path, f"refs/heads/{branch_name}"):
         _run_git(["checkout", branch_name], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
+        _update_submodules(
+            library_path,
+            error_msg=f"Switched {library_path} to {branch_name} but could not fetch or check out its submodules",
+            error_cls=GitRefError,
+        )
         logger.debug("Checked out existing local branch %s at %s", branch_name, library_path)
         return
 
@@ -910,6 +1090,11 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
         ["checkout", "-b", branch_name, "--track", remote_branch_name],
         error_msg=error_msg,
         cwd=library_path,
+        error_cls=GitRefError,
+    )
+    _update_submodules(
+        library_path,
+        error_msg=f"Switched {library_path} to {branch_name} but could not fetch or check out its submodules",
         error_cls=GitRefError,
     )
     logger.debug(
@@ -951,6 +1136,7 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
             cwd=library_path,
             error_cls=GitRefError,
         )
+        _remember_tracked_tag(library_path, ref_name, GitRefError)
     elif _ref_exists(library_path, f"refs/remotes/{remote_branch_name}"):
         # -B resets an existing local branch onto the freshly fetched remote tip.
         _run_git(
@@ -965,6 +1151,11 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
         msg = f"Ref {ref_name} not found at {library_path}"
         raise GitRefError(msg)
 
+    _update_submodules(
+        library_path,
+        error_msg=f"Switched {library_path} to {ref_name} but could not fetch or check out its submodules",
+        error_cls=GitRefError,
+    )
     logger.debug("Checked out %s at %s", ref_name, library_path)
 
 
@@ -1007,6 +1198,18 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
         error_cls=GitCloneError,
     )
 
+    # A partial clone left in place would block a retry with "already exists".
+    try:
+        _finish_clone(git_url, target_path, branch_tag_commit)
+    except GitError:
+        try:
+            shutil.rmtree(target_path, onexc=_clear_readonly_and_retry)
+        except OSError as cleanup_error:
+            logger.warning("Could not remove the partial clone at %s: %s", target_path, cleanup_error)
+        raise
+
+
+def _finish_clone(git_url: str, target_path: Path, branch_tag_commit: str | None) -> None:
     if branch_tag_commit:
         # A single checkout covers all three: a remote branch name becomes a local
         # tracking branch, a tag or commit lands on a detached HEAD.
@@ -1016,7 +1219,23 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
             cwd=target_path,
             error_cls=GitCloneError,
         )
+        if _current_branch(target_path) is None and _ref_exists(target_path, f"refs/tags/{branch_tag_commit}"):
+            _remember_tracked_tag(target_path, branch_tag_commit, GitCloneError)
         logger.debug("Checked out %s in %s", branch_tag_commit, target_path)
+
+    # After the checkout, so submodules land on the commits the requested ref records.
+    _update_submodules(
+        target_path,
+        error_msg=f"Failed to fetch submodules of {git_url} in {target_path}",
+        error_cls=GitCloneError,
+    )
+
+
+def _clear_readonly_and_retry(func: Callable[[str], object], target: str, _exc: BaseException) -> None:
+    """Let rmtree delete git's read-only object files, which Windows refuses to unlink."""
+    target_path = Path(target)
+    target_path.chmod(target_path.stat().st_mode | stat.S_IWRITE)
+    func(target)
 
 
 def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:
@@ -1076,7 +1295,10 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
         temp_path = Path(temp_dir)
 
         def run(args: list[str], error_msg: str) -> str:
-            return _run_git(args, error_msg=error_msg, cwd=temp_path, error_cls=GitCloneError)
+            # Each fetch, including checkout's lazy blob fetch, otherwise spawns a
+            # housekeeping process for a repository that is about to be deleted.
+            no_housekeeping = ["-c", "maintenance.auto=false", "-c", "gc.auto=0"]
+            return _run_git([*no_housekeeping, *args], error_msg=error_msg, cwd=temp_path, error_cls=GitCloneError)
 
         run(["init"], "Git init failed")
         run(["remote", "add", "origin", remote_url], "Git remote add failed")
@@ -1095,7 +1317,10 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
         ]
         sparse_checkout_file.write_text("\n".join(patterns), encoding="utf-8")
 
-        run(["fetch", "--depth=1", "origin", ref], f"Git fetch failed for {ref}")
+        # Sparse checkout only limits the working tree; the fetch would still download every
+        # file in the commit. blob:none defers file contents, so checkout fetches just the
+        # library JSON. A server without filter support ignores it and sends everything.
+        run(["fetch", "--depth=1", "--filter=blob:none", "origin", ref], f"Git fetch failed for {ref}")
         run(["checkout", "FETCH_HEAD"], "Git checkout failed")
 
         library_json_path = find_file_in_directory(temp_path, "griptape[-_]nodes[-_]library.json")

@@ -28,6 +28,9 @@ The **[Filesystem MCP Server](https://github.com/modelcontextprotocol/servers/bl
     }
     ```
 
+    If the server fails to start with `[Errno 2] No such file or directory: 'npx'`, see
+    [Server Won't Start](../connection_types/stdio.md#server-wont-start).
+
 1. **Click Create Server**
 
 ## Available Tools

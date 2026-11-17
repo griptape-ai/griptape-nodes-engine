@@ -15,9 +15,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
+from griptape_nodes.exe_types.connections import Connections
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
 from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 class _ParkedMachine(NamedTuple):
@@ -43,11 +45,17 @@ def _machine_parked_on_a_node_task() -> _ParkedMachine:
     # A stub engine keeps EngineScoped.engine from falling back to
     # current_engine(), which would stand up the process-root engine here.
     engine = MagicMock()
-    dag_builder = DagBuilder(engine)
+    dag_builder = DagBuilder(Connections())
     dag_builder.graphs["n"] = graph
     dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
 
-    machine = ParallelResolutionMachine("flow", max_nodes_in_parallel=1, dag_builder=dag_builder, engine=engine)
+    machine = ParallelResolutionMachine(
+        "flow",
+        workflow=WorkflowRuntime("wf", MagicMock()),
+        max_nodes_in_parallel=1,
+        dag_builder=dag_builder,
+        engine=engine,
+    )
 
     release = asyncio.Event()
     node_task = asyncio.ensure_future(release.wait())

@@ -55,7 +55,7 @@ class TestLibraryManagerDeterministicOrdering:
 
     @pytest.mark.asyncio
     async def test_discover_library_files_preserves_config_order(self, engine: Engine, temp_dir: Path) -> None:
-        """Test that _discover_library_files preserves the order from libraries_to_register."""
+        """Test that discover_library_files preserves the order from libraries_to_register."""
         library_manager = engine.library_manager
 
         # Create library files in different directories (to have distinct paths)
@@ -73,7 +73,7 @@ class TestLibraryManagerDeterministicOrdering:
         config_order = [str(lib_z), str(lib_a), str(lib_m)]
 
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(config_order)):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
             # Should preserve config order, not alphabetical
             assert [Path(entry.registration.path) for entry in result if entry.registration.path is not None] == [
@@ -108,7 +108,7 @@ class TestLibraryManagerDeterministicOrdering:
 
         # Mock config to point to the parent directory
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config([str(lib_dir)])):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
             # Files from directory should be sorted alphabetically by path
             assert [Path(entry.registration.path) for entry in result if entry.registration.path is not None] == [
@@ -151,7 +151,7 @@ class TestLibraryManagerDeterministicOrdering:
         config_order = [str(direct_lib), str(lib_dir), str(another_direct)]
 
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(config_order)):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
             # Should be: direct_lib, dir_lib_a, dir_lib_b, another_direct
             # (directory contents are sorted alphabetically by path)
@@ -179,7 +179,7 @@ class TestLibraryManagerDeterministicOrdering:
         config_order = [str(lib), str(lib)]
 
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(config_order)):
-            result = await library_manager._discover_library_files()
+            result = await library_manager.discovery.discover_library_files()
 
             # Should only appear once
             assert [Path(entry.registration.path) for entry in result if entry.registration.path is not None] == [lib]
@@ -205,7 +205,7 @@ class TestLibraryManagerDeterministicOrdering:
 
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(config_order)):
             request = DiscoverLibrariesRequest(include_sandbox=False)
-            result = await library_manager.discover_libraries_request(request)
+            result = await library_manager.discovery.discover_libraries_request(request)
 
             assert isinstance(result, DiscoverLibrariesResultSuccess)
             # Result should be a list, not a set
@@ -231,9 +231,9 @@ class TestLibraryManagerDeterministicOrdering:
         with patch.object(engine.config_manager, "get_config_value", side_effect=_register_only_config(libs)):
             request = DiscoverLibrariesRequest(include_sandbox=False)
 
-            result1 = await library_manager.discover_libraries_request(request)
-            result2 = await library_manager.discover_libraries_request(request)
-            result3 = await library_manager.discover_libraries_request(request)
+            result1 = await library_manager.discovery.discover_libraries_request(request)
+            result2 = await library_manager.discovery.discover_libraries_request(request)
+            result3 = await library_manager.discovery.discover_libraries_request(request)
 
             assert isinstance(result1, DiscoverLibrariesResultSuccess)
             assert isinstance(result2, DiscoverLibrariesResultSuccess)

@@ -6,6 +6,9 @@ App Settings covers what the application itself owns: how it closes, which
 theme it wears, the workspace it hands to the engine, your license, log
 files, and how the app updates itself.
 
+See [Desktop Environment Variables](environment_variables.md) for launch-time
+configuration.
+
 ## Opening App Settings
 
 Click your name in the top-right corner of the window, then choose
@@ -98,7 +101,8 @@ workflow first.
 and the app dials when it talks to the engine directly. The default,
 `ws://127.0.0.1:18125`, is a loopback socket that only your machine can
 reach. Change it only if your engine listens somewhere else, then restart
-the engine to apply it.
+the engine to apply it. The engine side of this connection is the
+`websocket_direct` transport; see [Transports](../transports.md).
 
 ## License
 
@@ -111,9 +115,16 @@ when it's the one in use. Use the pencil icon to give it a friendlier
 name, or **Remove** to deactivate it on this machine. Making a different
 license the active one restarts the engine.
 
-**Griptape Server Endpoint** points the engine at an on-premises Griptape
-server for cloud and license requests instead of the default
-`https://cloud.griptape.ai`. Restart the engine after changing it.
+**Griptape Server Endpoint** appears when a license is active. It points
+the app and engine at an on-premises Griptape server for Cloud and license
+requests instead of the default `https://cloud.griptape.ai`. Click **Save**
+after editing it, then restart the engine.
+
+**Route HTTPS traffic through this server** appears with an active
+license. It is off by default and routes HTTPS through a non-default
+server endpoint. See
+[Route HTTPS traffic through the Admin Server](../../enterprise/using_the_admin_server.md#route-https-traffic-through-the-admin-server)
+for requirements and setup.
 
 To add another key, paste it into the box and click **Add & Activate**.
 

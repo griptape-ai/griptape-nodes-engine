@@ -36,7 +36,7 @@ class TestHttpFileDriver:
         mock_response.content = b"downloaded content"
         mock_response.raise_for_status = Mock()
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.get = AsyncMock(return_value=mock_response)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -50,11 +50,11 @@ class TestHttpFileDriver:
     @pytest.mark.asyncio
     async def test_read_http_error(self, driver: HttpFileDriver) -> None:
         """Test that HTTP errors are raised as RuntimeError."""
-        import httpx
+        import httpx2
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
-            mock_client.get = AsyncMock(side_effect=httpx.HTTPError("Connection failed"))
+            mock_client.get = AsyncMock(side_effect=httpx2.HTTPError("Connection failed"))
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_class.return_value = mock_client
@@ -66,12 +66,12 @@ class TestHttpFileDriver:
 
     @pytest.mark.asyncio
     async def test_read_respects_timeout(self, driver: HttpFileDriver) -> None:
-        """Test that timeout parameter is passed to httpx."""
+        """Test that timeout parameter is passed to httpx2."""
         mock_response = Mock()
         mock_response.content = b"content"
         mock_response.raise_for_status = Mock()
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.get = AsyncMock(return_value=mock_response)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -87,7 +87,7 @@ class TestHttpFileDriver:
         mock_response = Mock()
         mock_response.status_code = 200
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.head = AsyncMock(return_value=mock_response)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -103,7 +103,7 @@ class TestHttpFileDriver:
         mock_response = Mock()
         mock_response.status_code = 404
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.head = AsyncMock(return_value=mock_response)
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -116,11 +116,11 @@ class TestHttpFileDriver:
     @pytest.mark.asyncio
     async def test_exists_returns_false_on_error(self, driver: HttpFileDriver) -> None:
         """Test exists returns False when HTTP error occurs."""
-        import httpx
+        import httpx2
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with patch("httpx2.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
-            mock_client.head = AsyncMock(side_effect=httpx.HTTPError("Connection failed"))
+            mock_client.head = AsyncMock(side_effect=httpx2.HTTPError("Connection failed"))
             mock_client.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client.__aexit__ = AsyncMock(return_value=None)
             mock_client_class.return_value = mock_client
@@ -134,7 +134,7 @@ class TestHttpFileDriver:
         mock_response.headers = {"content-length": "1234"}
         mock_response.raise_for_status = Mock()
 
-        with patch("httpx.Client") as mock_client_class:
+        with patch("httpx2.Client") as mock_client_class:
             mock_client = Mock()
             mock_client.head = Mock(return_value=mock_response)
             mock_client.__enter__ = Mock(return_value=mock_client)
@@ -151,7 +151,7 @@ class TestHttpFileDriver:
         mock_response.headers = {}
         mock_response.raise_for_status = Mock()
 
-        with patch("httpx.Client") as mock_client_class:
+        with patch("httpx2.Client") as mock_client_class:
             mock_client = Mock()
             mock_client.head = Mock(return_value=mock_response)
             mock_client.__enter__ = Mock(return_value=mock_client)
@@ -163,11 +163,11 @@ class TestHttpFileDriver:
 
     def test_get_size_returns_zero_on_error(self, driver: HttpFileDriver) -> None:
         """Test get_size returns 0 when HTTP error occurs."""
-        import httpx
+        import httpx2
 
-        with patch("httpx.Client") as mock_client_class:
+        with patch("httpx2.Client") as mock_client_class:
             mock_client = Mock()
-            mock_client.head = Mock(side_effect=httpx.HTTPError("Connection failed"))
+            mock_client.head = Mock(side_effect=httpx2.HTTPError("Connection failed"))
             mock_client.__enter__ = Mock(return_value=mock_client)
             mock_client.__exit__ = Mock(return_value=None)
             mock_client_class.return_value = mock_client

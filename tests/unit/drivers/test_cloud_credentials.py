@@ -6,9 +6,14 @@ import pytest
 
 from griptape_nodes.drivers.cloud_credentials import (
     API_KEY_SECRET_NAME,
+    BASE_URL_SETTING_NAME,
+    DEFAULT_CLOUD_BASE_URL,
     LICENSE_SECRET_NAME,
     is_license_credential,
+    join_cloud_url,
+    resolve_cloud_base_url,
     resolve_cloud_credential,
+    resolve_cloud_host,
 )
 
 _OTHER_SECRET_NAME = "OTHER_KEY"  # noqa: S105  # a secret's name, not a secret
@@ -29,7 +34,7 @@ class _FakeSecretsManager:
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate from the developer's own Griptape Cloud credentials."""
-    for var in (_PROXY_API_KEY_ENV_VAR, LICENSE_SECRET_NAME, API_KEY_SECRET_NAME):
+    for var in (_PROXY_API_KEY_ENV_VAR, LICENSE_SECRET_NAME, API_KEY_SECRET_NAME, BASE_URL_SETTING_NAME):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -120,3 +125,93 @@ class TestIsLicenseCredential:
     def test_classifies_credential(self, credential: str | None, expected: bool) -> None:  # noqa: FBT001
         """Only a three-segment JWT counts as a license."""
         assert is_license_credential(credential) is expected
+
+
+class TestResolveCloudBaseUrl:
+    """The deployment the engine posts budget checks and usage reports to."""
+
+    def test_no_override_is_production(self) -> None:
+        assert resolve_cloud_base_url() == "https://cloud.griptape.ai"
+
+    def test_a_workspace_env_override_wins(self) -> None:
+        secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: "https://dev.cloud.griptape.ai"})
+
+        assert resolve_cloud_base_url(secrets) == "https://dev.cloud.griptape.ai"  # type: ignore[arg-type]
+
+    def test_an_empty_override_is_production(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, "")
+
+        assert resolve_cloud_base_url() == DEFAULT_CLOUD_BASE_URL
+
+    def test_an_environment_override_wins_without_a_secrets_manager(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, "https://example.com/prefix")
+
+        assert resolve_cloud_base_url() == "https://example.com/prefix"
+
+    def test_a_secrets_manager_is_read_instead_of_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, "https://shell.example.com")
+        secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: "https://workspace.example.com"})
+
+        assert resolve_cloud_base_url(secrets) == "https://workspace.example.com"  # type: ignore[arg-type]
+
+
+class TestResolveCloudHost:
+    """Which deployment we are talking to, which decides whose 403 we explain."""
+
+    def test_no_override_is_production(self) -> None:
+        assert resolve_cloud_host() == "cloud.griptape.ai"
+
+    def test_a_workspace_env_override_is_still_our_host(self) -> None:
+        """The dev-control-plane setup: GT_CLOUD_BASE_URL in the workspace .env, not the shell.
+
+        An environment-only read resolves to production here, and the engine then declines to
+        explain a genuine refusal from the deployment actually in use -- on the one
+        configuration where budget enforcement is testable before it ships.
+        """
+        secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: "https://dev.cloud.griptape.ai"})
+
+        assert resolve_cloud_host(secrets) == "dev.cloud.griptape.ai"  # type: ignore[arg-type]
+
+    def test_an_environment_override_wins_without_a_secrets_manager(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Call sites with no engine reference still follow the shell."""
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, "https://dev.cloud.griptape.ai")
+
+        assert resolve_cloud_host() == "dev.cloud.griptape.ai"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "https://cloud.griptape.ai",
+            "https://cloud.griptape.ai/",
+            "https://cloud.griptape.ai/api",
+            "http://cloud.griptape.ai",
+            "https://cloud.griptape.ai:8443",
+        ],
+    )
+    def test_only_the_hostname_is_compared(self, base_url: str) -> None:
+        """A port, a path, a scheme or a trailing slash must not change whose host this is."""
+        secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: base_url})
+
+        assert resolve_cloud_host(secrets) == "cloud.griptape.ai"  # type: ignore[arg-type]
+
+    def test_a_url_with_no_host_yields_no_host(self) -> None:
+        """An empty string matches nothing, so a misconfigured URL declines rather than guesses."""
+        secrets = _FakeSecretsManager({BASE_URL_SETTING_NAME: "not-a-url"})
+
+        assert resolve_cloud_host(secrets) == ""  # type: ignore[arg-type]
+
+
+class TestJoinCloudUrl:
+    """join_cloud_url() keeps any path on the base URL."""
+
+    @pytest.mark.parametrize(
+        ("base_url", "expected"),
+        [
+            ("https://cloud.griptape.ai", "https://cloud.griptape.ai/api/buckets"),
+            ("https://cloud.griptape.ai/", "https://cloud.griptape.ai/api/buckets"),
+            ("https://example.com/prefix", "https://example.com/prefix/api/buckets"),
+            ("https://example.com/prefix/", "https://example.com/prefix/api/buckets"),
+        ],
+    )
+    def test_join(self, base_url: str, expected: str) -> None:
+        assert join_cloud_url(base_url, "/api/buckets") == expected
