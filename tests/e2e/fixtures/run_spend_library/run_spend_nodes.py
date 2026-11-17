@@ -13,7 +13,8 @@ puts that header on ``attribution_from_thread``.
 
 Given a ``gate_file``, it waits for that file to appear before finishing, so a test can act while the
 node is still running: by default it reports first and then waits, and with ``report_after_gate`` it
-waits first and reports once the gate opens, the way a slow provider call reports late.
+waits first and reports once the gate opens, the way a slow provider call reports late. A node that
+reports late asks for no header, so nothing it awaits comes before the shielded report.
 """
 
 from __future__ import annotations
@@ -85,17 +86,18 @@ class SpendingNode(ControlNode):
         )
 
     async def aprocess(self) -> None:
+        # Read now, while the node holds its run: a report sent after the gate must still name this run.
+        run = self.run_attribution
+        if self.get_parameter_value("report_after_gate"):
+            # Shielded before anything else is awaited, as a provider call blocked in a worker thread
+            # outlives the cancelled task that started it and still reports when it returns. A test
+            # cancels as soon as the node is resolving, so an await ahead of this could take the cancel.
+            await asyncio.shield(self._wait_then_report(run))
+            return
         header = await GriptapeNodes.ahandle_request(GetAttributionContextRequest())
         if isinstance(header, GetAttributionContextResultSuccess):
             self.parameter_output_values["attribution"] = json.loads(base64.urlsafe_b64decode(header.header_value))
         self.parameter_output_values["attribution_from_thread"] = await asyncio.to_thread(_header_from_a_copied_context)
-        # Read now, while the node holds its run: a report sent after the gate must still name this run.
-        run = self.run_attribution
-        if self.get_parameter_value("report_after_gate"):
-            # Shielded, as a provider call blocked in a worker thread outlives the cancelled task that
-            # started it and still reports when it returns.
-            await asyncio.shield(self._wait_then_report(run))
-            return
         await self._report(run)
         await self._wait_for_gate()
 
