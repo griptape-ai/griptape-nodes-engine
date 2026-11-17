@@ -692,7 +692,9 @@ Things to know about the output:
 ### Example: a library that cancels a run on blocked terms
 
 A library that checks chosen parameters for chosen words and cancels the flow when it finds
-one:
+one. This is a best-effort check, not a compliance control. The prompt may still reach the
+provider, and nodes inside a loop are never checked (both are covered below). For anything that
+must be enforced, use a node that raises, as shown at the end of this section.
 
 - [`griptape_nodes_library.json`](example_node_blocked_terms_library/griptape_nodes_library.json):
     manifest declaring the advanced library and no nodes of its own
@@ -729,12 +731,34 @@ Three things in this example are easy to get wrong:
     already be running when the cancel takes effect, so a prompt may still reach the model
     provider. If a blocked prompt must never be sent, put a node in front of the model node
     that raises an error when the text contains the term. A node that raises stops the run
-    before the next node starts.
+    before the next node starts. See the sketch after this list.
 - **Nodes inside a loop body are not covered.** The check reads the canvas node, which holds
     the values from before the loop started. If a **ForEach** feeds each item into an
     **Agent**'s `prompt`, an item containing the term does not cancel the run. The example
     does not look inside lists either, so it cannot check the list that feeds the loop. This
     is a current limitation: a library cannot yet check or stop the items of a loop.
+
+A node that enforces the rule raises from `process`, so the run stops before the next node
+starts. This sketch has one text input and passes the text through when it is clean:
+
+```python
+class BlockedTermsGate(DataNode):
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(ParameterString(name="text", tooltip="Text to check", allow_output=False))
+        self.add_parameter(ParameterString(name="checked_text", tooltip="The text, if it is clean", allow_input=False))
+
+    def process(self) -> None:
+        text = self.get_parameter_value("text")
+        for term in BLOCKED_TERMS:
+            if term.lower() in text.lower():
+                msg = f"Attempted to pass the text on. Failed because it contains the blocked term '{term}'."
+                raise ValueError(msg)
+        self.parameter_output_values["checked_text"] = text
+```
+
+Connect it between the node that makes the text and the model node. See
+[Error handling](error_handling.md) for raising errors with more detail.
 
 ### Example: a library that checks node outputs
 
