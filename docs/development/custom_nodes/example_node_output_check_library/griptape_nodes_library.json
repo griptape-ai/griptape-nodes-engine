@@ -5,7 +5,7 @@
     "author": "Griptape",
     "description": "Demonstrates a library that warns when a node output contains a flagged term.",
     "library_version": "0.1.0",
-    "engine_version": "0.97.0",
+    "engine_version": "0.105.0",
     "tags": ["demo", "execution-events"]
   },
   "categories": [],

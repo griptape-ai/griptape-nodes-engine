@@ -5,7 +5,7 @@
     "author": "Griptape",
     "description": "Demonstrates a library that cancels a run when a node input contains a blocked term.",
     "library_version": "0.1.0",
-    "engine_version": "0.97.0",
+    "engine_version": "0.105.0",
     "tags": ["demo", "execution-events"]
   },
   "categories": [],
