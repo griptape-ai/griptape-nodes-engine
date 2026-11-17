@@ -20,6 +20,7 @@ import pytest
 
 from griptape_nodes.drivers.cloud_credentials import API_KEY_SECRET_NAME, BASE_URL_SETTING_NAME
 from griptape_nodes.retained_mode.events.budget_events import ReportUsageRequest
+from griptape_nodes.retained_mode.events.context_events import CloseWorkflowRequest, CloseWorkflowResultSuccess
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
     ResolveNodeRequest,
@@ -395,3 +396,36 @@ async def test_a_call_that_reports_after_its_run_ended_still_counts_toward_it(
     run_ids = [report["tags"].get("run_id") for report in reports]
     assert run_ids.count(next_run_id) == len(NODE_NAMES), run_ids
     assert run_ids.count(cancelled_run_id) == 1, f"The late report should name the run that made it: {run_ids}"
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_reports_after_its_workflow_closed_still_counts_toward_its_run(
+    engine: Engine,
+    tmp_path: Path,
+    record_published: Callable[..., list[Any]],
+    stub_cloud: StubSpendServer,
+    three_node_flow: str,
+) -> None:
+    """Closing a workflow ends its run, but a slow call already made still reports, under that run."""
+    gate = tmp_path / "gates" / "first.gate"
+    first = NODE_NAMES[0]
+    engine.handle_request(SetParameterValueRequest(parameter_name="gate_file", node_name=first, value=str(gate)))
+    engine.handle_request(SetParameterValueRequest(parameter_name="report_after_gate", node_name=first, value=True))
+    workflow_id = engine.context_manager.get_current_workflow_id()
+    workflow_name = engine.workflow_registry.get(workflow_id).name
+    payloads = record_published(object)
+
+    slow_run = asyncio.create_task(engine.ahandle_request(StartFlowRequest(flow_name=three_node_flow)))
+    await wait_until_resolving(engine, first)
+    closed = await engine.ahandle_request(CloseWorkflowRequest(workflow_id=workflow_id))
+    assert isinstance(closed, CloseWorkflowResultSuccess), closed
+    gate.parent.mkdir(parents=True, exist_ok=True)
+    gate.write_text("open")
+    with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(slow_run), timeout=RUN_TIMEOUT_SECONDS)
+    slow_run.cancel()
+
+    [closed_run_id] = _announced_run_ids(payloads)
+    reports = await stub_cloud.wait_for_reports(1)
+    assert [report["tags"].get("run_id") for report in reports] == [closed_run_id]
+    assert reports[0]["tags"].get("workflow") == workflow_name

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
+    OutlivesWorkflowMixin,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -27,8 +28,8 @@ class RunAttribution:
 
     A call can report after its run has ended, when another run or project is current. Passing the
     saved value on the call's budget requests keeps the report on the run, workflow and project that
-    made it, so it also counts against that project's budgets. Its workflow has to still be open: a
-    request from a workflow that has since been closed is refused before it is sent.
+    made it, so it also counts against that project's budgets. That holds after the artist has
+    closed the workflow too.
 
     Args:
         run_id: The run, the id its request's result and `RunStartedEvent` name.
@@ -183,7 +184,7 @@ class BudgetAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class ReportUsageRequest(RequestPayload):
+class ReportUsageRequest(OutlivesWorkflowMixin, RequestPayload):
     """Report what a direct provider call used, so it counts against budgets and shows in usage.
 
     Send the provider's token counts and Griptape Cloud prices them, so no client holds prices.
