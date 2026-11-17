@@ -22,7 +22,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from griptape_nodes.machines.dag_builder import NodeState
+from griptape_nodes.machines.dag_builder import DagNode, NodeState
 from tests.unit.machines.scheduler_stubs import (
     let_the_run_finish,
     machine_running_one_node,
@@ -114,3 +114,28 @@ class TestStaleCancellationDoesNotLeakIntoTheNextRun:
         cancel_worker_execution_in.assert_any_await(machine.context.workflow, "running_then_cancelled")
 
         await let_the_run_finish(driver, release, held_node_execution)
+
+
+class TestCancellingStopsOnlyThisRunsWorkerNodes:
+    @pytest.mark.asyncio
+    async def test_a_node_that_finishes_while_a_cancel_is_sending_gets_no_cancel(self) -> None:
+        """Its worker request is found by node name, and by then the name may be the next run's."""
+        machine, release, dag_builder = machine_running_one_node(max_nodes_in_parallel=2)
+        finishing = DagNode(node_reference=node_stub("finishing"), node_state=NodeState.PROCESSING)
+        dag_builder.node_to_reference["finishing"] = finishing
+        finishes = asyncio.Event()
+        machine.context.task_to_node[asyncio.ensure_future(finishes.wait())] = finishing
+        sent: list[str] = []
+
+        async def slow_send(workflow: object, node_name: str) -> None:  # noqa: ARG001
+            sent.append(node_name)
+            # While this send is on the wire, the other node finishes.
+            finishes.set()
+            await asyncio.sleep(0)
+
+        machine.context.engine.node_manager.cancel_worker_execution_in = slow_send
+
+        await machine.cancel_all_nodes()
+
+        assert sent == ["running"]
+        release.set()

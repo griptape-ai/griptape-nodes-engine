@@ -1,13 +1,14 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
 import asyncio
+import contextlib
 import itertools
 import json
 import tempfile
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,6 +38,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ListRunsResultSuccess,
     ResolveNodeRequest,
     ResolveNodeResultFailure,
+    SingleExecutionStepRequest,
     StartFlowFromNodeRequest,
     StartFlowFromNodeResultFailure,
     StartFlowRequest,
@@ -65,11 +67,12 @@ from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDe
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNodeSpec, StartFlowSpec
 from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
-from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec
+from griptape_nodes.retained_mode.managers.run_queue import Run, RunSpec, RunState
 from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
 from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.serialization.commands import encode_commands
+from tests.run_end_states import record_end_states
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -1192,6 +1195,10 @@ class _Spec(RunSpec):
         return StartFlowResultFailure(validation_exceptions=[], result_details=details)
 
 
+async def _returns(result: Any) -> Any:
+    return result
+
+
 def _ran(name: str) -> StartFlowResultSuccess:
     return StartFlowResultSuccess(result_details=f"{name} ran")
 
@@ -1532,6 +1539,250 @@ class TestRunsEndCleanly:
 
             await asyncio.wait_for(reported.wait(), timeout=1.0)
         assert loops == [asyncio.get_running_loop()]
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestRunsEndInTheRightState:
+    """The state a run ends in says how it ended: the run queue reads it once the run is over."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_whose_task_is_cancelled_ends_cancelled(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        ended = record_end_states(flow_manager)
+        drivers: list[asyncio.Task] = []
+
+        async def body() -> Any:
+            # The run's body executes in the task that drives the run.
+            drivers.append(cast("asyncio.Task", asyncio.current_task()))
+            await asyncio.Event().wait()
+
+        run = flow_manager.submit_run(_Spec("flow", body))
+        for _ in range(10):
+            if drivers:
+                break
+            await asyncio.sleep(0)
+        (driver,) = drivers
+        driver.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(driver), timeout=1.0)
+
+        assert run.outcome.cancelled()
+        assert ended == ["cancelled"]
+
+    @pytest.mark.parametrize("cancel_all", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_run_whose_cancel_fails_ends_as_its_flow_did(self, engine: Engine, *, cancel_all: bool) -> None:
+        """Stopping the flow raised, so the cancel failed and the run went on to finish."""
+        flow_manager = engine.flow_manager
+        workflow = engine.current_workflow()
+        ended = record_end_states(flow_manager)
+        may_end = asyncio.Event()
+
+        async def body() -> Any:
+            await may_end.wait()
+            return _ran("run")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("flow", body)))
+        await asyncio.sleep(0)
+        run = workflow.flows.run_in_progress
+        assert run is not None
+
+        async def cancel() -> None:
+            if cancel_all:
+                await flow_manager.cancel_all_runs_in(workflow)
+            else:
+                await flow_manager.cancel_run_in(workflow, run.run_id)
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", return_value=True),
+            patch.object(flow_manager, "_cancel_run", side_effect=RuntimeError("worker gone")),
+            pytest.raises(RuntimeError, match="worker gone"),
+        ):
+            await cancel()
+        may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        assert ended == ["finished"]
+
+    @pytest.mark.parametrize("cancel_fails", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_run_that_pauses_while_its_cancel_waits(self, engine: Engine, *, cancel_fails: bool) -> None:
+        """Its request returns with the flow paused while the cancel is still stopping its nodes.
+
+        A cancel that goes through ends it cancelled. One that fails leaves it paused, so the user can
+        continue it to its end.
+        """
+        flow_manager = engine.flow_manager
+        flows = engine.current_workflow().flows
+        ended = record_end_states(flow_manager)
+        may_return = asyncio.Event()
+        flow = {"running": True}
+
+        async def body() -> Any:
+            await may_return.wait()
+            return _ran("run")
+
+        run = flow_manager.submit_run(_Spec("flow", body))
+        await asyncio.sleep(0)
+
+        async def slow_cancel(_flows: Any) -> None:
+            may_return.set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+            if cancel_fails:
+                msg = "worker gone"
+                raise RuntimeError(msg)
+            flow["running"] = False
+            flow_manager._finish_run_if_over(flows)
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow["running"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=slow_cancel),
+            patch.object(flow_manager, "_run_is_advancing", return_value=False),
+            patch.object(flow_manager, "_paused_run_failed", return_value=False),
+        ):
+            with contextlib.suppress(RuntimeError):
+                await flow_manager.cancel_run(run.run_id, flows=flows)
+            if cancel_fails:
+                assert run.state is RunState.PAUSED
+                # The user continues the paused run to its end.
+                flow["running"] = False
+                flow_manager._finish_run_if_over(flows)
+
+        if cancel_fails:
+            assert ended == ["finished"]
+        else:
+            assert ended == ["cancelled"]
+
+    @pytest.mark.parametrize("first_stop_fails", [True, False])
+    @pytest.mark.asyncio
+    async def test_a_cancel_during_a_failed_step_s_teardown_waits_for_it(
+        self, engine: Engine, *, first_stop_fails: bool
+    ) -> None:
+        """A step fails and its teardown is still stopping the flow when Cancel is pressed.
+
+        The cancel waits for the teardown, then starts from what it left. If both fail, the flow goes on
+        paused, so the run ends as its flow does. If the teardown went through, the run ended failed and
+        the cancel has nothing left to do.
+        """
+        flow_manager = engine.flow_manager
+        flows = engine.current_workflow().flows
+        ended = record_end_states(flow_manager)
+        flow = {"running": True}
+        teardown_may_end = asyncio.Event()
+        stops_attempted: list[RunState] = []
+
+        async def stop_flow(_flows: Any) -> None:
+            stops_attempted.append(run.state)
+            if len(stops_attempted) == 1:
+                await teardown_may_end.wait()
+                if not first_stop_fails:
+                    flow["running"] = False
+                    flow_manager._finish_run_if_over(flows)
+                    return
+            msg = "worker gone"
+            raise RuntimeError(msg)
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow["running"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_flow),
+            patch.object(flow_manager, "_run_is_advancing", return_value=False),
+            patch.object(flow_manager, "_paused_run_failed", return_value=False),
+        ):
+            # Its request returns with its flow still going: it pauses.
+            run = flow_manager.submit_run(_Spec("flow", lambda: _returns(_ran("run"))))
+            for _ in range(10):
+                if run.outcome.done():
+                    break
+                await asyncio.sleep(0)
+            assert run.state is RunState.PAUSED
+
+            teardown = asyncio.ensure_future(flow_manager._stop_run_in_progress(flows, run, RunState.FAILED))
+            await asyncio.sleep(0)
+            cancel = asyncio.ensure_future(flow_manager.cancel_run(run.run_id, flows=flows))
+            await asyncio.sleep(0)
+            assert stops_attempted == [RunState.FAILED], "the cancel stopped the flow while the teardown still was"
+            teardown_may_end.set()
+            with contextlib.suppress(RuntimeError):
+                await asyncio.wait_for(teardown, timeout=1.0)
+            with contextlib.suppress(RuntimeError):
+                await asyncio.wait_for(cancel, timeout=1.0)
+
+            if first_stop_fails:
+                # The cancel started from the pause the failed teardown put back.
+                assert stops_attempted == [RunState.FAILED, RunState.CANCELLED]
+                assert run.state is RunState.PAUSED
+                # The user continues the paused run to its end.
+                flow["running"] = False
+                flow_manager._finish_run_if_over(flows)
+
+        if first_stop_fails:
+            assert ended == ["finished"]
+        else:
+            assert stops_attempted == [RunState.FAILED]
+            assert ended == ["failed"]
+
+    @pytest.mark.parametrize("cancel_fails", [True, False])
+    @pytest.mark.asyncio
+    async def test_a_step_that_fails_during_a_cancel_waits_for_it(self, engine: Engine, *, cancel_fails: bool) -> None:
+        """Cancel is stopping the paused run when a step fails: its teardown waits for the cancel.
+
+        A cancel that goes through ends the run cancelled, and the teardown has nothing left to do. One
+        that fails puts the run back to paused, and the teardown then stops it as failed.
+        """
+        flow_manager = engine.flow_manager
+        workflow = engine.current_workflow()
+        flows = workflow.flows
+        ended = record_end_states(flow_manager)
+        flow = {"running": True}
+        cancel_may_end = asyncio.Event()
+        stops_attempted: list[RunState] = []
+
+        async def stop_flow(_flows: Any) -> None:
+            stops_attempted.append(run.state)
+            if len(stops_attempted) == 1:
+                await cancel_may_end.wait()
+                if cancel_fails:
+                    msg = "worker gone"
+                    raise RuntimeError(msg)
+            flow["running"] = False
+            flow_manager._finish_run_if_over(flows)
+
+        with (
+            patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow["running"]),
+            patch.object(flow_manager, "_cancel_run", side_effect=stop_flow),
+            patch.object(flow_manager, "_run_is_advancing", return_value=False),
+            patch.object(flow_manager, "_paused_run_failed", return_value=False),
+            patch.object(flow_manager, "single_execution_step", side_effect=RuntimeError("step broke")),
+            patch.object(flow_manager, "get_flow_by_name_in", return_value=MagicMock()),
+        ):
+            # Its request returns with its flow still going: it pauses.
+            run = flow_manager.submit_run(_Spec("flow", lambda: _returns(_ran("run"))))
+            for _ in range(10):
+                if run.outcome.done():
+                    break
+                await asyncio.sleep(0)
+            assert run.state is RunState.PAUSED
+
+            cancel = asyncio.ensure_future(flow_manager.cancel_run(run.run_id, flows=flows))
+            await asyncio.sleep(0)
+            step = asyncio.ensure_future(
+                flow_manager.on_single_execution_step_request(SingleExecutionStepRequest(flow_name="flow"), workflow)
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert stops_attempted == [RunState.CANCELLED], "the teardown stopped the flow while the cancel still was"
+            cancel_may_end.set()
+            with contextlib.suppress(RuntimeError):
+                await asyncio.wait_for(cancel, timeout=1.0)
+            await asyncio.wait_for(step, timeout=1.0)
+
+        if cancel_fails:
+            assert stops_attempted == [RunState.CANCELLED, RunState.FAILED]
+            assert ended == ["failed"]
+        else:
+            assert stops_attempted == [RunState.CANCELLED]
+            assert ended == ["cancelled"]
 
 
 class TestRunSpecs:
