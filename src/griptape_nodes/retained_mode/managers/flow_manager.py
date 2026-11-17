@@ -2130,8 +2130,9 @@ class FlowManager(EngineScoped):
             run = flows.run_in_progress
             # We REALLY don't want to fail here, else we'll take the whole engine down
             try:
-                if run is not None and run.state is RunState.PAUSED:
-                    # The step failed, so its run ends failed, not as its teardown would read.
+                # The step failed, so its run ends failed, not as its teardown would read. A run marked
+                # CANCELLED has a cancel stopping it: this waits for it, then sees whether the run ended.
+                if run is not None and run.state in (RunState.PAUSED, RunState.CANCELLED):
                     await self._stop_run_in_progress(flows, run, RunState.FAILED)
                 elif self._flow_is_running(flows):
                     await self._cancel_run(flows)
