@@ -1,0 +1,37 @@
+{
+  "name": "Run Spend Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "A node that reports what a direct model call cost, the way a library node does",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": [
+      "test"
+    ],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "SpendingNode",
+      "file_path": "run_spend_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Reports a fixed cost for a direct model call",
+        "display_name": "Spending Node"
+      }
+    }
+  ]
+}

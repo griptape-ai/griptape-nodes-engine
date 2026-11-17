@@ -62,6 +62,7 @@ def _mock_engine(*, credential: str | None = "gt-key") -> MagicMock:
     engine.get_engine_id.return_value = "engine-1"
     engine.get_session_id.return_value = "session-1"
     engine.only_open_workflow_or_none.return_value = None
+    engine.flow_manager.current_run_id = "run-1"
     secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": credential}
     engine.secrets_manager.get_secret.side_effect = lambda name, **_: secrets.get(name)
     return engine
@@ -201,6 +202,7 @@ class TestBudgetCheckAllowed:
                 "node_id": "node-7",
                 "engine_id": "engine-1",
                 "session_id": "session-1",
+                "run_id": "run-1",
             },
             "model": "gpt-5-nano",
             "estimated_cost_micro_usd": 40000,
@@ -221,6 +223,7 @@ class TestBudgetCheckAllowed:
         engine.project_manager.get_project_chain.return_value = []
         engine.get_engine_id.return_value = None
         engine.get_session_id.return_value = None
+        engine.flow_manager.current_run_id = None
 
         _check(_manager(engine), BudgetAccessRequest(model="m"))
 
@@ -447,6 +450,7 @@ class TestReportUsage:
                 "node_id": "node-7",
                 "engine_id": "engine-1",
                 "session_id": "session-1",
+                "run_id": "run-1",
             },
             "provider": "anthropic",
             "model": "claude-sonnet-5",
