@@ -1,7 +1,14 @@
 """Package for web servers the engine may need to start."""
 
+import errno
+import logging
 import socket
 import sys
+
+logger = logging.getLogger("griptape_nodes")
+
+# Windows reports an address already in use as WSAEADDRINUSE, not the C runtime's EADDRINUSE.
+_ADDRESS_IN_USE_ERRNOS = frozenset({errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE)})
 
 
 def bind_free_socket(host: str, port: int) -> socket.socket:
@@ -14,16 +21,31 @@ def bind_free_socket(host: str, port: int) -> socket.socket:
     close the socket.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # POSIX only, so a restart is not refused by a socket the previous run left in TIME_WAIT.
-    # Windows reads the same option as permission to take a port from a process still listening
-    # on it, which is the opposite of what a server wants: the bind succeeds, the fallback below
-    # never runs, and two servers advertise one port while only one answers. Windows refuses that
-    # bind with no option set, so the default is what this helper wants there. CPython's asyncio
-    # draws the line in the same place, defaulting reuse_address to POSIX.
+    # SO_REUSEADDR on POSIX only, so a restart is not refused by a port the previous run left in
+    # TIME_WAIT. Windows reads the same option as permission to bind a port another process is
+    # still listening on, so nothing is set there.
     if sys.platform != "win32":
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
     try:
         sock.bind((host, port))
-    except OSError:
-        sock.bind((host, 0))
+    except OSError as exc:
+        if exc.errno not in _ADDRESS_IN_USE_ERRNOS:
+            sock.close()
+            raise
+        try:
+            sock.bind((host, 0))
+        except OSError:
+            sock.close()
+            raise
+        logger.warning(
+            "Attempted to start a server on %s port %s. That port is already in use, so the "
+            "server is running on port %s instead. Anything pointed at port %s reaches whichever "
+            "program took it first.",
+            host,
+            port,
+            sock.getsockname()[1],
+            port,
+        )
+
     return sock

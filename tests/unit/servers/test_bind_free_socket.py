@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 
-from griptape_nodes.servers import bind_free_socket
+import pytest
+
+from griptape_nodes.servers import _ADDRESS_IN_USE_ERRNOS, bind_free_socket
 
 LOOPBACK = "127.0.0.1"
 
@@ -77,3 +80,39 @@ def test_keeps_its_port_across_a_restart_after_serving() -> None:
         )
     finally:
         restarted.close()
+
+
+def test_warns_with_the_requested_and_assigned_ports_when_it_falls_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The fallback has to say so, or a server quietly answers on a port nobody was told about."""
+    port = _free_port()
+
+    first = bind_free_socket(LOOPBACK, port)
+    try:
+        first.listen()
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            second = bind_free_socket(LOOPBACK, port)
+        try:
+            assert str(port) in caplog.text, "the warning does not say which port was asked for"
+            assert str(second.getsockname()[1]) in caplog.text, (
+                "the warning does not say which port the server ended up on"
+            )
+        finally:
+            second.close()
+    finally:
+        first.close()
+
+
+def test_raises_when_the_bind_fails_for_a_reason_other_than_the_port_being_taken() -> None:
+    """An address the machine does not hold is a misconfiguration, not a busy port.
+
+    Falling back to an OS-assigned port there would start the server on the wrong interface
+    and report success, so the error has to reach the caller.
+    """
+    unassignable_host = "192.0.2.1"  # TEST-NET-1, never assigned to a real interface.
+
+    with pytest.raises(OSError) as raised:  # noqa: PT011
+        bind_free_socket(unassignable_host, 0).close()
+
+    assert raised.value.errno not in _ADDRESS_IN_USE_ERRNOS
