@@ -109,13 +109,35 @@ else
 	$(file >$(RUN_OVERRIDES),-e $(CURDIR))
 endif
 
+# An engine change the app has to follow breaks the published app until the next app release, so
+# `run` takes the app's nightly build, which follows the app's main branch. The wheel for this
+# machine comes from the app repo's `latest` release through gh, since that repo is internal. uv
+# picks it over PyPI because its version is higher. `run` downloads it only when it isn't here, so
+# a download cut off midway stays broken until `run/refresh` replaces it.
+RUN_APP_DIR := .run-app
+ifeq ($(OS),Windows_NT)
+RUN_APP_WHEEL := griptape_nodes-*win_amd64.whl
+else ifeq ($(shell uname -s),Darwin)
+RUN_APP_WHEEL := griptape_nodes-*macosx_*_$(shell uname -m).whl
+else
+RUN_APP_WHEEL := griptape_nodes-*manylinux*_$(shell uname -m).whl
+endif
+
+.PHONY: run/app
+run/app:
+	@gh release download latest --repo griptape-ai/griptape-nodes-app --pattern "$(RUN_APP_WHEEL)" --dir $(RUN_APP_DIR) --clobber
+
 .PHONY: run
-run: run/overrides ## Run the engine from this checkout (published app + local editable engine).
-	@uvx --python 3.12 --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
+run: run/overrides $(if $(wildcard $(RUN_APP_DIR)/$(RUN_APP_WHEEL)),,run/app) ## Run the engine from this checkout (nightly app + local editable engine).
+	@uvx --python 3.12 --find-links $(RUN_APP_DIR) --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
 
 .PHONY: run/refresh
-run/refresh: run/overrides ## Run the engine, pulling the latest published app first.
-	@uvx --refresh --python 3.12 --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
+run/refresh: run/overrides run/app ## Run the engine, pulling the latest nightly app first.
+	@uvx --refresh --python 3.12 --find-links $(RUN_APP_DIR) --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
+
+.PHONY: run/published
+run/published: run/overrides ## Run the engine from this checkout with the published app, for those without access to the app repo.
+	@uvx --python 3.12 --overrides $(RUN_OVERRIDES) --from griptape-nodes --with-editable . gtn $(ARGS)
 
 .PHONY: lint
 lint: ## Lint project.

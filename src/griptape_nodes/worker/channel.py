@@ -20,8 +20,10 @@ to the other that it holds the per-connection token: each sends a random challen
 other's with an HMAC of it, compared with `hmac.compare_digest`. The token itself never crosses the
 wire. A connection to the parent that cannot prove it is closed without touching the real one, and
 a worker refuses a listener that cannot, such as a process that bound the port after the parent
-stopped listening. Frame bodies are opaque dicts; this module only moves them, in order, as JSON,
-never pickle.
+stopped listening. Neither end puts a clock on the handshake: either one may be an engine whose loop is
+busy for longer than any bound would allow. The parent's wait for its worker is the one deadline, and
+every connection still unproven ends with it. Frame bodies are opaque dicts; this module only moves
+them, in order, as JSON, never pickle.
 """
 
 from __future__ import annotations
@@ -48,7 +50,6 @@ logger = logging.getLogger("griptape_nodes")
 CHANNEL_ADDRESS_ENV = "GTN_WORKER_CHANNEL_ADDRESS"
 CHANNEL_TOKEN_ENV = "GTN_WORKER_CHANNEL_TOKEN"  # noqa: S105 - a secret's env var name, not a secret
 
-_HANDSHAKE_TIMEOUT_S = 5.0
 # Each handshake frame is under 200 bytes. A peer not yet proven must not be able to make either end
 # buffer an amount of memory it chooses.
 _HELLO_MAX_LENGTH = 4096
@@ -399,10 +400,17 @@ class AsyncChannel:
 class PendingWorker:
     """Parent side: a one-shot loopback server waiting for one worker with the right token."""
 
-    def __init__(self, server: asyncio.Server, token: str, connected: asyncio.Future[AsyncChannel]) -> None:
+    def __init__(
+        self,
+        server: asyncio.Server,
+        token: str,
+        connected: asyncio.Future[AsyncChannel],
+        unproven: set[asyncio.StreamWriter],
+    ) -> None:
         self._server = server
         self._token = token
         self._connected = connected
+        self._unproven = unproven
 
     @property
     def child_environment(self) -> dict[str, str]:
@@ -418,25 +426,43 @@ class PendingWorker:
             self.close()
 
     def close(self) -> None:
-        """Stop listening. Idempotent; safe even if `accept()` was never awaited."""
+        """Stop listening, and end every connection that has not proven it holds the token.
+
+        Idempotent; safe even if `accept()` was never awaited. Closing the server alone would leave those
+        connections open, each waiting on a peer with no clock to stop it.
+        """
         self._server.close()
         if not self._connected.done():
             self._connected.cancel()
+        for writer in list(self._unproven):
+            writer.close()
 
 
 async def listen_for_worker() -> PendingWorker:
     """Parent side: bind a loopback port and wait for one worker that proves it holds the token."""
     token = secrets.token_hex(32)
     connected: asyncio.Future[AsyncChannel] = asyncio.get_running_loop().create_future()
+    unproven: set[asyncio.StreamWriter] = set()
 
     async def _on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        unproven.add(writer)
+        try:
+            await _prove(reader, writer)
+        finally:
+            unproven.discard(writer)
+
+    async def _prove(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Done once the wait for a worker is over, by a worker or by the deadline: a connection the server
+        # accepted just as it closed would otherwise wait on its peer after `close` has run.
+        if connected.done():
+            logger.error("Worker channel handshake rejected a connection: this engine is no longer waiting for one.")
+            writer.close()
+            return
         challenge = secrets.token_hex(32)
         writer.write(_encode_frame({"challenge": challenge}))
         try:
-            answer = await asyncio.wait_for(
-                _read_json_frame(reader, max_length=_HELLO_MAX_LENGTH), _HANDSHAKE_TIMEOUT_S
-            )
-        except (TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
+            answer = await _read_json_frame(reader, max_length=_HELLO_MAX_LENGTH)
+        except (asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
             logger.error("Worker channel handshake rejected a connection: %s: %s", type(exc).__name__, exc)
             writer.close()
             return
@@ -453,7 +479,7 @@ async def listen_for_worker() -> PendingWorker:
         connected.set_result(AsyncChannel(reader, writer))
 
     server = await asyncio.start_server(_on_connect, host="127.0.0.1", port=0)
-    return PendingWorker(server, token, connected)
+    return PendingWorker(server, token, connected, unproven)
 
 
 async def connect_to_parent(environ: Mapping[str, str]) -> AsyncChannel:
@@ -476,7 +502,7 @@ async def connect_to_parent(environ: Mapping[str, str]) -> AsyncChannel:
         if not _proves(answer.get("proof"), token, challenge):
             msg = "it did not prove it holds the token"
             raise ValueError(msg)  # noqa: TRY301 - caught below, with every other way the handshake fails
-    except (TimeoutError, asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
+    except (asyncio.IncompleteReadError, ConnectionError, ValueError, UnicodeDecodeError) as exc:
         writer.close()
         msg = f"The process at the worker channel's address is not the engine that started this worker: {exc}"
         raise ChannelHandshakeError(msg) from exc
@@ -484,8 +510,12 @@ async def connect_to_parent(environ: Mapping[str, str]) -> AsyncChannel:
 
 
 async def _read_handshake_frame(reader: asyncio.StreamReader) -> dict:
-    """Read one handshake frame from a peer not yet proven, bounded in size and time."""
-    return await asyncio.wait_for(_read_json_frame(reader, max_length=_HELLO_MAX_LENGTH), _HANDSHAKE_TIMEOUT_S)
+    """Read one handshake frame from a peer not yet proven, bounded in size.
+
+    Not in time: the peer is the engine that started this worker, and may be busy. If it never answers,
+    it stops this worker when its own wait for it runs out.
+    """
+    return await _read_json_frame(reader, max_length=_HELLO_MAX_LENGTH)
 
 
 class WorkerLink:

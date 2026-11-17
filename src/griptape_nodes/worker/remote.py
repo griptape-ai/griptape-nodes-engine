@@ -58,8 +58,10 @@ class RemoteWorkerEnd:
     """Carries one worker this engine runs for the engine `artist_engine_id` to that engine.
 
     `on_hello` decides the worker's hello and returns the reply body. `on_closed` is called once when
-    the channel ends. Requests to the artist's engine wait at most `request_timeout_s`. Everything runs
-    on the engine loop that owns the channel.
+    the channel ends. Once the hello is accepted, requests to the artist's engine wait at most
+    `request_timeout_s`. Before that the worker is starting, and waits on the artist's engine for as
+    long as the link to it holds, as a worker waits on the engine that started it. Everything runs on
+    the engine loop that owns the channel.
     """
 
     def __init__(  # noqa: PLR0913 (each is a separate fact about the worker)
@@ -80,6 +82,7 @@ class RemoteWorkerEnd:
         self._on_closed = on_closed
         self._events: _EventBatches | None = None
         self._channel: AsyncChannel | None = None
+        self._accepted = False
 
     def attach(self, channel: AsyncChannel) -> None:
         """Start carrying `channel`. Call on the engine loop that owns it."""
@@ -109,6 +112,13 @@ class RemoteWorkerEnd:
             return GateDecision(dispatch=None, reply={"error": details})
         return GateDecision(dispatch=body, reply=None)
 
+    @property
+    def request_timeout_s(self) -> float | None:
+        """How long a request to the artist's engine waits: unbounded until the worker's hello is accepted."""
+        if not self._accepted:
+            return None
+        return self._request_timeout_s
+
     async def flush_events(self) -> None:
         """Wait until every event the worker sent before now has reached the artist's engine, or failed to."""
         await self._require_events().flush()
@@ -120,7 +130,7 @@ class RemoteWorkerEnd:
             result = await self._engine.request(
                 self._artist_engine_id,
                 request,
-                timeout_s=self._request_timeout_s,
+                timeout_s=self.request_timeout_s,
                 open_workflow_id=event_request.open_workflow_id,
                 origin_engine_id=self._worker_engine_id,
             )
@@ -169,7 +179,7 @@ class RemoteWorkerEnd:
             raise WireFormatError(msg)
         request = DecideWorkerCheckpointRequest(worker_engine_id=self._worker_engine_id, checkpoint=payload)
         try:
-            result = await self._engine.request(self._artist_engine_id, request, timeout_s=self._request_timeout_s)
+            result = await self._engine.request(self._artist_engine_id, request, timeout_s=self.request_timeout_s)
         except EngineNotFoundError as e:
             msg = f"Attempted to check a permission with the engine this worker works for. Failed because {e}"
             raise RuntimeError(msg) from e
@@ -181,7 +191,7 @@ class RemoteWorkerEnd:
     async def _deliver_events(self, events: list[dict[str, Any]]) -> None:
         request = DeliverWorkerEventsRequest(worker_engine_id=self._worker_engine_id, events=events)
         try:
-            result = await self._engine.request(self._artist_engine_id, request, timeout_s=self._request_timeout_s)
+            result = await self._engine.request(self._artist_engine_id, request, timeout_s=self.request_timeout_s)
         except EngineNotFoundError as e:
             logger.warning("Dropped %d event(s) from worker %s: %s", len(events), self._worker_engine_id, e)
             return
@@ -207,6 +217,8 @@ class RemoteWorkerEnd:
                 }
             else:
                 reply = await self._on_hello(hello)
+            if reply.get("accepted"):
+                self._accepted = True
             if self._channel is not None:
                 end_if_refused(reply, self._channel)
             return reply
