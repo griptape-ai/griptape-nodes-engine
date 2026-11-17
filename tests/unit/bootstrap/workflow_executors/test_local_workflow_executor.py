@@ -542,3 +542,21 @@ class TestSaveFailedWorkflow:
             await self._executor(tmp_path / "failed.py")._save_failed_workflow("boom")
 
         assert [type(request) for request in sent] == [GetTopLevelFlowRequest]
+
+    @pytest.mark.asyncio
+    async def test_skips_the_save_when_the_flow_cannot_be_serialized(self, engine: Engine, tmp_path: Path) -> None:
+        engine.context_manager.push_workflow(workflow_name="unserializable")
+        created = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        assert isinstance(created, CreateFlowResultSuccess), created.result_details
+        sent: list[RequestPayload] = []
+
+        async def record(request: RequestPayload) -> ResultPayload:
+            sent.append(request)
+            if isinstance(request, SerializeFlowToCommandsRequest):
+                return MagicMock()
+            return await engine.ahandle_request(request)
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", side_effect=record):
+            await self._executor(tmp_path / "failed.py")._save_failed_workflow("boom")
+
+        assert [type(request) for request in sent] == [GetTopLevelFlowRequest, SerializeFlowToCommandsRequest]
