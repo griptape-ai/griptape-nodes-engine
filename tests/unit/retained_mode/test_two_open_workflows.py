@@ -1439,7 +1439,7 @@ class TestOtherSharedState:
         sent: list[Any] = []
 
         class _CapturingClient:
-            async def request_from_worker(self, *, event_request: Any, **_: Any) -> dict:
+            async def request_from_worker(self, event_request: Any) -> dict:
                 sent.append(event_request)
                 msg = "captured"
                 raise RuntimeError(msg)
@@ -1449,8 +1449,6 @@ class TestOtherSharedState:
         transport_thread.start()
         event_manager = worker_engine.event_manager
         event_manager._worker_request_client = cast("Any", _CapturingClient())
-        event_manager._orchestrator_request_topic = "orchestrator"
-        event_manager._worker_response_topic = "worker"
         event_manager._websocket_event_loop = transport_loop
         try:
             with worker_engine.run_in_worker_workflow(runtime), pytest.raises(RuntimeError, match="captured"):

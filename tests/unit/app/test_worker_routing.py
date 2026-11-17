@@ -646,8 +646,6 @@ def _configure_forwarding_on_this_loop(event_manager: EventManager) -> None:
     """Make the calling loop the worker's websocket loop, the one that receives ActivateProjectRequest."""
     event_manager.configure_worker_forwarding(
         request_client=MagicMock(),
-        orchestrator_request_topic="orchestrator",
-        worker_response_topic="worker",
         websocket_event_loop=asyncio.get_running_loop(),
     )
 

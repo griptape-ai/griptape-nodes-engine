@@ -34,7 +34,6 @@ from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.managers.event_manager import read_forwarded_result
 from griptape_nodes.worker.parent import ParentEnd
 from griptape_nodes.worker.wire import (
-    CHANNEL_REQUEST_TOPIC,
     answer_event_request,
     event_request_envelope,
     read_event_request,
@@ -95,16 +94,10 @@ class SimulatedWorker:
         raw = await self.route_to_worker(EventRequest(request=request))
         return read_forwarded_result(request, raw)
 
-    async def request_from_worker(
-        self,
-        event_request: EventRequest,
-        request_topic: str,
-        worker_response_topic: str,  # noqa: ARG002
-        timeout_ms: int | None = None,  # noqa: ARG002
-    ) -> dict[str, Any]:
+    async def request_from_worker(self, event_request: EventRequest) -> dict[str, Any]:
         """Stands in for the worker's channel: carries a forwarded request to the orchestrator's end and back."""
         self.forwarded.append(event_request.request)
-        decision = self.parent_end.gate(event_request_envelope(event_request, request_topic))
+        decision = self.parent_end.gate(event_request_envelope(event_request))
         if decision.dispatch is None:
             return cast("dict[str, Any]", decision.reply)
         sent = read_event_request(decision.dispatch)
@@ -156,8 +149,6 @@ def simulated_worker_engine(orchestrator: Engine) -> Iterator[SimulatedWorker]:
     forwarding_thread.start()
     event_manager.configure_worker_forwarding(
         request_client=worker,
-        orchestrator_request_topic=CHANNEL_REQUEST_TOPIC,
-        worker_response_topic="worker",
         websocket_event_loop=forwarding_loop,
     )
     register_remote_handlers(event_manager)
