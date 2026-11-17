@@ -1,0 +1,86 @@
+{
+  "name": "Failure Output Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Nodes that fail in the ways the node-failure golden tests pin",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "KeyErrorNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "raises a KeyError naming the node", "display_name": "Key Error"}
+    },
+    {
+      "class_name": "ProviderErrorNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "raises a NodeError with fields, response and links", "display_name": "Provider Error"}
+    },
+    {
+      "class_name": "DeclinesInExecutionEnvironmentNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "declines to run", "display_name": "Declines To Run"}
+    },
+    {
+      "class_name": "ValidateBeforeRunNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "fails validate_before_node_run", "display_name": "Validate Before Run"}
+    },
+    {
+      "class_name": "FailsWorkflowValidationNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "fails validate_before_workflow_run", "display_name": "Fails Workflow Validation"}
+    },
+    {
+      "class_name": "PoisonSourceNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "outputs a value the next node refuses", "display_name": "Poison Source"}
+    },
+    {
+      "class_name": "RefusesPoisonInputNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "refuses its input value", "display_name": "Refuses Poison Input"}
+    },
+    {
+      "class_name": "ConstantFailingBodyNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "fails every iteration the same way", "display_name": "Constant Failing Body"}
+    },
+    {
+      "class_name": "ParityFailingBodyNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "fails with a reason per parity", "display_name": "Parity Failing Body"}
+    },
+    {
+      "class_name": "DistinctFailingBodyNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "fails with a reason per iteration", "display_name": "Distinct Failing Body"}
+    },
+    {
+      "class_name": "SomeItemsFailingBodyNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "fails some iterations", "display_name": "Some Items Failing Body"}
+    },
+    {
+      "class_name": "FourteenItemForEachGroupNode",
+      "file_path": "failure_output_nodes.py",
+      "metadata": {"category": "test", "description": "for each over fourteen items", "display_name": "Fourteen Item For Each"}
+    }
+  ]
+}
