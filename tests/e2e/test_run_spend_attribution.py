@@ -13,12 +13,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
-import json
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import pytest
 
@@ -41,6 +37,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
+from tests.e2e.stub_spend import StubSpendServer, serve_stub_spend
 from tests.e2e.waits import wait_until_resolving
 
 if TYPE_CHECKING:
@@ -65,67 +62,16 @@ LOOP_LIBRARY_NAME = "Griptape Nodes Library"
 # `ProbeForEachGroupNode` iterates a fixed three-item list.
 LOOP_ITERATIONS = 3
 
-SPEND_PATH = "/api/spend"
-REPORT_WAIT_SECONDS = 10.0
 RUN_TIMEOUT_SECONDS = 30.0
 
 
-class _StubSpendServer(HTTPServer):
-    """Records every usage report posted to it, in the order they arrive."""
-
-    def __init__(self) -> None:
-        super().__init__(("127.0.0.1", 0), _StubSpendHandler)
-        self.reports: list[dict[str, Any]] = []
-        self.lock = threading.Lock()
-
-    async def wait_for_reports(self, count: int) -> list[dict[str, Any]]:
-        """Wait for `count` reports, since the engine posts them from a background thread.
-
-        Waits with `asyncio.sleep`, so the engine's event loop keeps running meanwhile.
-        """
-        deadline = time.monotonic() + REPORT_WAIT_SECONDS
-        while time.monotonic() < deadline:
-            with self.lock:
-                if len(self.reports) >= count:
-                    return list(self.reports)
-            await asyncio.sleep(0.05)
-        with self.lock:
-            return list(self.reports)
-
-
-class _StubSpendHandler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:  # BaseHTTPRequestHandler's spelling
-        length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length))
-        server = cast("_StubSpendServer", self.server)
-        if self.path == SPEND_PATH:
-            with server.lock:
-                server.reports.append(body)
-        self.send_response(201)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", "2")
-        self.end_headers()
-        self.wfile.write(b"{}")
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002  # the base class names it this
-        """Swallow the per-request line the base class writes to stderr."""
-
-
 @pytest.fixture
-def stub_cloud(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Iterator[_StubSpendServer]:
+def stub_cloud(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Iterator[StubSpendServer]:
     """Run a stub Griptape Cloud and point the engine's spend reports at it."""
-    server = _StubSpendServer()
-    host, port = server.server_address[0], server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    monkeypatch.setenv(BASE_URL_SETTING_NAME, f"http://{host}:{port}")
-    engine.secrets_manager.set_secret(API_KEY_SECRET_NAME, "gt-test-key")
-    try:
+    with serve_stub_spend() as server:
+        monkeypatch.setenv(BASE_URL_SETTING_NAME, server.base_url)
+        engine.secrets_manager.set_secret(API_KEY_SECRET_NAME, "gt-test-key")
         yield server
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
 
 
 @pytest.fixture
@@ -167,7 +113,7 @@ def _announced_run_ids(payloads: list[Any]) -> list[str]:
 async def test_every_call_in_a_run_carries_the_id_the_run_announced(
     engine: Engine,
     record_published: Callable[..., list[Any]],
-    stub_cloud: _StubSpendServer,
+    stub_cloud: StubSpendServer,
     three_node_flow: str,
 ) -> None:
     """One run, three calls: Cloud can total the run because all three carry its id."""
@@ -190,7 +136,7 @@ async def test_every_call_in_a_run_carries_the_id_the_run_announced(
 async def test_the_next_run_gets_a_different_id(
     engine: Engine,
     record_published: Callable[..., list[Any]],
-    stub_cloud: _StubSpendServer,
+    stub_cloud: StubSpendServer,
     three_node_flow: str,
 ) -> None:
     """Two runs of one workflow write two separate totals, not one."""
@@ -210,7 +156,7 @@ async def test_the_next_run_gets_a_different_id(
 @pytest.mark.usefixtures("three_node_flow")
 @pytest.mark.asyncio
 async def test_running_one_node_is_a_run_of_its_own(
-    engine: Engine, record_published: Callable[..., list[Any]], stub_cloud: _StubSpendServer
+    engine: Engine, record_published: Callable[..., list[Any]], stub_cloud: StubSpendServer
 ) -> None:
     """Running a single node from the editor is a run, and its calls are totalled as one."""
     payloads = record_published(object)
@@ -225,7 +171,7 @@ async def test_running_one_node_is_a_run_of_its_own(
 
 
 @pytest.mark.asyncio
-async def test_spend_outside_a_run_carries_no_run_id(engine: Engine, stub_cloud: _StubSpendServer) -> None:
+async def test_spend_outside_a_run_carries_no_run_id(engine: Engine, stub_cloud: StubSpendServer) -> None:
     """A call made between runs, such as from the agent chat, belongs to no run."""
     engine.handle_request(ReportUsageRequest(declared_cost_micro_usd=1, model="gpt-5-nano"))
 
@@ -291,7 +237,7 @@ def loop_flow(
 async def test_a_loop_s_iterations_count_toward_the_run_that_started_them(
     engine: Engine,
     record_published: Callable[..., list[Any]],
-    stub_cloud: _StubSpendServer,
+    stub_cloud: StubSpendServer,
     loop_flow: _LoopFlow,
 ) -> None:
     """Each iteration runs as its own isolated subflow, and must not start a run of its own."""
@@ -314,7 +260,7 @@ async def test_a_group_run_for_another_engine_counts_toward_that_engine_s_run(
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
     record_published: Callable[..., list[Any]],
-    stub_cloud: _StubSpendServer,
+    stub_cloud: StubSpendServer,
     three_node_flow: str,
 ) -> None:
     """The engine that runs a node group in its own process reports under the parent's run.
@@ -386,7 +332,7 @@ async def test_a_run_that_waited_its_turn_keeps_the_id_it_waited_under(
     engine: Engine,
     tmp_path: Path,
     record_published: Callable[..., list[Any]],
-    stub_cloud: _StubSpendServer,
+    stub_cloud: StubSpendServer,
     three_node_flow: str,
 ) -> None:
     """A run started while another is in progress waits; it starts, and spends, under the id it queued with."""

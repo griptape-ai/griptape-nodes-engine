@@ -8,14 +8,10 @@ that holds each reply, so a report is still in flight when the run ends.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -31,6 +27,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
+from tests.e2e.stub_spend import StubSpendServer, serve_stub_spend
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -45,7 +42,6 @@ FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "usage_report_nodes.py"
 LIBRARY_NAME = "Usage Report Library"
 NODE_TYPE = "ReportingNode"
 
-SPEND_PATH = "/api/spend"
 # Long enough that the node's second report is still queued, behind the first's reply, when the
 # one-off engine's run ends.
 REPLY_DELAY_SECONDS = 1.0
@@ -54,46 +50,10 @@ REPORTS_PER_RUN = 2
 
 
 @pytest.fixture
-def stub_cloud() -> Iterator[_StubSpendServer]:
+def stub_cloud() -> Iterator[StubSpendServer]:
     """Run a stub Griptape Cloud that records usage reports."""
-    server = _StubSpendServer()
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
+    with serve_stub_spend() as server:
         yield server
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-
-class _StubSpendServer(ThreadingHTTPServer):
-    """Records every usage report posted to it, holding each reply for `reply_delay` seconds."""
-
-    def __init__(self) -> None:
-        super().__init__(("127.0.0.1", 0), _StubSpendHandler)
-        self.reports: list[dict[str, Any]] = []
-        self.lock = threading.Lock()
-        self.reply_delay = 0.0
-
-
-class _StubSpendHandler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:  # BaseHTTPRequestHandler's spelling
-        length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length))
-        server = cast("_StubSpendServer", self.server)
-        time.sleep(server.reply_delay)
-        if self.path == SPEND_PATH:
-            with server.lock:
-                server.reports.append(body)
-        self.send_response(201)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", "2")
-        self.end_headers()
-        self.wfile.write(b"{}")
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002  # the base class names it this
-        """Swallow the per-request line the base class writes to stderr."""
 
 
 def _runnable_workflow_source(engine: Engine, flow_name: str) -> str:
@@ -153,7 +113,7 @@ if __name__ == "__main__":
 def test_an_engine_that_exits_after_its_run_still_sends_its_reports(  # noqa: PLR0913
     tmp_path: Path,
     engine: Engine,
-    stub_cloud: _StubSpendServer,
+    stub_cloud: StubSpendServer,
     *,
     engine_subprocess_env: Callable[..., dict[str, str]],
     materialize_library: Callable[..., Path],
@@ -182,12 +142,11 @@ def test_an_engine_that_exits_after_its_run_still_sends_its_reports(  # noqa: PL
     workspace.mkdir(exist_ok=True)
     config_root = tmp_path / "xdg_config"
     write_isolated_config(config_root, workspace=workspace, library_path=library_json)
-    host, port = stub_cloud.server_address[0], stub_cloud.server_address[1]
     stub_cloud.reply_delay = REPLY_DELAY_SECONDS
 
     result = subprocess.run(  # noqa: S603
         [sys.executable, str(workflow_path)],
-        env=engine_subprocess_env(XDG_CONFIG_HOME=str(config_root), **{BASE_URL_SETTING_NAME: f"http://{host}:{port}"}),
+        env=engine_subprocess_env(XDG_CONFIG_HOME=str(config_root), **{BASE_URL_SETTING_NAME: stub_cloud.base_url}),
         capture_output=True,
         text=True,
         timeout=120,
@@ -196,6 +155,5 @@ def test_an_engine_that_exits_after_its_run_still_sends_its_reports(  # noqa: PL
 
     diagnostic = f"exit code {result.returncode}\n--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
     assert result.returncode == 0, diagnostic
-    with stub_cloud.lock:
-        reports = list(stub_cloud.reports)
+    reports = stub_cloud.received()
     assert len(reports) == REPORTS_PER_RUN, f"The engine exited with a report still queued.\n{diagnostic}"

@@ -549,8 +549,7 @@ class RunEndedEvent(ExecutionPayload):
     Args:
         run_id: The run `RunStartedEvent` announced.
         flow_name: The flow the run executed.
-        state: How it ended: "finished", "failed" or "cancelled", the values `ListRunsRequest`
-            reports a run's state in.
+        state: How it ended: "finished", "failed" or "cancelled".
     """
 
     run_id: str
