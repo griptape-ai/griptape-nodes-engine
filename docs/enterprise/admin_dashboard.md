@@ -145,7 +145,7 @@ Griptape Cloud checks the budgets that cover a call **before** the model runs. I
 
 ### The budget table
 
-![The Spend & Budgets page with budgets for two shows, a feature, a pilot, artist keys and departments](../assets/img/enterprise/admin_dashboard-spend_budgets.png)
+![The Spend & Budgets page, with organization-wide caps and the Fallback Budget in the Organization section above the projects](../assets/img/enterprise/admin_dashboard-spend_budgets.png)
 
 Budgets are grouped into four sections: **Organization**, **Projects**, **License Keys**, and **Access Groups**. Each row shows:
 
