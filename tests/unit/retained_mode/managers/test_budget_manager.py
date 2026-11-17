@@ -19,7 +19,8 @@ import pytest
 from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.exe_types.node_types import BaseNode, aprocess_scope
-from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events import converters
+from griptape_nodes.retained_mode.events.base_events import EventRequest, ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
     ATTRIBUTION_HEADER_NAME,
     ATTRIBUTION_SCHEMA_VERSION,
@@ -676,6 +677,28 @@ class TestHeaderMatchesDirectCalls:
     def test_no_node_is_named_outside_a_node_s_run(self) -> None:
         assert "node_type" not in _tags(_succeed(BudgetManager(MagicMock(), engine=_engine_with_call_state())))
 
+    def test_a_library_worker_s_node_gets_the_header_a_node_in_the_engine_does(self) -> None:
+        """A worker sends the request to the engine, which answers outside the node's context."""
+        manager = BudgetManager(MagicMock(), engine=_engine_with_call_state())
+        node = _SpendingNode(name="Draft")
+        run = RunAttribution(run_id="run-a", workflow="Workflow A", project_chain=("project-a",))
+        with aprocess_scope(node=node, run=run):
+            in_the_engine = _tags(_succeed(manager))
+            built_in_the_worker = GetAttributionContextRequest()
+
+        received = converters.engine.structure(
+            json.loads(converters.engine.dumps(EventRequest(request=built_in_the_worker))), EventRequest
+        ).request
+        from_the_worker = manager.on_get_attribution_context_request(received, _bound_workflow(manager))
+
+        assert isinstance(from_the_worker, GetAttributionContextResultSuccess)
+        assert _tags(from_the_worker) == in_the_engine
+        assert (in_the_engine["node_type"], in_the_engine["run_id"], in_the_engine["project"]) == (
+            "_SpendingNode",
+            "run-a",
+            ["project-a"],
+        )
+
 
 class TestHeaderSizeLimit:
     """Over Cloud's limit, detail is given up so the call keeps its project."""
@@ -757,10 +780,10 @@ class TestHeaderSizeLimit:
         assert "project" not in caplog.text
 
     @pytest.mark.parametrize("workflow", ["Poster pipeline", "Poster \udcff draft"])
-    def test_a_project_chain_too_large_alone_is_sent_as_it_is_today(
+    def test_a_project_chain_too_large_alone_is_sent_with_its_project_only(
         self, caplog: pytest.LogCaptureFixture, workflow: str
     ) -> None:
-        """Cloud discards the header whole, so it goes with its project only, as before, and nothing is blamed."""
+        """Cloud discards the header whole, so it goes with its project only, and nothing is blamed."""
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = _succeed(self._manager_with(chain_entries=self.OVER_ON_ITS_OWN, workflow=workflow))
 

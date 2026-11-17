@@ -9,6 +9,7 @@ first with `BudgetAccessRequest` and reports what it spent with `ReportUsageRequ
 from dataclasses import dataclass, field
 from typing import Any
 
+from griptape_nodes.exe_types.node_types import get_running_node
 from griptape_nodes.retained_mode.events.base_events import (
     OutlivesWorkflowMixin,
     RequestPayload,
@@ -60,10 +61,11 @@ class GetAttributionContextRequest(RequestPayload):
     exception is a call from a running node, whose header takes the project chain its run saved
     when it started, as its direct report does: a chain unreadable then was saved as no project.
 
-    The workflow, run and node are read from the context the request is sent in. Send it from the
-    node's own task, or from a thread started in a copy of that context
+    The workflow, run and node are read from the context the request is built and sent in. Build
+    and send it from the node's own task, or from a thread started in a copy of that context
     (`contextvars.copy_context().run`); from a bare thread the header carries no run, workflow or
-    node.
+    node. The request saves the node's class and run when it is built, so a node running in a
+    library worker gets the same header as one in the engine.
 
     Use when: A node or driver is about to make a credit-consuming call and wants the spend
     attributed to the project the user is working in.
@@ -72,6 +74,9 @@ class GetAttributionContextRequest(RequestPayload):
         part_of_workflow_run: False for a call made outside the workflow, such as a chat turn with
             the assistant. Its header then names only the project, engine and session: a workflow
             may be running at the same time, and its run and name aren't this call's.
+        node_type: The running node's class. Filled when the request is built; leave it unset.
+        run: The run the running node is executing for. Filled when the request is built; leave
+            it unset.
 
     Results: GetAttributionContextResultSuccess (a header value is available) |
         GetAttributionContextResultFailure (none could be produced; the call should still
@@ -79,6 +84,8 @@ class GetAttributionContextRequest(RequestPayload):
     """
 
     part_of_workflow_run: bool = field(default=True, kw_only=True)
+    node_type: str | None = field(default=None, kw_only=True)
+    run: RunAttribution | None = field(default=None, kw_only=True)
 
     # Per-call and useful only to the direct caller; otherwise the Success payload broadcasts on
     # the WebSocket feed once per metered call.
@@ -87,6 +94,17 @@ class GetAttributionContextRequest(RequestPayload):
     # `kw_only=True` but this subclass is a plain `@dataclass`, so a bare redeclaration would
     # re-register the field as positional and reorder __init__.
     broadcast_result: bool = field(default=False, kw_only=True)
+
+    def __post_init__(self) -> None:
+        """Save the running node's class and run, which a library worker's engine can't look up."""
+        running_node = get_running_node()
+        if running_node is None:
+            return
+        if self.node_type is None:
+            # The class, never `name`: a node's name is what the artist typed on the canvas.
+            self.node_type = type(running_node).__name__
+        if self.run is None and self.part_of_workflow_run:
+            self.run = running_node.run_attribution
 
 
 @dataclass

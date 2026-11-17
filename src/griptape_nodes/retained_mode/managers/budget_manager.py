@@ -36,7 +36,6 @@ from griptape_nodes.drivers.cloud_credentials import (
     resolve_cloud_base_url,
     resolve_cloud_credential,
 )
-from griptape_nodes.exe_types.node_types import get_running_node
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
@@ -122,8 +121,8 @@ def _fit_attribution_tags(tags: dict[str, Any]) -> list[str]:
     the largest and user-authored, and `run_id` last, being what totals a run's proxy spend with
     its direct spend. `project` is never dropped. A project chain that cannot be encoded drops
     nothing, since the header is refused either way. One too large on its own is sent with its
-    project only, as before these tags were added: Cloud discards it whole either way, and the
-    tags would only add bytes toward the ingress's 8 KB header limit, past which the call fails.
+    project only: Cloud discards it whole either way, and the tags would only add bytes toward
+    the ingress's 8 KB header limit, past which the call fails.
     """
     dropped: list[str] = []
     project = _encoded({key: value for key, value in tags.items() if key == "project"})
@@ -290,14 +289,9 @@ class BudgetManager(EngineScoped):
         Neither condition clears on its own, so an ERROR would repeat once per metered call for
         something the artist cannot act on and that did not stop the work.
         """
-        running_node = get_running_node()
-        node_type = None
         run = None
-        if running_node is not None:
-            # The class, never `name`: a node's name is what the artist typed on the canvas.
-            node_type = type(running_node).__name__
-            if request.part_of_workflow_run:
-                run = running_node.run_attribution
+        if request.part_of_workflow_run:
+            run = request.run
         if run is None:
             project_chain = self._resolve_project_chain()
             if project_chain is None:
@@ -320,7 +314,9 @@ class BudgetManager(EngineScoped):
             workflow_name = run.workflow
             run_id = run.run_id
         # No node_id: nodes have no stable opaque id, and direct-call reports send none either.
-        tags = self._tags_for(project_chain, workflow=workflow_name, run_id=run_id, node_type=node_type, node_id=None)
+        tags = self._tags_for(
+            project_chain, workflow=workflow_name, run_id=run_id, node_type=request.node_type, node_id=None
+        )
         if not request.part_of_workflow_run:
             for key in _WORKFLOW_RUN_TAG_KEYS:
                 tags.pop(key, None)
