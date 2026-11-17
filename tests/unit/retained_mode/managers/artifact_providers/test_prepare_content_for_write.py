@@ -1,6 +1,8 @@
 """Tests for collect_metadata_for_write and prepare_content_for_write on ImageArtifactProvider and ArtifactManager."""
 
 import logging
+import struct
+import zlib
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,6 +21,22 @@ _MODULE = "griptape_nodes.retained_mode.managers.artifact_providers.image.image_
 COLLECT_PATH = f"{_MODULE}.collect_workflow_metadata"
 IMAGE_OPEN_PATH = f"{_MODULE}.Image.open"
 DRIVER_REGISTRY_PATH = f"{_MODULE}.ImageMetadataDriverRegistry.get_driver_for_format"
+
+
+def _rgb16_png() -> bytes:
+    """A 2x2 16-bit RGB PNG whose samples aren't multiples of 257, so 8-bit can't hold them."""
+
+    def chunk(chunk_type: bytes, chunk_data: bytes) -> bytes:
+        crc = zlib.crc32(chunk_type + chunk_data)
+        return struct.pack(">I", len(chunk_data)) + chunk_type + chunk_data + struct.pack(">I", crc)
+
+    row = b"\x00" + struct.pack(">HHHHHH", 1000, 2000, 3001, 1001, 40000, 65534)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 16, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(row * 2))
+        + chunk(b"IEND", b"")
+    )
 
 
 @pytest.fixture
@@ -99,9 +117,18 @@ class TestImageArtifactProviderPrepareContentForWrite:
             result = image_provider.prepare_content_for_write(original_bytes, "image.png", metadata)
 
         assert result == injected_bytes
-        mock_driver.inject_metadata.assert_called_once_with(mock_image, metadata)
+        mock_driver.inject_metadata.assert_called_once_with(original_bytes, mock_image, metadata)
         # It runs on a worker thread, so it must not read engine state itself.
         mock_collect.assert_not_called()
+
+    def test_keeps_16_bit_png_at_16_bits(self, image_provider: ImageArtifactProvider) -> None:
+        source = _rgb16_png()
+
+        result = image_provider.prepare_content_for_write(source, "image.png", {"gtn_saved_at": "x"})
+
+        bit_depth_offset = 24
+        assert result[bit_depth_offset] == source[bit_depth_offset] == 16  # noqa: PLR2004
+        assert b"gtn_saved_at" in result
 
     def test_returns_data_unchanged_without_metadata(self, image_provider: ImageArtifactProvider) -> None:
         with patch(IMAGE_OPEN_PATH) as mock_open:

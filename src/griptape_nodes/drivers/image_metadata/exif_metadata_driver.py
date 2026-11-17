@@ -37,13 +37,14 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         """
         return ["JPEG", "TIFF", "MPO", "WEBP"]
 
-    def inject_metadata(self, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:
+    def inject_metadata(self, data: bytes, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:  # noqa: ARG002
         """Inject metadata into EXIF UserComment field as JSON.
 
         Serializes metadata dictionary to JSON and stores in EXIF UserComment.
         Preserves all existing EXIF tags.
 
         Args:
+            data: Encoded image bytes that pil_image was opened from (unused; the image is re-saved)
             pil_image: PIL Image to inject metadata into
             metadata: Dictionary of key-value pairs to inject
 

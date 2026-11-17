@@ -27,11 +27,13 @@ class BaseImageMetadataDriver(ABC):
         ...
 
     @abstractmethod
-    def inject_metadata(self, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:
+    def inject_metadata(self, data: bytes, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:
         """Inject metadata into image and return modified image bytes.
 
         Args:
-            pil_image: PIL Image object to inject metadata into
+            data: Encoded image bytes that pil_image was opened from. A driver that can add
+                metadata without re-encoding the image works from these bytes.
+            pil_image: PIL Image object opened from data
             metadata: Dictionary of key-value string pairs to inject
 
         Returns:
