@@ -5,6 +5,12 @@
 passes -- the model, the cost, its own class name, and the run it is executing for -- so every other
 tag on the report is the engine's to add.
 
+It also asks for the attribution header a call through Griptape Cloud's proxy would carry, the way
+the library's ``build_griptape_cloud_headers_async`` does, and puts the decoded header on its
+``attribution`` output, so a test can compare it with the direct report. It asks a second time from
+a thread started in a copy of its own context, the way a library's synchronous helper has to, and
+puts that header on ``attribution_from_thread``.
+
 Given a ``gate_file``, it waits for that file to appear before finishing, so a test can act while the
 node is still running: by default it reports first and then waits, and with ``report_after_gate`` it
 waits first and reports once the gate opens, the way a slow provider call reports late.
@@ -13,13 +19,22 @@ waits first and reports once the gate opens, the way a slow provider call report
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextvars
+import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import ControlNode
-from griptape_nodes.retained_mode.events.budget_events import ReportUsageRequest, RunAttribution
+from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextRequest,
+    GetAttributionContextResultSuccess,
+    ReportUsageRequest,
+    RunAttribution,
+)
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 COST_MICRO_USD = 400_000
@@ -50,8 +65,30 @@ class SpendingNode(ControlNode):
                 allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
             )
         )
+        self.add_parameter(
+            Parameter(
+                name="attribution",
+                tooltip="The decoded attribution header a proxied call from this node would carry.",
+                type="dict",
+                default_value={},
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
+        self.add_parameter(
+            Parameter(
+                name="attribution_from_thread",
+                tooltip="The same header, asked for from a thread started in a copy of the node's context.",
+                type="dict",
+                default_value={},
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
 
     async def aprocess(self) -> None:
+        header = await GriptapeNodes.ahandle_request(GetAttributionContextRequest())
+        if isinstance(header, GetAttributionContextResultSuccess):
+            self.parameter_output_values["attribution"] = json.loads(base64.urlsafe_b64decode(header.header_value))
+        self.parameter_output_values["attribution_from_thread"] = await asyncio.to_thread(_header_from_a_copied_context)
         # Read now, while the node holds its run: a report sent after the gate must still name this run.
         run = self.run_attribution
         if self.get_parameter_value("report_after_gate"):
@@ -90,3 +127,22 @@ class SpendingNode(ControlNode):
                 msg = f"Node '{self.name}' waited {_MAX_GATE_WAIT_SECONDS}s for its gate file, and it never appeared."
                 raise TimeoutError(msg)
             await asyncio.sleep(_GATE_POLL_SECONDS)
+
+
+def _header_from_a_copied_context() -> dict[str, Any]:
+    """Ask for the header from a new thread started in a copy of this one's context.
+
+    A bare thread starts with an empty context, so the engine could not tell which node, run or
+    workflow it asks for; a copy carries all three.
+    """
+    headers: list[Any] = []
+    thread = threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(lambda: headers.append(GriptapeNodes.handle_request(GetAttributionContextRequest())),),
+    )
+    thread.start()
+    thread.join()
+    (header,) = headers
+    if not isinstance(header, GetAttributionContextResultSuccess):
+        return {}
+    return json.loads(base64.urlsafe_b64decode(header.header_value))

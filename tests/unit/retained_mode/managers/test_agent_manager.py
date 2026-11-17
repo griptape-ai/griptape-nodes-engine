@@ -87,6 +87,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
 )
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultDetails
 from griptape_nodes.retained_mode.events.budget_events import (
+    GetAttributionContextRequest,
     GetAttributionContextResultFailure,
     GetAttributionContextResultSuccess,
 )
@@ -1517,9 +1518,13 @@ class TestAttributionHeaders:
     @pytest.mark.asyncio
     async def test_cloud_run_sends_the_header(self) -> None:
         answer = GetAttributionContextResultSuccess(header_value="abc", project_chain=["p1"], result_details="ok")
-        manager, _asked = self._manager("griptape_cloud", answer)
+        manager, asked = self._manager("griptape_cloud", answer)
 
         assert await manager._attribution_headers(None) == {"X-Griptape-Attribution": "abc"}
+        # A chat turn isn't part of a workflow run that may be going on at the same time.
+        assert [(type(request), getattr(request, "part_of_workflow_run", None)) for request in asked] == [
+            (GetAttributionContextRequest, False)
+        ]
 
     @pytest.mark.asyncio
     async def test_failed_lookup_sends_nothing(self) -> None:
