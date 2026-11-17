@@ -240,6 +240,21 @@ class TestEnterActivatesProject:
         assert not any(isinstance(request, ActivateWorkspaceProjectRequest) for request in requests)
 
 
+class TestUsageReportsOnExit:
+    """A workflow run from the command line exits after its run, which would drop queued usage reports."""
+
+    @pytest.mark.asyncio
+    async def test_exiting_waits_for_queued_usage_reports(self) -> None:
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._save_on_failure_path = None
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            await executor.__aexit__(None, None, None)
+
+        # A one-off run waits the default time, longer than an Isolated Execution process.
+        mock_gn.BudgetManager.return_value.flush_reports.assert_called_once_with()
+
+
 class TestPrepareWorkflowForRunStorageBackend:
     """Regression tests for issue #4828.
 

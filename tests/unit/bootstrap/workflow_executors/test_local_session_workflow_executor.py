@@ -289,7 +289,7 @@ class TestExecutionEventsAreSentOnce:
 
 
 class TestUsageReportsOnExit:
-    """A node group run in its own process exits after its run, which would drop queued usage reports."""
+    """A group or loop set to Isolated Execution exits after its run, which would drop queued usage reports."""
 
     @pytest.mark.asyncio
     async def test_exiting_waits_for_queued_usage_reports(
@@ -306,5 +306,5 @@ class TestUsageReportsOnExit:
         async with executor:
             flush_reports.assert_not_called()
 
-        # A node group's process waits less than a one-off run: a loop can start one per iteration.
+        # An Isolated Execution process waits less than a one-off run: a loop can start one per iteration.
         flush_reports.assert_called_once_with(NODE_GROUP_REPORT_FLUSH_TIMEOUT_SECONDS)

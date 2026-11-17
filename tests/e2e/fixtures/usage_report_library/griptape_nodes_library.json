@@ -29,7 +29,7 @@
       "file_path": "usage_report_nodes.py",
       "metadata": {
         "category": "test",
-        "description": "Reports a fixed cost for a direct model call",
+        "description": "Reports fixed costs for direct model calls",
         "display_name": "Reporting Node"
       }
     }
