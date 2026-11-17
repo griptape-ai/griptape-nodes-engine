@@ -39,8 +39,10 @@ MAX_VALUE_CHARS = 500
 
 class NodeInputsLibrary(AdvancedNodeLibrary):
     def __init__(self) -> None:
-        # Listeners should return quickly, so the log line is written from a background thread.
-        # This is where you would send the inputs to your own monitoring instead.
+        # Only the log write goes to a background thread, as a stand-in for slower work such as
+        # sending the inputs to your own monitoring. The reads in _collect_inputs stay on the
+        # engine loop: the node starts as soon as the listener returns, so reading later from a
+        # background thread would race the node and could see values it has already changed.
         self._writer = ThreadPoolExecutor(max_workers=1)
 
     def get_execution_event_listeners(self) -> list[tuple[type, Callable]]:
@@ -55,6 +57,7 @@ class NodeInputsLibrary(AdvancedNodeLibrary):
         self._writer.shutdown(wait=True)
 
     def _on_start(self, event: NodeStartProcessEvent) -> None:
+        # Read the values now, before this listener returns and the node starts.
         values = self._collect_inputs(event.node_name)
         # A node with no input parameters has nothing to report.
         if not values:
