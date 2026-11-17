@@ -9,22 +9,19 @@ inside a `node_execution_scope`, which is the only time a node spends credits.
 from __future__ import annotations
 
 import asyncio
-import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
-from griptape_nodes.api_client.request_client import RequestClient
 from griptape_nodes.app.worker_routing import (
     LOCAL_ONLY_REQUEST_TYPES,
     RemoteHandler,
     register_remote_handlers,
 )
 from griptape_nodes.retained_mode.engine import Engine
-from griptape_nodes.retained_mode.events import converters
-from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultFailure, EventResultSuccess
+from griptape_nodes.retained_mode.events.base_events import EventResultFailure, EventResultSuccess
 from griptape_nodes.retained_mode.events.budget_events import (
     BudgetAccessRequest,
     BudgetAccessResultFailure,
@@ -36,6 +33,8 @@ from griptape_nodes.retained_mode.events.budget_events import (
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError, describe, refusal_from_check
+from griptape_nodes.worker.runtime import WorkerSide, _ChannelRequestSender
+from griptape_nodes.worker.wire import read_event_request, result_body
 from tests.unit.worker.harness import InProcessWorkerHarness
 
 
@@ -193,10 +192,10 @@ class TestSpendRequestsAreForwardedFromWorkers:
 
     @pytest.mark.asyncio
     async def test_a_refusal_reaches_the_worker_s_node_as_a_budget_refusal(self) -> None:
-        """Over the real wire, a refusal reaches the node as a refusal that still names its budget.
+        """Over the channel a worker forwards on, a refusal reaches the node still naming its budget.
 
         It arrives as `BudgetAccessResultFailure` carrying a `BudgetExceededError`, so raising it stops
-        the run as it would in process.
+        the run naming the node, as it would in process.
         """
         refusal = refusal_from_check({"blocked_by": [STUDIO_MONTHLY]})
         message = describe(refusal)
@@ -206,21 +205,15 @@ class TestSpendRequestsAreForwardedFromWorkers:
             result_details=message,
             exception=BudgetExceededError(message, refusal),
         )
-        wire = _WireToOrchestrator(orchestrator_answer)
+        side = WorkerSide(_ParentAnswering(orchestrator_answer), on_parent_gone=lambda: None)  # type: ignore[arg-type]
         worker = EventManager()
-        async with RequestClient(
-            client=wire,  # type: ignore[arg-type]
-            request_topic_fn=lambda: "request",
-            response_topic_fn=lambda: "response",
-        ) as request_client:
-            worker.configure_worker_forwarding(
-                request_client=request_client,
-                orchestrator_request_topic="sessions/s/request",
-                worker_response_topic="sessions/s/workers/w1/response",
-                websocket_event_loop=asyncio.get_running_loop(),
-                timeout_ms=5000,
-            )
-            event = await worker.forward_to_orchestrator(BudgetAccessRequest(model="gpt-4o"), ResultContext())
+        worker.configure_worker_forwarding(
+            request_client=_ChannelRequestSender(side),
+            orchestrator_request_topic="request",
+            worker_response_topic="response",
+            websocket_event_loop=asyncio.get_running_loop(),
+        )
+        event = await worker.forward_to_orchestrator(BudgetAccessRequest(model="gpt-4o"), ResultContext())
 
         result = event.result
         assert isinstance(result, BudgetAccessResultFailure)
@@ -247,28 +240,16 @@ STUDIO_MONTHLY = {
 }
 
 
-class _WireToOrchestrator:
-    """A transport whose orchestrator answers every published request with `answer`, as the real one would.
+class _ParentAnswering:
+    """A worker's link to a parent that answers every forwarded request with `answer`.
 
-    The answer goes through the engine's converter and back in through the RequestClient's message
-    filter, the path a reply from another process takes.
+    The request is read off the wire envelope and the answer written back with `result_body`, as the
+    parent's `WorkerParent._on_request` does, so both cross the boundary in their wire form.
     """
 
     def __init__(self, answer: Any) -> None:
         self.answer = answer
-        self.subscribe = AsyncMock()
-        self._filters: list[Any] = []
 
-    def add_message_filter(self, fn: Any) -> None:
-        self._filters.append(fn)
-
-    def remove_message_filter(self, fn: Any) -> None:
-        self._filters.remove(fn)
-
-    async def publish(self, _event_type: str, payload: dict[str, Any], _topic: str) -> None:
-        request = converters.engine.structure(payload, EventRequest)
-        reply = json.loads(converters.engine.dumps(EventResultFailure(request=request.request, result=self.answer)))
-        reply["request_id"] = payload["request_id"]
-        for message_filter in self._filters:
-            if await message_filter({"payload": reply}):
-                return
+    async def request_async(self, body: dict[str, Any], _timeout_s: float | None) -> dict[str, Any]:
+        event_request = read_event_request(body)
+        return result_body(EventResultFailure(request=event_request.request, result=self.answer))

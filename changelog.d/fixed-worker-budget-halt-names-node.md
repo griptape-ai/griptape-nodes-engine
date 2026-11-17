@@ -1,5 +1,4 @@
-- A node in a library that runs in its own process now gets the engine's real failure result back
-  when a request it sends fails, instead of a generic error holding the message text. A budget
-  check that Griptape Cloud refuses is now recognized there, and raising it stops the run with
-  "Budget stopped this run." naming the node and the budgets, as it does for a node in the engine.
+- A node in a library that runs in its own process now names itself when Griptape Cloud refuses its
+  `BudgetAccessRequest` and it raises the refusal: the run stops with "Budget stopped this run.
+  'Node' was blocked by ...", as for a node in the engine, instead of "The next call was blocked by".
   [#5869](https://github.com/griptape-ai/griptape-nodes-engine/issues/5869)
