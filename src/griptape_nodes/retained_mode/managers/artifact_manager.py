@@ -2,6 +2,9 @@
 
 import json
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -176,6 +179,10 @@ class PreviewSettings(BaseModel):
     generator_params: BaseGeneratorParameters  # Will be a specific BaseGeneratorParameters subclass
 
 
+# The library whose load is registering providers, so they can be removed when it unloads.
+_loading_library_name: ContextVar[str | None] = ContextVar("_loading_library_name", default=None)
+
+
 class ArtifactManager(EngineScoped):
     """Manages artifact operations including preview generation.
 
@@ -193,6 +200,8 @@ class ArtifactManager(EngineScoped):
         super().__init__(engine)
         # Provider registry for managing artifact providers
         self._registry = ProviderRegistry(engine=engine)
+        # Providers each library registered while it loaded, so unloading the library can remove them.
+        self._library_provider_classes: dict[str, list[type[BaseArtifactProvider]]] = {}
 
         # Per-source single-flight lock for preview lookup/regeneration, keyed on the
         # canonicalized source path. Must be a KeyedMutex, not asyncio.Locks: request
@@ -209,6 +218,37 @@ class ArtifactManager(EngineScoped):
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
             )
+
+    @contextmanager
+    def attributing_providers_to_library(self, library_name: str) -> Iterator[None]:
+        """Attribute every provider registered inside this block to a library.
+
+        Libraries register providers from their own load callbacks, so the block wraps the library's
+        load. Unloading the library with `unregister_providers_for_library` then removes them, and the
+        library's next load can register them again.
+
+        Args:
+            library_name: The library loading inside the block
+        """
+        token = _loading_library_name.set(library_name)
+        try:
+            yield
+        finally:
+            _loading_library_name.reset(token)
+
+    def unregister_providers_for_library(self, library_name: str) -> int:
+        """Remove the providers a library registered while it loaded.
+
+        Args:
+            library_name: The library being unloaded
+
+        Returns:
+            The number of providers removed
+        """
+        provider_classes = self._library_provider_classes.pop(library_name, [])
+        for provider_class in provider_classes:
+            self._registry.unregister_provider(provider_class)
+        return len(provider_classes)
 
     def sniff_extension(self, data: bytes) -> str | None:
         """Sniff a canonical on-disk extension for ``data`` from registered providers.
@@ -1099,6 +1139,10 @@ class ArtifactManager(EngineScoped):
         # FAILURE CASE: Try to register provider
         try:
             self._registry.register_provider(provider_class)
+            # Attributed before the settings step, which can fail after the class is registered.
+            library_name = _loading_library_name.get()
+            if library_name is not None:
+                self._library_provider_classes.setdefault(library_name, []).append(provider_class)
             self._register_provider_settings(provider_class)
         except Exception as e:
             return RegisterArtifactProviderResultFailure(
