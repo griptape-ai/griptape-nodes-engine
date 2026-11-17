@@ -38,6 +38,8 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ListRunsResultSuccess,
     ResolveNodeRequest,
     ResolveNodeResultFailure,
+    RunEndedEvent,
+    RunStartedEvent,
     SingleExecutionStepRequest,
     StartFlowFromNodeRequest,
     StartFlowFromNodeResultFailure,
@@ -1233,6 +1235,18 @@ class TestALineOfItsOwn:
         first_may_end.set()
         await asyncio.wait_for(first.outcome, timeout=1.0)
 
+    @pytest.mark.asyncio
+    async def test_a_run_in_a_line_of_its_own_announces_neither_its_start_nor_its_end(self, engine: Engine) -> None:
+        """Its spend is tagged with the other engine's run, so an id announced here would total nothing."""
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+        line = WorkflowFlows()
+
+        run = engine.flow_manager.submit_run(_Spec("a run from engine x", _ran_async("remote")), flows=line)
+        await asyncio.wait_for(run.ended, timeout=1.0)
+
+        assert _payloads(engine, RunStartedEvent) == []
+        assert _payloads(engine, RunEndedEvent) == []
+
     def test_a_run_given_no_line_still_needs_a_workflow(self, engine: Engine) -> None:
         with pytest.raises(NoOpenWorkflowError):
             engine.flow_manager.submit_run(_Spec("flow", _ran_async("flow")))
@@ -2105,6 +2119,159 @@ class TestRunResultsNameTheirRun:
         turned_away = await asyncio.wait_for(waiting, timeout=1.0)
         assert "did not start: it was cancelled" in str(turned_away.result_details)
         assert executed == []
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestSpendNamesTheRunInProgress:
+    """Spend tags, the start event and the end events all name the run its request started."""
+
+    @pytest.mark.asyncio
+    async def test_the_run_in_progress_is_the_one_its_request_names(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        seen: list[str | None] = []
+
+        async def body() -> Any:
+            seen.append(flow_manager.spend_run_id)
+            return _ran("run")
+
+        result = await flow_manager.start_run(_Spec("flow", body))
+
+        assert isinstance(result, StartFlowResultSuccess)
+
+        assert seen == [result.run_id]
+        assert flow_manager.spend_run_id is None, "Spend made between runs belongs to no run."
+
+    @pytest.mark.asyncio
+    async def test_a_run_announces_its_id_when_it_starts(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+
+        result = await flow_manager.start_run(_Spec("flow", lambda: _async(_ran("run"))))
+
+        assert isinstance(result, StartFlowResultSuccess)
+
+        started = _payloads(engine, RunStartedEvent)
+        assert [(event.run_id, event.flow_name) for event in started] == [(result.run_id, "flow")]
+
+    @pytest.mark.asyncio
+    async def test_a_node_group_run_for_another_engine_counts_toward_that_engine_s_run(self, engine: Engine) -> None:
+        """It spends under the parent's id, and leaves the run's start and end events to the parent engine."""
+        flow_manager = engine.flow_manager
+        flow_manager.parent_run_id = "parent-run"
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+        seen: list[str | None] = []
+
+        async def body() -> Any:
+            seen.append(flow_manager.spend_run_id)
+            return _ran("run")
+
+        try:
+            await flow_manager.start_run(_Spec("flow", body))
+        finally:
+            flow_manager.parent_run_id = None
+
+        assert seen == ["parent-run"]
+        assert _payloads(engine, RunStartedEvent) == []
+        assert _payloads(engine, RunEndedEvent) == []
+
+
+@pytest.mark.usefixtures("open_workflow")
+class TestEachRunEndsOnce:
+    """Every run that announced a start announces one end, under the same id, saying how it ended."""
+
+    @pytest.mark.asyncio
+    async def test_a_run_ends_once_with_its_state(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+
+        result = await flow_manager.start_run(_Spec("flow", lambda: _async(_ran("run"))))
+        assert isinstance(result, StartFlowResultSuccess)
+
+        ended = [(event.run_id, event.state) for event in _payloads(engine, RunEndedEvent)]
+        assert ended == [(result.run_id, "finished")]
+
+    @pytest.mark.asyncio
+    async def test_a_run_whose_request_fails_ends_failed(self, engine: Engine) -> None:
+        """Covers a flow that fails before it starts: the run's request fails, and the run still ends."""
+        flow_manager = engine.flow_manager
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+
+        async def body() -> Any:
+            return StartFlowResultFailure(validation_exceptions=[], result_details="nothing to run")
+
+        result = await flow_manager.start_run(_Spec("flow", body))
+        assert isinstance(result, StartFlowResultFailure)
+
+        ended = [(event.run_id, event.state) for event in _payloads(engine, RunEndedEvent)]
+        assert ended == [(result.run_id, "failed")]
+
+    @pytest.mark.asyncio
+    async def test_a_run_that_raises_ends_failed(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+
+        async def body() -> Any:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        run = flow_manager.submit_run(_Spec("flow", body))
+        with pytest.raises(RuntimeError, match="boom"):
+            await asyncio.wait_for(run.outcome, timeout=1.0)
+
+        ended = [(event.run_id, event.state) for event in _payloads(engine, RunEndedEvent)]
+        assert ended == [(run.run_id, "failed")]
+
+    @pytest.mark.asyncio
+    async def test_a_run_cancelled_before_it_starts_its_flow_ends_cancelled(self, engine: Engine) -> None:
+        """It got the machine and announced a start, then was cancelled before executing."""
+        flow_manager = engine.flow_manager
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        run = engine.current_workflow().flows.run_in_progress
+        assert run is not None
+        await flow_manager.cancel_run_in(engine.current_workflow(), run.run_id)
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        ended = [(event.run_id, event.state) for event in _payloads(engine, RunEndedEvent)]
+        assert ended == [(run.run_id, "cancelled")]
+
+    @pytest.mark.asyncio
+    async def test_a_waiting_run_that_is_turned_away_neither_starts_nor_ends(self, engine: Engine) -> None:
+        flow_manager = engine.flow_manager
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+        first_may_end = asyncio.Event()
+
+        async def first() -> Any:
+            await first_may_end.wait()
+            return _ran("first")
+
+        running = asyncio.ensure_future(flow_manager.start_run(_Spec("first", first)))
+        await asyncio.sleep(0)
+        waiting = flow_manager.submit_run(_Spec("second", lambda: _async(_ran("second"))))
+        await flow_manager.cancel_run_in(engine.current_workflow(), waiting.run_id)
+        first_may_end.set()
+        await asyncio.wait_for(running, timeout=1.0)
+
+        assert waiting.run_id not in [event.run_id for event in _payloads(engine, RunStartedEvent)]
+        assert waiting.run_id not in [event.run_id for event in _payloads(engine, RunEndedEvent)]
+
+
+def _payloads(engine: Engine, payload_type: type) -> list[Any]:
+    calls = engine.event_manager.put_event.call_args_list  # type: ignore[attr-defined]
+    payloads = [getattr(getattr(call.args[0], "wrapped_event", None), "payload", None) for call in calls]
+    return [payload for payload in payloads if isinstance(payload, payload_type)]
+
+
+async def _async(value: Any) -> Any:
+    return value
 
 
 @pytest.mark.usefixtures("open_workflow")

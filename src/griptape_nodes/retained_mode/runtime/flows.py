@@ -50,6 +50,11 @@ class WorkflowFlows:
         # stop (a Cancel during a failed step's teardown) waits and then sees the state the first left.
         self.stopping_run = asyncio.Lock()
 
+    @property
+    def workflow(self) -> WorkflowRuntime | None:
+        """The workflow this run state belongs to, or None for a line of runs that belongs to no workflow."""
+        return self._workflow
+
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
         """An execution event about a run here, naming the workflow it belongs to, or none."""
         workflow_id = None

@@ -464,3 +464,26 @@ class TestRedirectPackagedEdgesAndRemove:
         NodeExecutor._redirect_packaged_edges_and_remove(network, {"NotHere"}, "End")
 
         assert network.nodes() == {"X", "Y"}
+
+
+class TestSubprocessRunsUnderTheParentRun:
+    """A group run in its own process counts its spend toward the run that started it."""
+
+    @pytest.mark.asyncio
+    async def test_the_child_engine_is_given_the_run_in_progress(self, tmp_path: Any) -> None:
+        executor = _make_executor()
+        cast("MagicMock", executor.engine).flow_manager.spend_run_id = "parent-run"
+        executor._get_storage_backend = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
+        child = MagicMock()
+        child.__aenter__ = AsyncMock(return_value=child)
+        child.__aexit__ = AsyncMock(return_value=False)
+        child.arun = AsyncMock()
+        child.output = {}
+
+        with patch(
+            "griptape_nodes.bootstrap.workflow_executors.subprocess_workflow_executor.SubprocessWorkflowExecutor",
+            return_value=child,
+        ) as executor_class:
+            await executor._execute_subprocess(tmp_path / "group.py", "group")
+
+        assert executor_class.call_args.kwargs["parent_run_id"] == "parent-run"
