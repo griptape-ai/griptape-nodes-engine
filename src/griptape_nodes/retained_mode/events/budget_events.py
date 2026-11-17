@@ -162,10 +162,8 @@ class BudgetAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        # Across the worker boundary the exception arrives as a ForwardedException, which carries
-        # only its type and message, and the message says "The next call". Rebuild the refusal from
-        # `blocked_by`, which crosses as plain data, so the worker can word the halt for the node
-        # that raised it, as the engine does for a node of its own.
+        # From a worker, the exception arrives as a ForwardedException without the refusal. Rebuild it
+        # from `blocked_by` so the halt can name the node.
         if isinstance(self.exception, ForwardedException) and self.exception.original_type == _BUDGET_EXCEEDED_TYPE:
             self.exception = BudgetExceededError(
                 str(self.exception), refusal_from_check({"blocked_by": self.blocked_by})
