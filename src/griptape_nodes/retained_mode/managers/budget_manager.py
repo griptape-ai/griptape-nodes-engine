@@ -394,7 +394,7 @@ class BudgetManager(EngineScoped):
         return RunAttribution(
             run_id=run_id,
             workflow=self._workflow_name(workflow),
-            project_chain=self._resolve_project_chain() or [],
+            project_chain=tuple(self._resolve_project_chain() or ()),
         )
 
     def _resolve_project_chain(self) -> list[str] | None:
@@ -438,7 +438,7 @@ class BudgetManager(EngineScoped):
             project_chain = run.project_chain
         tags: dict[str, Any] = {}
         if project_chain:
-            tags["project"] = project_chain
+            tags["project"] = list(project_chain)
         candidates = {
             "workflow": workflow_name,
             "node_type": node_type,

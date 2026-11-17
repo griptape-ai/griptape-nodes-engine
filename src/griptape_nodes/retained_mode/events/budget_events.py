@@ -39,7 +39,7 @@ class RunAttribution:
 
     run_id: str
     workflow: str | None = None
-    project_chain: list[str] = field(default_factory=list)
+    project_chain: tuple[str, ...] = ()
 
 
 @dataclass

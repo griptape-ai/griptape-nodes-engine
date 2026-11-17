@@ -410,7 +410,7 @@ class _ImageInputDataNode(DataNode):
         self.seen_image = self.parameter_values.get("image")
 
 
-RUN = RunAttribution(run_id="run-1", workflow="poster_flow", project_chain=["shot-6"])
+RUN = RunAttribution(run_id="run-1", workflow="poster_flow", project_chain=("shot-6",))
 
 
 class _RunRecordingDataNode(DataNode):

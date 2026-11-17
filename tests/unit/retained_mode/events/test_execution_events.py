@@ -61,7 +61,7 @@ class TestExecuteNodeWireForm:
 
     def test_the_run_survives_the_wire(self) -> None:
         """A worker's node names its run on its budget requests, so it must arrive as a run, not a dict."""
-        run = RunAttribution(run_id="run-1", workflow="poster_flow", project_chain=["shot-6", "star-wars-x"])
+        run = RunAttribution(run_id="run-1", workflow="poster_flow", project_chain=("shot-6", "star-wars-x"))
         request = ExecuteNodeRequest(node_name="n", run=run)
 
         received = converters.engine.structure(

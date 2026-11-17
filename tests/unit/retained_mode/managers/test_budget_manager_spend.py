@@ -76,7 +76,7 @@ def _workflow_named(engine: MagicMock, name: str) -> MagicMock:
 
 
 CALLING_RUN = RunAttribution(
-    run_id="calling-run", workflow="calling_flow", project_chain=["calling-project", "calling-parent"]
+    run_id="calling-run", workflow="calling_flow", project_chain=("calling-project", "calling-parent")
 )
 
 
@@ -316,7 +316,7 @@ class TestCurrentRunAttribution:
         engine = _mock_engine()
 
         assert _manager(engine).current_run_attribution(_workflow_named(engine, "poster_flow")) == RunAttribution(
-            run_id="run-1", workflow="poster_flow", project_chain=["shot-6", "star-wars-x"]
+            run_id="run-1", workflow="poster_flow", project_chain=("shot-6", "star-wars-x")
         )
 
     def test_is_none_outside_a_run(self) -> None:
@@ -332,7 +332,7 @@ class TestCurrentRunAttribution:
         run = _manager(engine).current_run_attribution(_workflow_named(engine, "poster_flow"))
 
         assert run is not None
-        assert run.project_chain == []
+        assert run.project_chain == ()
 
 
 class TestBudgetCheckDenied:
