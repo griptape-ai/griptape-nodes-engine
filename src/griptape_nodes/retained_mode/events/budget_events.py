@@ -60,6 +60,11 @@ class GetAttributionContextRequest(RequestPayload):
     exception is a call from a running node, whose header takes the project chain its run saved
     when it started, as its direct report does: a chain unreadable then was saved as no project.
 
+    The workflow, run and node are read from the context the request is sent in. Send it from the
+    node's own task, or from a thread started in a copy of that context
+    (`contextvars.copy_context().run`); from a bare thread the header carries no run, workflow or
+    node.
+
     Use when: A node or driver is about to make a credit-consuming call and wants the spend
     attributed to the project the user is working in.
 
