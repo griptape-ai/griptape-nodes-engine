@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ExecutionGriptapeNodeEvent,
     ExecutionPayload,
     GraphAccessMixin,
+    OutlivesWorkflowMixin,
     ProgressEvent,
     RequestPayload,
     RequestSender,
@@ -1256,8 +1257,8 @@ class EventManager(EngineScoped):
         Raises:
             ValueError: The request type already has a handler.
             TypeError: The callback's signature does not say what the request acts on (see
-                `scope_from_signature`), or the request type is in `ONLY_OPEN_UNTIL_CLIENTS_NAME` and
-                the callback is not OPTIONAL_WORKFLOW.
+                `scope_from_signature`), or the request type is in `ONLY_OPEN_UNTIL_CLIENTS_NAME` or
+                is an `OutlivesWorkflowMixin`, and the callback is not OPTIONAL_WORKFLOW.
         """
         existing_manager = self._request_type_to_manager.get(request_type)
         if existing_manager is not None:
@@ -1273,6 +1274,12 @@ class EventManager(EngineScoped):
             msg = (
                 f"Attempted to register a handler for {request_type.__name__}. Failed because it is listed in "
                 "ONLY_OPEN_UNTIL_CLIENTS_NAME, which only an OPTIONAL_WORKFLOW handler can use."
+            )
+            raise TypeError(msg)
+        if issubclass(request_type, OutlivesWorkflowMixin) and scope is not RequestScope.OPTIONAL_WORKFLOW:
+            msg = (
+                f"Attempted to register a handler for {request_type.__name__}. Failed because the request is "
+                "handled after its workflow closes, with no workflow, which only an OPTIONAL_WORKFLOW handler can take."
             )
             raise TypeError(msg)
         self._request_type_to_manager[request_type] = callback
@@ -1766,7 +1773,8 @@ class EventManager(EngineScoped):
 
         Raises:
             _RequestWorkflowError: The envelope id names no open workflow, or the caller is bound to
-                a workflow that has closed, or a WORKFLOW request names no workflow, or names nothing
+                a workflow that has closed, unless the request is an `OutlivesWorkflowMixin`, which
+                then acts on no workflow. Or a WORKFLOW request names no workflow, or names nothing
                 while none or several are open, or a listed OPTIONAL_WORKFLOW request names nothing
                 while several are open.
         """
@@ -1822,8 +1830,10 @@ class EventManager(EngineScoped):
             return None
         return open_workflows[0]
 
-    def _open_workflow_named_by_envelope(self, request: RequestPayload, open_workflow_id: str) -> WorkflowRuntime:
-        """The open workflow an envelope id names.
+    def _open_workflow_named_by_envelope(
+        self, request: RequestPayload, open_workflow_id: str
+    ) -> WorkflowRuntime | NoWorkflow:
+        """The open workflow an envelope id names, or NO_WORKFLOW for an `OutlivesWorkflowMixin` request whose workflow isn't open.
 
         Raises:
             _RequestWorkflowError: No open workflow has that id, answered with `WorkflowNotOpenResultFailure`.
@@ -1831,6 +1841,8 @@ class EventManager(EngineScoped):
         # Looked up once: a workflow closing between a check and a second lookup would otherwise
         # fail the request after it was admitted.
         workflow = self.engine.open_workflows.find(open_workflow_id)
+        if workflow is None and isinstance(request, OutlivesWorkflowMixin):
+            return NO_WORKFLOW
         if workflow is None:
             msg = (
                 f"Attempted to handle {type(request).__name__} in workflow '{open_workflow_id}'. "
@@ -1842,6 +1854,8 @@ class EventManager(EngineScoped):
     def _caller_workflow(self, request: RequestPayload) -> WorkflowRuntime | NoWorkflow | None:
         """The caller's binding, which a request naming no workflow acts on.
 
+        An `OutlivesWorkflowMixin` request from a caller bound to a closed workflow acts on no workflow.
+
         Raises:
             _RequestWorkflowError: The caller is bound to a workflow that has closed, answered with
                 `WorkflowNotOpenResultFailure`.
@@ -1849,6 +1863,8 @@ class EventManager(EngineScoped):
         caller_binding = bound_workflow.get()
         if caller_binding is None or caller_binding is NO_WORKFLOW or not caller_binding.closed:
             return caller_binding
+        if isinstance(request, OutlivesWorkflowMixin):
+            return NO_WORKFLOW
         msg = (
             f"Attempted to handle {type(request).__name__} in workflow '{caller_binding.workflow_id}'. "
             "Failed because that workflow was closed. Reopen the workflow and try again."

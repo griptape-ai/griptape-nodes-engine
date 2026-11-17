@@ -199,6 +199,9 @@ class WorkflowOpenedEvent(AppPayload):
 class WorkflowClosedEvent(AppPayload):
     """An open workflow closed. Requests that name its id now fail with `WorkflowNotOpenResultFailure`.
 
+    A provider call's `ReportUsageRequest` is the exception: it is handled with no workflow, so a
+    call that outlives its workflow still counts.
+
     Sent only for a workflow that had a `WorkflowOpenedEvent`.
 
     Args:

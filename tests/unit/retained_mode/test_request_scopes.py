@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from griptape_nodes.app.worker_routing import RemoteHandler, register_broadcast_handlers
+from griptape_nodes.drivers.cloud_credentials import API_KEY_SECRET_NAME
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeRequest
 from griptape_nodes.retained_mode.events.agent_events import ResolveToolApprovalsRequest, RunAgentRequest
@@ -23,8 +24,18 @@ from griptape_nodes.retained_mode.events.arbitrary_python_events import (
     RunArbitraryPythonStringRequest,
     RunArbitraryPythonStringResultSuccess,
 )
-from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload, ResultPayloadSuccess
-from griptape_nodes.retained_mode.events.budget_events import BudgetAccessRequest, ReportUsageRequest
+from griptape_nodes.retained_mode.events.base_events import (
+    OutlivesWorkflowMixin,
+    RequestPayload,
+    ResultPayload,
+    ResultPayloadSuccess,
+)
+from griptape_nodes.retained_mode.events.budget_events import (
+    BudgetAccessRequest,
+    ReportUsageRequest,
+    ReportUsageResultSuccess,
+    RunAttribution,
+)
 from griptape_nodes.retained_mode.events.config_events import (
     GetConfigCategoryRequest,
     GetWorkspaceRequest,
@@ -94,6 +105,11 @@ class _ScopeProbeRequest(RequestPayload):
 
 @dataclass(kw_only=True)
 class _InnerProbeRequest(RequestPayload):
+    pass
+
+
+@dataclass(kw_only=True)
+class _OutlivingProbeRequest(OutlivesWorkflowMixin, RequestPayload):
     pass
 
 
@@ -537,6 +553,78 @@ class TestRequestsARuntimeSends:
         assert isinstance(result, WorkflowNotOpenResultFailure)
         assert [info.workflow_id for info in result.open_workflows] == [still_open.workflow_id]
         assert calls.workflows == []
+
+
+class TestRequestsThatOutliveTheirWorkflow:
+    """A request recording something that already happened is handled with no workflow once its workflow closes."""
+
+    @pytest.mark.asyncio
+    async def test_a_caller_bound_to_a_closed_workflow_is_handled_with_no_workflow(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        closed = _open_workflow(engine, "closed")
+        engine.close_workflow(closed)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _OutlivingProbeRequest)
+
+        with engine.bind_workflow(closed):
+            result = await engine.ahandle_request(_OutlivingProbeRequest())
+
+        assert result.succeeded(), result
+        assert calls.workflows == [None]
+        assert calls.current == [None]
+
+    def test_an_envelope_naming_a_closed_workflow_is_handled_with_no_workflow(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        closed = _open_workflow(engine, "closed")
+        engine.close_workflow(closed)
+        _open_workflow(engine)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _OutlivingProbeRequest)
+
+        result_event = engine.event_manager.handle_request(
+            _OutlivingProbeRequest(), result_context=ResultContext(open_workflow_id=closed.workflow_id)
+        )
+
+        assert result_event.result.succeeded(), result_event.result
+        assert calls.workflows == [None]
+        assert calls.current == [None]
+
+    @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.HOST])
+    def test_a_handler_that_is_not_optional_workflow_cannot_register(
+        self, engine: Engine, calls: _Calls, scope: RequestScope
+    ) -> None:
+        with pytest.raises(TypeError, match="handled after its workflow closes"):
+            _register(engine, calls, scope, _OutlivingProbeRequest)
+
+    @pytest.mark.asyncio
+    async def test_a_usage_report_from_a_closed_workflow_is_queued_under_its_run(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A provider call can finish after the artist closes its workflow, and its spend still counts."""
+        closed = _open_workflow(engine, "closed")
+        engine.close_workflow(closed)
+        engine.secrets_manager.set_secret(API_KEY_SECRET_NAME, "gt-test-key")
+        queued = MagicMock()
+        monkeypatch.setattr(engine.budget_manager._reports, "put", queued)
+        run = RunAttribution(run_id="closed-run", workflow="Closed workflow")
+
+        with engine.bind_workflow(closed):
+            result = await engine.ahandle_request(ReportUsageRequest(declared_cost_micro_usd=1, model="m", run=run))
+
+        assert isinstance(result, ReportUsageResultSuccess), result
+        [body] = [call.args[0] for call in queued.call_args_list]
+        assert (body["tags"]["run_id"], body["tags"]["workflow"]) == ("closed-run", "Closed workflow")
+
+    @pytest.mark.asyncio
+    async def test_a_budget_check_from_a_closed_workflow_is_refused(self, engine: Engine) -> None:
+        """Closing a workflow stops calls that haven't started, so their check is refused, not answered."""
+        closed = _open_workflow(engine, "closed")
+        engine.close_workflow(closed)
+
+        with engine.bind_workflow(closed):
+            result = await engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
+
+        assert isinstance(result, WorkflowNotOpenResultFailure)
 
 
 # Requests whose handlers act on the workflow the envelope names.

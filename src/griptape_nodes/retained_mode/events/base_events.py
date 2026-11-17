@@ -185,6 +185,19 @@ class GraphAccessMixin:
     """
 
 
+class OutlivesWorkflowMixin:
+    """Marks a request that is still handled after the workflow it was sent from has closed.
+
+    Dispatch refuses a request bound to a closed workflow, since acting on it would act on nothing.
+    A request with this mixin is handled with no workflow instead. It records something that has
+    already happened, such as the spend `ReportUsageRequest` reports for a provider call that
+    finished after the artist closed the workflow, and refusing it would lose that record. A request
+    that starts new work, such as `BudgetAccessRequest` before a call, stays refused, so closing a
+    workflow stops calls that haven't started. Its handler takes an optional workflow
+    (OPTIONAL_WORKFLOW), and gets None.
+    """
+
+
 class SkipTheLineMixin:
     """Mixin for events that should skip the event queue and be processed immediately.
 
@@ -329,6 +342,7 @@ class EventRequest[P: Payload](BaseEvent):
             handler, and every task it starts, acts on that workflow. An id that names no open
             workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
             handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
+            An `OutlivesWorkflowMixin` request whose id names no open workflow acts on no workflow too.
             Left out, the request acts on the engine's only open workflow, unless another engine
             sent it: then it acts on no workflow. A payload field named `workflow_id` is something
             else: the workflow the request is about.
