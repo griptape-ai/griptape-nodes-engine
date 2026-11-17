@@ -22,6 +22,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
     GetTopLevelFlowRequest,
+    SerializeFlowToCommandsRequest,
 )
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
@@ -30,6 +31,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultSuccess,
     SetCurrentProjectResultSuccess,
+)
+from griptape_nodes.retained_mode.events.workflow_events import (
+    SaveWorkflowFileFromSerializedFlowRequest,
+    SaveWorkflowFileFromSerializedFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.serialization.values import encode_value
@@ -479,26 +484,61 @@ class TestSetInputForFlow:
 
 
 class TestSaveFailedWorkflow:
+    """The executor runs bound to no workflow, as a standalone run does, with its one workflow open."""
+
+    @staticmethod
+    def _executor(target: Path) -> LocalWorkflowExecutor:
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._save_on_failure_path = str(target)
+        return executor
+
     @pytest.mark.asyncio
-    async def test_sends_every_request_bound_to_the_open_workflow(self, engine: Engine, tmp_path: Path) -> None:
-        """The executor runs bound to no workflow, as a standalone run does, with its one workflow open."""
+    async def test_saves_the_open_workflow_with_every_request_bound_to_it(self, engine: Engine, tmp_path: Path) -> None:
         engine.context_manager.push_workflow(workflow_name="failing")
         workflow = engine.current_workflow()
         created = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
         assert isinstance(created, CreateFlowResultSuccess), created.result_details
-        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
-        executor._save_on_failure_path = str(tmp_path / "failing_failed.py")
-        sent: list[tuple[str, object]] = []
+        target = tmp_path / "failing_failed.py"
+        sent: list[tuple[RequestPayload, object]] = []
 
         async def record(request: RequestPayload) -> ResultPayload:
-            sent.append((type(request).__name__, bound_workflow.get()))
-            if isinstance(request, GetTopLevelFlowRequest):
-                return await engine.ahandle_request(request)
-            return MagicMock()
+            sent.append((request, bound_workflow.get()))
+            if isinstance(request, SaveWorkflowFileFromSerializedFlowRequest):
+                # Writing the file is the save handler's own concern, covered by its tests.
+                return MagicMock(spec=SaveWorkflowFileFromSerializedFlowResultSuccess, file_path=str(target))
+            return await engine.ahandle_request(request)
 
         with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", side_effect=record):
-            await executor._save_failed_workflow(RuntimeError("boom"))
+            await self._executor(target)._save_failed_workflow(RuntimeError("boom"))
 
-        assert sent
-        assert sent[0][0] == "GetTopLevelFlowRequest"
-        assert all(binding is workflow for _name, binding in sent)
+        assert [type(request) for request, _ in sent] == [
+            GetTopLevelFlowRequest,
+            SerializeFlowToCommandsRequest,
+            SaveWorkflowFileFromSerializedFlowRequest,
+        ]
+        assert all(binding is workflow for _, binding in sent)
+        save = sent[-1][0]
+        assert isinstance(save, SaveWorkflowFileFromSerializedFlowRequest)
+        assert save.file_path == str(target)
+        assert "boom" in (save.description or "")
+
+    @pytest.mark.asyncio
+    async def test_skips_the_save_with_no_workflow_open(self, tmp_path: Path) -> None:
+        with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request") as ahandle_request:
+            await self._executor(tmp_path / "failed.py")._save_failed_workflow("boom")
+
+        ahandle_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_the_save_for_a_workflow_with_no_flow(self, engine: Engine, tmp_path: Path) -> None:
+        engine.context_manager.push_workflow(workflow_name="empty")
+        sent: list[RequestPayload] = []
+
+        async def record(request: RequestPayload) -> ResultPayload:
+            sent.append(request)
+            return await engine.ahandle_request(request)
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", side_effect=record):
+            await self._executor(tmp_path / "failed.py")._save_failed_workflow("boom")
+
+        assert [type(request) for request in sent] == [GetTopLevelFlowRequest]

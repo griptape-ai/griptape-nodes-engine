@@ -2020,13 +2020,9 @@ class FlowManager(EngineScoped):
         return CancelFlowResultSuccess(result_details=details)
 
     @handles(CancelRunRequest)
-    async def on_cancel_run_request(
-        self, request: CancelRunRequest, workflow: WorkflowRuntime | None = None
-    ) -> ResultPayload:
-        """Cancel the request's run of `workflow`. With no workflow there is none to cancel."""
-        cancelled = False
-        if workflow is not None:
-            cancelled = await self.cancel_run_in(workflow, request.run_id)
+    async def on_cancel_run_request(self, request: CancelRunRequest, workflow: WorkflowRuntime) -> ResultPayload:
+        """Cancel the request's run of `workflow`."""
+        cancelled = await self.cancel_run_in(workflow, request.run_id)
         if not cancelled:
             details = f"Attempted to cancel run '{request.run_id}'. Failed because no run with that id is in progress or waiting."
             return CancelRunResultFailure(result_details=details)
@@ -2034,11 +2030,9 @@ class FlowManager(EngineScoped):
 
     @handles(CancelAllRunsRequest)
     async def on_cancel_all_runs_request(
-        self, _request: CancelAllRunsRequest, workflow: WorkflowRuntime | None = None
+        self, _request: CancelAllRunsRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
-        """Cancel every run of `workflow`. With no workflow there is nothing to cancel."""
-        if workflow is None:
-            return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
+        """Cancel every run of `workflow`."""
         try:
             await self.cancel_all_runs_in(workflow)
         except Exception as e:
@@ -2048,11 +2042,9 @@ class FlowManager(EngineScoped):
         return CancelAllRunsResultSuccess(result_details="Cancelled every run.")
 
     @handles(ListRunsRequest)
-    def on_list_runs_request(self, _request: ListRunsRequest, workflow: WorkflowRuntime | None = None) -> ResultPayload:
-        """List `workflow`'s runs. With no workflow there are none."""
+    def on_list_runs_request(self, _request: ListRunsRequest, workflow: WorkflowRuntime) -> ResultPayload:
+        """List `workflow`'s runs."""
         runs: list[RunInfo] = []
-        if workflow is None:
-            return ListRunsResultSuccess(runs=runs, result_details="Listed 0 run(s).")
         flows = workflow.flows
         in_progress = flows.run_in_progress
         if in_progress is not None:

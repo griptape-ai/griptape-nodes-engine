@@ -74,9 +74,6 @@ def _open_workflow(engine: Engine) -> WorkflowRuntime:
 _OPTIONAL_WORKFLOW_REQUESTS = {
     ListFlowsInFlowRequest,
     ExtractFlowCommandsFromImageMetadataRequest,
-    CancelRunRequest,
-    CancelAllRunsRequest,
-    ListRunsRequest,
 }
 
 
@@ -165,15 +162,29 @@ class TestCancelBinding:
         assert seen == [workflow]
 
     @pytest.mark.asyncio
-    async def test_cancelling_with_no_workflow_named_leaves_the_open_ones_running(self, engine: Engine) -> None:
-        _open_workflow(engine)
-        cancel_all_runs_in = MagicMock()
+    async def test_cancelling_with_no_workflow_named_cancels_the_only_open_ones_runs(self, engine: Engine) -> None:
+        """It acts on a workflow, so naming none acts on the only open one."""
+        workflow = _open_workflow(engine)
+        cancelled: list[WorkflowRuntime] = []
+
+        async def cancel_all_runs_in(target: WorkflowRuntime) -> None:
+            cancelled.append(target)
 
         with patch.object(engine.flow_manager, "cancel_all_runs_in", cancel_all_runs_in):
             result = (await engine.event_manager.ahandle_request(CancelAllRunsRequest())).result
 
         assert result.succeeded(), result.result_details
-        cancel_all_runs_in.assert_not_called()
+        assert cancelled == [workflow]
+
+    @pytest.mark.parametrize(
+        "request_payload", [CancelAllRunsRequest(), CancelRunRequest(run_id="run"), ListRunsRequest()]
+    )
+    def test_run_requests_naming_no_workflow_fail_with_nothing_open(
+        self, engine: Engine, request_payload: RequestPayload
+    ) -> None:
+        result = engine.event_manager.handle_request(request_payload).result
+
+        assert isinstance(result, WorkflowNotNamedResultFailure)
 
 
 class TestHandlersActOnTheWorkflowTheyAreHanded:
