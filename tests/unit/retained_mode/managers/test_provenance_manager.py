@@ -5,10 +5,8 @@ overwrite, collision-walk keying, failure-policy behavior (fail vs warn),
 legacy-template inactivity, and parent linking.
 """
 
-import base64
 import io
 import logging
-import pickle  # noqa: TID251 -- asserts the record payload's tagged pickle-v1 format round-trips
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -74,6 +72,7 @@ from griptape_nodes.retained_mode.events.provenance_events import (
     ProvenanceQueryFailureReason,
 )
 from griptape_nodes.retained_mode.file_metadata.provenance_record import (
+    SERIALIZED_NODE_FORMAT,
     ArtifactIdentity,
     ProducingNodeIdentity,
     ProducingNodeIdentitySource,
@@ -573,9 +572,9 @@ class _ProvProbeNode(DataNode):
 class TestFaithfulPayload:
     """The payload must be the FULL serialize-node protocol output.
 
-    Commands + indirect set-value commands + the pickled unique-values dict. A
+    Commands + indirect set-value commands + the encoded unique-values pool. A
     bare serialize call (the original bug) records commands whose value
-    references point at a dict that was never captured.
+    references point at a pool that was never captured.
     """
 
     _LIBRARY = "provenance-payload-test-library"
@@ -634,11 +633,9 @@ class TestFaithfulPayload:
         payload = record.payload
         # No 'kind' discriminator: sub-object presence IS the answer.
         assert payload.serialized_node is not None
-        assert payload.serialized_node.serialized_node_commands
-        assert payload.serialized_node.set_parameter_value_commands
-        unique_values = pickle.loads(  # noqa: S301
-            base64.b64decode(payload.serialized_node.pickled_parameter_values)
-        )
+        assert payload.serialized_node.node_commands
+        assert payload.serialized_node.format == SERIALIZED_NODE_FORMAT
+        unique_values = payload.serialized_node.parameter_values
         assert isinstance(unique_values, dict)
         assert unique_values
 
@@ -666,29 +663,29 @@ class TestFaithfulPayload:
         # (element_modification_commands is polymorphic; a generic dict
         # restructure silently degrades them to bare RequestPayload, which is
         # exactly the bug this guard exists to catch). If the protocol's shapes
-        # change without keeping records rehydratable (or bumping the record
+        # change without keeping records decodable (or bumping the record
         # schema), THIS is the test that fails.
         from griptape_nodes.retained_mode.events.base_events import RequestPayload
-        from griptape_nodes.retained_mode.events.event_converter import converter
-        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, SerializedNodeCommands
-
-        assert payload.serialized_node.pickled_node_commands is not None
-        rehydrated_commands = pickle.loads(  # noqa: S301
-            base64.b64decode(payload.serialized_node.pickled_node_commands)
+        from griptape_nodes.retained_mode.events.node_events import (
+            CreateNodeRequest,
+            SerializedNodeCommands,
+            SerializedSelectedNodesCommands,
         )
+        from griptape_nodes.serialization.commands import decode_commands
+
+        decoded = decode_commands(payload.serialized_node.node_commands, SerializedSelectedNodesCommands)
+        assert len(decoded.serialized_node_commands) == 1
+        rehydrated_commands = decoded.serialized_node_commands[0]
         assert isinstance(rehydrated_commands, SerializedNodeCommands)
         assert rehydrated_commands.node_uuid
         assert isinstance(rehydrated_commands.create_node_command, CreateNodeRequest)
         for element_command in rehydrated_commands.element_modification_commands:
             assert type(element_command) is not RequestPayload, "element command lost its concrete type"
 
-        # The indirect set-value commands are concrete types; the converter handles them.
-        rehydrated_set_commands = [
-            converter.structure(entry, SerializedNodeCommands.IndirectSetParameterValueCommand)
-            for entry in payload.serialized_node.set_parameter_value_commands
-        ]
+        # The indirect set-value commands decode alongside, keying into the stored value pool.
+        rehydrated_set_commands = decoded.set_parameter_value_commands[rehydrated_commands.node_uuid]
         assert rehydrated_set_commands
-        stored_uuids = {entry.unique_value_uuid for entry in rehydrated_set_commands}
+        stored_uuids = {str(entry.unique_value_uuid) for entry in rehydrated_set_commands}
         assert stored_uuids <= set(unique_values.keys())
 
         # THE WIRE DIET: query results carry the header with the payload
@@ -952,6 +949,42 @@ class TestProducingNodeInference:
         finally:
             engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         assert identity is None
+
+
+class TestRecordWorkflowAttribution:
+    """A record attributes the save to the workflow the request envelope names.
+
+    Capture reads the workflow dispatch binds for the request, so with two
+    workflows open, a save addressed at one of them records that one, not
+    whichever happens to be focused.
+    """
+
+    def test_record_names_the_addressed_workflow(self, engine: Engine, temp_dir: Path) -> None:
+        from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+
+        focused_entry = engine.workflow_registry.register_unsaved("focused", str(temp_dir), listed=False)
+        addressed_entry = engine.workflow_registry.register_unsaved("addressed", str(temp_dir), listed=False)
+        focused_name = focused_entry.name
+        addressed_name = addressed_entry.name
+        assert focused_name != addressed_name
+        try:
+            engine.open_workflow(focused_entry.workflow_id)
+            engine.open_workflow(addressed_entry.workflow_id)
+
+            request = WriteFileRequest(
+                file_path=str(temp_dir / "hero.txt"), content="pixels", provenance=_sample_provenance()
+            )
+            result = engine.event_manager.handle_request(
+                request, result_context=ResultContext(open_workflow_id=addressed_entry.workflow_id)
+            ).result
+        finally:
+            engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        assert isinstance(result, WriteFileResultSuccess)
+        record = _load_single_record(_record_dir_for(temp_dir, "hero.txt"))
+        assert record.workflow is not None
+        assert record.workflow.name == addressed_name
+        assert record.workflow.name != focused_name
 
 
 class TestScratchPathEdges:

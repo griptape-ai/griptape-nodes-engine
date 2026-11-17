@@ -30,7 +30,7 @@ These were ruled during design review and are recorded so they are not relitigat
 1. Failure handling is a **separate policy axis**. Default: an elected record that cannot be written **fails the artifact save**.
 1. Records are **immutable per-save-event files**, never overwritten. Iteration history — including overwriting the same output path — falls out for free. Canonical history is never cleared by UI actions; a "reset" of the artist-facing view is an editor-side cursor (#5627). Users deleting record files by hand is their prerogative; readers tolerate it.
 1. Records live in a **centralized, preview-style mirrored store** in a **visible** (not dot-hidden) directory — provenance is canonical work product customers will commit and ship, unlike regenerable preview caches.
-1. Each record is **two-layer**: a human-readable envelope plus a faithful payload produced by the engine's existing serialization machinery (many parameter types cannot be represented as plain text). Revised 2026-09-23: the payload is the FULL serialize-node protocol (commands + indirect set-value commands + pickled unique values) — the readable `parameters_preview` is an explicitly lossy display projection, never the truth.
+1. Each record is **two-layer**: a human-readable envelope plus a faithful payload produced by the engine's existing serialization machinery (many parameter types cannot be represented as plain text). Revised 2026-09-23: the payload is the FULL serialize-node protocol (commands + indirect set-value commands + the unique-values pool) — the readable `parameters_preview` is an explicitly lossy display projection, never the truth. Revised 2026-11-17: the payload travels in the engine's plain-data commands layout (`serialization/commands.py` + encoded values), the same transport the clipboard uses — no pickles in records.
 1. Source links are **hybrid**: a precise reference `(path_at_use, record_id, content_hash)` plus an embedded one-line ancestor summary that survives even if the ancestor's record is later deleted.
 1. Lineage attaches at **file boundaries**. The standard library passes media between nodes exclusively as file-backed URL artifacts, so this covers real flows; a third-party node that hands raw bytes downstream without a save creates a documented chain break.
 1. **Out of scope**: C2PA/signing, databases or index files (plain files + scans only), and embedding anything in file-format metadata (EXIF/PNG chunks).
@@ -178,10 +178,9 @@ One JSON document per record, `schema_version: "1.0.0"` (independent of the old 
 
   "payload": {
     "serialized_node": {                               // presence = the node is rebuildable
-      "serialized_node_commands": { /* readable structure */ },
-      "set_parameter_value_commands": [ /* indirect commands keying into the pickled values */ ],
-      "pickled_parameter_values": "<base64 pickle>",   // engine-only; the unique-values dict
-      "parameter_values_format": "gtn-unique-values-pickle-v1"
+      "node_commands": { /* one-node SerializedSelectedNodesCommands in the plain-data commands layout */ },
+      "parameter_values": { /* encoded unique-values pool the commands key into */ },
+      "format": "gtn-commands-json-v1"
     },
     "serialized_workflow": {                           // presence = FULL_WORKFLOW_SNAPSHOT
       "workflow_file_content": "…full runnable workflow .py text (block scalar in YAML)…",

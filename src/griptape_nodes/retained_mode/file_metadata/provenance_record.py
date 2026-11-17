@@ -54,10 +54,10 @@ _CONTENT_HASH_DIGEST_SIZE = 32
 # intermediate directory so one directory never accumulates every hash.
 BY_HASH_SHARD_CHARS = 2
 
-# Format tag for the pickled unique-parameter-values blob inside a record's
-# payload: base64 of pickle.dumps(unique_parameter_uuid_to_values), exactly the
-# dict the engine's node serialization protocol fills in.
-PARAMETER_VALUES_FORMAT = "gtn-unique-values-pickle-v1"
+# Format tag for the serialized-node block inside a record's payload: the engine's
+# plain-data commands layout (griptape_nodes.serialization.commands) plus the encoded
+# unique-values pool it keys into -- the same transport the clipboard uses.
+SERIALIZED_NODE_FORMAT = "gtn-commands-json-v1"
 
 RECORD_FILE_EXTENSION = "yaml"
 
@@ -181,38 +181,30 @@ class SourceLink(BaseModel):
 class SerializedNodePayload(BaseModel):
     """The producing node via the FULL serialize-node protocol: rebuildable by an engine.
 
-    PERSISTENCE COUPLING: the dict fields hold the event-converter unstructured
-    forms of SerializedNodeCommands and its IndirectSetParameterValueCommand
-    list (node_events.py). Changes to those dataclasses must keep old records
-    structurable, or bump RECORD_SCHEMA_VERSION -- there is a round-trip
+    PERSISTENCE COUPLING: `node_commands` holds the plain-data commands layout of
+    griptape_nodes.serialization.commands (a one-node SerializedSelectedNodesCommands,
+    exactly what the clipboard writes), and `parameter_values` the encoded value pool
+    of griptape_nodes.serialization.values it keys into. Changes to those layouts must
+    keep old records decodable, or bump RECORD_SCHEMA_VERSION -- there is a round-trip
     regression test that fails when the shapes drift apart.
     """
 
-    serialized_node_commands: dict[str, Any] = Field(
+    node_commands: dict[str, Any] = Field(
         description=(
-            "READABLE projection of SerializedNodeCommands (node type, parameter names, "
-            "structure). Not faithfully restructurable: element commands are polymorphic; "
-            "rehydrate from pickled_node_commands instead."
+            "The producing node as a one-node SerializedSelectedNodesCommands in the engine's "
+            "plain-data commands layout (encode_commands/decode_commands): readable AND the "
+            "FAITHFUL form for rehydration, the same transport the clipboard uses. Its "
+            "set_parameter_value_commands key into parameter_values."
         )
     )
-    pickled_node_commands: str | None = Field(
-        default=None,
+    parameter_values: dict[str, Any] = Field(
+        default_factory=dict,
         description=(
-            "base64(pickle.dumps(SerializedNodeCommands)): the FAITHFUL form for rehydration, "
-            "the same transport the engine's clipboard path uses. Optional only for records "
-            "written before this field existed."
+            "The unique parameter values the node commands key into, each in the engine's "
+            "encoded plain-data value form (griptape_nodes.serialization.values)."
         ),
     )
-    set_parameter_value_commands: list[dict[str, Any]] = Field(
-        default_factory=list,
-        description="Indirect set-value commands keying into the pickled unique-values dict",
-    )
-    pickled_parameter_values: str = Field(
-        description="base64(pickle.dumps(unique_parameter_uuid_to_values)); engine-only, see parameter_values_format",
-    )
-    parameter_values_format: str = Field(
-        description=f"Format tag for pickled_parameter_values; currently '{PARAMETER_VALUES_FORMAT}'"
-    )
+    format: str = Field(description=f"Format tag for this block; currently '{SERIALIZED_NODE_FORMAT}'")
 
 
 class SerializedWorkflowPayload(BaseModel):
@@ -292,8 +284,8 @@ class ProvenancePayloadSummary(BaseModel):
 
     has_serialized_node: bool = False
     has_serialized_workflow: bool = False
-    pickled_parameter_values_bytes: int | None = Field(
-        default=None, description="Encoded size of the pickled unique-values blob"
+    parameter_value_count: int | None = Field(
+        default=None, description="Number of unique parameter values in the serialized-node payload"
     )
     workflow_file_chars: int | None = Field(default=None, description="Length of the embedded workflow .py text")
     workflow_file_hash: str | None = None
@@ -304,7 +296,7 @@ class ProvenancePayloadSummary(BaseModel):
         summary = cls()
         if payload.serialized_node is not None:
             summary.has_serialized_node = True
-            summary.pickled_parameter_values_bytes = len(payload.serialized_node.pickled_parameter_values)
+            summary.parameter_value_count = len(payload.serialized_node.parameter_values)
         if payload.serialized_workflow is not None:
             summary.has_serialized_workflow = True
             summary.workflow_file_chars = len(payload.serialized_workflow.workflow_file_content)
@@ -473,10 +465,10 @@ _RECORD_KEY_COMMENTS: dict[str, str] = {
 # sub-object it explains (the block can be hundreds of KB long).
 _PAYLOAD_KEY_COMMENTS: dict[str, str] = {
     "serialized_node": (
-        "The producing node, rebuildable by an engine. serialized_node_commands is the\n"
-        "READABLE projection (node type, parameter names, structure); rehydration uses\n"
-        "pickled_node_commands + set-value commands + pickled_parameter_values (base64;\n"
-        "engine-only) -- the same transport the clipboard path uses."
+        "The producing node, rebuildable by an engine. node_commands holds the engine's\n"
+        "plain-data commands layout (readable AND faithful); its set-value commands key\n"
+        "into parameter_values, the encoded unique-values pool -- the same transport the\n"
+        "clipboard path uses."
     ),
     "serialized_workflow": (
         "The ENTIRE workflow as a runnable .py workflow file's text.\n"

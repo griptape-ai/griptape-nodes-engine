@@ -12,9 +12,7 @@ Design: docs/development/designs/artifact_provenance.md (§7, §8).
 
 from __future__ import annotations
 
-import base64
 import logging
-import pickle  # noqa: TID251 -- records carry the tagged pickle-v1 payload format; migration to serialization.commands tracked in PR #5658
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -36,7 +34,6 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.files.path_utils import canonicalize_for_identity, decompose_source_path, parse_static_server_url
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
@@ -44,6 +41,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.node_events import (
     SerializedNodeCommands,
     SerializedParameterValueTracker,
+    SerializedSelectedNodesCommands,
     SerializeNodeToCommandsRequest,
     SerializeNodeToCommandsResultSuccess,
 )
@@ -85,7 +83,7 @@ from griptape_nodes.retained_mode.events.provenance_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.provenance_record import (
     BY_PATH_DIR_NAME,
-    PARAMETER_VALUES_FORMAT,
+    SERIALIZED_NODE_FORMAT,
     ArtifactIdentity,
     ByHashPointer,
     ProducingNodeIdentity,
@@ -114,6 +112,8 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
     _collect_workflow_info,
     _parameter_values_of,
 )
+from griptape_nodes.serialization.commands import encode_commands
+from griptape_nodes.serialization.values import ValueEncodeError
 from griptape_nodes.utils.version_utils import get_current_version
 
 if TYPE_CHECKING:
@@ -930,9 +930,10 @@ class ProvenanceManager(EngineScoped):
 
         The unique parameter values live in the dict passed INTO the request
         (filled in-place); recording the commands without that dict would
-        produce references to values that don't exist. This is the same
-        protocol workflow save uses: commands + indirect set-value commands +
-        the pickled values dict, deserializable with existing machinery.
+        produce references to values that don't exist. The commands travel as a
+        one-node SerializedSelectedNodesCommands in the engine's plain-data
+        commands layout -- the same transport the clipboard uses -- so
+        decode_commands rebuilds them with the element commands' concrete types.
         """
         unique_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any] = {}
         tracker = SerializedParameterValueTracker()
@@ -941,35 +942,30 @@ class ProvenanceManager(EngineScoped):
                 node_name=node_name,
                 unique_parameter_uuid_to_values=unique_values,
                 serialized_parameter_value_tracker=tracker,
-                use_pickling=True,
                 serialize_all_parameter_values=True,
             )
         )
         if not isinstance(serialize_result, SerializeNodeToCommandsResultSuccess):
             logger.warning("Provenance: failed to serialize node '%s' commands", node_name)
             return ProvenancePayload()
+        node_commands = serialize_result.serialized_node_commands
+        selected = SerializedSelectedNodesCommands(
+            serialized_node_commands=[node_commands],
+            set_parameter_value_commands={node_commands.node_uuid: serialize_result.set_parameter_value_commands},
+            set_lock_commands_per_node={},
+            serialized_connection_commands=[],
+        )
         try:
-            # TYPED access, deliberately not to_json()+dict.get(): if the
-            # serialize-node protocol renames or reshapes its outputs, this
-            # breaks loudly at type-check instead of silently storing empty
-            # payloads. See the companion note on SerializedNodeCommands.
-            commands_dict = safe_unstructure(serialize_result.serialized_node_commands)
-            set_value_dicts = safe_unstructure(serialize_result.set_parameter_value_commands)
-            # The element-modification command list is polymorphic, so the
-            # unstructured dicts are readable but not faithfully restructurable.
-            # Pickle is the faithful transport, exactly as the clipboard path does it.
-            pickled_commands = base64.b64encode(pickle.dumps(serialize_result.serialized_node_commands)).decode("ascii")
-            pickled_values = base64.b64encode(pickle.dumps(unique_values)).decode("ascii")
-        except Exception as e:
+            encoded_commands = encode_commands(selected)
+        except ValueEncodeError as e:
             logger.warning("Provenance: failed to encode node '%s' payload: %s", node_name, e)
             return ProvenancePayload()
         return ProvenancePayload(
             serialized_node=SerializedNodePayload(
-                serialized_node_commands=commands_dict,
-                pickled_node_commands=pickled_commands,
-                set_parameter_value_commands=set_value_dicts or [],
-                pickled_parameter_values=pickled_values,
-                parameter_values_format=PARAMETER_VALUES_FORMAT,
+                node_commands=encoded_commands,
+                # The pool already holds encoded plain-data values (serialization/values.py).
+                parameter_values={str(uuid): value for uuid, value in unique_values.items()},
+                format=SERIALIZED_NODE_FORMAT,
             )
         )
 
