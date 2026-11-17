@@ -76,6 +76,13 @@ REPORT_MAX_ATTEMPTS = 3
 # The report thread exits after this long with nothing queued, so it never outlives its engine
 # for long. The next report starts another.
 REPORT_THREAD_IDLE_SECONDS = 30.0
+# How long a one-off engine process waits for its queued reports before exiting, shared by all of
+# them. Sized to REPORT_MAX_ATTEMPTS request timeouts; reports still retrying when it runs out are
+# logged and lost.
+REPORT_FLUSH_TIMEOUT_SECONDS = REPORT_TIMEOUT_SECONDS * REPORT_MAX_ATTEMPTS
+# The same wait for a node group's own process. One request timeout covers a Cloud that is answering:
+# a loop can start one of these per iteration, so a longer wait multiplies when Cloud hangs.
+NODE_GROUP_REPORT_FLUSH_TIMEOUT_SECONDS = REPORT_TIMEOUT_SECONDS
 
 # Cloud's length caps on the free-text descriptors. A value over its cap is left out rather than
 # sent, so one long name cannot get the whole report rejected.
@@ -121,8 +128,9 @@ class _ReportQueue:
     the queue has sat empty for `idle_seconds`. A thread that never exits would keep its manager,
     and so its engine, alive for the rest of the process.
 
-    A daemon thread, so engine exit never waits on queued reports. Not an asyncio task: a sync
-    `handle_request` runs the handler on a short-lived loop that would cancel it.
+    A daemon thread, so a long-running engine never waits on queued reports at exit; an engine
+    process that runs one workflow and exits waits for them with `flush`. Not an asyncio task: a
+    sync `handle_request` runs the handler on a short-lived loop that would cancel it.
     """
 
     def __init__(
@@ -135,6 +143,9 @@ class _ReportQueue:
         # Guards `_thread`, and the enqueue with it, so a report never lands after the thread has
         # decided to exit and before a new one starts.
         self._lock = threading.Lock()
+        # Reports queued and not yet sent or dropped. `_all_sent` is notified as each one finishes.
+        self._pending = 0
+        self._all_sent = threading.Condition(self._lock)
 
     @property
     def thread(self) -> threading.Thread | None:
@@ -142,6 +153,7 @@ class _ReportQueue:
 
     def put(self, body: dict[str, Any]) -> None:
         with self._lock:
+            self._pending += 1
             self._queue.put(body)
             if self._thread is None:
                 thread = threading.Thread(target=self._post_reports, name="budget-report", daemon=True)
@@ -165,6 +177,20 @@ class _ReportQueue:
                 self._send(body)
             except Exception:
                 logger.exception("A usage report failed unexpectedly and was dropped.")
+            finally:
+                with self._lock:
+                    self._pending -= 1
+                    self._all_sent.notify_all()
+
+    def flush(self, timeout: float) -> int:
+        """Wait for the queued reports to be sent or dropped, for at most `timeout` seconds; return how many are left."""
+        with self._all_sent:
+            pending = self._pending
+            if pending:
+                # Said before waiting, so a pause at exit, which a Ctrl-C doesn't cut short, is explained.
+                logger.info("Waiting up to %ss for %s usage report(s) to reach Griptape Cloud.", timeout, pending)
+            self._all_sent.wait_for(lambda: self._pending == 0, timeout=timeout)
+            return self._pending
 
 
 class BudgetManager(EngineScoped):
@@ -335,6 +361,23 @@ class BudgetManager(EngineScoped):
             idempotency_key=idempotency_key,
             result_details=f"Queued a usage report for {_describe_call(request.model)}.",
         )
+
+    def flush_reports(self, timeout: float = REPORT_FLUSH_TIMEOUT_SECONDS) -> int:
+        """Wait for queued usage reports to be sent or given up on, for at most `timeout` seconds.
+
+        For an engine process about to exit: the report thread is a daemon, so exiting with
+        reports still queued loses them, and Cloud never counts that spend. Returns how many
+        reports were still unsent when the wait ended, and logs them, so a short wait is visible.
+        """
+        unsent = self._reports.flush(timeout)
+        if unsent:
+            logger.warning(
+                "%s usage report(s) were still unsent after waiting %ss; if the engine exits now, "
+                "that spend will not count against budgets.",
+                unsent,
+                timeout,
+            )
+        return unsent
 
     def _resolve_project_chain(self) -> list[str] | None:
         """Resolve the current project's ancestry as ids, leaf-first.

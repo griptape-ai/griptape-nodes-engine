@@ -27,6 +27,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     progress_to_execution_event,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.budget_manager import NODE_GROUP_REPORT_FLUSH_TIMEOUT_SECONDS
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
@@ -79,6 +80,8 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         exc_tb: TracebackType | None,
     ) -> None:
         """Async context manager exit."""
+        # The process exits next, which would drop usage reports still queued.
+        await asyncio.to_thread(GriptapeNodes.BudgetManager().flush_reports, NODE_GROUP_REPORT_FLUSH_TIMEOUT_SECONDS)
         await self._stop_websocket_connection()
 
         GriptapeNodes.SessionManager().remove_session(self._session_id)
