@@ -84,6 +84,8 @@ class BlockedTermsLibrary(AdvancedNodeLibrary):
                 "%s contains blocked term %r but its flow is unknown. Not cancelling.", node_name, blocked_term
             )
             return
+        # Reading event_manager.event_loop is the documented way to schedule work onto the engine
+        # loop. The rest of this library talks to the engine through requests.
         loop = GriptapeNodes.get_instance().event_manager.event_loop
         if loop is None:
             logger.warning(
