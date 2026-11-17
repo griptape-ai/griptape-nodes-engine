@@ -429,3 +429,19 @@ async def test_a_call_that_reports_after_its_workflow_closed_still_counts_toward
     reports = await stub_cloud.wait_for_reports(1)
     assert [report["tags"].get("run_id") for report in reports] == [closed_run_id]
     assert reports[0]["tags"].get("workflow") == workflow_name
+
+
+@pytest.mark.asyncio
+async def test_a_proxied_call_carries_the_same_run_and_tags_as_a_direct_one(
+    engine: Engine, stub_cloud: StubSpendServer, three_node_flow: str
+) -> None:
+    """A run's proxy spend is attributed like its direct spend, so the two total together (#5872)."""
+    result = await engine.ahandle_request(StartFlowRequest(flow_name=three_node_flow))
+    assert isinstance(result, StartFlowResultSuccess), result
+
+    reports = await stub_cloud.wait_for_reports(len(NODE_NAMES))
+    headers = [engine.node_manager.get_node_by_name(name).parameter_output_values["attribution"] for name in NODE_NAMES]
+    assert [header["tags"] for header in headers] == [report["tags"] for report in reports], (
+        "A proxied call's header should carry exactly the tags the same node's direct report carries."
+    )
+    assert {header["tags"]["run_id"] for header in headers} == {reports[0]["tags"]["run_id"]}
