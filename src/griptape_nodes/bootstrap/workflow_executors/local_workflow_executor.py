@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import traceback
@@ -117,6 +118,8 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
         if exc_val is not None and self._save_on_failure_path is not None:
             await self._save_failed_workflow(exc_val)
+        # The process usually exits next, which would drop usage reports still queued.
+        await asyncio.to_thread(GriptapeNodes.BudgetManager().flush_reports)
 
     def _get_workflow_name(self) -> str:
         """The name a failed workflow's file starts with.
