@@ -329,15 +329,9 @@ class TestErrorProxyNode:
 
     def test_policy_denial_reads_as_warning(self) -> None:
         """A policy denial is recoverable, so it reads as a warning that surfaces the hook's reason."""
-        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
 
-        node = ErrorProxyNode(
-            name="proxy",
-            original_node_type="FancyNode",
-            original_library_name="fancy-lib",
-            failure_reason="Ask your admin to enable Labs nodes.",
-            denied_by_policy=True,
-        )
+        node = self._denied_proxy(CheckpointFailure(detail="Ask your admin to enable Labs nodes."))
 
         message = self._message(node)
         assert node.denied_by_policy is True
@@ -345,6 +339,135 @@ class TestErrorProxyNode:
         assert message.markdown is True
         assert "**Permission denied**" in message.value
         assert "Ask your admin to enable Labs nodes." in message.value
+
+    def test_denied_placeholder_and_run_error_give_the_same_restore_advice(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
+
+        node = self._denied_proxy(CheckpointFailure(detail="Labs nodes are off."))
+
+        errors = node.validate_before_node_run()
+
+        assert errors is not None
+        restore_advice = "reload this workflow and the placeholder will be automatically replaced"
+        assert restore_advice in self._message(node).value
+        assert restore_advice in str(errors[0])
+
+    @staticmethod
+    def _denied_proxy(*failures):  # noqa: ANN205
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+
+        return ErrorProxyNode(
+            name="proxy",
+            original_node_type="InvertImage",
+            original_library_name="image-lib",
+            failure_reason="unused when a denial is given",
+            denial=CheckpointDenial(failures=tuple(failures)),
+        )
+
+    def test_denial_renders_each_failure_as_its_own_bullet(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
+
+        node = self._denied_proxy(
+            CheckpointFailure(detail="Inverting images is not allowed."),
+            CheckpointFailure(detail="Labs nodes are disabled."),
+        )
+
+        message = self._message(node)
+        assert node.denied_by_policy is True
+        assert message.variant == "warning"
+        assert message.markdown is True
+        assert "- Inverting images is not allowed.\n- Labs nodes are disabled." in message.value
+        assert "**InvertImage**" in message.value
+        assert "**image-lib**" in message.value
+        assert "Unknown" not in message.value
+
+    def test_denial_bullets_drop_repeated_details_in_order(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
+
+        node = self._denied_proxy(
+            CheckpointFailure(detail="B.", source="policy 'One'"),
+            CheckpointFailure(detail="A."),
+            CheckpointFailure(detail="B.", source="policy 'Two'"),
+        )
+
+        assert "- B.\n- A." in self._message(node).value
+        assert self._message(node).value.count("- B.") == 1
+
+    def test_denial_is_exposed_to_the_editor_as_a_ui_option(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
+
+        first = CheckpointFailure(
+            detail="Inverting images is not allowed.",
+            capability="image.invert",
+            advice="Ask your admin to allow it.",
+            source="policy 'Image Edits' (rule 'no-invert-image')",
+        )
+        second = CheckpointFailure(detail="Labs nodes are disabled.")
+        node = self._denied_proxy(first, second, first)
+
+        ui_options = self._message(node).to_dict()["ui_options"]
+
+        assert ui_options["permission_denial"] == {
+            "node_type": "InvertImage",
+            "library_name": "image-lib",
+            "failures": [
+                {
+                    "detail": "Inverting images is not allowed.",
+                    "capability": "image.invert",
+                    "advice": "Ask your admin to allow it.",
+                    "source": "policy 'Image Edits' (rule 'no-invert-image')",
+                },
+                {"detail": "Labs nodes are disabled.", "capability": None, "advice": None, "source": None},
+            ],
+        }
+        assert ui_options["variant"] == "warning"
+        assert ui_options["markdown"] is True
+
+    def test_load_failure_has_no_permission_denial_ui_option(self) -> None:
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="proxy",
+            original_node_type="FancyNode",
+            original_library_name="fancy-lib",
+            failure_reason="No module named 'fancy'",
+        )
+
+        assert "permission_denial" not in self._message(node).to_dict()["ui_options"]
+
+    def test_running_a_denied_proxy_lists_each_reason_as_a_permission_problem(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointFailure
+
+        node = self._denied_proxy(
+            CheckpointFailure(detail="Inverting images is not allowed."),
+            CheckpointFailure(detail="Labs nodes are disabled."),
+        )
+
+        errors = node.validate_before_node_run()
+
+        assert errors is not None
+        assert len(errors) == 1
+        text = str(errors[0])
+        assert "don't have permission" in text
+        assert "- Inverting images is not allowed.\n- Labs nodes are disabled." in text
+        assert "technical issue" not in text
+        assert "failed to load" not in text
+
+    def test_running_a_load_failure_proxy_keeps_the_technical_issue_wording(self) -> None:
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="proxy",
+            original_node_type="FancyNode",
+            original_library_name="fancy-lib",
+            failure_reason="No module named 'fancy'",
+        )
+
+        errors = node.validate_before_node_run()
+
+        assert errors is not None
+        assert "failed to load due to this technical issue" in str(errors[0])
 
 
 class TestLockedSuccessFailureNodeRouting:
