@@ -41,7 +41,8 @@ class WorkflowRuntime:
         """
         self.workflow_id = workflow_id
         self.engine = engine
-        # Set when it closes. Work still bound to it is refused rather than acting on a dead runtime.
+        # Set when it closes. Work still bound to it is refused rather than acting on a dead runtime,
+        # apart from `OutlivesWorkflowMixin` requests, which are handled with no workflow.
         self.closed = False
         self.context = WorkflowContextStack()
         self.objects = WorkflowObjects()
@@ -50,7 +51,10 @@ class WorkflowRuntime:
         self.variables = WorkflowVariables()
 
     def handle_request(self, request: RequestPayload) -> ResultPayload:
-        """Handle a request bound to this workflow. Refused once it has closed, never sent to another."""
+        """Handle a request bound to this workflow. Refused once it has closed, never sent to another.
+
+        An `OutlivesWorkflowMixin` request is handled with no workflow once it has closed.
+        """
         token = bound_workflow.set(self)
         try:
             return self.engine.handle_request(request)
@@ -58,7 +62,10 @@ class WorkflowRuntime:
             bound_workflow.reset(token)
 
     async def ahandle_request(self, request: RequestPayload) -> ResultPayload:
-        """Handle a request bound to this workflow. Refused once it has closed, never sent to another."""
+        """Handle a request bound to this workflow. Refused once it has closed, never sent to another.
+
+        An `OutlivesWorkflowMixin` request is handled with no workflow once it has closed.
+        """
         token = bound_workflow.set(self)
         try:
             return await self.engine.ahandle_request(request)
