@@ -21,6 +21,26 @@ ATTRIBUTION_HEADER_NAME = "X-Griptape-Attribution"
 ATTRIBUTION_SCHEMA_VERSION = 1
 
 
+@dataclass(frozen=True)
+class RunAttribution:
+    """The workflow run a model call belongs to, saved when the call starts.
+
+    A call can report after its run has ended, when another workflow or project is open. Passing
+    the saved value on the call's budget requests keeps the report on the run, workflow and project
+    that made it, so it also counts against that project's budgets.
+
+    Args:
+        run_id: The run, the id its request's result and `RunStartedEvent` name.
+        workflow: The workflow's name, or None when none was open.
+        project_chain: The open project's id and its ancestors' ids, leaf first; empty when no
+            project was open.
+    """
+
+    run_id: str
+    workflow: str | None = None
+    project_chain: list[str] = field(default_factory=list)
+
+
 @dataclass
 @PayloadRegistry.register
 class GetAttributionContextRequest(RequestPayload):
@@ -111,6 +131,9 @@ class BudgetAccessRequest(RequestPayload):
             only by budgets with no headroom left.
         node_type: Library class of the calling node, for attribution
         node_id: Opaque id of the calling node, for attribution. Never the node's label.
+        run: The workflow run the call is part of: the calling node's `run_attribution`, saved
+            when the call started. When omitted, the call is attributed to the run, workflow and
+            project in progress when the request arrives.
 
     Results: BudgetAccessResultSuccess (cleared to proceed) |
         BudgetAccessResultFailure (a budget refused the call; the node should not make it)
@@ -120,6 +143,7 @@ class BudgetAccessRequest(RequestPayload):
     estimated_cost_micro_usd: int | None = None
     node_type: str | None = None
     node_id: str | None = None
+    run: RunAttribution | None = None
     broadcast_result: bool = field(default=False, kw_only=True)
 
 
@@ -190,6 +214,9 @@ class ReportUsageRequest(RequestPayload):
         activity_type: Kind of call, e.g. "chat_completion"
         node_type: Library class of the calling node, for attribution
         node_id: Opaque id of the calling node, for attribution. Never the node's label.
+        run: The workflow run the call is part of: the calling node's `run_attribution`, saved
+            when the call started. When omitted, the call is attributed to the run, workflow and
+            project in progress when the request arrives.
         correlation_id: From the `BudgetAccessResultSuccess` of the check before this call, if any
 
     Results: ReportUsageResultSuccess (queued) | ReportUsageResultFailure (not sent)
@@ -207,6 +234,7 @@ class ReportUsageRequest(RequestPayload):
     activity_type: str | None = None
     node_type: str | None = None
     node_id: str | None = None
+    run: RunAttribution | None = None
     correlation_id: str | None = None
     broadcast_result: bool = field(default=False, kw_only=True)
 

@@ -15,6 +15,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.budget_events import RunAttribution
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue, Value
@@ -849,6 +850,10 @@ class ExecuteNodeRequest(RequestPayload):
             worker's registry entry for the workflow answers. The worker builds its copy of the
             node in that workflow, so a request with no orchestrator_workflow_id fails rather than
             running without one.
+        run: The workflow run this execution is part of, which the node holds as its
+            `run_attribution` while it runs. Sent so a worker's node can name its run on the budget
+            requests it makes, since the worker has no run of its own. None when no run is in
+            progress.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -866,6 +871,7 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
     element_modification_commands: list[RequestPayload] = field(default_factory=list)
+    run: RunAttribution | None = None
 
 
 @dataclass

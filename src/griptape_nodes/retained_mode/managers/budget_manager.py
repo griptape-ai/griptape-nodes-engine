@@ -46,6 +46,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
     ReportUsageRequest,
     ReportUsageResultFailure,
     ReportUsageResultSuccess,
+    RunAttribution,
 )
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -269,7 +270,7 @@ class BudgetManager(EngineScoped):
         """
         correlation_id = uuid.uuid4().hex
         body: dict[str, Any] = {
-            "tags": self._build_tags(request.node_type, request.node_id, workflow),
+            "tags": self._build_tags(request.node_type, request.node_id, workflow, request.run),
             "model": request.model,
             "correlation_id": correlation_id,
         }
@@ -337,7 +338,7 @@ class BudgetManager(EngineScoped):
         idempotency_key = uuid.uuid4().hex
         body: dict[str, Any] = {
             "idempotency_key": idempotency_key,
-            "tags": self._build_tags(request.node_type, request.node_id, workflow),
+            "tags": self._build_tags(request.node_type, request.node_id, workflow, request.run),
             "occurred_at": datetime.now(UTC).isoformat(),
         }
         if request.declared_cost_micro_usd is None:
@@ -379,6 +380,23 @@ class BudgetManager(EngineScoped):
             )
         return unsent
 
+    def current_run_attribution(self, workflow: WorkflowRuntime) -> RunAttribution | None:
+        """`workflow`'s run in progress, with the workflow and project it runs in, or None outside a run.
+
+        A node holds this as its `run_attribution` while it executes, so a call it makes can report to
+        this run, workflow and project after another one is open. A project chain that can't be read is
+        saved as no project, the same as a call that reports with no chain.
+        """
+        run_id = self.engine.flow_manager.spend_run_id
+        if run_id is None:
+            return None
+
+        return RunAttribution(
+            run_id=run_id,
+            workflow=self._workflow_name(workflow),
+            project_chain=self._resolve_project_chain() or [],
+        )
+
     def _resolve_project_chain(self) -> list[str] | None:
         """Resolve the current project's ancestry as ids, leaf-first.
 
@@ -398,24 +416,44 @@ class BudgetManager(EngineScoped):
         return [entry.id for entry in chain if entry.id.strip() != SYSTEM_DEFAULTS_KEY]
 
     def _build_tags(
-        self, node_type: str | None, node_id: str | None, workflow: WorkflowRuntime | None
+        self,
+        node_type: str | None,
+        node_id: str | None,
+        workflow: WorkflowRuntime | None,
+        run: RunAttribution | None,
     ) -> dict[str, Any]:
-        """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown."""
+        """Build the `tags` body field Cloud reads attribution from, leaving out what is unknown.
+
+        A call that names its run keeps that run's workflow and project, since the ones open when the
+        request arrives may belong to a later run. One that names none is counted toward the run in
+        progress, `workflow` (the workflow it is made for) and the project open now.
+        """
+        if run is None:
+            run_id = self.engine.flow_manager.spend_run_id
+            workflow_name = self._workflow_name(workflow)
+            project_chain = self._resolve_project_chain()
+        else:
+            run_id = run.run_id
+            workflow_name = run.workflow
+            project_chain = run.project_chain
         tags: dict[str, Any] = {}
-        project_chain = self._resolve_project_chain()
         if project_chain:
             tags["project"] = project_chain
-        if workflow is not None:
-            tags["workflow"] = self.engine.workflow_registry.get(workflow.workflow_id).name
         candidates = {
+            "workflow": workflow_name,
             "node_type": node_type,
             "node_id": node_id,
             "engine_id": self.engine.get_engine_id(),
             "session_id": self.engine.get_session_id(),
-            "run_id": self.engine.flow_manager.spend_run_id,
+            "run_id": run_id,
         }
         tags.update({key: value for key, value in candidates.items() if value is not None})
         return tags
+
+    def _workflow_name(self, workflow: WorkflowRuntime | None) -> str | None:
+        if workflow is None:
+            return None
+        return self.engine.workflow_registry.get(workflow.workflow_id).name
 
     def _cloud_target(self, path: str) -> CloudTarget:
         """The Griptape Cloud URL for `path` and the headers to authenticate it. Raises `_NoCredentialError`."""
