@@ -655,6 +655,25 @@ class TestMetadata:
         assert EXIF_USERCOMMENT_TAG in Exif.from_bytes(block)
         assert read_spec(injected).getattribute("Make") == "Camera Maker"
 
+    def test_exif_driver_writes_user_comment_where_earlier_releases_read_it(self) -> None:
+        camera = _camera_exif()
+        camera[EXIF_USERCOMMENT_TAG] = "a camera comment"
+        source = _with_exif(encode(solid(8, 8), "jpg"), camera)
+
+        with GriptapeImage.open(source) as image:
+            injected = ExifMetadataDriver().inject_metadata(image, {"gtn_key": "value"})
+
+        block = read_exif(injected, ImageFormat.JPEG)
+        assert block is not None
+        exif = Exif.from_bytes(block)
+        # IFD0 holds the workflow, as Pillow's getexif() reads it; the sub-IFD keeps the camera's comment
+        assert EXIF_USERCOMMENT_TAG in exif._ifd0
+        assert exif.get(EXIF_USERCOMMENT_TAG) == '{"gtn_key":"value"}'
+        with GriptapeImage.open(injected) as image:
+            assert ExifMetadataDriver().extract_metadata(image)["gtn_key"] == "value"
+        exif._ifd0.pop(EXIF_USERCOMMENT_TAG)
+        assert exif.get(EXIF_USERCOMMENT_TAG) == "a camera comment"
+
     @pytest.mark.parametrize("color", [RED, (*RED, 128)])
     def test_exif_round_trips_through_webp(self, color: tuple[int, ...]) -> None:
         source = _webp(solid(8, 8, color), ImageMetadata(exif=_camera_exif()))
@@ -1109,3 +1128,17 @@ class TestTiffExif:
             GriptapeImagePipeline(image).exif_transpose().end() as upright,
         ):
             assert (upright.width, upright.height) == (4, 8)
+
+
+class TestLosslessWebp:
+    def test_lossless_webp_keeps_every_pixel(self) -> None:
+        pixels = noise(16, 16, 4)
+        with GriptapeImage.from_array(pixels) as image:
+            reread = decode(image.encode(ImageFormat.WEBP, lossless=True))
+        # libwebp, as with Pillow's default, clears the color of fully transparent pixels
+        visible = pixels[:, :, 3] > 0
+        assert np.array_equal(reread[visible], pixels[visible])
+
+    def test_lossless_jpeg_is_refused(self) -> None:
+        with GriptapeImage.from_array(noise(4, 4)) as image, pytest.raises(ValueError, match="always lossy"):
+            image.encode(ImageFormat.JPEG, lossless=True)

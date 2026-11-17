@@ -69,8 +69,9 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         # Serialize metadata to JSON for UserComment field
         metadata_json = json.dumps(metadata, separators=(",", ":"))
 
-        # Set UserComment field
-        exif_data[EXIF_USERCOMMENT_TAG] = metadata_json
+        # In IFD0, where earlier releases wrote it and Pillow's getexif() reads it, so they can still
+        # load the workflow. A camera's own UserComment in the Exif sub-IFD stays as it was.
+        exif_data.set_primary(EXIF_USERCOMMENT_TAG, metadata_json)
 
         # Save with updated EXIF
         return image.encode(image.format, metadata=replace(image.metadata, exif=exif_data))
