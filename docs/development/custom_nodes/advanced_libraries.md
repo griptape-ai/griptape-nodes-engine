@@ -749,7 +749,7 @@ class BlockedTermsGate(DataNode):
         self.add_parameter(ParameterString(name="checked_text", tooltip="The text, if it is clean", allow_input=False))
 
     def process(self) -> None:
-        text = self.get_parameter_value("text")
+        text = self.get_parameter_value("text") or ""
         for term in BLOCKED_TERMS:
             if term.lower() in text.lower():
                 msg = f"Attempted to pass the text on. Failed because it contains the blocked term '{term}'."
