@@ -51,7 +51,9 @@ class OutputCheckLibrary(AdvancedNodeLibrary):
         if event.outcome != NodeProcessOutcome.SUCCEEDED:
             return
 
-        listed = GriptapeNodes.handle_request(ListParametersOnNodeRequest(node_name=event.node_name))
+        listed = GriptapeNodes.handle_request(
+            ListParametersOnNodeRequest(node_name=event.node_name, broadcast_result=False)
+        )
         if not isinstance(listed, ListParametersOnNodeResultSuccess):
             return
 
@@ -63,7 +65,9 @@ class OutputCheckLibrary(AdvancedNodeLibrary):
             if not terms:
                 continue
             result = GriptapeNodes.handle_request(
-                GetParameterValueRequest(parameter_name=parameter_name, node_name=event.node_name)
+                GetParameterValueRequest(
+                    parameter_name=parameter_name, node_name=event.node_name, broadcast_result=False
+                )
             )
             if not isinstance(result, GetParameterValueResultSuccess):
                 continue

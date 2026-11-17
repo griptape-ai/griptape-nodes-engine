@@ -73,10 +73,12 @@ class NodeInputsLibrary(AdvancedNodeLibrary):
         """Return {parameter name: value} for the node's input and property parameters.
 
         Requests go through `GriptapeNodes.handle_request` because a library should not reach into
-        the engine's managers directly. A request that fails is skipped rather than raised, so a
+        the engine's managers directly. Each request sets `broadcast_result=False`, because the
+        result is only for this listener. Without it the engine also sends every result, values
+        included, to the connected editor. A request that fails is skipped rather than raised, so a
         node the engine can't read never breaks the run it is logging.
         """
-        listed = GriptapeNodes.handle_request(ListParametersOnNodeRequest(node_name=node_name))
+        listed = GriptapeNodes.handle_request(ListParametersOnNodeRequest(node_name=node_name, broadcast_result=False))
         if not isinstance(listed, ListParametersOnNodeResultSuccess):
             return {}
 
@@ -85,7 +87,7 @@ class NodeInputsLibrary(AdvancedNodeLibrary):
             if not self._is_input(node_name, parameter_name):
                 continue
             result = GriptapeNodes.handle_request(
-                GetParameterValueRequest(parameter_name=parameter_name, node_name=node_name)
+                GetParameterValueRequest(parameter_name=parameter_name, node_name=node_name, broadcast_result=False)
             )
             if not isinstance(result, GetParameterValueResultSuccess):
                 continue
@@ -99,7 +101,7 @@ class NodeInputsLibrary(AdvancedNodeLibrary):
         node. Both are left out.
         """
         details = GriptapeNodes.handle_request(
-            GetParameterDetailsRequest(parameter_name=parameter_name, node_name=node_name)
+            GetParameterDetailsRequest(parameter_name=parameter_name, node_name=node_name, broadcast_result=False)
         )
         if not isinstance(details, GetParameterDetailsResultSuccess):
             return False

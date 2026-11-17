@@ -55,7 +55,7 @@ class BlockedTermsLibrary(AdvancedNodeLibrary):
 
     def _find_blocked_term(self, node_name: str) -> str | None:
         """Return the first blocked term found in the node's text inputs, or None."""
-        listed = GriptapeNodes.handle_request(ListParametersOnNodeRequest(node_name=node_name))
+        listed = GriptapeNodes.handle_request(ListParametersOnNodeRequest(node_name=node_name, broadcast_result=False))
         if not isinstance(listed, ListParametersOnNodeResultSuccess):
             return None
 
@@ -67,7 +67,7 @@ class BlockedTermsLibrary(AdvancedNodeLibrary):
             if not terms:
                 continue
             result = GriptapeNodes.handle_request(
-                GetParameterValueRequest(parameter_name=parameter_name, node_name=node_name)
+                GetParameterValueRequest(parameter_name=parameter_name, node_name=node_name, broadcast_result=False)
             )
             if not isinstance(result, GetParameterValueResultSuccess):
                 continue
