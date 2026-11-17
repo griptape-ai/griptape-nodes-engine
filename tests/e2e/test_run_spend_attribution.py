@@ -445,3 +445,10 @@ async def test_a_proxied_call_carries_the_same_run_and_tags_as_a_direct_one(
         "A proxied call's header should carry exactly the tags the same node's direct report carries."
     )
     assert {header["tags"]["run_id"] for header in headers} == {reports[0]["tags"]["run_id"]}
+    from_threads = [
+        engine.node_manager.get_node_by_name(name).parameter_output_values["attribution_from_thread"]
+        for name in NODE_NAMES
+    ]
+    assert [header["tags"] for header in from_threads] == [report["tags"] for report in reports], (
+        "A header asked for from a thread started in a copy of the node's context should carry the same tags."
+    )
