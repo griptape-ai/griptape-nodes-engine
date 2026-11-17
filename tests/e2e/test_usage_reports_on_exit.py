@@ -46,8 +46,11 @@ LIBRARY_NAME = "Usage Report Library"
 NODE_TYPE = "ReportingNode"
 
 SPEND_PATH = "/api/spend"
-# Long enough that the report is still in flight when the one-off engine's run ends.
+# Long enough that the node's second report is still queued, behind the first's reply, when the
+# one-off engine's run ends.
 REPLY_DELAY_SECONDS = 1.0
+# The fixture node reports this many calls each run.
+REPORTS_PER_RUN = 2
 
 
 @pytest.fixture
@@ -157,10 +160,11 @@ def test_an_engine_that_exits_after_its_run_still_sends_its_reports(  # noqa: PL
     write_isolated_config: Callable[..., None],
     create_node: Callable[..., str],
 ) -> None:
-    """A one-off engine reports a call in its last node, then exits as soon as the run ends.
+    """A one-off engine reports two calls in its last node, then exits as soon as the run ends.
 
-    The report thread is a daemon, so without waiting for it the process ends with the report
-    unsent. Cloud's reply is held long enough that the report is still in flight at that point.
+    Reports go out one at a time from a daemon thread, and Cloud's reply to the first is held, so
+    the second is still queued when the run ends. Without waiting for the queue, the process exits
+    with it unsent, however long its teardown takes.
     """
     library_json = materialize_library(
         tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE
@@ -194,4 +198,4 @@ def test_an_engine_that_exits_after_its_run_still_sends_its_reports(  # noqa: PL
     assert result.returncode == 0, diagnostic
     with stub_cloud.lock:
         reports = list(stub_cloud.reports)
-    assert len(reports) == 1, f"The engine exited without sending its report to Cloud.\n{diagnostic}"
+    assert len(reports) == REPORTS_PER_RUN, f"The engine exited with a report still queued.\n{diagnostic}"

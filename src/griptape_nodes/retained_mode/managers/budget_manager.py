@@ -160,6 +160,16 @@ class _ReportQueue:
                 thread.start()
                 self._thread = thread
 
+    def flush(self, timeout: float) -> int:
+        """Wait for the queued reports to be sent or dropped, for at most `timeout` seconds; return how many are left."""
+        with self._all_sent:
+            pending = self._pending
+            if pending:
+                # Said before waiting, so a pause at exit, which a Ctrl-C doesn't cut short, is explained.
+                logger.info("Waiting up to %ss for %s usage report(s) to reach Griptape Cloud.", timeout, pending)
+            self._all_sent.wait_for(lambda: self._pending == 0, timeout=timeout)
+            return self._pending
+
     def _post_reports(self) -> None:
         """Post queued reports one at a time until the queue has been idle for `idle_seconds`."""
         while True:
@@ -181,16 +191,6 @@ class _ReportQueue:
                 with self._lock:
                     self._pending -= 1
                     self._all_sent.notify_all()
-
-    def flush(self, timeout: float) -> int:
-        """Wait for the queued reports to be sent or dropped, for at most `timeout` seconds; return how many are left."""
-        with self._all_sent:
-            pending = self._pending
-            if pending:
-                # Said before waiting, so a pause at exit, which a Ctrl-C doesn't cut short, is explained.
-                logger.info("Waiting up to %ss for %s usage report(s) to reach Griptape Cloud.", timeout, pending)
-            self._all_sent.wait_for(lambda: self._pending == 0, timeout=timeout)
-            return self._pending
 
 
 class BudgetManager(EngineScoped):
