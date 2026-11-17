@@ -412,7 +412,7 @@ class BudgetManager(EngineScoped):
             "node_id": node_id,
             "engine_id": self.engine.get_engine_id(),
             "session_id": self.engine.get_session_id(),
-            "run_id": self.engine.flow_manager.current_run_id,
+            "run_id": self.engine.flow_manager.spend_run_id,
         }
         tags.update({key: value for key, value in candidates.items() if value is not None})
         return tags

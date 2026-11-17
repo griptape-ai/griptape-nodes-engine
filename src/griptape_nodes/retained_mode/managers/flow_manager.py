@@ -295,8 +295,8 @@ class FlowManager(EngineScoped):
         return self._global_single_node_resolution
 
     @property
-    def current_run_id(self) -> str | None:
-        """The id of the current workflow's run in progress, or None when nothing is running.
+    def spend_run_id(self) -> str | None:
+        """The run spend is tagged with: the current workflow's run in progress, or None when nothing is running.
 
         Spend attribution reads this, so a model call made while a run is in progress counts toward
         that run. A node in a library worker sends its budget requests to this engine, which is why
@@ -2662,7 +2662,7 @@ class FlowManager(EngineScoped):
 
     def _announce_run_started(self, run: Run) -> None:
         """Tell clients the run has the machine and its id, unless another engine's run owns it."""
-        if self.parent_run_id is not None:
+        if not self._announces(run):
             return
         self.engine.event_manager.put_event(
             run.flows.execution_event(RunStartedEvent(run_id=run.run_id, flow_name=run.flow_name))
@@ -2670,11 +2670,20 @@ class FlowManager(EngineScoped):
 
     def _announce_run_ended(self, run: Run) -> None:
         """Tell clients the run has ended and how, unless another engine's run owns it."""
-        if self.parent_run_id is not None:
+        if not self._announces(run):
             return
         self.engine.event_manager.put_event(
             run.flows.execution_event(RunEndedEvent(run_id=run.run_id, flow_name=run.flow_name, state=run.state.value))
         )
+
+    def _announces(self, run: Run) -> bool:
+        """Whether `run` is this engine's own workflow run, which clients total spend for by its id.
+
+        A node group's child engine runs on behalf of its parent's run, and a lease line holds other
+        engines' runs, which belong to no workflow here; spend in either is tagged with another
+        engine's run, so announcing them would name runs no spend carries.
+        """
+        return self.parent_run_id is None and run.flows.workflow is not None
 
     def _finish_run_if_over(self, flows: WorkflowFlows) -> None:
         """End the run in progress in `flows` if its flow has stopped, on the paths that can stop a paused run.

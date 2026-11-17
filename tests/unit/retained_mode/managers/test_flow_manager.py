@@ -1235,6 +1235,18 @@ class TestALineOfItsOwn:
         first_may_end.set()
         await asyncio.wait_for(first.outcome, timeout=1.0)
 
+    @pytest.mark.asyncio
+    async def test_a_run_in_a_line_of_its_own_announces_neither_its_start_nor_its_end(self, engine: Engine) -> None:
+        """Its spend is tagged with the other engine's run, so an id announced here would total nothing."""
+        engine.event_manager.put_event = MagicMock()  # type: ignore[method-assign]
+        line = WorkflowFlows()
+
+        run = engine.flow_manager.submit_run(_Spec("a run from engine x", _ran_async("remote")), flows=line)
+        await asyncio.wait_for(run.ended, timeout=1.0)
+
+        assert _payloads(engine, RunStartedEvent) == []
+        assert _payloads(engine, RunEndedEvent) == []
+
     def test_a_run_given_no_line_still_needs_a_workflow(self, engine: Engine) -> None:
         with pytest.raises(NoOpenWorkflowError):
             engine.flow_manager.submit_run(_Spec("flow", _ran_async("flow")))
@@ -2119,7 +2131,7 @@ class TestSpendNamesTheRunInProgress:
         seen: list[str | None] = []
 
         async def body() -> Any:
-            seen.append(flow_manager.current_run_id)
+            seen.append(flow_manager.spend_run_id)
             return _ran("run")
 
         result = await flow_manager.start_run(_Spec("flow", body))
@@ -2127,7 +2139,7 @@ class TestSpendNamesTheRunInProgress:
         assert isinstance(result, StartFlowResultSuccess)
 
         assert seen == [result.run_id]
-        assert flow_manager.current_run_id is None, "Spend made between runs belongs to no run."
+        assert flow_manager.spend_run_id is None, "Spend made between runs belongs to no run."
 
     @pytest.mark.asyncio
     async def test_a_run_announces_its_id_when_it_starts(self, engine: Engine) -> None:
@@ -2150,7 +2162,7 @@ class TestSpendNamesTheRunInProgress:
         seen: list[str | None] = []
 
         async def body() -> Any:
-            seen.append(flow_manager.current_run_id)
+            seen.append(flow_manager.spend_run_id)
             return _ran("run")
 
         try:

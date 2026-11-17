@@ -472,7 +472,7 @@ class TestSubprocessRunsUnderTheParentRun:
     @pytest.mark.asyncio
     async def test_the_child_engine_is_given_the_run_in_progress(self, tmp_path: Any) -> None:
         executor = _make_executor()
-        cast("MagicMock", executor.engine).flow_manager.current_run_id = "parent-run"
+        cast("MagicMock", executor.engine).flow_manager.spend_run_id = "parent-run"
         executor._get_storage_backend = AsyncMock(return_value=MagicMock())  # type: ignore[method-assign]
         child = MagicMock()
         child.__aenter__ = AsyncMock(return_value=child)

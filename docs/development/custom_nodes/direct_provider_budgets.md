@@ -81,7 +81,7 @@ await GriptapeNodes.ahandle_request(
 
 ## What one run cost
 
-Every `BudgetAccessRequest` and `ReportUsageRequest` sent while a workflow runs carries that run's id as the `run_id` tag, so Griptape Cloud can total what one run cost, apart from earlier runs of the same workflow. A loop's iterations, a node run while a flow is already running, and a node group set to run in a separate process on the same machine all count toward the run in progress. A group sent to a remote execution environment reports under that environment's own run ids. A request sent while no run is in progress carries no `run_id`.
+Every `BudgetAccessRequest` and `ReportUsageRequest` sent while a workflow runs carries that run's id as the `run_id` tag, so Griptape Cloud can total what one run cost, apart from earlier runs of the same workflow. A loop's iterations, a node run while another node run is in progress, and a node group set to run in a separate process on the same machine all count toward the run in progress. A group sent to a remote execution environment reports under that environment's own run ids. A request sent while no run is in progress carries no `run_id`.
 
 The id is the run's own: the one its request's result names in `run_id`, and the one `RunQueuedEvent`, `ListRunsRequest` and `CancelRunRequest` use. A run started while another is in progress waits its turn and keeps that id. The engine announces it on `RunStartedEvent` when the run starts, so a client can learn the id as the run starts rather than when its request returns, and on `RunEndedEvent` when the run ends, with how it ended: finished, failed, or cancelled. Every run that sends a start event sends exactly one end event, including a run whose flow fails before it starts.
 
