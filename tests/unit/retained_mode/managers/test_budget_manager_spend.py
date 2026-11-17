@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.events.budget_events import (
     ReportUsageRequest,
     ReportUsageResultFailure,
     ReportUsageResultSuccess,
+    RunAttribution,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.managers import budget_manager as budget_manager_module
@@ -66,6 +67,17 @@ def _mock_engine(*, credential: str | None = "gt-key") -> MagicMock:
     secrets = {"GT_CLOUD_BASE_URL": BASE_URL, "GT_CLOUD_API_KEY": credential}
     engine.secrets_manager.get_secret.side_effect = lambda name, **_: secrets.get(name)
     return engine
+
+
+def _workflow_named(engine: MagicMock, name: str) -> MagicMock:
+    """A workflow the request is bound to, which the registry names `name`."""
+    engine.workflow_registry.get.return_value.name = name
+    return MagicMock()
+
+
+CALLING_RUN = RunAttribution(
+    run_id="calling-run", workflow="calling_flow", project_chain=("calling-project", "calling-parent")
+)
 
 
 def _manager(engine: MagicMock | None = None) -> BudgetManager:
@@ -239,6 +251,88 @@ class TestBudgetCheckAllowed:
         assert isinstance(first, BudgetAccessResultSuccess)
         assert isinstance(second, BudgetAccessResultSuccess)
         assert first.correlation_id != second.correlation_id
+
+
+class TestRunAttribution:
+    """A call names the run that made it; the run, workflow and project open when it arrives can be later ones."""
+
+    def test_a_check_that_names_its_run_keeps_it(self, http: MagicMock) -> None:
+        http.return_value = _response(200, {"allowed": True})
+        engine = _mock_engine()
+        engine.flow_manager.spend_run_id = "later-run"
+
+        _check(_manager(engine), BudgetAccessRequest(model="m", run=CALLING_RUN))
+
+        assert _sent(http)["tags"]["run_id"] == "calling-run"
+
+    def test_a_late_report_keeps_its_run_s_workflow_and_project(self, http: MagicMock) -> None:
+        """Another workflow and project are open by the time it reports; it still counts toward its own."""
+        http.return_value = _response(201)
+        engine = _mock_engine()
+        engine.flow_manager.spend_run_id = "later-run"
+        later_workflow = _workflow_named(engine, "later_flow")
+        engine.project_manager.get_project_chain.return_value = [ProjectChainEntry(id="later-project", name="Later")]
+
+        _manager(engine).on_report_usage_request(
+            ReportUsageRequest(declared_cost_micro_usd=1, model="m", run=CALLING_RUN), later_workflow
+        )
+
+        tags = _sent(http)["tags"]
+        assert tags["run_id"] == "calling-run"
+        assert tags["workflow"] == "calling_flow"
+        assert tags["project"] == ["calling-project", "calling-parent"]
+
+    def test_a_run_saved_with_no_project_or_workflow_sends_neither(self, http: MagicMock) -> None:
+        """The project and workflow open at report time aren't the call's, so they aren't filled in."""
+        http.return_value = _response(201)
+
+        _manager().on_report_usage_request(
+            ReportUsageRequest(declared_cost_micro_usd=1, model="m", run=RunAttribution(run_id="calling-run"))
+        )
+
+        tags = _sent(http)["tags"]
+        assert tags["run_id"] == "calling-run"
+        assert "workflow" not in tags
+        assert "project" not in tags
+
+    def test_a_call_that_names_no_run_counts_toward_what_is_open_now(self, http: MagicMock) -> None:
+        """What a library that doesn't send `run` yet gets."""
+        http.return_value = _response(201)
+        engine = _mock_engine()
+        engine.flow_manager.spend_run_id = "run-in-progress"
+
+        _manager(engine).on_report_usage_request(
+            ReportUsageRequest(declared_cost_micro_usd=1, model="m"), _workflow_named(engine, "poster_flow")
+        )
+
+        tags = _sent(http)["tags"]
+        assert tags["run_id"] == "run-in-progress"
+        assert tags["workflow"] == "poster_flow"
+        assert tags["project"] == ["shot-6", "star-wars-x"]
+
+
+class TestCurrentRunAttribution:
+    def test_saves_the_run_in_progress_with_its_workflow_and_project(self) -> None:
+        engine = _mock_engine()
+
+        assert _manager(engine).current_run_attribution(_workflow_named(engine, "poster_flow")) == RunAttribution(
+            run_id="run-1", workflow="poster_flow", project_chain=("shot-6", "star-wars-x")
+        )
+
+    def test_is_none_outside_a_run(self) -> None:
+        engine = _mock_engine()
+        engine.flow_manager.spend_run_id = None
+
+        assert _manager(engine).current_run_attribution(_workflow_named(engine, "poster_flow")) is None
+
+    def test_an_unreadable_project_chain_is_saved_as_no_project(self) -> None:
+        engine = _mock_engine()
+        engine.project_manager.get_project_chain.side_effect = RuntimeError("project file unreadable")
+
+        run = _manager(engine).current_run_attribution(_workflow_named(engine, "poster_flow"))
+
+        assert run is not None
+        assert run.project_chain == ()
 
 
 class TestBudgetCheckDenied:

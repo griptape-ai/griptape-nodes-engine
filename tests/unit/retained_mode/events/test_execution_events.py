@@ -6,6 +6,7 @@ from griptape.artifacts import ImageUrlArtifact
 
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import EventRequest, EventResultSuccess, SkipTheLineMixin
+from griptape_nodes.retained_mode.events.budget_events import RunAttribution
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     CancelExecuteNodeResultFailure,
@@ -57,6 +58,17 @@ class TestExecuteNodeWireForm:
         assert type(values["image"]) is ImageUrlArtifact
         assert values["image"].to_dict() == artifact.to_dict()
         assert values["pair"] == (1, "b")
+
+    def test_the_run_survives_the_wire(self) -> None:
+        """A worker's node names its run on its budget requests, so it must arrive as a run, not a dict."""
+        run = RunAttribution(run_id="run-1", workflow="poster_flow", project_chain=("shot-6", "star-wars-x"))
+        request = ExecuteNodeRequest(node_name="n", run=run)
+
+        received = converters.engine.structure(
+            json.loads(converters.engine.dumps(EventRequest(request=request))), EventRequest
+        )
+
+        assert received.request.run == run
 
     def test_result_values_survive_the_wire(self) -> None:
         result = ExecuteNodeResultSuccess(
