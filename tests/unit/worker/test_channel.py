@@ -50,6 +50,9 @@ WRAPPER = ["cmd", "/c"] if sys.platform == "win32" else [shutil.which("env") or 
 REQUEST_TIMEOUT_S = 5.0
 ACCEPT_TIMEOUT_S = 5.0
 SHORT_TIMEOUT_S = 0.3
+# How long a test holds the parent's loop, as an engine busy with something else does. Longer than any
+# per-read bound worth putting on a loopback handshake, so one put back makes these tests fail.
+BUSY_PARENT_HOLDS_ITS_LOOP_S = 6.0
 
 
 class _ConnectedPair(NamedTuple):
@@ -94,6 +97,33 @@ class _Recorder:
     def on_closed(self) -> None:
         self.closed_count += 1
         self.closed.set()
+
+
+class _ParentLoop:
+    """Runs the parent's end on a loop of its own, so a test can hold that loop as a busy engine does."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self.loop.run_forever, name="test-parent-loop", daemon=True)
+        self._thread.start()
+
+    def run(self, coro: Any) -> Any:
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    async def hold(self, seconds: float) -> None:
+        """Block the parent's loop for `seconds`, returning once the hold has begun."""
+        begun = threading.Event()
+
+        def busy() -> None:
+            begun.set()
+            time.sleep(seconds)
+
+        self.loop.call_soon_threadsafe(busy)
+        assert await asyncio.to_thread(begun.wait, REQUEST_TIMEOUT_S)
+
+    def stop(self) -> None:
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(REQUEST_TIMEOUT_S)
 
 
 async def _drain_other_tasks() -> None:
@@ -789,6 +819,91 @@ async def test_bad_and_silent_peers_do_not_block_a_real_worker() -> None:
         silent_writer.close()
         wrong_writer.close()
         garbage_writer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_worker_outwaits_a_parent_whose_loop_is_held_before_it_sends_its_challenge() -> None:
+    """A busy parent sends its challenge late; its worker connects once it does, however late that is."""
+    parent = _ParentLoop()
+    try:
+        pending = parent.run(listen_for_worker()).result(REQUEST_TIMEOUT_S)
+        accepted = parent.run(pending.accept(BUSY_PARENT_HOLDS_ITS_LOOP_S + ACCEPT_TIMEOUT_S))
+        await parent.hold(BUSY_PARENT_HOLDS_ITS_LOOP_S)
+
+        child = await connect_to_parent(pending.child_environment)
+        parent_channel = await asyncio.wrap_future(accepted)
+        child.close()
+        parent.loop.call_soon_threadsafe(parent_channel.close)
+    finally:
+        parent.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_parent_whose_loop_was_held_takes_the_proof_that_arrived_meanwhile() -> None:
+    """The worker answers while its parent is busy; the parent reads that answer once it is free."""
+    parent = _ParentLoop()
+    try:
+        pending = parent.run(listen_for_worker()).result(REQUEST_TIMEOUT_S)
+        accepted = parent.run(pending.accept(BUSY_PARENT_HOLDS_ITS_LOOP_S + ACCEPT_TIMEOUT_S))
+        environ = pending.child_environment
+        token = environ[channel_module.CHANNEL_TOKEN_ENV]
+        host, port_str = environ[channel_module.CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+        reader, writer = await asyncio.open_connection(host, int(port_str))
+        parent_challenge = (await channel_module._read_json_frame(reader))["challenge"]
+
+        # The parent is now waiting for this worker's answer, and is held before it can read it.
+        await parent.hold(BUSY_PARENT_HOLDS_ITS_LOOP_S)
+        worker_challenge = secrets.token_hex(32)
+        proof = channel_module._proof(token, parent_challenge)
+        writer.write(channel_module._encode_frame({"proof": proof, "challenge": worker_challenge}))
+        await writer.drain()
+        answer = await asyncio.wait_for(
+            channel_module._read_json_frame(reader), BUSY_PARENT_HOLDS_ITS_LOOP_S + REQUEST_TIMEOUT_S
+        )
+        parent_channel = await asyncio.wrap_future(accepted)
+
+        assert channel_module._proves(answer.get("proof"), token, worker_challenge)
+        writer.close()
+        parent.loop.call_soon_threadsafe(parent_channel.close)
+    finally:
+        parent.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_unproven_connection_ends_once_the_parent_has_its_worker() -> None:
+    """A peer that never answers is cut off as soon as the real worker is in, not by a clock."""
+    pending = await listen_for_worker()
+    host, port_str = pending.child_environment[channel_module.CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+    silent_reader, silent_writer = await asyncio.open_connection(host, int(port_str))
+
+    child = await connect_to_parent(pending.child_environment)
+    parent_channel = await pending.accept(ACCEPT_TIMEOUT_S)
+    try:
+        # Everything it was ever sent, up to the end of the connection: the challenge, then EOF. Well
+        # inside the time any read bound would take, so the end can only have come from the accept.
+        sent = await asyncio.wait_for(silent_reader.read(), REQUEST_TIMEOUT_S / 2)
+        assert b'"challenge"' in sent
+        assert b'"proof"' not in sent
+    finally:
+        parent_channel.close()
+        child.close()
+        silent_writer.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unproven_connection_ends_when_the_wait_for_a_worker_does() -> None:
+    """With no worker in time, the parent stops waiting, and every connection still unproven ends with it."""
+    pending = await listen_for_worker()
+    host, port_str = pending.child_environment[channel_module.CHANNEL_ADDRESS_ENV].rsplit(":", 1)
+    silent_reader, silent_writer = await asyncio.open_connection(host, int(port_str))
+
+    with pytest.raises(TimeoutError):
+        await pending.accept(SHORT_TIMEOUT_S)
+    try:
+        sent = await asyncio.wait_for(silent_reader.read(), REQUEST_TIMEOUT_S / 2)
+        assert b'"proof"' not in sent
+    finally:
+        silent_writer.close()
 
 
 @pytest.mark.asyncio

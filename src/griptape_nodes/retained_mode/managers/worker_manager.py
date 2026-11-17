@@ -129,6 +129,7 @@ _RUN_ON_REMOTE_WORKERS = frozenset({ExecuteNodeRequest.__name__})
 
 # Why a node's local worker went away, when nothing that stopped it said otherwise.
 _LOCAL_WORKER_STOPPED = "the worker process running it stopped."
+_RESTARTED_BY_NEXT_NODE = " The library's next node starts it again."
 
 
 @dataclass
@@ -431,25 +432,28 @@ class WorkerManager(EngineScoped):
         self._transport = _WorkerTransport(send_message=send_message)
 
     async def _activate_project_on_worker(self, worker_engine_id: str) -> None:
-        """Tell one worker which project to be on, as of the last activation that committed.
+        """Have one worker adopt the project this engine is on, which it asks for.
 
         Sent without awaiting a reply: registration must not depend on a round trip back into the
         worker, which would make answering it hostage to a worker that is merely slow. The worker
-        blocks on having applied an activation before it loads a library instead, which is a wait it
-        can bound locally.
-
-        The COMMITTED pair rather than the live id: `_current_project_id` is assigned before
-        activation's fallible steps, so reading it mid-switch could name a project about to be
-        rolled back. Both halves come from one read, so the generation always describes the id it
-        was committed with. Sent for system defaults too -- a worker has to be told what it is on
-        even when that is the rest state, or nothing distinguishes "told" from "not yet told".
+        blocks on having applied an activation before it loads a library instead, a wait that ends
+        with that adoption, however long this engine takes to answer what it asks.
         """
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 
-        project_id, generation = self.engine.project_manager.committed_project()
         await self.forward_event_to_worker(
-            EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=generation)),
-            worker_engine_id=worker_engine_id,
+            EventRequest(request=ActivateProjectRequest()), worker_engine_id=worker_engine_id
+        )
+
+    @handles(worker_events.GetCommittedProjectRequest)
+    def handle_get_committed_project_request(
+        self,
+        request: worker_events.GetCommittedProjectRequest,  # noqa: ARG002
+    ) -> worker_events.GetCommittedProjectResultSuccess:
+        """Answer a worker asking which project to be on."""
+        project_id = self.engine.project_manager.committed_project_id
+        return worker_events.GetCommittedProjectResultSuccess(
+            project_id=project_id, result_details=f"This engine is on project '{project_id}'."
         )
 
     def is_worker_running_or_starting(self, worker_key: str | None) -> bool:
@@ -674,6 +678,8 @@ class WorkerManager(EngineScoped):
             return
         del self._workers[worker_id]
         worker_key = registration.worker_key
+        # Read before the reason below settles the library: one that never loaded failed while starting up.
+        loaded = self.has_settled(worker_key)
         proc = registration.process
         returncode = None
         if proc is not None and self._managed_worker_processes.get(worker_key) is proc:
@@ -681,12 +687,18 @@ class WorkerManager(EngineScoped):
             await self._terminate_managed_process(worker_key, proc)
             returncode = proc.returncode
         reason = registration.gone_reason
-        if reason is None:
-            reason = f"the worker process running it stopped (exit code {returncode}). The engine log has the details."
-            logger.error(
-                "Worker for key '%s' stopped (exit code %s). Its own log lines above say why.", worker_key, returncode
-            )
-        self.note_worker_unavailable(worker_key, reason)
+        if reason is not None:
+            self.note_worker_unavailable(worker_key, reason)
+            return
+        reason = f"the worker process running it stopped (exit code {returncode}). The engine log has the details."
+        logger.error(
+            "Worker for key '%s' stopped (exit code %s). Its own log lines above say why.", worker_key, returncode
+        )
+        # A library worker that crashed after loading is started again by its library's next node.
+        retryable = loaded and worker_key is not None
+        if retryable:
+            reason += _RESTARTED_BY_NEXT_NODE
+        self.note_worker_unavailable(worker_key, reason, retryable=retryable)
 
     async def _relay_worker_event(self, event_type: str, payload: dict[str, Any]) -> None:
         """Send on, unacted on, what a worker would have sent the editor, when there is an editor to send it to."""
@@ -1404,12 +1416,9 @@ class WorkerManager(EngineScoped):
             host_engine_id=host_engine_id, library_name=library_name
         )
         logger.info("Asking %s to start worker %s for library '%s'.", host_engine_id, worker_engine_id, library_name)
-        project_id, generation = self.engine.project_manager.committed_project()
         request = worker_events.StartWorkerForEngineRequest(
             library_name=library_name,
             worker_engine_id=worker_engine_id,
-            project_id=project_id,
-            project_generation=generation,
         )
         try:
             result = await self.engine.request(host_engine_id, request, timeout_s=ENGINE_REQUEST_TIMEOUT_S)
@@ -1557,8 +1566,9 @@ class WorkerManager(EngineScoped):
         """Settle a worker another engine ran for this engine, now that that engine reports it exited.
 
         Handled like a local worker's exit: a start whose worker never loaded settles the library with
-        the reason, and a worker in service is removed at once. "exited" leaves the library unavailable
-        with the reason; "stopped" leaves it free to be started again.
+        the reason, and a worker in service is removed at once. A worker that crashed after loading leaves
+        the library to be started again by its next node; one that never loaded or was refused leaves it
+        unavailable with the reason; "stopped" leaves it free to be started again.
         """
         wid = request.worker_engine_id
         start = self._starts_asked_of_hosts.get(wid)
@@ -1592,12 +1602,16 @@ class WorkerManager(EngineScoped):
                 "That engine's log has the details."
             )
         logger.warning("Worker %s for library '%s' on %s %s.", wid, library_name, host_engine_id, request.reason)
+        # A worker that crashed after loading is started again by its library's next node.
+        retryable = registered and request.reason == "exited" and request.details is None
+        if retryable:
+            reason += _RESTARTED_BY_NEXT_NODE
         if registered:
             self._release_worker(wid, reason)
-        # The local rules: a worker that ended on its own leaves its library unavailable, and one that
-        # was stopped does so only if it never loaded, so whatever waits on it hears why.
+        # As for a local worker, one that ended on its own records why, and one that was stopped does
+        # so only if it never loaded, so whatever waits on it hears why.
         if request.reason == "exited" or not self.has_settled(library_name):
-            self.note_worker_unavailable(library_name, reason)
+            self.note_worker_unavailable(library_name, reason, retryable=retryable)
         return worker_events.ReportWorkerExitedResultSuccess(result_details=f"Recorded that worker {wid} exited.")
 
     @handles(
@@ -1619,7 +1633,7 @@ class WorkerManager(EngineScoped):
         self._workers[wid] = WorkerRegistration(worker_key=start.library_name, host_engine_id=start.host_engine_id)
         logger.debug("Worker %s for library '%s' runs on engine %s", wid, start.library_name, start.host_engine_id)
         await self._note_libraries_loaded(start.library_name, request.libraries)
-        # It started on the project the start named; a switch since then reaches it only this way.
+        # It asked which project as it started; a switch since then reaches it only this way.
         self._send_notice(self._activate_project_on_worker(wid))
         return worker_events.ReportRemoteWorkerReadyResultSuccess(result_details=f"Took worker {wid} into service.")
 
@@ -1838,7 +1852,7 @@ class WorkerManager(EngineScoped):
             )
         registration.process = proc
         served.started.set()
-        self._watch_and_connect_served_worker(worker_engine_id, registration, proc, pending, request)
+        self._watch_and_connect_served_worker(worker_engine_id, registration, proc, pending)
         return worker_events.StartWorkerForEngineResultSuccess(
             result_details=f"Started worker {worker_engine_id} for library '{library_name}' for another engine."
         )
@@ -1871,7 +1885,6 @@ class WorkerManager(EngineScoped):
         registration: WorkerRegistration,
         proc: asyncio.subprocess.Process,
         pending: PendingWorker,
-        request: worker_events.StartWorkerForEngineRequest,
     ) -> None:
         """Watch a just-started worker this engine runs for another engine, and connect it, each in its own task."""
         loop = asyncio.get_running_loop()
@@ -1882,29 +1895,19 @@ class WorkerManager(EngineScoped):
         watcher.add_done_callback(self._exit_watchers.discard)
         connecting = create_task_bound_to_no_workflow(
             loop,
-            self._connect_served_worker(
-                worker_engine_id,
-                registration,
-                proc,
-                pending,
-                project_id=request.project_id,
-                project_generation=request.project_generation,
-            ),
+            self._connect_served_worker(worker_engine_id, registration, proc, pending),
         )
         self._exit_watchers.add(connecting)
         connecting.add_done_callback(self._exit_watchers.discard)
 
-    async def _connect_served_worker(  # noqa: PLR0913 (each is a separate fact about this start)
+    async def _connect_served_worker(
         self,
         worker_engine_id: str,
         registration: WorkerRegistration,
         proc: asyncio.subprocess.Process,
         pending: PendingWorker,
-        *,
-        project_id: str,
-        project_generation: int,
     ) -> None:
-        """Wait for a worker this engine runs for another engine to connect, then carry it, on that engine's project."""
+        """Wait for a worker this engine runs for another engine to connect, then carry it and have it adopt that engine's project."""
         # Lazy import: worker_routing imports this module.
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 
@@ -1942,7 +1945,8 @@ class WorkerManager(EngineScoped):
         served.end = end
         end.attach(channel)
         logger.debug("Worker %s for key '%s' (pid %s) connected", worker_engine_id, registration.worker_key, proc.pid)
-        activation = EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=project_generation))
+        # The artist's engine answers this worker from the moment it asked for it, so the worker can ask already.
+        activation = EventRequest(request=ActivateProjectRequest())
         with contextlib.suppress(ChannelClosedError):
             channel.notify(event_request_envelope(activation))
 
@@ -1964,7 +1968,9 @@ class WorkerManager(EngineScoped):
             worker_engine_id=worker_engine_id, libraries=hello.libraries
         )
         try:
-            result = await self.engine.request(served.owning_engine_id, ready, timeout_s=ENGINE_REQUEST_TIMEOUT_S)
+            # Unbounded, as everything the worker asks before its hello is accepted: the link to that
+            # engine failing is what ends the wait, and a busy engine is not a failed one.
+            result = await self.engine.request(served.owning_engine_id, ready, timeout_s=None)
         except EngineNotFoundError as e:
             return {
                 "accepted": False,
@@ -2656,6 +2662,11 @@ class WorkerManager(EngineScoped):
         if ready is not None:
             ready.set()
 
+    def may_start_worker(self, library_name: str | None) -> bool:
+        """Whether `library_name`'s worker may be started: nothing has ruled it out, or what did is retryable."""
+        unavailable = self._worker_unavailable.get(library_name)
+        return unavailable is None or unavailable.retryable
+
     def note_worker_unavailable(self, library_name: str | None, reason: str, *, retryable: bool = False) -> None:
         """Record why no worker will run `library_name`, and release anything waiting on one.
 
@@ -2733,9 +2744,10 @@ class WorkerManager(EngineScoped):
         once, as before a lease, which must not load the library there while another run holds that engine.
         """
         if library_name is not None:
-            if start_stopped:
-                await self._ask_host_to_restart_stopped_worker(library_name)
-            elif self._host_stopped_remote_worker(library_name):
+            # No lease holds a local worker, so one that crashed is started again either way.
+            if start_stopped or self._engine_for_library(library_name) is None:
+                await self._start_worker_if_stopped(library_name)
+            elif self._worker_stopped(library_name):
                 return
         if self.has_settled(library_name):
             return
@@ -2759,21 +2771,23 @@ class WorkerManager(EngineScoped):
                 )
             raise RuntimeError(msg) from None
 
-    async def _ask_host_to_restart_stopped_worker(self, library_name: str) -> None:
-        """Start a library's worker on its engine again, if that engine stopped it rather than it ending on its own."""
-        if not self._host_stopped_remote_worker(library_name):
+    async def _start_worker_if_stopped(self, library_name: str) -> None:
+        """Start a library's worker again, if it is stopped and may be started again."""
+        if not self._worker_stopped(library_name):
             return
         await self.handle_start_worker_request(worker_events.StartWorkerRequest(library_name=library_name))
 
-    def _host_stopped_remote_worker(self, library_name: str) -> bool:
-        """Whether `library_name`'s worker on another engine is stopped and may be started again there."""
-        if self._engine_for_library(library_name) is None:
-            return False
+    def _worker_stopped(self, library_name: str) -> bool:
+        """Whether `library_name`'s worker is stopped and may be started again."""
         if self.is_worker_running_or_starting(library_name):
             return False
-        # A worker that ended on its own left a reason, which stays until the library is reset.
-        unavailable = self._worker_unavailable.get(library_name)
-        return unavailable is None or unavailable.retryable
+        if self._engine_for_library(library_name) is None:
+            # A local library with no reason has no worker to start: either it runs in this process,
+            # or its worker is started when the library loads.
+            unavailable = self._worker_unavailable.get(library_name)
+            return unavailable is not None and unavailable.retryable
+        # One that ended on its own left a reason, which only a crash after loading leaves retryable.
+        return self.may_start_worker(library_name)
 
     def get_topics_to_subscribe(self) -> list[str]:
         """Build the list of topics to subscribe to at connection start.
@@ -3002,20 +3016,16 @@ class WorkerManager(EngineScoped):
     async def _on_current_project_changed(self, _event: CurrentProjectChanged) -> None:
         """Fan out an ActivateProjectRequest after the orchestrator switched projects.
 
-        Reads the committed pair rather than taking the id off the event, so the id and the
-        generation describing it come from one read. Two switches in quick succession therefore
-        both fan out the newest committed state, and a worker cannot be told to go backwards.
-        Awaited inline for the same side-loop reason documented on ``_on_config_changed``; lazy
-        import for the same circular-dependency reason.
+        It names no project: each worker asks which one when it adopts, so two switches in quick
+        succession cannot leave a worker on the older. Awaited inline for the same side-loop reason
+        documented on ``_on_config_changed``; lazy import for the same circular-dependency reason.
         """
         from griptape_nodes.app.worker_routing import ActivateProjectRequest
 
         if not self._own_workers():
             return
-        project_id, generation = self.engine.project_manager.committed_project()
-        failures = await self.broadcast_to_workers_awaiting_replies(
-            EventRequest(request=ActivateProjectRequest(project_id=project_id, generation=generation))
-        )
+        project_id = self.engine.project_manager.committed_project_id
+        failures = await self.broadcast_to_workers_awaiting_replies(EventRequest(request=ActivateProjectRequest()))
         # A worker left on the old project resolves workspace-relative paths against the old
         # workspace, so it writes where this engine does not read. Loud here beats silent there.
         for failure in failures:
