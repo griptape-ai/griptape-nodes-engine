@@ -242,7 +242,7 @@ The agent chat shows a similar message when a budget stops a reply. Nothing is c
 
 !!! note "Which plans include it"
 
-    **Usage Audit** is included with the Professional, Paid, Partner, and Enterprise plans. On other plans it does not appear in the sidebar.
+    **Usage Audit** is included with the Professional and Enterprise plans. On other plans it does not appear in the sidebar.
 
 **Usage Audit** shows where your organization's credits went, so you can see which shows, artists and models are spending, and set budgets to match.
 
