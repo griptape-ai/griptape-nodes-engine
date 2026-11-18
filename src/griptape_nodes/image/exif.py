@@ -348,6 +348,10 @@ class Exif:
         copied._thumbnail = self._thumbnail
         return copied
 
+    def set_gps(self, tag: int, value: Any) -> None:
+        """Set a tag inside the GPS sub-IFD."""
+        self._gps_ifd[tag] = _encoded(tag, value, self._gps_ifd.get(tag), self._byte_order)
+
     def remove_thumbnail(self) -> None:
         """Drop the embedded thumbnail, as one that no longer matches the picture should be."""
         self._ifd1 = {}

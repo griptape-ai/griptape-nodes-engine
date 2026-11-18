@@ -4,12 +4,10 @@ import copy
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx2
-from PIL import Image
 
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import BaseNodeGroup
@@ -18,6 +16,7 @@ from griptape_nodes.exe_types.node_types import (
     NodeDependencies,
     VariableReference,
 )
+from griptape_nodes.image import GriptapeImage
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -1273,7 +1272,7 @@ class FlowSerialization(EngineScoped):
         raise FlowDeserializationError(msg)
 
     @handles(ExtractFlowCommandsFromImageMetadataRequest)
-    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
+    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911
         self, request: ExtractFlowCommandsFromImageMetadataRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Extract flow commands from PNG image metadata.
@@ -1288,50 +1287,10 @@ class FlowSerialization(EngineScoped):
             ExtractFlowCommandsFromImageMetadataResultFailure if any step fails
         """
         file_url_or_path = request.file_url_or_path
-
-        # Check if input is a URL or file path
-        is_url = file_url_or_path.startswith(("http://", "https://"))
-
-        if is_url:
-            # Handle URL: download the image
-            try:
-                response = httpx2.get(file_url_or_path, timeout=30.0)
-                response.raise_for_status()
-                pil_image = Image.open(BytesIO(response.content))
-            except Exception as e:
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"Failed to download or open image from URL: {e}",
-                    file_path=file_url_or_path,
-                )
-        else:
-            # Handle file path: validate and open
-            path_obj = Path(file_url_or_path)
-            if not path_obj.exists():
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"File not found: {file_url_or_path}",
-                    file_path=file_url_or_path,
-                )
-
-            if not path_obj.is_file():
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"Path is not a file: {file_url_or_path}",
-                    file_path=file_url_or_path,
-                )
-
-            # Read PNG image and extract metadata
-            try:
-                pil_image = Image.open(file_url_or_path)
-            except Exception as e:
-                return ExtractFlowCommandsFromImageMetadataResultFailure(
-                    result_details=f"Failed to open image file: {e}",
-                    file_path=file_url_or_path,
-                )
-
-        # An image without embedded flow commands is a valid state, not an error.
-        metadata = pil_image.info if hasattr(pil_image, "info") else {}
-        # Closed now: a failure reading the commands can keep this frame, and the open file, alive
-        # until garbage collection, and Windows won't delete or replace an open file.
-        pil_image.close()
+        metadata_or_failure = self._read_image_text_metadata(file_url_or_path)
+        if isinstance(metadata_or_failure, ExtractFlowCommandsFromImageMetadataResultFailure):
+            return metadata_or_failure
+        metadata = metadata_or_failure
         if not metadata:
             return ExtractFlowCommandsFromImageMetadataResultSuccess(
                 result_details=f"Image has no metadata: {file_url_or_path}",
@@ -1389,6 +1348,49 @@ class FlowSerialization(EngineScoped):
             serialized_flow_commands=serialized_flow_commands,
             altered_workflow_state=False,
         )
+
+    def _read_image_text_metadata(
+        self, file_url_or_path: str
+    ) -> dict[str, str] | ExtractFlowCommandsFromImageMetadataResultFailure:
+        """Open ``file_url_or_path``, read its text metadata, and close the image handle immediately."""
+        if file_url_or_path.startswith(("http://", "https://")):
+            try:
+                response = httpx2.get(file_url_or_path, timeout=30.0)
+                response.raise_for_status()
+                image = GriptapeImage.open(response.content)
+            except Exception as e:
+                return ExtractFlowCommandsFromImageMetadataResultFailure(
+                    result_details=f"Failed to download or open image from URL: {e}",
+                    file_path=file_url_or_path,
+                )
+        else:
+            path_obj = Path(file_url_or_path)
+            if not path_obj.exists():
+                return ExtractFlowCommandsFromImageMetadataResultFailure(
+                    result_details=f"File not found: {file_url_or_path}",
+                    file_path=file_url_or_path,
+                )
+            if not path_obj.is_file():
+                return ExtractFlowCommandsFromImageMetadataResultFailure(
+                    result_details=f"Path is not a file: {file_url_or_path}",
+                    file_path=file_url_or_path,
+                )
+            try:
+                image = GriptapeImage.open(path_obj)
+            except Exception as e:
+                return ExtractFlowCommandsFromImageMetadataResultFailure(
+                    result_details=f"Failed to open image file: {e}",
+                    file_path=file_url_or_path,
+                )
+
+        with image:
+            try:
+                return dict(image.metadata.text)
+            except ValueError as e:
+                return ExtractFlowCommandsFromImageMetadataResultFailure(
+                    result_details=f"Failed to read image metadata: {e}",
+                    file_path=file_url_or_path,
+                )
 
     def _read_image_flow_commands(self, text: str) -> SerializedFlowCommands:
         """Read the flow commands an image's metadata holds as JSON, or as pickle from earlier engines.

@@ -14,9 +14,9 @@ from griptape_nodes.image import (
     GriptapeImage,
     GriptapeImagePipeline,
     ImageFormat,
-    apply_openimageio_settings,
 )
 from griptape_nodes.image.formats import sniff_image_extension
+from griptape_nodes.image.oiio_config import apply_openimageio_settings
 
 if TYPE_CHECKING:
     from collections.abc import Generator

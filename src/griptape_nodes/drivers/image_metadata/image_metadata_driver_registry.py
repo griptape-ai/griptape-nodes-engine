@@ -28,7 +28,7 @@ class ImageMetadataDriverRegistry:
         """Get the first driver that supports the given format.
 
         Args:
-            format_str: PIL format string (e.g., "PNG", "JPEG")
+            format_str: Uppercase image format string (for example "PNG" or "JPEG")
 
         Returns:
             Driver instance or None if no driver supports format
