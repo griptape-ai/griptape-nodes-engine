@@ -9,13 +9,13 @@ This skill covers the full cold-start cycle (build → wire → run → read) ag
 
 ## Mental Model
 
-- **Workflow**: Top-level namespace. Only ONE can be active at a time. Reset with `ClearAllObjectStateRequest`.
+- **Workflow**: Top-level namespace. The engine can have several open at once, such as one per editor tab.
 - **Flow**: The canvas inside a workflow. A workflow has exactly one top-level "canvas" flow. Sub-flows are possible but rarely needed for scratch work.
 - **Node**: A unit of work with parameters (inputs, outputs, properties).
 - **Connection**: An edge between two parameters. Two kinds:
     - **Data flow**: A typed parameter on one node → a typed parameter on another. The engine derives execution order from data dependencies, so data connections alone are usually sufficient.
     - **Control flow**: `exec_out` → `exec_in`. Only needed when two nodes must run in a specific order but don't share data (e.g. side-effecting steps, branching). Skip these by default.
-- **Current Context**: A stack (workflow → flow → node). Most requests default to "current" when a name is omitted.
+- **Your workflow**: Every tool call that builds, changes, or runs a graph acts on one open workflow. With no `X-Griptape-Workflow-Id` header, that is the workflow your MCP session opened most recently. With the header, it is the workflow the header names. Within that workflow, requests that omit `flow_name` use its top-level flow. See "Choosing the workflow you build into" below.
 
 ## What the MCP server actually exposes
 
@@ -186,8 +186,10 @@ workspace survey above has confirmed the relevant library exposes those node typ
 
 ```
 1. griptape_nodes_EnsureWorkflowAndFlowRequest()
-   → returns workflow_name, flow_name, created_workflow, created_flow.
-     Idempotent: if both pieces are already in context, reuses them.
+   → returns workflow_id, workflow_name, flow_name, created_workflow, created_flow.
+     If your session has no workflow yet, opens a new one and makes it the
+     session's workflow. Once it has one, reuses it and only creates the flow if
+     it is missing, so calling it again is safe.
 
 2. griptape_nodes_DescribeNodeTypeRequest(node_type="TextInput")
 3. griptape_nodes_DescribeNodeTypeRequest(node_type="Agent")
@@ -223,10 +225,10 @@ workspace survey above has confirmed the relevant library exposes those node typ
     → required after any multi-node build. Without it, every node lands at (0, 0)
       and the canvas shows them stacked on top of each other. Topologically sorts
       the graph and assigns column-and-row positions. Omit `flow_name` to lay out
-      the current-context flow.
+      your workflow's top-level flow.
 
 12. griptape_nodes_StartFlowRequest(wait_for_completion=True, completion_timeout_ms=60000)
-    → omit flow_name; the handler uses the current-context flow.
+    → omit flow_name; the handler uses your workflow's top-level flow.
       wait_for_completion blocks until the flow resolves or times out.
 
 13. griptape_nodes_GetParameterValueRequest(node_name="DisplayText_1", parameter_name="text")
@@ -302,7 +304,7 @@ against stale state.
     (60000+ ms). Otherwise the call returns the instant the flow is kicked off and
     you have to poll `GetNodeResolutionStateRequest` yourself.
 - **Omit `flow_name` on `StartFlowRequest`** when you just finished building a
-    single flow. The handler defaults to the current-context flow.
+    single flow. The handler defaults to your workflow's top-level flow.
 - **Read the response, don't assume names.** `CreateNodeResultSuccess.node_name` is
     the authoritative handle for every later call. Pass it verbatim into
     `SetParameterValueRequest`, `CreateConnectionRequest`, and
@@ -325,8 +327,8 @@ in `_trim_response`):
 `ok` reflects whether the engine produced a `*ResultSuccess` payload. The remaining
 fields are flattened from the inner result class, so for example
 `CreateNodeResultSuccess.node_name` is reachable as `response["node_name"]`,
-`EnsureWorkflowAndFlowResultSuccess` exposes `workflow_name`, `flow_name`,
-`created_workflow`, `created_flow` at the top level, and `AutoLayoutFlowResultSuccess`
+`EnsureWorkflowAndFlowResultSuccess` exposes `workflow_id`, `workflow_name`,
+`flow_name`, `created_workflow`, `created_flow` at the top level, and `AutoLayoutFlowResultSuccess`
 exposes `flow_name` and `positioned_nodes`. Failures surface as MCP tool errors with
 the engine's `result_details` message attached.
 
@@ -408,11 +410,33 @@ The slot name is engine-generated and only known after the add returns, so the
 an `EventRequestBatch`. Batch all the adds in one round trip, read each slot's
 `parameter_name`, then batch the connects/sets in the next.
 
-### Only one workflow in context at a time
+### Choosing the workflow you build into
 
-`SetWorkflowContextRequest` refuses if a workflow is already in context. To swap,
-`ClearAllObjectStateRequest(i_know_what_im_doing=True)` first — this wipes
-EVERYTHING (nodes, flows, connections, workflow). There is no softer reset today.
+The user may have other workflows open in the editor. Your session builds into one
+of them and leaves the rest alone:
+
+- **Start fresh:** `EnsureWorkflowAndFlowRequest()` as the first call of a session
+    opens a new workflow. To start another one later in the same session, call
+    `OpenWorkflowRequest(create_flow=True)` with no `workflow_id`. The session
+    switches to the workflow it opens.
+- **Work in a workflow that's already open,** such as the user's tab:
+    `ListOpenWorkflowsRequest()` lists every open workflow with its `workflow_id`.
+    `OpenWorkflowRequest(workflow_id=...)` returns it with `already_open` set,
+    changes nothing about it, and makes it your session's workflow.
+- **Pin one workflow:** an `X-Griptape-Workflow-Id` header in the client's MCP
+    configuration makes every call act on that workflow, including each request
+    inside `EventRequestBatch`.
+- **Close it:** `CloseWorkflowRequest(workflow_id=...)` closes that one workflow
+    and leaves the others open.
+
+If your workflow is closed by someone else, such as the user closing its tab,
+every call that acts on it fails with `WorkflowNotOpenResultFailure`, including
+`EnsureWorkflowAndFlowRequest`. Its `open_workflows` lists what is still open.
+Recover with `OpenWorkflowRequest`: `workflow_id=...` for one of those, or
+`create_flow=True` for a new one.
+
+Do not reach for `ClearAllObjectStateRequest` to reset. It closes every open
+workflow, including the ones in the user's editor tabs.
 
 ### Agents cannot be interrupted mid-run
 
@@ -448,7 +472,10 @@ flow keeps running in the engine until it finishes or errors. A subsequent
 | Inspect state                                                                       | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
-| Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
+| List open workflows                                                                 | `ListOpenWorkflowsRequest`                                                                                                                                |
+| Start a new workflow, or switch to an open one                                      | `OpenWorkflowRequest` (`create_flow=True` for a new one, `workflow_id=...` for an open one)                                                               |
+| Close your workflow                                                                 | `CloseWorkflowRequest(workflow_id=...)`                                                                                                                   |
+| Close every open workflow, including the user's tabs                                | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 
 ## Custom nodes
 
