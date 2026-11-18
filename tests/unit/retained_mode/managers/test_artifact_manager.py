@@ -10,11 +10,11 @@ import anyio
 import pytest
 import static_ffmpeg._add_paths
 import static_ffmpeg.run
-from PIL import Image
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.image import GriptapeImage
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -45,10 +45,11 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
 )
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils import ffmpeg_cache
+from tests.unit.image.sample_images import RED, encode, solid
 from tests.workflow_context import unsaved_workflow_open
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
+    from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
         PILThumbnailParameters,
     )
 
@@ -771,11 +772,7 @@ class TestGeneratePreview:
             Path to a 100x100 JPEG test image with known properties
         """
         image_path = temp_dir / "test_source.jpg"
-
-        # Create a simple test image (100x100 red square)
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
-
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
         return image_path
 
     @pytest.fixture
@@ -818,7 +815,7 @@ class TestGeneratePreview:
         assert preview_path.exists()
 
         # Verify preview dimensions
-        with Image.open(str(preview_path)) as preview_img:
+        with GriptapeImage.open(preview_path) as preview_img:
             assert preview_img.width <= 50  # noqa: PLR2004
             assert preview_img.height <= 50  # noqa: PLR2004
 
@@ -939,7 +936,7 @@ class TestGeneratePreview:
         preview_dir = test_image_path.parent / ".griptape-nodes-previews"
         preview_path = preview_dir / f"{test_image_path.name}.webp"
 
-        with Image.open(str(preview_path)) as preview_img:
+        with GriptapeImage.open(preview_path) as preview_img:
             assert preview_img.width <= 30  # noqa: PLR2004
             assert preview_img.height <= 40  # noqa: PLR2004
             # Verify aspect ratio preserved (source is 100x100, so should be square)
@@ -1259,8 +1256,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
     def test_image_path(self, temp_dir: Path) -> Path:
         """Create a real test image file."""
         image_path = temp_dir / "test_source.jpg"
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
         return image_path
 
     @pytest.fixture
@@ -1385,11 +1381,7 @@ class TestGetPreviewForArtifact:
     def test_image_path(self, temp_dir: Path) -> Path:
         """Create a real test image file."""
         image_path = temp_dir / "test_source.jpg"
-
-        # Create a simple test image (100x100 red square)
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
-
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
         return image_path
 
     @pytest.fixture

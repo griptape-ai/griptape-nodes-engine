@@ -1,0 +1,221 @@
+"""Tests for ThumbnailGenerator, RoundedPreviewGenerator, and backward-compatible PIL aliases."""
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import anyio
+import numpy as np
+import OpenImageIO as oiio  # noqa: N813
+import pytest
+from pydantic import ValidationError
+
+from griptape_nodes.image import GriptapeImage, ImageFormat
+from griptape_nodes.image.oiio_config import apply_openimageio_settings
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
+    PILRoundedParameters,
+    PILRoundedPreviewGenerator,
+    PILThumbnailGenerator,
+    PILThumbnailParameters,
+    RoundedParameters,
+    RoundedPreviewGenerator,
+    ThumbnailGenerator,
+    ThumbnailParameters,
+)
+from tests.unit.image.sample_images import BLUE, RED, encode, solid
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from griptape_nodes.retained_mode.engine import Engine
+
+
+@pytest.fixture
+def temp_test_image() -> Generator[str, None, None]:
+    """Create a temporary 200x100 RGB PNG image."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(encode(solid(200, 100, RED), "png"))
+        temp_path = f.name
+
+    yield temp_path
+
+    Path(temp_path).unlink(missing_ok=True)
+
+
+@pytest.fixture
+def temp_transparent_image() -> Generator[str, None, None]:
+    """Create a temporary 200x100 semi-transparent RGBA PNG image."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(encode(solid(200, 100, (255, 0, 0, 128)), "png"))
+        temp_path = f.name
+
+    yield temp_path
+
+    Path(temp_path).unlink(missing_ok=True)
+
+
+@pytest.fixture
+def temp_output_dir() -> Generator[str, None, None]:
+    """Create temporary output directory."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield tmpdir
+
+
+class TestBackwardCompatibleAliases:
+    def test_pil_prefixed_aliases_point_to_new_classes(self) -> None:
+        assert PILThumbnailGenerator is ThumbnailGenerator
+        assert PILThumbnailParameters is ThumbnailParameters
+        assert PILRoundedPreviewGenerator is RoundedPreviewGenerator
+        assert PILRoundedParameters is RoundedParameters
+
+
+class TestRoundedPreviewGeneratorParameters:
+    @pytest.mark.parametrize(
+        "params",
+        [
+            {"max_width": -100, "max_height": 100, "corner_radius_percent": 2.0},
+            {"max_width": 0, "max_height": 100, "corner_radius_percent": 2.0},
+            {"max_width": 8193, "max_height": 100, "corner_radius_percent": 2.0},
+            {"max_width": 100, "max_height": -100, "corner_radius_percent": 2.0},
+            {"max_width": 100, "max_height": 0, "corner_radius_percent": 2.0},
+            {"max_width": 100, "max_height": 8193, "corner_radius_percent": 2.0},
+            {"max_width": 100, "max_height": 100, "corner_radius_percent": -1.0},
+            {"max_width": 100, "max_height": 100, "corner_radius_percent": 11.0},
+        ],
+    )
+    def test_invalid_parameters_raise_validation_error(
+        self, temp_test_image: str, temp_output_dir: str, params: dict[str, object]
+    ) -> None:
+        with pytest.raises(ValidationError):
+            RoundedPreviewGenerator(
+                source_file_location=temp_test_image,
+                preview_format="png",
+                destination_preview_directory=temp_output_dir,
+                destination_preview_file_name="output.png",
+                params=params,
+            )
+
+    def test_string_coercion_and_valid_parameters(self, temp_test_image: str, temp_output_dir: str) -> None:
+        generator = RoundedPreviewGenerator(
+            source_file_location=temp_test_image,
+            preview_format="png",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.png",
+            params={"max_width": "150", "max_height": 150, "corner_radius_percent": "2.0"},
+        )
+        assert generator.params.max_width == 150  # noqa: PLR2004
+        assert generator.params.max_height == 150  # noqa: PLR2004
+        assert generator.params.corner_radius_percent == 2.0  # noqa: PLR2004
+
+
+class TestRoundedPreviewGeneratorClassMethods:
+    def test_get_friendly_name(self) -> None:
+        assert RoundedPreviewGenerator.get_friendly_name() == "Rounded Image Preview Generation"
+        assert ThumbnailGenerator.get_friendly_name() == "Standard Thumbnail Generation"
+
+    def test_get_supported_source_formats_includes_expanded_formats(self) -> None:
+        for gen_cls in (ThumbnailGenerator, RoundedPreviewGenerator):
+            formats = gen_cls.get_supported_source_formats()
+            for expected in ("png", "jpg", "jpeg", "webp", "exr", "hdr", "dpx", "psd", "jp2", "dds"):
+                assert expected in formats
+
+    def test_get_supported_preview_formats(self) -> None:
+        assert RoundedPreviewGenerator.get_supported_preview_formats() == {"webp", "jpg", "png"}
+
+    def test_get_parameters(self) -> None:
+        params_model_class = RoundedPreviewGenerator.get_parameters()
+        model_fields = params_model_class.model_fields
+        assert set(model_fields) == {"max_width", "max_height", "corner_radius_percent"}
+
+
+class TestPreviewGeneratorGeneration:
+    @pytest.mark.asyncio
+    async def test_generate_png_webp_and_jpeg_outputs(
+        self, engine: Engine, temp_test_image: str, temp_output_dir: str
+    ) -> None:
+        for ext, expected_fmt, expected_cs in (
+            ("png", ImageFormat.PNG, "RGBA"),
+            ("webp", ImageFormat.WEBP, "RGBA"),
+            ("jpg", ImageFormat.JPEG, "RGB"),
+        ):
+            generator = RoundedPreviewGenerator(
+                source_file_location=temp_test_image,
+                preview_format=ext,
+                destination_preview_directory=temp_output_dir,
+                destination_preview_file_name=f"output.{ext}",
+                params={"max_width": 100, "max_height": 100, "corner_radius_percent": 2.0},
+                engine=engine,
+            )
+            result_filename = await generator.attempt_generate_preview()
+            output_path = Path(temp_output_dir) / result_filename
+            with GriptapeImage.open(output_path) as img:
+                assert img.format == expected_fmt
+                assert img.color_space == expected_cs
+                assert img.width == 100  # noqa: PLR2004
+                assert img.height == 50  # noqa: PLR2004
+
+    @pytest.mark.asyncio
+    async def test_generate_transparent_and_small_inputs(
+        self, engine: Engine, temp_transparent_image: str, temp_output_dir: str
+    ) -> None:
+        generator = RoundedPreviewGenerator(
+            source_file_location=temp_transparent_image,
+            preview_format="png",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="transparent_out.png",
+            params={"max_width": 150, "max_height": 150, "corner_radius_percent": 0.0},
+            engine=engine,
+        )
+        result_filename = await generator.attempt_generate_preview()
+        with GriptapeImage.open(Path(temp_output_dir) / result_filename) as img:
+            assert img.color_space == "RGBA"
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(encode(solid(10, 10, BLUE), "png"))
+            tiny_path = f.name
+        try:
+            tiny_gen = RoundedPreviewGenerator(
+                source_file_location=tiny_path,
+                preview_format="png",
+                destination_preview_directory=temp_output_dir,
+                destination_preview_file_name="tiny_out.png",
+                params={"max_width": 100, "max_height": 100, "corner_radius_percent": 0.5},
+                engine=engine,
+            )
+            await tiny_gen.attempt_generate_preview()
+            with GriptapeImage.open(Path(temp_output_dir) / "tiny_out.png") as img:
+                assert (img.width, img.height) == (10, 10)
+        finally:
+            await anyio.Path(tiny_path).unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_float_exr_streams_through_image_cache_for_preview(self, engine: Engine, tmp_path: Path) -> None:
+        # Given a 32-bit float EXR on disk and an invalidated shared ImageCache
+        apply_openimageio_settings(engine.config_manager)
+        cache = oiio.ImageCache(shared=True)
+        exr_path = tmp_path / "shot.exr"
+        pixels = np.full((64, 32, 4), 0.5, dtype=np.float32)
+        assert oiio.ImageBuf(np.ascontiguousarray(pixels)).write(str(exr_path))
+        cache.invalidate_all(True)
+        unique_before = cache.getattribute("stat:unique_files", oiio.INT)
+
+        # When ThumbnailGenerator renders a WebP preview from the local EXR path
+        out_dir = tmp_path / "previews"
+        generator = ThumbnailGenerator(
+            source_file_location=str(exr_path),
+            preview_format="webp",
+            destination_preview_directory=str(out_dir),
+            destination_preview_file_name="shot.exr.webp",
+            params={"max_width": 16, "max_height": 16},
+            engine=engine,
+        )
+        filename = await generator.attempt_generate_preview()
+
+        # Then the preview is generated via ImageCache and fits within 16x16
+        assert cache.getattribute("stat:unique_files", oiio.INT) >= unique_before + 1
+        with GriptapeImage.open(out_dir / filename) as preview:
+            assert preview.format == ImageFormat.WEBP
+            assert preview.width == 8  # noqa: PLR2004
+            assert preview.height == 16  # noqa: PLR2004
