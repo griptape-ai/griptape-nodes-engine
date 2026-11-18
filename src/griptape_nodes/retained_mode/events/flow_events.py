@@ -55,7 +55,7 @@ class CreateFlowRequest(RequestPayload, GraphAccessMixin):
     Args:
         parent_flow_name: Name of the parent flow to create the new flow within
         flow_name: Name for the new flow (None for auto-generated)
-        set_as_new_context: Whether to set this flow as the new current context
+        set_as_new_context: Deprecated and ignored. Name the flow on later requests instead.
         metadata: Initial metadata for the flow
 
     Results: CreateFlowResultSuccess (with flow name) | CreateFlowResultFailure (parent not found, name conflicts)
@@ -63,8 +63,7 @@ class CreateFlowRequest(RequestPayload, GraphAccessMixin):
 
     parent_flow_name: str | None
     flow_name: str | None = None
-    # When True, this Flow will be pushed as the new Current Context.
-    set_as_new_context: bool = True
+    set_as_new_context: bool = False
     metadata: dict | None = None
 
 
@@ -517,9 +516,6 @@ class SerializeFlowToCommandsResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 @PayloadRegistry.register
 class DeserializeFlowFromCommandsRequest(RequestPayload, GraphAccessMixin):
     serialized_flow_commands: SerializedFlowCommands
-    pop_flow_context_after: bool = (
-        True  # Whether to pop the flow context after deserialization (default: True for cleanup)
-    )
 
 
 @dataclass

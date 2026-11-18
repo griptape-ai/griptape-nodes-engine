@@ -293,7 +293,6 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
             other,
         )
         assert isinstance(created, CreateNodeResultSuccess), created.result_details
-        other.context.push_flow(engine.flow_manager.get_flow_by_name_in(other, "elsewhere"))
         conversion = ConversionConfig(
             library=_LIBRARY_NAME,
             node_type="_ValueNode",
@@ -302,7 +301,8 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
             offset_x=-300,
         )
 
-        with _also_open(engine, other):
+        elsewhere = engine.flow_manager.get_flow_by_name_in(other, "elsewhere")
+        with _also_open(engine, other), other.context.flow(elsewhere):
             result = engine.node_manager.on_migrate_parameter_request(
                 MigrateParameterRequest(
                     source_node_name="target",

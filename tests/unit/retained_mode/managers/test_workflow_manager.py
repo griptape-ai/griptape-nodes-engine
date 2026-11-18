@@ -2882,20 +2882,13 @@ class TestWorkflowManager:
         assert ast.unparse(open_stmt) == "GriptapeNodes.ContextManager().push_workflow(file_path=__file__)"
         assert ast.unparse(build_stmt) == "await build_workflow()"
 
-    def test_generate_workflow_file_content_ensure_context_is_async(self, engine: Engine) -> None:
-        """_ensure_workflow_context is now async and must await ahandle_request."""
+    def test_generated_file_leaves_the_current_flow_to_the_engine(self, engine: Engine) -> None:
+        """The engine treats the top-level flow as current, so the file neither pins it nor asks for it."""
         content = self._generate(engine, with_shape=True)
-        module = ast.parse(content)
 
-        ensure = next(
-            node
-            for node in module.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ensure_workflow_context"
-        )
-        body_src = "\n".join(ast.unparse(stmt) for stmt in ensure.body)
-        assert "await GriptapeNodes.ahandle_request" in body_src
-        # Sanity check: the old sync variant is gone.
-        assert "GriptapeNodes.handle_request(" not in body_src
+        assert "_ensure_workflow_context" not in content
+        assert "push_flow" not in content
+        assert "set_as_new_context" not in content
 
     def test_generate_workflow_file_content_is_valid_python(self, engine: Engine) -> None:
         """Generated content must parse cleanly (no smuggled-string comments left behind)."""
@@ -3680,11 +3673,10 @@ class TestRunWorkflowWithCurrentStateRequest:
     ) -> None:
         open_flow = Mock(spec=ControlFlow)
         open_flow.name = self._OPEN_FLOW_NAME
-        open_workflow.context.push_flow(open_flow)
-
-        result = await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
-            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
-        )
+        with open_workflow.context.flow(open_flow):
+            result = await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
+                RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
+            )
 
         assert isinstance(result, RunWorkflowWithCurrentStateResultFailure), result
         # The guard is a precondition on engine state, so the file never gets exec'd.
@@ -5992,8 +5984,6 @@ class TestConcurrentWorkflowImports:
             task_name = asyncio.current_task().get_name()  # type: ignore[union-attr]
             arrived[task_name].set()
             await asyncio.wait_for(asyncio.gather(arrived["A"].wait(), arrived["B"].wait()), timeout=5.0)
-            # Both imports are inside their flow context; neither push may reach the shared stack.
-            assert self.shared_stack_names(engine) == []
             if task_name == "B":
                 await asyncio.wait_for(a_created.wait(), timeout=5.0)
             result = engine.handle_request(
@@ -6032,11 +6022,6 @@ class TestConcurrentWorkflowImports:
         assert result_b.created_flow_name == "ConcImportedB"
         assert engine.flow_manager.get_parent_flow_in(workflow, "ConcImportedA") == target_a
         assert engine.flow_manager.get_parent_flow_in(workflow, "ConcImportedB") == target_b
-        assert self.shared_stack_names(engine) == []
-
-    def shared_stack_names(self, engine: Engine) -> list[str]:
-        workflow_stack = engine.current_workflow().context
-        return [flow_state._flow.name for flow_state in workflow_stack._flow_stack]
 
 
 class TestReferencedWorkflowTagging:

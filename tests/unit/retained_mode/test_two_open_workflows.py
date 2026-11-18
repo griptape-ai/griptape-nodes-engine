@@ -430,19 +430,23 @@ class TestEachWorkflowSeesOnlyItsOwn:
 
     def test_context_is_per_workflow(self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]) -> None:
         a, b = two_open
-        extra = _send(engine, CreateFlowRequest(parent_flow_name=None, flow_name="second", set_as_new_context=True), a)
+        extra = _send(engine, CreateFlowRequest(parent_flow_name=None, flow_name="second"), a)
         assert extra.succeeded(), extra.result_details
+        second = engine.flow_manager.get_flow_by_name_in(a, "second")
 
-        context_a = _send(engine, GetWorkflowContextRequest(), a)
-        context_b = _send(engine, GetWorkflowContextRequest(), b)
-        top_b = _send(engine, GetTopLevelFlowRequest(), b)
+        with a.context.flow(second):
+            context_a = _send(engine, GetWorkflowContextRequest(), a)
+            context_b = _send(engine, GetWorkflowContextRequest(), b)
+            top_b = _send(engine, GetTopLevelFlowRequest(), b)
+            current_a = a.context.get_current_flow().name
+            current_b = b.context.get_current_flow().name
 
         assert isinstance(context_a, GetWorkflowContextSuccess)
         assert isinstance(context_b, GetWorkflowContextSuccess)
         assert context_a.workflow_id == a.workflow_id
         assert context_b.workflow_id == b.workflow_id
-        assert a.context.get_current_flow().name == "second"
-        assert b.context.get_current_flow().name == "canvas"
+        assert current_a == "second"
+        assert current_b == "canvas"
         assert isinstance(top_b, GetTopLevelFlowResultSuccess)
         assert top_b.flow_name == "canvas"
 

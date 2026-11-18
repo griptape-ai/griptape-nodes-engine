@@ -500,9 +500,6 @@ class WorkflowCodeGenerator(EngineScoped):
             right=ast.Constant(value=None),
         )
 
-        # Generate the ensure flow context function call
-        ensure_context_call = self._generate_ensure_flow_context_call()
-
         # Construct a default LocalWorkflowExecutor only when the caller did not supply one.
         # `**kwargs` is splatted into the constructor; a typo'd kwarg surfaces as a TypeError
         # from LocalWorkflowExecutor.__init__.
@@ -604,7 +601,7 @@ class WorkflowCodeGenerator(EngineScoped):
                 keywords=[ast.keyword(arg="file_path", value=ast.Name(id="__file__", ctx=ast.Load()))],
             )
         )
-        with_stmt.body = [open_workflow_call, await_main_call, ensure_context_call, *with_stmt.body]
+        with_stmt.body = [open_workflow_call, await_main_call, *with_stmt.body]
 
         # === Generate async aexecute_workflow function ===
         async_func_def = ast.AsyncFunctionDef(
@@ -659,10 +656,7 @@ class WorkflowCodeGenerator(EngineScoped):
         # === 2) build the `if __name__ == "__main__":` block ===
         if_node = self._generate_main_block(workflow_shape)
 
-        # Generate the ensure flow context function
-        ensure_context_func = self._generate_ensure_flow_context_function(import_recorder)
-
-        return [ensure_context_func, sync_func_def, async_func_def, if_node]
+        return [sync_func_def, async_func_def, if_node]
 
     def _generate_main_block(self, workflow_shape: dict) -> ast.If:
         """Generates the `if __name__ == '__main__':` block for the serialized workflow file."""
@@ -997,201 +991,6 @@ class WorkflowCodeGenerator(EngineScoped):
         ast.fix_missing_locations(if_node)
 
         return if_node
-
-    def _generate_ensure_flow_context_function(
-        self,
-        import_recorder: ImportRecorder,
-    ) -> ast.AsyncFunctionDef:
-        """Generates the async _ensure_workflow_context function for the serialized workflow file."""
-        import_recorder.add_from_import("griptape_nodes.retained_mode.events.flow_events", "GetTopLevelFlowRequest")
-        import_recorder.add_from_import(
-            "griptape_nodes.retained_mode.events.flow_events", "GetTopLevelFlowResultSuccess"
-        )
-
-        # Function signature: async def _ensure_workflow_context():
-        func_def = ast.AsyncFunctionDef(
-            name="_ensure_workflow_context",
-            args=ast.arguments(
-                posonlyargs=[],
-                args=[],
-                vararg=None,
-                kwonlyargs=[],
-                kw_defaults=[],
-                kwarg=None,
-                defaults=[],
-            ),
-            body=[],
-            decorator_list=[],
-            returns=None,
-            type_params=[],
-        )
-
-        context_manager_assign = ast.Assign(
-            targets=[ast.Name(id="context_manager", ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
-                    attr="ContextManager",
-                    ctx=ast.Load(),
-                ),
-                args=[],
-                keywords=[],
-            ),
-        )
-
-        # if not context_manager.has_current_flow():
-        has_flow_check = ast.UnaryOp(
-            op=ast.Not(),
-            operand=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="context_manager", ctx=ast.Load()),
-                    attr="has_current_flow",
-                    ctx=ast.Load(),
-                ),
-                args=[],
-                keywords=[],
-            ),
-        )
-
-        # top_level_flow_request = GetTopLevelFlowRequest()  # noqa: ERA001
-        flow_request_assign = ast.Assign(
-            targets=[ast.Name(id="top_level_flow_request", ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Name(id="GetTopLevelFlowRequest", ctx=ast.Load()),
-                args=[],
-                keywords=[],
-            ),
-        )
-
-        # top_level_flow_result = await GriptapeNodes.ahandle_request(top_level_flow_request)  # noqa: ERA001
-        flow_result_assign = ast.Assign(
-            targets=[ast.Name(id="top_level_flow_result", ctx=ast.Store())],
-            value=ast.Await(
-                value=ast.Call(
-                    func=ast.Attribute(
-                        value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
-                        attr="ahandle_request",
-                        ctx=ast.Load(),
-                    ),
-                    args=[ast.Name(id="top_level_flow_request", ctx=ast.Load())],
-                    keywords=[],
-                ),
-            ),
-        )
-
-        # isinstance check and flow_name is not None
-        isinstance_check = ast.Call(
-            func=ast.Name(id="isinstance", ctx=ast.Load()),
-            args=[
-                ast.Name(id="top_level_flow_result", ctx=ast.Load()),
-                ast.Name(id="GetTopLevelFlowResultSuccess", ctx=ast.Load()),
-            ],
-            keywords=[],
-        )
-
-        flow_name_check = ast.Compare(
-            left=ast.Attribute(
-                value=ast.Name(id="top_level_flow_result", ctx=ast.Load()),
-                attr="flow_name",
-                ctx=ast.Load(),
-            ),
-            ops=[ast.IsNot()],
-            comparators=[ast.Constant(value=None)],
-        )
-
-        success_condition = ast.BoolOp(
-            op=ast.And(),
-            values=[isinstance_check, flow_name_check],
-        )
-
-        # flow_manager = GriptapeNodes.FlowManager()  # noqa: ERA001
-        flow_manager_assign = ast.Assign(
-            targets=[ast.Name(id="flow_manager", ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
-                    attr="FlowManager",
-                    ctx=ast.Load(),
-                ),
-                args=[],
-                keywords=[],
-            ),
-        )
-
-        # flow_obj = flow_manager.get_flow_by_name(top_level_flow_result.flow_name)  # noqa: ERA001
-        flow_obj_assign = ast.Assign(
-            targets=[ast.Name(id="flow_obj", ctx=ast.Store())],
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="flow_manager", ctx=ast.Load()),
-                    attr="get_flow_by_name",
-                    ctx=ast.Load(),
-                ),
-                args=[
-                    ast.Attribute(
-                        value=ast.Name(id="top_level_flow_result", ctx=ast.Load()),
-                        attr="flow_name",
-                        ctx=ast.Load(),
-                    )
-                ],
-                keywords=[],
-            ),
-        )
-
-        # context_manager.push_flow(flow_obj)  # noqa: ERA001
-        push_flow_call = ast.Expr(
-            value=ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id="context_manager", ctx=ast.Load()),
-                    attr="push_flow",
-                    ctx=ast.Load(),
-                ),
-                args=[ast.Name(id="flow_obj", ctx=ast.Load())],
-                keywords=[],
-            ),
-        )
-
-        # Build the inner if statement for success condition
-        success_if = ast.If(
-            test=success_condition,
-            body=[
-                flow_manager_assign,
-                flow_obj_assign,
-                push_flow_call,
-            ],
-            orelse=[],
-        )
-
-        # Build the main if statement
-        main_if = ast.If(
-            test=has_flow_check,
-            body=[
-                flow_request_assign,
-                flow_result_assign,
-                success_if,
-            ],
-            orelse=[],
-        )
-
-        # Set the function body
-        func_def.body = [context_manager_assign, main_if]
-        ast.fix_missing_locations(func_def)
-
-        return func_def
-
-    def _generate_ensure_flow_context_call(
-        self,
-    ) -> ast.Expr:
-        """Generates the call to await _ensure_workflow_context() function."""
-        return ast.Expr(
-            value=ast.Await(
-                value=ast.Call(
-                    func=ast.Name(id="_ensure_workflow_context", ctx=ast.Load()),
-                    args=[],
-                    keywords=[],
-                )
-            )
-        )
 
     def _generate_workflow_run_prerequisite_code(
         self,
