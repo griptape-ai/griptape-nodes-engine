@@ -177,11 +177,13 @@ The **Organization** section sits at the top of the table, above **Projects**. I
 
 #### Organization-wide caps
 
-An organization-wide cap limits everything your organization spends, whatever project, key or group it comes from. Create one with **+ Create Budget** and the **Organization** scope type, or with **Add organization budget** in the Organization section when you have none yet. You can have one per period, so a daily cap can run alongside a monthly one. A monthly cap is the figure the **Monthly Limits** card shows.
+An organization-wide cap limits everything your organization spends, whatever project, key or group it comes from. Create one with **+ Create Budget** and the **Organization** scope type, or with **Add organization budget** in the Organization section when you have none yet. You can have one per period, so a daily cap can run alongside a monthly one. A monthly cap is the figure the **Monthly Limits** card shows. A cap doesn't replace the [Fallback Budget](#the-fallback-budget): spend outside your project budgets counts toward both.
 
 #### The Fallback Budget
 
 Every organization has a **Fallback Budget**, listed last in the Organization section. Griptape Cloud creates it the first time anyone opens your organization's budgets, for example in Spend & Budgets; until then, nothing limits spend outside your project budgets. It limits spend that no project budget covers, including calls that carry no project, or project details Griptape Cloud can't read. It is a **Hard Limit**, so once that spend reaches its limit for the period, those calls stop until you raise the limit or the period resets. A new organization's Fallback Budget starts at $100 a month. If you had already set its limit, that limit is kept. You can change its limit and period, switch it to **Soft Limit**, or freeze it, but you cannot delete it.
+
+Other budgets don't take this spend off the Fallback Budget. A call with no project, or in a project with no budget of its own, counts toward the Fallback Budget and toward every organization-wide, license key, or access group budget that covers it, and any of them can stop it. So if your organization doesn't budget its projects, the Fallback Budget limits that work even when your organization-wide cap has room. To avoid that, give the project a budget of its own or raise the Fallback Budget's limit.
 
 ### Creating a budget
 
