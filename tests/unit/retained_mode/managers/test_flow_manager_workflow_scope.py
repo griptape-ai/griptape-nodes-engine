@@ -324,14 +324,13 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
     async def test_edge_methods_report_failure_with_no_workflow_open(self, engine: Engine) -> None:
         flow_manager = engine.flow_manager
 
-        assert not flow_manager.check_for_existing_running_flow()
         with pytest.raises(KeyError, match="doesn't exist"):
             flow_manager.get_flow_by_name("canvas")
 
     @pytest.mark.parametrize(
         "edge",
         [
-            lambda c: c.fm.get_all_connected_nodes(c.node),
+            lambda c: c.fm.get_connections(),
         ],
     )
     def test_connection_edge_methods_with_no_workflow_open_raise(self, engine: Engine, edge: Any) -> None:

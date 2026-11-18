@@ -127,7 +127,9 @@ class TestWorkStillBoundToAClosedWorkflow:
             outcomes: list[object] = [engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="late"))]
             for write in (
                 engine.current_workflow,
-                lambda: engine.resource_manager.put_local_object(object(), owner="Lib", source="N", key="late"),
+                lambda: engine.resource_manager.put_local_object(
+                    object(), owner="Lib", source="N", key="late", workflow=workflow
+                ),
             ):
                 try:
                     write()
@@ -200,9 +202,9 @@ class TestACloseTurnsAwayItsWaitingRuns:
             executed.append("second")
             return StartFlowResultSuccess(result_details="second ran")
 
-        running = asyncio.ensure_future(engine.flow_manager.start_run(_RunSpec("canvas", first)))
+        running = asyncio.ensure_future(engine.flow_manager.start_run(workflow, _RunSpec("canvas", first)))
         await asyncio.sleep(0)
-        waiting = engine.flow_manager.submit_run(_RunSpec("canvas", second))
+        waiting = engine.flow_manager.submit_run(_RunSpec("canvas", second), flows=workflow.flows)
 
         if close == "clear_all":
             cleared = await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

@@ -70,7 +70,7 @@ class TestRunSeconds:
     @pytest.mark.asyncio
     async def test_cancelling_a_run_reports_how_long_it_ran(self) -> None:
         engine = MagicMock()
-        engine.current_workflow.return_value = WorkflowRuntime("wf", engine)
+        runtime = WorkflowRuntime("wf", engine)
         flow_manager = FlowManager(MagicMock(spec=EventManager), engine=engine)
         machine = MagicMock()
         machine.cancel_flow = AsyncMock()
@@ -79,10 +79,10 @@ class TestRunSeconds:
         machine.reset_machine.side_effect = lambda **_: setattr(
             machine.context.seconds_since_run_started, "return_value", None
         )
-        flow_manager._global_control_flow_machine = machine
-        flow_manager.check_for_existing_running_flow = MagicMock(return_value=True)
+        runtime.flows.global_control_flow_machine = machine
+        flow_manager._flow_is_running = MagicMock(return_value=True)  # type: ignore[method-assign]
 
-        await flow_manager._cancel_run(flow_manager._current_flows())
+        await flow_manager._cancel_run(runtime.flows)
 
         payloads = [call.args[0].wrapped_event.payload for call in engine.event_manager.put_event.call_args_list]
         cancelled = [p for p in payloads if isinstance(p, ControlFlowCancelledEvent)]

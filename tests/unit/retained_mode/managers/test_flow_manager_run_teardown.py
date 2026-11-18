@@ -1,7 +1,7 @@
 """A run that dies mid-drive must leave the engine restartable.
 
 `FSM._advance` leaves `_current_state` pointing at whatever state it was entering when a state
-raised, and `check_for_existing_running_flow` reads that state. So anything that starts a run owns
+raised, and `check_for_existing_running_flow_in` reads that state. So anything that starts a run owns
 the cleanup: if it does not reset the machine on the way out, the engine reports a run in progress
 forever, the Run button never clears, and every later start is refused.
 
@@ -61,17 +61,18 @@ def _doomed_run(monkeypatch: pytest.MonkeyPatch, *, cancel_also_fails: bool = Fa
         machine.cancel_flow = AsyncMock()
 
     monkeypatch.setattr(flow_manager_module, "ControlFlowMachine", MagicMock(return_value=machine))
-    flow_manager._global_dag_builder.node_to_reference["Doomed"] = MagicMock()
+    runtime.flows.global_dag_builder.node_to_reference["Doomed"] = MagicMock()
 
     return _DoomedRun(flow_manager=flow_manager, machine=machine)
 
 
 def _assert_engine_is_restartable(flow_manager: FlowManager) -> None:
-    assert flow_manager.check_for_existing_running_flow() is False, (
+    workflow = flow_manager.engine.current_workflow()
+    assert flow_manager.check_for_existing_running_flow_in(workflow) is False, (
         "The engine still reports a run in progress, so the Run button stays lit and every later start is refused."
     )
-    assert flow_manager.global_single_node_resolution is False
-    assert flow_manager._global_dag_builder.node_to_reference == {}
+    assert workflow.flows.global_single_node_resolution is False
+    assert workflow.flows.global_dag_builder.node_to_reference == {}
 
 
 class TestStartFlowCleansUpAfterAFailedRun:

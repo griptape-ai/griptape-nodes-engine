@@ -224,8 +224,13 @@ class WorkflowCodeGenerator(EngineScoped):
         self,
         serialized_flow_commands: SerializedFlowCommands,
         workflow_metadata: WorkflowMetadata,
+        workflow: WorkflowRuntime | None = None,
     ) -> str:
-        """Generate workflow file content from serialized commands and metadata."""
+        """Generate workflow file content from serialized commands and metadata.
+
+        `workflow` is the open workflow being saved, whose variable substitution flag the file bakes in.
+        With None, the file bakes in the default.
+        """
         metadata_block = self._generate_workflow_metadata_header(workflow_metadata=workflow_metadata)
         if metadata_block is None:
             details = f"Failed to generate metadata block for workflow '{workflow_metadata.name}'."
@@ -255,7 +260,7 @@ class WorkflowCodeGenerator(EngineScoped):
         main_body: list[ast.stmt] = []
 
         # Snapshot the flag now (at save time) so it's baked into build_workflow().
-        variable_substitution_enabled = self.engine.workflow_manager.variable_substitution.is_enabled()
+        variable_substitution_enabled = self.engine.workflow_manager.variable_substitution.is_enabled(workflow)
 
         prereq_code = self._generate_workflow_run_prerequisite_code(
             import_recorder=import_recorder,

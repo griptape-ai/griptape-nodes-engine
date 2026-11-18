@@ -270,7 +270,7 @@ async def test_a_refusal_halts_the_run_and_names_every_budget(
     assert BUDGET_HALT_PREFIX in node_errors[0], (
         f"The node-level error the editor pins to the node is generic: {node_errors[0]}"
     )
-    assert engine.flow_manager.check_for_existing_running_flow() is False, (
+    assert engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()) is False, (
         "The run never ended, so the editor's Run button never clears."
     )
 

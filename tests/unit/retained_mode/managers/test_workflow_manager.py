@@ -3892,6 +3892,7 @@ class TestWorkflowSaveSituationMacro:
         destination, _relative = workflow_manager.saver._build_workflow_save_path(f"{file_name}.py")
 
         result = workflow_manager.saver._save_workflow_file_inline(
+            workflow=None,
             destination=destination,
             serialized_flow_commands=self._empty_commands(),
             file_name=file_name,
@@ -3935,6 +3936,7 @@ class TestWorkflowSaveSituationMacro:
         assert relative == str(Path("episode") / "my_workflow.py")
 
         result = workflow_manager.saver._save_workflow_file_inline(
+            workflow=None,
             destination=destination,
             serialized_flow_commands=self._empty_commands(),
             file_name="my_workflow",
@@ -4534,7 +4536,7 @@ class TestWorkflowCreationOnTheDefaultProject:
         saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=saved.workflow_name)))
         assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
 
-        assert engine.workflow_manager.variable_substitution.is_enabled() is False
+        assert engine.workflow_manager.variable_substitution.is_enabled(engine.current_workflow()) is False
         assert "SetVariableSubstitutionEnabledRequest" in Path(saved_again.file_path).read_text(encoding="utf-8")
 
     def test_saving_the_users_own_workflow_still_overwrites_it(self, engine: Engine, temp_dir: Path) -> None:
@@ -6626,19 +6628,19 @@ class TestRepairPathShapedDisplayName:
 class TestNodeLibraryDelegates:
     """Node libraries call these on `GriptapeNodes.WorkflowManager()`; they must reach the parts."""
 
-    def test_run_workflow_opens_the_file_when_no_workflow_is_open(self, engine: Engine) -> None:
+    def test_run_workflow_opens_the_file_when_it_is_given_no_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
-            assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
+            assert asyncio.run(workflow_manager.run_workflow("flow.py", None)) is result
         run_mock.assert_awaited_once_with("flow.py", None)
 
-    def test_run_workflow_builds_into_the_open_workflow(self, engine: Engine) -> None:
+    def test_run_workflow_builds_into_the_workflow_it_is_given(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
         opened = engine.context_manager.open_workflow(workflow_name="open")
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
-            assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
+            assert asyncio.run(workflow_manager.run_workflow("flow.py", opened)) is result
         run_mock.assert_awaited_once_with("flow.py", opened)
 
     def test_walk_object_tree_delegates_to_codegen(self, engine: Engine) -> None:

@@ -260,6 +260,7 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     save_result = engine.workflow_manager.saver._save_workflow_file_inline(
+        workflow=None,
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,
@@ -280,6 +281,7 @@ def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_
     serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
     assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
     saved = engine.workflow_manager.saver._save_workflow_file_inline(
+        workflow=None,
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialized.serialized_flow_commands,
         file_name=file_stem,
@@ -358,8 +360,8 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
 
 
 def _run(engine: Engine, relative_file_path: str) -> Any:
-    """Run a saved file as node libraries do: into the current workflow, else opened as one."""
-    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path))
+    """Run a saved file into the current workflow, else opened as one."""
+    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path, engine.current_workflow_or_none()))
 
 
 def _register_workflow(engine: Engine, tmp_path: Path, relative_file_path: str) -> str:

@@ -94,7 +94,9 @@ def play(engine: Engine, compare_flow: str) -> Callable[[], Awaitable[None]]:
         with engine.context_manager.flow(compare_flow):
             result = await engine.ahandle_request(ResolveNodeRequest(node_name="Compare Images"))
         assert isinstance(result, ResolveNodeResultSuccess), result
-        assert not engine.flow_manager.check_for_existing_running_flow(), "The flow is still marked as running."
+        assert not engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()), (
+            "The flow is still marked as running."
+        )
 
     return _play
 

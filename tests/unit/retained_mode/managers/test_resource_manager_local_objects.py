@@ -332,10 +332,10 @@ class TestDropForWorkflow:
         manager = engine.resource_manager
         host_key = manager.put_local_object(Held("host"), owner="Lib A", source="N", key="host")
         engine.context_manager.push_workflow("wf")
-        workflow_id = engine.context_manager.get_current_workflow_id()
+        workflow = engine.current_workflow()
+        workflow_id = workflow.workflow_id
 
-        with engine.bind_workflow(engine.current_workflow()):
-            key = manager.put_local_object(Held("wf"), owner="Lib A", source="N", key="wf")
+        key = manager.put_local_object(Held("wf"), owner="Lib A", source="N", key="wf", workflow=workflow)
 
         entry = manager.entry_for(key)
         host_entry = manager.entry_for(host_key)
@@ -352,8 +352,8 @@ class TestDropForWorkflow:
         with engine.bind_workflow(workflow):
             # Closed by other work, as a node task started before the close sees it.
             contextvars.copy_context().run(engine.context_manager.pop_workflow)
-            with pytest.raises(WorkflowNotOpenError, match="was closed"):
-                manager.put_local_object(Held("late"), owner="Lib A", source="N", key="late")
+        with pytest.raises(WorkflowNotOpenError, match="was closed"):
+            manager.put_local_object(Held("late"), owner="Lib A", source="N", key="late", workflow=workflow)
 
         assert manager.drop_all_local_objects() == 0
 
@@ -479,6 +479,7 @@ class TestWorkflowStateClearReleasesObjects:
         manager = engine.resource_manager
         released: list[str] = []
         engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
         for library, label in (("Lib A", "a"), ("Lib B", "b")):
             manager.put_local_object(
                 Held(label),
@@ -486,6 +487,7 @@ class TestWorkflowStateClearReleasesObjects:
                 source="N",
                 key="N-slot",
                 on_drop=lambda value: released.append(value.label),
+                workflow=workflow,
             )
 
         engine.clear_current_workflow_data()
@@ -500,14 +502,14 @@ class TestWorkflowStateClearReleasesObjects:
         closing = engine.open_workflow(registry.register_unsaved("closing", listed=False).workflow_id)
         staying = engine.open_workflow(registry.register_unsaved("staying", listed=False).workflow_id)
         for workflow, label in ((closing, "closing"), (staying, "staying")):
-            with engine.bind_workflow(workflow):
-                manager.put_local_object(
-                    Held(label),
-                    owner="Lib A",
-                    source="N",
-                    key=label,
-                    on_drop=lambda value: released.append(value.label),
-                )
+            manager.put_local_object(
+                Held(label),
+                owner="Lib A",
+                source="N",
+                key=label,
+                on_drop=lambda value: released.append(value.label),
+                workflow=workflow,
+            )
         manager.put_local_object(
             Held("host"), owner="Lib A", source="N", key="host", on_drop=lambda value: released.append(value.label)
         )
