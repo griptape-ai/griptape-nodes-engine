@@ -92,6 +92,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowWithCurrentStateRequest,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
+    SaveWorkflowFileFromSerializedFlowRequest,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
     SaveWorkflowRequest,
     SaveWorkflowResultFailure,
@@ -154,6 +155,7 @@ _OPTIONAL_WORKFLOW_REQUESTS = {
     GetWorkflowRunCommandRequest,
     GetWorkflowContextRequest,
     RunWorkflowWithCurrentStateRequest,
+    SaveWorkflowFileFromSerializedFlowRequest,
 }
 
 

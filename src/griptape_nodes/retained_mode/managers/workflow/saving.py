@@ -618,10 +618,14 @@ class WorkflowSaver(EngineScoped):
 
     @handles(SaveWorkflowFileFromSerializedFlowRequest)
     async def on_save_workflow_file_from_serialized_flow_request(
-        self, request: SaveWorkflowFileFromSerializedFlowRequest
+        self, request: SaveWorkflowFileFromSerializedFlowRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
-        """Save a workflow file from serialized flow commands without registry overhead."""
-        return self._save_serialized_flow_file(request, workflow=None)
+        """Save a workflow file from serialized flow commands without registry overhead.
+
+        The file keeps the settings of the workflow the request runs in, such as disabled variable
+        substitution. With no workflow it gets the defaults.
+        """
+        return self._save_serialized_flow_file(request, workflow=workflow)
 
     def _save_serialized_flow_file(
         self, request: SaveWorkflowFileFromSerializedFlowRequest, *, workflow: WorkflowRuntime | None

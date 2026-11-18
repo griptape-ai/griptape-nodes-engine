@@ -3913,6 +3913,34 @@ class TestWorkflowSaveSituationMacro:
         )
         return result.file_path
 
+    def test_a_save_from_serialized_flow_keeps_its_workflows_disabled_substitution(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """Packaging and the failed-run saver send this request bound to their workflow; its setting must survive."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowFileFromSerializedFlowRequest,
+            SaveWorkflowFileFromSerializedFlowResultSuccess,
+            SetVariableSubstitutionEnabledRequest,
+        )
+
+        entry = engine.workflow_registry.register_unsaved("substitution_off", listed=False)
+        workflow = engine.open_workflow(entry.workflow_id)
+        workflow.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
+
+        result = asyncio.run(
+            workflow.ahandle_request(
+                SaveWorkflowFileFromSerializedFlowRequest(
+                    serialized_flow_commands=self._empty_commands(),
+                    file_name="substitution_off",
+                    file_path=str(temp_dir / "substitution_off.py"),
+                )
+            )
+        )
+
+        assert isinstance(result, SaveWorkflowFileFromSerializedFlowResultSuccess), result.result_details
+        content = Path(result.file_path).read_text(encoding="utf-8")
+        assert "SetVariableSubstitutionEnabledRequest(enabled=False" in content
+
     def test_first_save_writes_v001(self, engine: Engine, temp_dir: Path) -> None:
         """Bug #4941: the first save with `{_index:03}` must produce v001 (not fail with MISSING_REQUIRED)."""
         saved_path = self._save(engine, "my_workflow")
