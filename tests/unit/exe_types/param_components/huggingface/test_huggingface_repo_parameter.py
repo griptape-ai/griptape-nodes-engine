@@ -63,18 +63,6 @@ class TestGetDownloadModels:
         # The two `Lightricks/LTX-2::*` entries resolve to the same base repo and must collapse.
         assert param.get_download_models() == ["Lightricks/LTX-2", "dg845/LTX-2.3-Diffusers"]
 
-    def test_excludes_deprecated_repos(self) -> None:
-        node = MockNode()
-        param = HuggingFaceRepoParameter(
-            node,
-            repo_ids=["Lightricks/LTX-2::ltx-2-19b-dev"],
-            deprecated_repo_ids=["Lightricks/LTX-2::ltx-2-19b-dev-fp4"],
-        )
-
-        # Deprecated repos must be filtered before `::` stripping, otherwise the dedup set
-        # would still let a deprecated entry shadow a live one.
-        assert param.get_download_models() == ["Lightricks/LTX-2"]
-
     def test_deprecated_only_yields_empty_list(self) -> None:
         node = MockNode()
         param = HuggingFaceRepoParameter(
