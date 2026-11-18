@@ -46,6 +46,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ENV_VAR_PREFIX
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.serialization.values import decode_value
 
 if TYPE_CHECKING:
@@ -121,9 +122,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             if exc_val is not None and self._save_on_failure_path is not None:
                 await self._save_failed_workflow(exc_val)
         finally:
-            if self._workflow is not None:
-                GriptapeNodes.get_instance().unbind_opened_workflow(self._workflow)
-                self._workflow = None
+            if self._workflow is not None and bound_workflow.get() is self._workflow:
+                bound_workflow.set(None)
+            self._workflow = None
 
     def _get_workflow_name(self) -> str:
         """The name a failed workflow's file starts with.
@@ -258,7 +259,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         if isinstance(result, RunWorkflowFromScratchResultSuccess) and result.workflow_id is not None:
             engine = GriptapeNodes.get_instance()
             self._workflow = engine.open_workflows.get(result.workflow_id)
-            engine.bind_opened_workflow(self._workflow)
+            bound_workflow.set(self._workflow)
 
         # A FLAWED load succeeded but is missing pieces -- placeholders stand in for nodes whose
         # library would not register. That trade is right in the editor, where an artist can see

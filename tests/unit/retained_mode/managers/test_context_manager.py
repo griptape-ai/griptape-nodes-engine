@@ -34,7 +34,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
-from tests.workflow_context import empty_workflow_registry, the_open_workflow
+from tests.workflow_context import bind, empty_workflow_registry, the_open_workflow
 
 
 def _file_path(context_manager: ContextManager) -> str | None:
@@ -326,7 +326,7 @@ class TestWorkflowWorkingDirectory:
                     SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
                 # The folder is NOT the registry key: the workflow is still unsaved.
                 assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
                 assert _file_path(context_manager) is None
@@ -353,7 +353,7 @@ class TestWorkflowWorkingDirectory:
             try:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
                 assert context_manager.get_current_workflow().working_directory is None
 
                 assert self._resolve_outputs(engine) == workspace / "outputs" / "img.png"
@@ -379,7 +379,7 @@ class TestWorkflowWorkingDirectory:
             try:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
 
                 with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
                     resolved = self._resolve_outputs(engine)
@@ -408,7 +408,7 @@ class TestWorkflowWorkingDirectory:
             try:
                 result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
 
                 resolved = engine.current_workflow().handle_request(
                     GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
@@ -440,7 +440,7 @@ class TestWorkflowWorkingDirectory:
                     SetWorkflowContextRequest(display_name="Untitled", working_directory="shots/sh020")
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
 
                 expected = workspace / "shots" / "sh020"
                 assert context_manager.get_current_workflow().working_directory == str(expected)
@@ -471,7 +471,7 @@ class TestWorkflowWorkingDirectory:
                     SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
                 assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
 
                 # What the save path does once the workflow gets a file.
@@ -535,7 +535,7 @@ class TestWorkflowWorkingDirectory:
                 )
 
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
                 assert self._resolve_outputs(engine) == not_yet / "outputs" / "img.png"
             finally:
                 config_manager.workspace_path = original
@@ -565,7 +565,7 @@ class TestWorkflowWorkingDirectory:
                     SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
                 )
                 assert isinstance(result, SetWorkflowContextSuccess)
-                engine.bind_opened_workflow(the_open_workflow(engine))
+                bind(the_open_workflow(engine))
 
                 with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
                     self._resolve_outputs(engine)
@@ -743,7 +743,7 @@ class TestEnsureWorkflowAndFlowRequest:
         )
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess)
-        engine.bind_opened_workflow(the_open_workflow(engine))
+        bind(the_open_workflow(engine))
         assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
         assert result.workflow_id == context_manager.get_current_workflow_id()
         assert context_manager.get_current_workflow().metadata.name == "my_workflow"

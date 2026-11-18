@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -39,7 +40,7 @@ def unsaved_workflow_open(engine: Engine) -> Iterator[Workflow]:
         yield entry
     finally:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        engine.unbind_opened_workflow(workflow)
+        unbind(workflow)
 
 
 def push_unsaved_workflow(
@@ -72,4 +73,15 @@ def clear_all_object_state(engine: Engine) -> None:
     opened = engine.open_workflows.all_open()
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     for workflow in opened:
-        engine.unbind_opened_workflow(workflow)
+        unbind(workflow)
+
+
+def bind(workflow: WorkflowRuntime) -> None:
+    """Bind `workflow` for the rest of the test, as `push_workflow` binds what it opens. The autouse fixture clears it."""
+    bound_workflow.set(workflow)
+
+
+def unbind(workflow: WorkflowRuntime) -> None:
+    """End a `bind` to `workflow`, leaving a binding to any other workflow alone."""
+    if bound_workflow.get() is workflow:
+        bound_workflow.set(None)

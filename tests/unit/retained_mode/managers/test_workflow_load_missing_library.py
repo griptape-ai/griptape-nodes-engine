@@ -86,7 +86,7 @@ from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFr
 from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.utils.version_utils import engine_version
-from tests.workflow_context import the_open_workflow
+from tests.workflow_context import bind, the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -368,7 +368,7 @@ def _run(engine: Engine, relative_file_path: str) -> Any:
     workflow = engine.current_workflow_or_none()
     result = asyncio.run(engine.workflow_manager.run_workflow(relative_file_path, workflow))
     if workflow is None and result.workflow_id is not None:
-        engine.bind_opened_workflow(engine.open_workflows.get(result.workflow_id))
+        bind(engine.open_workflows.get(result.workflow_id))
     return result
 
 
@@ -676,7 +676,7 @@ class TestOpenWorkflowRequest:
         result = reopened.handle_request(RunWorkflowFromRegistryRequest(workflow_name=workflow_name))
 
         assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result
-        reopened.bind_opened_workflow(the_open_workflow(reopened))
+        bind(the_open_workflow(reopened))
         assert not isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
 

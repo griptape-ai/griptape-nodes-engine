@@ -51,6 +51,7 @@ from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from tests.workflow_context import unbind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -390,7 +391,7 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
         """As an MCP client that names no workflow sends it: no envelope id and no binding."""
         workflow = _open_workflow(engine)
         node_name = _create_node(engine, _create_canvas(engine), "node")
-        engine.unbind_opened_workflow(workflow)
+        unbind(workflow)
         process = MagicMock()
 
         with patch.object(_ValueNode, "process", process):

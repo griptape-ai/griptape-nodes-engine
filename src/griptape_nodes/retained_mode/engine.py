@@ -63,7 +63,6 @@ from griptape_nodes.retained_mode.runtime.binding import (
     NoWorkflow,
     WorkflowNotOpenError,
     bound_workflow,
-    opened_binding,
 )
 from griptape_nodes.retained_mode.runtime.open_workflow_set import (
     NoOpenWorkflowError,
@@ -706,34 +705,6 @@ class Engine:
             yield
         finally:
             bound_workflow.reset(token)
-
-    def bind_opened_workflow(self, workflow: WorkflowRuntime) -> None:
-        """Act on `workflow` for the rest of the current work, with no block to end the binding.
-
-        For an edge that opens a workflow and then acts on it at the same level: a saved workflow
-        file run standalone, which opens itself with `ContextManager.push_workflow` and then calls
-        the `GriptapeNodes` facade, and the workflow executors. Everything else binds with
-        `bind_workflow`, whose block ends the binding. A request handler needs neither: dispatch
-        binds the handler's workflow and restores the caller's binding when the handler returns,
-        which also undoes a binding made inside it.
-
-        The binding lasts in the context it was made in, and in tasks started from there. A sync
-        function that binds leaves it set in its caller, so whoever closes the workflow ends it with
-        `unbind_opened_workflow`. A binding to a workflow that closed some other way is refused like
-        any other (`WorkflowNotOpenError`) until the next open binds the next workflow.
-        """
-        bound_workflow.set(workflow)
-        opened_binding.set(workflow)
-
-    def unbind_opened_workflow(self, workflow: WorkflowRuntime) -> None:
-        """End the `bind_opened_workflow` binding to `workflow`, once it is closed or its run is over.
-
-        Leaves any other binding as it is, including a `bind_workflow` binding to `workflow`: work
-        that was bound to a workflow stays bound to it after it closes, and is refused.
-        """
-        if opened_binding.get() is workflow and bound_workflow.get() is workflow:
-            bound_workflow.set(None)
-            opened_binding.set(None)
 
     @contextmanager
     def run_in_worker_workflow(self, workflow: WorkflowRuntime) -> Iterator[None]:

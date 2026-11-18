@@ -4,7 +4,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from griptape_nodes.retained_mode.runtime.binding import bound_workflow, opened_binding
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 
 
 @pytest.fixture(autouse=True)
@@ -15,7 +15,5 @@ def reset_workflow_binding() -> Iterator[None]:
     and a test is one piece of work, so what it binds must not reach the next test.
     """
     bound_token = bound_workflow.set(None)
-    opened_token = opened_binding.set(None)
     yield
-    opened_binding.reset(opened_token)
     bound_workflow.reset(bound_token)

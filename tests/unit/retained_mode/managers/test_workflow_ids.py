@@ -88,7 +88,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
-from tests.workflow_context import clear_all_object_state, send_in_the_open_workflow_async
+from tests.workflow_context import bind, clear_all_object_state, send_in_the_open_workflow_async
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -131,7 +131,7 @@ def _open_new_workflow(engine: Engine, display_name: str) -> str:
     result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
     assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
     assert result.workflow_id is not None
-    engine.bind_opened_workflow(engine.open_workflows.get(result.workflow_id))
+    bind(engine.open_workflows.get(result.workflow_id))
     return result.workflow_id
 
 

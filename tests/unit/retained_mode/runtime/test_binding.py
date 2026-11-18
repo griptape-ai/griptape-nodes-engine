@@ -109,17 +109,17 @@ class TestClosedWorkflowBinding:
             with pytest.raises(WorkflowNotOpenError, match="was closed"):
                 engine.current_workflow()
 
-    def test_the_work_that_closes_its_workflow_is_refused_after(self, engine: Engine) -> None:
+    def test_the_work_that_closes_its_workflow_is_unbound_after(self, engine: Engine) -> None:
         workflow = _open(engine, "closing")
 
         with engine.bind_workflow(workflow):
             engine.context_manager.pop_workflow()
-            assert bound_workflow.get() is workflow
-            with pytest.raises(WorkflowNotOpenError, match="was closed"):
-                engine.current_workflow_or_none()
+            with pytest.raises(NoOpenWorkflowError):
+                engine.current_workflow()
+        assert bound_workflow.get() is None
 
     def test_the_work_that_closes_a_pushed_workflow_is_unbound_after(self, engine: Engine) -> None:
-        """`push_workflow` binds what it opens, and `pop_workflow` ends that binding and no other."""
+        """`push_workflow` binds what it opens, and `pop_workflow` ends that binding."""
         engine.context_manager.push_workflow(workflow_name="opened")
         assert bound_workflow.get() is engine.open_workflows.all_open()[0]
 

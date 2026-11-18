@@ -225,11 +225,3 @@ class TestPopWorkflowUnbinds:
         second = _push_like_a_saved_file(engine)
 
         assert engine.current_workflow_or_none() is second
-
-    def test_pop_leaves_a_binding_to_another_workflow_alone(self, engine: Engine) -> None:
-        opened = _push_like_a_saved_file(engine)
-        other = _open_unbound(engine, "other")
-
-        engine.unbind_opened_workflow(other)
-
-        assert engine.current_workflow_or_none() is opened

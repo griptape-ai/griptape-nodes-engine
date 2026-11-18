@@ -31,6 +31,7 @@ from griptape_nodes.retained_mode.events.context_events import (
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
@@ -751,11 +752,11 @@ class ContextManager(EngineScoped):
         registry entry. Workflows do not nest: a push while the current work is bound to a live
         workflow is refused.
 
-        Binds the opened workflow for the rest of the current work (`Engine.bind_opened_workflow`),
-        so a saved workflow file run standalone, which pushes itself and then calls the
-        `GriptapeNodes` facade, acts on the workflow it opened. The binding is the caller's, in the
-        context it called from and the tasks started there. `pop_workflow` ends it. A request
-        handler that calls this has its own binding restored when dispatch returns.
+        Binds the opened workflow in the caller's context, with no block to end it, so a saved
+        workflow file run standalone, which pushes itself and then calls the `GriptapeNodes` facade,
+        acts on the workflow it opened. This is the compatibility path for saved files, which have
+        no handle to their workflow. `pop_workflow` ends the binding, and a request handler that
+        calls this has its caller's binding restored when dispatch returns.
 
         A library-provided workflow opens as a new unsaved copy of itself
         (`register_unsaved_copy`), so every open, a script's own included, leaves the library's
@@ -784,7 +785,7 @@ class ContextManager(EngineScoped):
         """
         entry = self._entry_to_open(workflow_name, file_path=file_path, working_directory=working_directory)
         workflow = self.engine.open_workflow(entry.workflow_id)
-        self.engine.bind_opened_workflow(workflow)
+        bound_workflow.set(workflow)
         return workflow
 
     def _entry_to_open(
@@ -873,7 +874,8 @@ class ContextManager(EngineScoped):
             raise self.WorkerWorkflowNotClosableError(msg)
 
         self.engine.close_workflow(workflow)
-        self.engine.unbind_opened_workflow(workflow)
+        if bound_workflow.get() is workflow:
+            bound_workflow.set(None)
         return name
 
     def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:

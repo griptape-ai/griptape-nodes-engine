@@ -60,7 +60,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
-from tests.workflow_context import the_open_workflow
+from tests.workflow_context import bind, the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -298,7 +298,7 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
         EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow")
     )
     assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened
-    engine.bind_opened_workflow(the_open_workflow(engine))
+    bind(the_open_workflow(engine))
     try:
         yield _LIBRARY_NAME
     finally:

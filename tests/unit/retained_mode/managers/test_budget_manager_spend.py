@@ -33,7 +33,7 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
 from griptape_nodes.utils.budget_refusal import BUDGET_HALT_PREFIX, BudgetExceededError
 from griptape_nodes.utils.http_utils import request_with_retry
-from tests.workflow_context import push_unsaved_workflow
+from tests.workflow_context import push_unsaved_workflow, unbind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -806,7 +806,7 @@ class TestWorkflowTag:
         """As a node calls from its library's own thread pool: no envelope id and no binding."""
         http.return_value = _response(200, {"allowed": True})
         workflow = push_unsaved_workflow(budget_engine, "poster_flow")
-        budget_engine.unbind_opened_workflow(budget_engine.open_workflows.get(workflow.workflow_id))
+        unbind(budget_engine.open_workflows.get(workflow.workflow_id))
 
         result = await budget_engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
 

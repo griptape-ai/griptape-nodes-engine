@@ -47,6 +47,7 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.request_handlers import RequiredSender
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotOpenError, bound_workflow
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.variable_types import VariableScope
 from tests.unit.exe_types.mocks import MockNode
 
@@ -148,8 +149,8 @@ class TestRuntimeLifecycle:
 
         with engine.bind_workflow(closed):
             engine.context_manager.pop_workflow()
-            with pytest.raises(WorkflowNotOpenError):
-                engine.current_workflow_or_none()
+            with pytest.raises(NoOpenWorkflowError):
+                engine.current_workflow()
 
         assert engine.open_workflows.all_open() == [other]
 

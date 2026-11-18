@@ -56,7 +56,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifa
 )
 from griptape_nodes.retained_mode.managers.filesystem.file_writing import StagingFailedError
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
-from tests.workflow_context import unsaved_workflow_open
+from tests.workflow_context import unbind, unsaved_workflow_open
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
@@ -578,7 +578,7 @@ class TestMetadataInjection:
             if named:
                 result = workflow.handle_request(request)
             else:
-                engine.unbind_opened_workflow(workflow)
+                unbind(workflow)
                 result = engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
