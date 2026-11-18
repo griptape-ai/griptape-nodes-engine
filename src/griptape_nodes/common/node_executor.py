@@ -420,6 +420,12 @@ class NodeExecutor(EngineScoped):
             # a worker would answer from an empty context and silently degrade the paths its node
             # writes to. Harmless on the local route, where these are this process's own values.
             workflow_context = self.engine.project_manager.workflow_context_for_dispatch(workflow)
+            variables = self._resolve_variables_for_node(workflow, node.name)
+            node.record_templates_for_run(variables)
+            # The request reads an empty dict as "substitute nothing".
+            request_variables: dict[str, str | int] = {}
+            if variables is not None:
+                request_variables = variables
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
@@ -427,7 +433,7 @@ class NodeExecutor(EngineScoped):
                 ExecuteNodeRequest(
                     node_name=node.name,
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
-                    variables=self._resolve_variables_for_node(workflow, node.name),
+                    variables=request_variables,
                     local_object_source=node.local_object_source,
                     orchestrator_workflow_id=workflow_context.workflow_id,
                     workflow_name=workflow_context.name,
@@ -533,25 +539,30 @@ class NodeExecutor(EngineScoped):
             details = build_engine_error_details(node_name, result_details, exc)
         return ExecuteNodeFailedError(message, details=details)
 
-    def _resolve_variables_for_node(self, workflow: WorkflowRuntime, node_name: str) -> dict[str, str | int]:
+    def _resolve_variables_for_node(self, workflow: WorkflowRuntime, node_name: str) -> dict[str, str | int] | None:
         """Resolve the variable dict for a node's flow on the orchestrator.
 
         Workers run transient nodes that are never added to ObjectManager, so the
         lazy fetch inside VariableResolver.get_variables_if_enabled fails with
         KeyError. Pre-seeding here lets the worker skip that path entirely.
+
+        Returns None when substitution is off or the variables cannot be looked up, the same
+        answer `VariableResolver.get_variables_without_memoizing` gives. What a node records about
+        its templates here is compared with what that function renders before its next run, so
+        the two must agree on every path or the node runs again for nothing.
         """
         if not VariableResolver.is_substitution_enabled(self.engine, workflow):
-            return {}
+            return None
         try:
             flow_name = workflow.nodes.parent_flow_name(node_name)
         except KeyError:
-            return {}
+            return None
         var_result = workflow.handle_request(
             ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
         if not isinstance(var_result, ListVariablesResultSuccess):
             logger.debug("Variable substitution skipped for node %s: %s", node_name, var_result.result_details)
-            return {}
+            return None
         return VariableResolver._filter_for_substitution({v.name: v.value for v in var_result.variables})
 
     @staticmethod
