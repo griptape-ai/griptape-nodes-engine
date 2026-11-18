@@ -249,20 +249,16 @@ class ResultPayloadSuccess(ResultPayload, ABC):
 class ForwardedException(Exception):  # noqa: N818
     """Placeholder for an exception that crossed the worker boundary.
 
-    The converter's Exception hook emits worker-side exceptions as a
-    ``{type, message, traceback}`` dict, then rebuilds them into a
-    ``ForwardedException`` on the receiving side. The placeholder is
-    still an ``Exception`` (so ``raise ... from result.exception``
-    chains) and carries the worker-side class name and formatted
-    traceback so the orchestrator can show both.
+    The converter's Exception hook emits worker-side exceptions as a ``{type, message, traceback}`` dict, then
+    rebuilds them into a ``ForwardedException`` on the receiving side. The placeholder is still an
+    ``Exception`` (so ``raise ... from result.exception`` chains) and carries the worker-side class name and
+    formatted traceback so the orchestrator can show both.
 
-    ``NodeExecutor._format_node_failure_message`` is the consumer:
-    it reads ``original_type`` for the ``[builtins.ValueError]``
-    prefix on the user-visible ``RuntimeError`` message, and
-    ``original_traceback`` for the ``Worker traceback:`` block.
-    Without these attributes the chained exception would print only
-    ``Type: message`` with no frames, because the placeholder is
-    constructed (not raised) and so its ``__traceback__`` is ``None``.
+    ``format_node_failure_message`` is the consumer: it reads ``original_type`` for the
+    ``[builtins.ValueError]`` prefix on the user-visible ``RuntimeError`` message, and ``original_traceback``
+    for the ``Worker traceback:`` block. Without these attributes the chained exception would print only
+    ``Type: message`` with no frames, because the placeholder is constructed (not raised) and so its
+    ``__traceback__`` is ``None``.
     """
 
     def __init__(

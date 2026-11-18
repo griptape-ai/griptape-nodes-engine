@@ -19,6 +19,7 @@ from griptape_nodes.machines.parallel_resolution import (
     ExecuteDagState,
     ParallelResolutionContext,
     ParallelResolutionMachine,
+    RecordedError,
 )
 from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
 from tests.unit.machines.scheduler_stubs import add_waiting_node, machine_running_one_node, node_stub
@@ -186,7 +187,7 @@ class TestAFailureLetsRunningNodesFinish:
     async def test_a_second_failure_still_reaches_its_node(self, published: AsyncMock) -> None:  # noqa: ARG002
         machine, release, dag_builder = machine_running_one_node(max_nodes_in_parallel=5)
         context = machine.context
-        context.error_message = "Node 'first' encountered a problem: boom"
+        context.recorded_error = RecordedError(message="Node 'first' encountered a problem: boom")
         running = dag_builder.node_to_reference["running"]
         context.task_to_node.clear()
 

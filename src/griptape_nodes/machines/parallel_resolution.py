@@ -4,9 +4,10 @@ import asyncio
 import contextlib
 import logging
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
 
-from griptape_nodes.common.node_executor import ExecuteNodeFailedError, node_error_details_for
+from griptape_nodes.common import failure_trees
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.core_types import Parameter, ParameterTypeBuiltin
@@ -27,7 +28,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     NodeResolvedEvent,
     ParameterValueUpdateEvent,
 )
-from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
+from griptape_nodes.retained_mode.events.failure_tree import ExecuteNodeFailureError
 from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultFailure,
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.machines.dag_builder import DagBuilder, DagNode
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.events.failure_tree import FailureTree
     from griptape_nodes.retained_mode.runtime.flows import WorkflowFlows
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -61,10 +63,19 @@ class NodeStatesResult(NamedTuple):
     leaf_nodes: set[str]
 
 
+@dataclass(frozen=True)
+class RecordedError:
+    """Why a run errored: the message, and what failed when the run knows."""
+
+    message: str
+    failure_tree: FailureTree | None = None
+
+
 class ParallelResolutionContext(EngineScoped):
     paused: bool
     flow_name: str
-    error_message: str | None
+    # None while the run has not errored, and for a run that was cancelled.
+    recorded_error: RecordedError | None
     workflow_state: WorkflowState
     # Execution fields
     max_nodes_in_parallel: int
@@ -97,7 +108,7 @@ class ParallelResolutionContext(EngineScoped):
         super().__init__(engine)
         self.flow_name = flow_name
         self.paused = False
-        self.error_message = None
+        self.recorded_error = None
         self.workflow_state = WorkflowState.NO_ERROR
         self.dag_builder = dag_builder
         self.workflow = workflow
@@ -171,7 +182,7 @@ class ParallelResolutionContext(EngineScoped):
                         )
         else:
             self.workflow_state = WorkflowState.NO_ERROR
-            self.error_message = None
+            self.recorded_error = None
             self.last_resolved_node = None
 
         # Both paths: an abandoning driver no longer drains this, and a leftover
@@ -739,14 +750,17 @@ class ExecuteDagState(State):
                         NodeErrorEvent(
                             node_name=error_node_name,
                             error_message=str(e),
-                            error=node_error_details_for(error_node_name, e),
+                            error=failure_trees.error_details_from_exception(e, error_node_name),
                         )
                     )
                 )
                 if context.was_reset_since(generation):
                     ExecuteDagState._log_abandoned(context)
                     return None
-                context.error_message = f"Parameter passthrough failed for node '{error_node_name}': {e}"
+                context.recorded_error = RecordedError(
+                    message=f"Parameter passthrough failed for node '{error_node_name}': {e}",
+                    failure_tree=failure_trees.failure_tree_from_exception(error_node_name, e),
+                )
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
 
@@ -768,20 +782,23 @@ class ExecuteDagState(State):
                 context.running_tasks_count -= 1  # Decrement on error
                 validation_node_name = node_reference.node_reference.name
                 msg = f"Node '{validation_node_name}' encountered problems: {exceptions}"
+                validation_failure_tree = failure_trees.failure_leaf_from_validation(validation_node_name, exceptions)
                 logger.error("Canceling flow run. %s", msg)
                 await context.engine.event_manager.aput_event(
                     context.workflow.execution_event(
                         NodeErrorEvent(
                             node_name=validation_node_name,
                             error_message=str(exceptions),
-                            error=build_node_error_details(validation_node_name, exceptions),
+                            error=failure_trees.render_error_details(
+                                validation_failure_tree, text=str(exceptions), node_name=validation_node_name
+                            ),
                         )
                     )
                 )
                 if context.was_reset_since(generation):
                     ExecuteDagState._log_abandoned(context)
                     return None
-                context.error_message = msg
+                context.recorded_error = RecordedError(message=msg, failure_tree=validation_failure_tree)
                 context.workflow_state = WorkflowState.ERRORED
                 return ErrorState
 
@@ -798,7 +815,7 @@ class ExecuteDagState(State):
                         f"Cannot have a Start Loop Node without an End Loop Node: {node_reference.node_reference.name}"
                     )
                     logger.error(msg)
-                    context.error_message = msg
+                    context.recorded_error = RecordedError(message=msg)
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
                 # We're going to skip straight to the end node here instead.
@@ -905,8 +922,8 @@ class ExecuteDagState(State):
 
                     # Every caller of the machine reports the failure from `get_error_message()`.
                     logger.debug("Node '%s' failed", node_name, exc_info=exc)
-                    # ExecuteNodeFailedError already names the node.
-                    if isinstance(exc, ExecuteNodeFailedError):
+                    # ExecuteNodeFailureError already names the node.
+                    if isinstance(exc, ExecuteNodeFailureError):
                         msg = str(exc)
                     else:
                         msg = f"Node '{node_name}' encountered a problem: {exc}"
@@ -916,7 +933,7 @@ class ExecuteDagState(State):
                             NodeErrorEvent(
                                 node_name=node_name,
                                 error_message=str(exc),
-                                error=node_error_details_for(node_name, exc),
+                                error=failure_trees.error_details_from_exception(exc, node_name),
                                 run_seconds=dag_node.run_seconds,
                             )
                         )
@@ -924,7 +941,9 @@ class ExecuteDagState(State):
                     if context.was_reset_since(generation):
                         ExecuteDagState._log_abandoned(context)
                         return None
-                    context.error_message = msg
+                    context.recorded_error = RecordedError(
+                        message=msg, failure_tree=failure_trees.failure_tree_from_exception(node_name, exc)
+                    )
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
 
@@ -973,7 +992,7 @@ class ErrorState(State):
         # remote generation one of them started keeps running (and billing) even if its task is
         # cancelled, so cancelling would only throw its result away. No error message means a
         # node was cancelled, so the run itself is being cancelled and everything stops.
-        if context.error_message is None:
+        if context.recorded_error is None:
             for task in list(context.task_to_node.keys()):
                 if not task.done():
                     task.cancel()
@@ -1023,12 +1042,11 @@ class ErrorState(State):
                 if node.state is NodeResolutionState.RESOLVING:
                     node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVING})
 
-            # ErrorState is entered either because a task raised an exception
-            # (error_message is set) or because a task was cancelled via user-
-            # initiated flow cancel (error_message is None). Distinguish here
-            # so flow_manager.is_errored() doesn't surface "Exception occurred:
-            # None" for a clean cancel.
-            if context.error_message is None:
+            # ErrorState is entered either because a task raised an exception (recorded_error is set) or
+            # because a task was cancelled via user-initiated flow cancel (recorded_error is None).
+            # Distinguish here so flow_manager.is_errored() doesn't surface "Exception occurred: None" for a
+            # clean cancel.
+            if context.recorded_error is None:
                 context.workflow_state = WorkflowState.CANCELED
             else:
                 context.workflow_state = WorkflowState.ERRORED
@@ -1057,7 +1075,7 @@ class ErrorState(State):
                     NodeErrorEvent(
                         node_name=node_name,
                         error_message=str(exc),
-                        error=node_error_details_for(node_name, exc),
+                        error=failure_trees.error_details_from_exception(exc, node_name),
                         run_seconds=dag_node.run_seconds,
                     )
                 )
@@ -1194,4 +1212,12 @@ class ParallelResolutionMachine(FSM[ParallelResolutionContext]):
         return self._current_state is ErrorState
 
     def get_error_message(self) -> str | None:
-        return self._context.error_message
+        if self._context.recorded_error is None:
+            return None
+        return self._context.recorded_error.message
+
+    def get_error_failure_tree(self) -> FailureTree | None:
+        """What failed in the run that errored, or None when the run only recorded a message."""
+        if self._context.recorded_error is None:
+            return None
+        return self._context.recorded_error.failure_tree

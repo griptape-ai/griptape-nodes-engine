@@ -10,7 +10,7 @@ These tests cover small, near-pure helpers that decide loop control flow:
   read and clear the body exit that handed control to the packaged End node.
 * ``_check_control_source_fired`` - decide whether a (source_node, source_param)
   pair is the exit that handed control to the packaged End node.
-* ``_format_loop_failure_message`` / ``_format_iteration_failure_lines`` - compose
+* ``render_loop_message`` / ``format_iteration_failure_lines`` - compose
   the artist-facing error naming which iterations failed and why.
 * ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
   creations from reaching editors.
@@ -26,7 +26,9 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
-from griptape_nodes.common.node_executor import IterationControlAction, IterationFailure, NodeExecutor
+from griptape_nodes.common import failure_trees
+from griptape_nodes.common.failure_trees import IterationFailure
+from griptape_nodes.common.node_executor import IterationControlAction, NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
@@ -432,28 +434,28 @@ class TestFormatIterationFailureLines:
     """Renders one indented line per distinct reason, collapsing iterations that agree."""
 
     def test_returns_no_lines_for_no_failures(self) -> None:
-        assert NodeExecutor._format_iteration_failure_lines([]) == []
+        assert failure_trees.format_iteration_failure_lines([]) == []
 
     def test_renders_one_based_iteration_number(self) -> None:
         """Iteration 0 internally is iteration 1 to the artist who built the loop."""
-        lines = NodeExecutor._format_iteration_failure_lines([IterationFailure(iteration_index=0, detail="boom")])
+        lines = failure_trees.format_iteration_failure_lines([IterationFailure(iteration_index=0, detail="boom")])
         assert lines == ["  Iteration 1: boom"]
 
     def test_collapses_iterations_sharing_a_detail(self) -> None:
         """The common case is every iteration failing identically; say the reason once."""
         failures = [IterationFailure(iteration_index=index, detail="same reason") for index in range(3)]
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 1-3: same reason"]
 
     def test_names_a_wholly_failed_loop_as_such(self) -> None:
         """When nothing survived, saying so beats naming every iteration."""
         failures = [IterationFailure(iteration_index=index, detail="same reason") for index in range(50)]
-        lines = NodeExecutor._format_iteration_failure_lines(failures, total_iterations=50)
+        lines = failure_trees.format_iteration_failure_lines(failures, total_iterations=50)
         assert lines == ["  Every iteration: same reason"]
 
     def test_names_the_iteration_when_the_loop_had_only_one(self) -> None:
         """A one-item loop satisfies both "every iteration" and "one iteration"; the number wins."""
-        lines = NodeExecutor._format_iteration_failure_lines(
+        lines = failure_trees.format_iteration_failure_lines(
             [IterationFailure(iteration_index=0, detail="boom")], total_iterations=1
         )
         assert lines == ["  Iteration 1: boom"]
@@ -468,30 +470,30 @@ class TestFormatIterationFailureLines:
         failures = [IterationFailure(iteration_index=index, detail="boom") for index in range(iteration_count)]
         # No total_iterations, so the "every iteration" shortcut cannot apply and the run must
         # still be summarised rather than enumerated.
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 1-500: boom"]
 
     def test_truncates_a_scattered_iteration_list(self) -> None:
         """A non-contiguous set has no range to collapse to, so the enumeration itself is capped."""
         scattered = [1, 3, 5, 7, 9, 11, 13, 15, 17]
         failures = [IterationFailure(iteration_index=index, detail="boom") for index in scattered]
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 2, 4, 6, 8, 10, 12 (+3 more): boom"]
 
     def test_names_a_two_iteration_gap_without_a_range(self) -> None:
         failures = [IterationFailure(iteration_index=index, detail="boom") for index in (0, 4)]
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 1, 5: boom"]
 
     def test_keeps_distinct_details_on_separate_lines(self) -> None:
-        lines = NodeExecutor._format_iteration_failure_lines(_make_iteration_failures(["first", "second"]))
+        lines = failure_trees.format_iteration_failure_lines(_make_iteration_failures(["first", "second"]))
         assert lines == ["  Iteration 1: first", "  Iteration 2: second"]
 
     def test_caps_lines_and_reports_the_remainder(self) -> None:
         reason_count = 8
         max_lines = 3
         failures = _make_iteration_failures([f"reason {index}" for index in range(reason_count)])
-        lines = NodeExecutor._format_iteration_failure_lines(failures, max_lines=max_lines)
+        lines = failure_trees.format_iteration_failure_lines(failures, max_lines=max_lines)
         assert len(lines) == max_lines + 1  # the capped reasons, plus the tail line
         assert f"... and {reason_count - max_lines} more reason(s)" in lines[-1]
         assert "engine log" in lines[-1]
@@ -509,61 +511,53 @@ class TestFormatIterationFailureLines:
             IterationFailure(iteration_index=max_lines + index, detail="the reason that got cut") for index in range(95)
         ]
 
-        lines = NodeExecutor._format_iteration_failure_lines(failures, total_iterations=100, max_lines=max_lines)
+        lines = failure_trees.format_iteration_failure_lines(failures, total_iterations=100, max_lines=max_lines)
 
         assert len(lines) == max_lines + 1
         assert "1 more reason(s) affecting 95 iteration(s)" in lines[-1]
 
     def test_does_not_add_a_tail_line_when_everything_fits(self) -> None:
         failures = _make_iteration_failures(["a", "b", "c"])
-        lines = NodeExecutor._format_iteration_failure_lines(failures, max_lines=len(failures) + 2)
+        lines = failure_trees.format_iteration_failure_lines(failures, max_lines=len(failures) + 2)
         assert len(lines) == len(failures)
         assert not any("more reason" in line for line in lines)
 
     def test_preserves_multiline_detail_text(self) -> None:
         """ResultDetails.__str__ joins several messages with newlines; keep them verbatim."""
         detail = "Attempted to run node 'Blur'.\nFailed because the input image was empty."
-        lines = NodeExecutor._format_iteration_failure_lines([IterationFailure(iteration_index=4, detail=detail)])
+        lines = failure_trees.format_iteration_failure_lines([IterationFailure(iteration_index=4, detail=detail)])
         assert lines == [f"  Iteration 5: {detail}"]
 
 
-class TestFormatLoopFailureMessage:
+def _loop_message(loop_name: str, total_iterations: int, iteration_failures: list[IterationFailure]) -> str:
+    """The message a loop raises when it lost the given iterations."""
+    loop_failure = failure_trees.loop_failure_from_iterations(loop_name, total_iterations, iteration_failures)
+    return failure_trees.render_loop_message(loop_failure)
+
+
+class TestRenderLoopMessage:
     """Leads with what was attempted and how much was lost, then names the reasons."""
 
     def test_includes_loop_name_and_counts(self) -> None:
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=4,
-            iteration_failures=_make_iteration_failures(["first", "second"]),
-        )
+        msg = _loop_message("Trim Frames End", 4, _make_iteration_failures(["first", "second"]))
         assert "'Trim Frames End'" in msg
         assert "all 4 iterations" in msg
         assert "2 of them did not finish" in msg
 
     def test_follows_the_attempted_failed_because_form(self) -> None:
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=1,
-            iteration_failures=_make_iteration_failures(["boom"]),
-        )
+        msg = _loop_message("Trim Frames End", 1, _make_iteration_failures(["boom"]))
         assert msg.startswith("Attempted to run all")
         assert ". Failed because " in msg
 
     def test_appends_one_detail_line_per_reason(self) -> None:
         failures = _make_iteration_failures(["first", "second"])
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=len(failures),
-            iteration_failures=failures,
-        )
+        msg = _loop_message("Trim Frames End", len(failures), failures)
         # One newline joining the summary to the detail block, then one per extra reason.
         assert msg.count("\n") == len(failures)
 
     def test_returns_summary_only_when_failures_empty(self) -> None:
         """Guards the branch even though production only calls this with failures."""
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End", total_iterations=3, iteration_failures=[]
-        )
+        msg = _loop_message("Trim Frames End", 3, [])
         assert "\n" not in msg
 
     def test_message_survives_str_of_result_details(self) -> None:
@@ -572,11 +566,7 @@ class TestFormatLoopFailureMessage:
             ResultDetail(message="Attempted to run node 'Blur'.", level=logging.ERROR),
             ResultDetail(message="Failed because the input image was empty.", level=logging.ERROR),
         )
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=1,
-            iteration_failures=[IterationFailure(iteration_index=0, detail=str(details))],
-        )
+        msg = _loop_message("Trim Frames End", 1, [IterationFailure(iteration_index=0, detail=str(details))])
         assert "Attempted to run node 'Blur'." in msg
         assert "Failed because the input image was empty." in msg
 

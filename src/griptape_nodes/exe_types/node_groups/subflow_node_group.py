@@ -27,6 +27,11 @@ from griptape_nodes.retained_mode.events.connection_events import (
     DeleteConnectionRequest,
     DeleteConnectionResultSuccess,
 )
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartLocalSubflowRequest,
+    StartLocalSubflowResultFailure,
+)
+from griptape_nodes.retained_mode.events.failure_tree import FailureTreeError, GroupFailure
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -1749,11 +1754,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         Can be called by concrete subclasses in their aprocess() implementation.
         """
-        from griptape_nodes.retained_mode.events.execution_events import (
-            StartLocalSubflowRequest,
-            StartLocalSubflowResultFailure,
-        )
-
         subflow = self.metadata.get("subflow_name")
         if subflow is not None and isinstance(subflow, str):
             entry_node_name, _entry_param_name = self.resolve_inner_entry_node()
@@ -1765,8 +1765,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Clear partial outputs to prevent inconsistent state
                 self.parameter_output_values.clear()
                 # Re-raise the error message directly without wrapping
-                msg = result.result_details
-                raise RuntimeError(msg)
+                msg = str(result.result_details)
+                # When the subflow said which node failed, the group wraps that failure; otherwise the group itself is
+                # recorded as the node that failed.
+                if result.failure_tree is None:
+                    raise RuntimeError(msg)
+                raise FailureTreeError(GroupFailure(node_name=self.name, inner=result.failure_tree), msg)
 
         self._propagate_output_values_from_internal_nodes()
 

@@ -68,6 +68,7 @@ class TestStartLoopNodeWithoutAnEndNode:
         await _until(lambda: machine.current_state is ErrorState, "the node without an end node never stopped the run")
 
         assert machine.get_error_message() == "Cannot have a Start Loop Node without an End Loop Node: Loop Start"
+        assert machine.get_error_failure_tree() is None
         assert machine.context.workflow_state == WorkflowState.ERRORED
         assert dag_builder.node_to_reference["Loop Start"].node_state is NodeState.DONE
         put_event = cast("AsyncMock", machine.context.engine.event_manager.aput_event)
