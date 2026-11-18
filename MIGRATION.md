@@ -77,10 +77,10 @@ result = GriptapeNodes.NodeManager().on_get_parameter_value_request(request)
 result = GriptapeNodes.handle_request(request)
 ```
 
-From a node, send it with `self.handle_request(request)`, or `await self.ahandle_request(request)`
-in async code such as `aprocess()`. These send the request through the workflow the node is in.
-They also work in a node that isn't in a workflow yet, such as during its `__init__`: requests about
-the engine still answer, and a request that needs a workflow fails cleanly.
+From a node's `process()` or `aprocess()`, or a thread they start, send it through the node's
+workflow with `self.workflow.handle_request(request)`, or `await self.workflow.ahandle_request(request)`
+in async code. `self.workflow` is `None` until the node is added to a workflow, so don't send
+requests from a node's `__init__`.
 
 The two-argument `on_<name>_request_in_workflow` names are gone, renamed to the bare
 `on_<name>_request` names with the same arguments. For example,

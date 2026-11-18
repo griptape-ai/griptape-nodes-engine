@@ -345,7 +345,7 @@ class WorkflowNode(ControlNode):
 
         self._apply_inputs(subflow_name, live_routes)
 
-        result = await self.ahandle_request(StartLocalSubflowRequest(flow_name=subflow_name))
+        result = await self._ahandle_request_in_workflow(StartLocalSubflowRequest(flow_name=subflow_name))
         if not isinstance(result, StartLocalSubflowResultSuccess):
             msg = (
                 f"Attempted to run the workflow behind node '{self.name}'. "
@@ -390,7 +390,7 @@ class WorkflowNode(ControlNode):
             # Torn down out from under us (for example when the parent flow was deleted).
             self.metadata.pop(SUBFLOW_NAME_KEY, None)
 
-        flow_result = self.handle_request(GetFlowForNodeRequest(node_name=self.name))
+        flow_result = self._handle_request_in_workflow(GetFlowForNodeRequest(node_name=self.name))
         if not isinstance(flow_result, GetFlowForNodeResultSuccess):
             msg = (
                 f"Attempted to run the workflow behind node '{self.name}'. "
@@ -399,7 +399,7 @@ class WorkflowNode(ControlNode):
             raise RuntimeError(msg)  # noqa: TRY004 - the lookup failed at run time; this is not a type error
 
         registry_key = self._register_workflow()
-        import_result = await self.ahandle_request(
+        import_result = await self._ahandle_request_in_workflow(
             ImportWorkflowAsReferencedSubFlowRequest(
                 workflow_name=registry_key,
                 flow_name=flow_result.flow_name,
@@ -459,7 +459,7 @@ class WorkflowNode(ControlNode):
             return
         if _get_flow_or_none(self._require_workflow(), tracked) is None:
             return
-        delete_result = self.handle_request(DeleteFlowRequest(flow_name=tracked))
+        delete_result = self._handle_request_in_workflow(DeleteFlowRequest(flow_name=tracked))
         if delete_result.failed():
             logger.warning(
                 "Node '%s' could not clean up its workflow subflow '%s': %s",
@@ -530,7 +530,7 @@ class WorkflowNode(ControlNode):
 
     def _apply_inputs(self, subflow_name: str, live_routes: WorkflowNodeLiveRoutes) -> None:
         for surface_name, route in live_routes.inputs.items():
-            set_result = self.handle_request(
+            set_result = self._handle_request_in_workflow(
                 SetParameterValueRequest(
                     parameter_name=route.parameter_name,
                     node_name=route.workflow_node_name,

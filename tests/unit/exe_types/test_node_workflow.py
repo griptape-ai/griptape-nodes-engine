@@ -159,6 +159,6 @@ class TestNodeEngine:
         assert in_workflow.flow_name == "canvas"
 
         with engine.bind_workflow(workflow):
-            result = node.handle_request(GetTopLevelFlowRequest())
+            result = node._handle_request_in_workflow(GetTopLevelFlowRequest())
 
         assert isinstance(result, WorkflowNotNamedResultFailure)

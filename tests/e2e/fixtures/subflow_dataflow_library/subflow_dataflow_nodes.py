@@ -96,7 +96,11 @@ class RunSubflowNode(ControlNode):
     async def aprocess(self) -> None:
         subflow = self.metadata["subflow_name"]
         end_node_name = self.metadata["end_node_name"]
-        result = await self.ahandle_request(StartLocalSubflowRequest(flow_name=subflow))
+        workflow = self.workflow
+        if workflow is None:
+            self.parameter_output_values["collected_value"] = "START_FAIL: the node isn't in a workflow"
+            return
+        result = await workflow.ahandle_request(StartLocalSubflowRequest(flow_name=subflow))
         if isinstance(result, StartLocalSubflowResultFailure):
             self.parameter_output_values["collected_value"] = f"START_FAIL: {result.result_details}"
             return
