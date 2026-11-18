@@ -181,7 +181,7 @@ An organization-wide cap limits everything your organization spends, whatever pr
 
 #### The Fallback Budget
 
-Every organization has a **Fallback Budget**, listed last in the Organization section. It limits spend that no project budget covers, including calls that carry no project, or project details Griptape Cloud can't read. It is a **Hard Limit**, so once that spend reaches its limit for the period, those calls stop until you raise the limit or the period resets. A new organization's Fallback Budget starts at $100 a month. If you had already set its limit, that limit is kept. You can change its limit and period, switch it to **Soft Limit**, or freeze it, but you cannot delete it.
+Every organization has a **Fallback Budget**, listed last in the Organization section. Griptape Cloud creates it the first time anyone opens your organization's budgets, for example in Spend & Budgets; until then, nothing limits spend outside your project budgets. It limits spend that no project budget covers, including calls that carry no project, or project details Griptape Cloud can't read. It is a **Hard Limit**, so once that spend reaches its limit for the period, those calls stop until you raise the limit or the period resets. A new organization's Fallback Budget starts at $100 a month. If you had already set its limit, that limit is kept. You can change its limit and period, switch it to **Soft Limit**, or freeze it, but you cannot delete it.
 
 ### Creating a budget
 
