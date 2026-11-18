@@ -13,12 +13,13 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 
+import OpenImageIO as oiio  # noqa: N813
 import tomlkit
-from PIL import Image
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
 
 console = Console()
+_RGBA_CHANNELS = 4
 
 
 def extract_metadata_block(file_path: Path) -> tuple[str, str]:
@@ -153,51 +154,50 @@ def process_image(image_path: Path, output_path: Path) -> None:
         msg = f"Image file not found: {image_path}"
         raise ValueError(msg)
 
-    try:
-        # Check if it's a GIF - if so, copy as-is
-        if image_path.suffix.lower() == ".gif":
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(image_path, output_path)
-            return
-
-        # Load image
-        img = Image.open(image_path)
-
-        # Convert to RGB if needed (webp supports RGB/RGBA)
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
-
-        # Resize to cover 512x512 while maintaining aspect ratio
-        # This is similar to CSS object-fit: cover
-        target_size = (512, 512)
-        img_width, img_height = img.size
-        target_width, target_height = target_size
-
-        # Calculate scaling factor to cover the target size
-        scale = max(target_width / img_width, target_height / img_height)
-
-        # Calculate new dimensions
-        new_width = int(img_width * scale)
-        new_height = int(img_height * scale)
-
-        # Resize image
-        img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        # Crop from center to exact target size
-        left = (new_width - target_width) // 2
-        top = (new_height - target_height) // 2
-        right = left + target_width
-        bottom = top + target_height
-
-        img_cropped = img_resized.crop((left, top, right, bottom))
-
-        # Save as webp with quality=85
+    if image_path.suffix.lower() == ".gif":
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        img_cropped.save(output_path, format="WEBP", quality=85)
+        shutil.copy2(image_path, output_path)
+        return
 
-    except Exception as err:
-        msg = f"Failed to process image: {err}"
-        raise ValueError(msg) from err
+    buf = oiio.ImageBuf(str(image_path))
+    if not buf.read(0, 0, force=True) or buf.has_error:
+        msg = f"Failed to process image: OpenImageIO could not read {image_path}: {buf.geterror()}"
+        raise ValueError(msg)
+
+    if buf.nchannels in (1, 2):
+        buf = oiio.ImageBufAlgo.channels(buf, (0, 0, 0), ("R", "G", "B"))
+    elif buf.nchannels > _RGBA_CHANNELS:
+        buf = oiio.ImageBufAlgo.channels(buf, (0, 1, 2, 3), ("R", "G", "B", "A"))
+
+    target_width, target_height = 512, 512
+    spec = buf.spec()
+    scale = max(target_width / spec.width, target_height / spec.height)
+    new_width = max(target_width, round(spec.width * scale))
+    new_height = max(target_height, round(spec.height * scale))
+
+    resized = oiio.ImageBufAlgo.resize(
+        buf,
+        "lanczos3",
+        roi=oiio.ROI(0, new_width, 0, new_height, 0, 1, 0, buf.nchannels),
+    )
+    left = (new_width - target_width) // 2
+    top = (new_height - target_height) // 2
+    cropped = oiio.ImageBufAlgo.cut(
+        resized,
+        oiio.ROI(left, left + target_width, top, top + target_height, 0, 1, 0, resized.nchannels),
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_spec = oiio.ImageSpec(target_width, target_height, cropped.nchannels, oiio.UINT8)
+    out_spec.attribute("compression", "webp:85")
+    out = oiio.ImageOutput.create(str(output_path))
+    if out is None or not out.open(str(output_path), out_spec) or not cropped.write(out):
+        err_detail = out.geterror() if out is not None else oiio.geterror()
+        if out is not None:
+            out.close()
+        msg = f"Failed to process image: OpenImageIO could not write {output_path}: {err_detail or cropped.geterror()}"
+        raise ValueError(msg)
+    out.close()
 
 
 def generate_github_url(library_path: Path, thumbnail_filename: str) -> str:

@@ -173,6 +173,7 @@ Examples:
 | `storage_backend`               | `GTN_CONFIG_STORAGE_BACKEND`                |
 | `worker.library_load_timeout_s` | `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S` |
 | `library.lazy_node_loading`     | `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`     |
+| `openimageio.max_memory_mb`     | `GTN_CONFIG_OPENIMAGEIO__MAX_MEMORY_MB`     |
 | `agent.system_prompt`           | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`           |
 
 This is useful for scripted environments, containers, and CI/CD pipelines where you want to inject configuration without modifying any config files:
@@ -204,6 +205,18 @@ GTN_CONFIG_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested layouts
 ```
 
 A value of `0` scans only the top-level directory (no subdirectories).
+
+## Image Cache and Processing (`openimageio`)
+
+The engine decodes image headers and generates previews through OpenImageIO, backed by a shared tile cache so repeated reads of high-resolution files (such as OpenEXR, TIFF, DPX, or PSD plates) reuse decoded tiles in memory instead of reading from disk again. Changes to `openimageio` settings take effect immediately without restarting the engine:
+
+- `openimageio.max_memory_mb` (default `1024`): memory budget in megabytes for cached image tiles. Raise this when scrubbing multi-frame 4K or 8K float sequences; lower it on machines with limited RAM.
+- `openimageio.max_open_files` (default `100`): maximum number of image files kept open simultaneously by the cache.
+- `openimageio.autotile_size` (default `64`): scanline strip height (`0`, `64`, `128`, `256`, or `512`) used to split untiled images (PNG, JPEG, WebP, scanline EXR) so parts of a large image can be evicted within `max_memory_mb`.
+- `openimageio.deduplicate` (default `true`): shares cached tiles across identical files stored in multiple folders.
+- `openimageio.threads` (default `0`, meaning all CPU cores): caps OpenImageIO and OpenEXR worker threads when running parallel node execution alongside local models.
+- `openimageio.max_image_size_mb` (default `4096`): maximum uncompressed pixel buffer size in megabytes allowed for a single image (`0` disables the limit).
+- `openimageio.failure_retries` (default `0`): number of tile-read retries for busy network storage.
 
 ## Running a Library's Nodes on Another Computer
 

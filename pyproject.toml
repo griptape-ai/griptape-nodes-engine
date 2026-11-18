@@ -26,7 +26,6 @@ dependencies = [
   "mcp>=2.0,<3",
   "openimageio>=3.2.2.0,<4",
   "numpy>=2.0,<3",
-  "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
   "watchfiles>=1.1.0",
   # Ceiling: default libraries pin transformers/tokenizers that need huggingface-hub<2. Library
