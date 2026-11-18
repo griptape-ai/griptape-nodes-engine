@@ -479,10 +479,19 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         and absorb only ever move the outer wire for the member recorded in _entry_wire_owner /
         _exit_wire_owner, which this is the one place that sets.
 
+        inner_entry and control_out are both single-target ports, so drawing either leg when it is
+        already wired to a different member would silently delete that wire. A second pre-wired node
+        joining an already-populated group skips exactly that at-risk leg instead -- the member simply
+        falls back to implicit entry discovery (entry side) or stays off the group's exit port
+        (exit side), the same structural limit as two members both leading to the exit. The other leg
+        of the pair is never at risk: control_in is an input and inner_exit is an input, and neither
+        is single-target.
+
         Args:
             old_connection: The member's connection that crossed the boundary, already deleted
             is_incoming: True if the wire came into the group
         """
+        connections = self._require_workflow().flows.connections
         if is_incoming:
             outer = CreateConnectionRequest(
                 source_node_name=old_connection.source_node.name,
@@ -491,7 +500,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 target_parameter_name=self.control_in.name,
             )
             inner = None
-            if self.inner_entry is not None:
+            entry_already_wired = self.inner_entry is not None and connections.get_outgoing_connections_from_parameter(
+                self, self.inner_entry
+            )
+            if self.inner_entry is not None and not entry_already_wired:
                 inner = CreateConnectionRequest(
                     source_node_name=self.name,
                     source_parameter_name=self.inner_entry.name,
@@ -501,12 +513,15 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
                 self._entry_wire_owner = (old_connection.target_node.name, old_connection.target_parameter.name)
         else:
-            outer = CreateConnectionRequest(
-                source_node_name=self.name,
-                source_parameter_name=self.control_out.name,
-                target_node_name=old_connection.target_node.name,
-                target_parameter_name=old_connection.target_parameter.name,
-            )
+            outer = None
+            exit_already_wired = connections.get_outgoing_connections_from_parameter(self, self.control_out)
+            if not exit_already_wired:
+                outer = CreateConnectionRequest(
+                    source_node_name=self.name,
+                    source_parameter_name=self.control_out.name,
+                    target_node_name=old_connection.target_node.name,
+                    target_parameter_name=old_connection.target_parameter.name,
+                )
             inner = None
             if self.inner_exit is not None:
                 inner = CreateConnectionRequest(

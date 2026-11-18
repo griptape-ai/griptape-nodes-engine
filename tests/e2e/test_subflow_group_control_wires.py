@@ -218,6 +218,44 @@ class TestGroupingAControlChain:
         }
         assert "Up.exec_out->Child.exec_in" in _edges(engine, "Child")
 
+    def test_grouping_a_second_wired_node_does_not_steal_the_entry_port(self, engine: Engine, flow: str) -> None:
+        """inner_entry is single-target: drawing a second On Start leg must not delete the first member's."""
+        _ = flow
+        _chain(engine)
+        _group(engine, ["Child"])
+        _node(engine, "EchoNode", "Up2")
+        _node(engine, "EchoNode", "Y")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Y", value="Y")
+        ).succeeded()
+        _connect(engine, "Up2", "exec_out", "Y", "exec_in")
+
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Y"], node_group_name="G"))
+
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+        assert "G.on_start->Child.exec_in (internal)" in _edges(engine, "G")
+        assert "Up2.exec_out->G.group_exec_in" in _edges(engine, "Up2", control_only=True)
+        assert "G.on_start->Y.exec_in (internal)" not in _edges(engine, "G")
+
+    def test_grouping_a_second_wired_node_does_not_steal_the_exit_port(self, engine: Engine, flow: str) -> None:
+        """control_out is single-target: drawing a second successor leg must not delete the first member's."""
+        _ = flow
+        _chain(engine)
+        _group(engine, ["Child"])
+        _node(engine, "EchoNode", "Z")
+        _node(engine, "EchoNode", "Down2")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Z", value="Z")
+        ).succeeded()
+        _connect(engine, "Z", "exec_out", "Down2", "exec_in")
+
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Z"], node_group_name="G"))
+
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+        assert "G.group_exec_out->Down.exec_in" in _edges(engine, "G")
+        assert "Z.exec_out->G.group_complete (internal)" in _edges(engine, "G")
+        assert "G.group_exec_out->Down2.exec_in" not in _edges(engine, "G")
+
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
 class TestUngrouping:
