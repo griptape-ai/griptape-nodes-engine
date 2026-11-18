@@ -141,7 +141,7 @@ class AppGetSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
         engine_version: Current engine version string
         engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
         engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
-        is_initializing: Whether the engine is still loading libraries and workflows
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
     """
 
     session_id: str | None
@@ -552,6 +552,9 @@ class SessionHeartbeatResultFailure(ResultPayloadFailure):
 @PayloadRegistry.register
 class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Request clients can use to discover active engines and their status.
+
+    A client connected to a session follows the engine with `AppGetSessionRequest` and
+    `SessionHeartbeatRequest` instead, since discovery may not list that engine.
 
     Attributes:
         heartbeat_id: Unique identifier for the heartbeat request, used to correlate requests and responses.
