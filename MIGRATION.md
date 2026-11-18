@@ -82,6 +82,12 @@ in async code such as `aprocess()`. These send the request through the workflow 
 They also work in a node that isn't in a workflow yet, such as during its `__init__`: requests about
 the engine still answer, and a request that needs a workflow fails cleanly.
 
+The two-argument `on_<name>_request_in_workflow` names are gone, renamed to the bare
+`on_<name>_request` names with the same arguments. For example,
+`on_set_parameter_value_request_in_workflow(request, workflow)` is now
+`on_set_parameter_value_request(request, workflow)`. They are dispatch handlers too, so send the
+request rather than call them.
+
 ## Parameter values keep their type
 
 **Library authors.** A field of your own request, result, or event payload that holds parameter
