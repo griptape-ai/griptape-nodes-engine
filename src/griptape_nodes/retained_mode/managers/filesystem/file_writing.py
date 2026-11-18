@@ -31,6 +31,7 @@ from griptape_nodes.files.path_utils import (
     normalize_path_for_platform,
     sanitize_path_string,
 )
+from griptape_nodes.image.oiio_config import invalidate_image_cache
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
@@ -1125,6 +1126,7 @@ class FileWriter(EngineScoped):
                     error_message=msg,
                 )
 
+        invalidate_image_cache(normalized_path)
         try:
             atomic_write_bytes(normalized_path, data)
         except IsADirectoryError as e:
@@ -1212,6 +1214,8 @@ class FileWriter(EngineScoped):
             - Continue: all fields are None (file exists/locked but caller wants to continue)
             - Failure: failure_reason and error_message are set, bytes_written is None
         """
+        if mode != "x":
+            invalidate_image_cache(normalized_path)
         try:
             bytes_written = self._write_with_portalocker(
                 str(normalized_path),

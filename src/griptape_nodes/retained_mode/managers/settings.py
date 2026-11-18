@@ -1,5 +1,6 @@
 import json
 import logging
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
@@ -41,6 +42,27 @@ LOG_TO_FILE_KEY = "logging.log_to_file"
 LOG_DIRECTORY_KEY = "logging.log_directory"
 LOG_RETENTION_DAYS_KEY = "logging.log_retention_days"
 SESSION_LOG_BUFFER_LINES_KEY = "logging.session_log_buffer_lines"
+OPENIMAGEIO_KEY = "openimageio"
+OPENIMAGEIO_MAX_MEMORY_MB_KEY = "openimageio.max_memory_mb"
+OPENIMAGEIO_MAX_OPEN_FILES_KEY = "openimageio.max_open_files"
+OPENIMAGEIO_AUTOTILE_SIZE_KEY = "openimageio.autotile_size"
+OPENIMAGEIO_DEDUPLICATE_KEY = "openimageio.deduplicate"
+OPENIMAGEIO_THREADS_KEY = "openimageio.threads"
+OPENIMAGEIO_MAX_IMAGE_SIZE_MB_KEY = "openimageio.max_image_size_mb"
+OPENIMAGEIO_FAILURE_RETRIES_KEY = "openimageio.failure_retries"
+DEFAULT_OIIO_MAX_MEMORY_MB = 1024
+MIN_OIIO_MAX_MEMORY_MB = 64
+DEFAULT_OIIO_MAX_OPEN_FILES = 100
+MIN_OIIO_MAX_OPEN_FILES = 10
+MAX_OIIO_MAX_OPEN_FILES = 4096
+DEFAULT_OIIO_AUTOTILE_SIZE = 64
+VALID_OIIO_AUTOTILE_SIZES = frozenset({0, 64, 128, 256, 512})
+DEFAULT_OIIO_DEDUPLICATE = True
+DEFAULT_OIIO_THREADS = 0
+MAX_OIIO_THREADS = 256
+DEFAULT_OIIO_MAX_IMAGE_SIZE_MB = 4096
+DEFAULT_OIIO_FAILURE_RETRIES = 0
+MAX_OIIO_FAILURE_RETRIES = 10
 # Validation context flag ConfigManager sets when checking a single GTN_CONFIG_ variable. Env vars
 # are always strings, so validators that need a typed value convert under this flag, and a value
 # that can't be converted fails validation so the variable is reported as a bad value instead of
@@ -168,6 +190,10 @@ AGENT = Category(name="Agent", description="Agent behavior and system prompt")
 LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
 BETA_FEATURES = Category(name="Beta Features", description="Experimental features that can be turned on or off")
 LOGGING = Category(name="Logging", description="Where engine logs are kept and how much history is retained")
+IMAGE_PROCESSING = Category(
+    name="Image Processing",
+    description="Image memory cache, concurrency, and decoding limits",
+)
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -656,6 +682,197 @@ class LoggingSettings(BaseModel):
     )
 
 
+@dataclass(frozen=True)
+class _IntSettingSpec:
+    key: str
+    default: int
+    minimum: int
+    maximum: int | None = None
+
+
+def _validate_oiio_int_range(spec: _IntSettingSpec, value: Any, *, from_env: bool) -> int:
+    """Validate an integer OpenImageIO setting, warning and falling back for persisted configs."""
+    bounds_label = f"at least {spec.minimum}" if spec.maximum is None else f"between {spec.minimum} and {spec.maximum}"
+    if from_env:
+        if isinstance(value, bool):
+            msg = f"{spec.key} must be a whole number {bounds_label}, got {value!r}"
+            raise ValueError(msg)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as e:
+            msg = f"{spec.key} must be a whole number {bounds_label}, got {value!r}"
+            raise ValueError(msg) from e
+        if parsed < spec.minimum or (spec.maximum is not None and parsed > spec.maximum):
+            msg = f"{spec.key} must be a whole number {bounds_label}, got {value!r}"
+            raise ValueError(msg)
+        return parsed
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        _warn_once(
+            (spec.key, repr(value)),
+            f"Ignoring {spec.key} = {value!r}: expected a whole number {bounds_label}. Using {spec.default}.",
+        )
+        return spec.default
+    if value < spec.minimum or (spec.maximum is not None and value > spec.maximum):
+        _warn_once(
+            (spec.key, repr(value)),
+            f"Ignoring {spec.key} = {value!r}: expected a whole number {bounds_label}. Using {spec.default}.",
+        )
+        return spec.default
+    return value
+
+
+class OpenImageIOSettings(BaseModel):
+    """OpenImageIO shared cache, concurrency, and image-decoding limits."""
+
+    max_memory_mb: int = Field(
+        category=IMAGE_PROCESSING,
+        default=DEFAULT_OIIO_MAX_MEMORY_MB,
+        description=(
+            "Maximum memory in megabytes that the image cache uses to hold decoded image tiles (minimum 64). "
+            "Raise this when working with high-resolution EXR or TIFF sequences so recently viewed frames stay "
+            "in memory. Lower it on machines with tight RAM."
+        ),
+    )
+    max_open_files: int = Field(
+        category=IMAGE_PROCESSING,
+        default=DEFAULT_OIIO_MAX_OPEN_FILES,
+        description=(
+            "Maximum number of image files kept open at the same time by the image cache (10 to 4096). "
+            "Raise this for workflows that read long frame sequences, or lower it if your system has a low "
+            "open-file limit."
+        ),
+    )
+    autotile_size: Literal[0, 64, 128, 256, 512] = Field(
+        category=IMAGE_PROCESSING,
+        default=DEFAULT_OIIO_AUTOTILE_SIZE,
+        description=(
+            "Scanline strip height in pixels used to split untiled images (such as PNG, JPEG, WebP, and scanline EXR) "
+            "in the image cache so max_memory_mb can evict parts of large images. Larger values reduce network-drive "
+            "reads; set to 0 to cache untiled images whole."
+        ),
+    )
+    deduplicate: bool = Field(
+        category=IMAGE_PROCESSING,
+        default=DEFAULT_OIIO_DEDUPLICATE,
+        description=(
+            "Share cached image tiles when identical files appear in more than one folder (for example in both "
+            "inputs and outputs), saving memory."
+        ),
+    )
+    threads: int = Field(
+        category=IMAGE_PROCESSING,
+        default=DEFAULT_OIIO_THREADS,
+        description=(
+            "Number of CPU threads OpenImageIO and OpenEXR use when decoding and resizing images (0 to 256). "
+            "0 uses all available CPU cores. Set a fixed number to limit CPU contention when running several "
+            "nodes at once."
+        ),
+    )
+    max_image_size_mb: int = Field(
+        category=IMAGE_PROCESSING,
+        default=DEFAULT_OIIO_MAX_IMAGE_SIZE_MB,
+        description=(
+            "Maximum uncompressed pixel memory in megabytes allowed for a single image when decoding (0 disables "
+            "the limit). Protects the engine from running out of memory on damaged or oversized files; raise this "
+            "when working with 16K or 32K float images."
+        ),
+    )
+    failure_retries: int = Field(
+        category=IMAGE_PROCESSING,
+        default=DEFAULT_OIIO_FAILURE_RETRIES,
+        description=(
+            "How many times the image cache retries a failed tile read before reporting an error (0 to 10). "
+            "Useful when reading image sequences from busy network storage."
+        ),
+    )
+
+    @field_validator("max_memory_mb", mode="before")
+    @classmethod
+    def validate_max_memory_mb(cls, v: Any, info: ValidationInfo) -> int:
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        spec = _IntSettingSpec(OPENIMAGEIO_MAX_MEMORY_MB_KEY, DEFAULT_OIIO_MAX_MEMORY_MB, MIN_OIIO_MAX_MEMORY_MB)
+        return _validate_oiio_int_range(spec, v, from_env=from_env)
+
+    @field_validator("max_open_files", mode="before")
+    @classmethod
+    def validate_max_open_files(cls, v: Any, info: ValidationInfo) -> int:
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        spec = _IntSettingSpec(
+            OPENIMAGEIO_MAX_OPEN_FILES_KEY,
+            DEFAULT_OIIO_MAX_OPEN_FILES,
+            MIN_OIIO_MAX_OPEN_FILES,
+            MAX_OIIO_MAX_OPEN_FILES,
+        )
+        return _validate_oiio_int_range(spec, v, from_env=from_env)
+
+    @field_validator("autotile_size", mode="before")
+    @classmethod
+    def validate_autotile_size(cls, v: Any, info: ValidationInfo) -> int:
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        allowed_text = "0, 64, 128, 256, or 512"
+        if from_env:
+            if isinstance(v, bool):
+                msg = f"{OPENIMAGEIO_AUTOTILE_SIZE_KEY} must be one of {allowed_text}, got {v!r}"
+                raise ValueError(msg)
+            try:
+                parsed = int(v)
+            except (TypeError, ValueError) as e:
+                msg = f"{OPENIMAGEIO_AUTOTILE_SIZE_KEY} must be one of {allowed_text}, got {v!r}"
+                raise ValueError(msg) from e
+            if parsed not in VALID_OIIO_AUTOTILE_SIZES:
+                msg = f"{OPENIMAGEIO_AUTOTILE_SIZE_KEY} must be one of {allowed_text}, got {v!r}"
+                raise ValueError(msg)
+            return parsed
+
+        if isinstance(v, bool) or not isinstance(v, int) or v not in VALID_OIIO_AUTOTILE_SIZES:
+            _warn_once(
+                (OPENIMAGEIO_AUTOTILE_SIZE_KEY, repr(v)),
+                f"Ignoring {OPENIMAGEIO_AUTOTILE_SIZE_KEY} = {v!r}: expected one of {allowed_text}. "
+                f"Using {DEFAULT_OIIO_AUTOTILE_SIZE}.",
+            )
+            return DEFAULT_OIIO_AUTOTILE_SIZE
+        return v
+
+    @field_validator("deduplicate", mode="before")
+    @classmethod
+    def validate_deduplicate(cls, v: Any, info: ValidationInfo) -> bool:
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if from_env:
+            return _env_value_to_bool(OPENIMAGEIO_DEDUPLICATE_KEY, v)
+        if not isinstance(v, bool):
+            _warn_once(
+                (OPENIMAGEIO_DEDUPLICATE_KEY, repr(v)),
+                f"Ignoring {OPENIMAGEIO_DEDUPLICATE_KEY} = {v!r}: expected true or false. "
+                f"Using {DEFAULT_OIIO_DEDUPLICATE}.",
+            )
+            return DEFAULT_OIIO_DEDUPLICATE
+        return v
+
+    @field_validator("threads", mode="before")
+    @classmethod
+    def validate_threads(cls, v: Any, info: ValidationInfo) -> int:
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        spec = _IntSettingSpec(OPENIMAGEIO_THREADS_KEY, DEFAULT_OIIO_THREADS, 0, MAX_OIIO_THREADS)
+        return _validate_oiio_int_range(spec, v, from_env=from_env)
+
+    @field_validator("max_image_size_mb", mode="before")
+    @classmethod
+    def validate_max_image_size_mb(cls, v: Any, info: ValidationInfo) -> int:
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        spec = _IntSettingSpec(OPENIMAGEIO_MAX_IMAGE_SIZE_MB_KEY, DEFAULT_OIIO_MAX_IMAGE_SIZE_MB, 0)
+        return _validate_oiio_int_range(spec, v, from_env=from_env)
+
+    @field_validator("failure_retries", mode="before")
+    @classmethod
+    def validate_failure_retries(cls, v: Any, info: ValidationInfo) -> int:
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        spec = _IntSettingSpec(
+            OPENIMAGEIO_FAILURE_RETRIES_KEY, DEFAULT_OIIO_FAILURE_RETRIES, 0, MAX_OIIO_FAILURE_RETRIES
+        )
+        return _validate_oiio_int_range(spec, v, from_env=from_env)
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -886,6 +1103,10 @@ class Settings(BaseModel):
         category=LIBRARIES,
         default_factory=LibrarySettings,
     )
+    openimageio: OpenImageIOSettings = Field(
+        category=IMAGE_PROCESSING,
+        default_factory=OpenImageIOSettings,
+    )
     beta_features: dict[str, bool] = Field(
         category=BETA_FEATURES,
         default_factory=dict,
@@ -941,3 +1162,21 @@ class Settings(BaseModel):
             )
             for library_key, features in v.items()
         }
+
+    @field_validator("openimageio", mode="before")
+    @classmethod
+    def validate_openimageio(cls, v: Any, info: ValidationInfo) -> Any:
+        """Fall back to default OpenImageIOSettings when a persisted config stores a non-mapping."""
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        if isinstance(v, OpenImageIOSettings):
+            return v
+        if isinstance(v, dict):
+            return v
+        if from_env:
+            msg = f"{OPENIMAGEIO_KEY} must be a mapping of OpenImageIO settings, got {v!r}"
+            raise ValueError(msg)
+        _warn_once(
+            (OPENIMAGEIO_KEY, repr(v)),
+            f"Ignoring {OPENIMAGEIO_KEY} = {v!r}: expected a mapping of OpenImageIO settings. Using defaults.",
+        )
+        return OpenImageIOSettings()

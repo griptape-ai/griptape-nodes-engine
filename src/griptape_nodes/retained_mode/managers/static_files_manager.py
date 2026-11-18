@@ -17,6 +17,7 @@ from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.drivers.storage.local_storage_driver import FileFingerprint, LocalStorageDriver
 from griptape_nodes.files.path_utils import FilenameParts, resolve_workspace_path
+from griptape_nodes.image.oiio_config import invalidate_image_cache
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -674,6 +675,7 @@ class StaticFilesManager(EngineScoped):
         self.file_watcher.set_max_files(self._refresh_previews_max_files())
 
     def _on_watched_file_changed(self, change: WatchedFileChange) -> None:
+        invalidate_image_cache(change.path)
         # A change can be detected just before the watcher is cleared for the setting turning off.
         if not self._refresh_previews_on_file_change():
             return

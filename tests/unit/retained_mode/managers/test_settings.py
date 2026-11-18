@@ -13,6 +13,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDependencyInstallBehavior,
     LibraryDownload,
     LibraryRegistration,
+    OpenImageIOSettings,
     Settings,
 )
 
@@ -186,3 +187,133 @@ class TestDistributedExecutionMaxWorkers:
         settings = DistributedExecutionSettings.model_validate({"max_workers": value})
 
         assert settings.max_workers == value
+
+
+class TestOpenImageIOSettings:
+    """OpenImageIO cache, concurrency, and size-limit settings coerce bad persisted values to defaults."""
+
+    def test_defaults(self) -> None:
+        defaults = Settings().openimageio
+
+        assert isinstance(defaults, OpenImageIOSettings)
+        assert defaults.max_memory_mb == 1024  # noqa: PLR2004
+        assert defaults.max_open_files == 100  # noqa: PLR2004
+        assert defaults.autotile_size == 64  # noqa: PLR2004
+        assert defaults.deduplicate is True
+        assert defaults.threads == 0
+        assert defaults.max_image_size_mb == 4096  # noqa: PLR2004
+        assert defaults.failure_retries == 0
+
+    def test_valid_values_are_preserved(self) -> None:
+        parsed = Settings.model_validate(
+            {
+                "openimageio": {
+                    "max_memory_mb": 4096,
+                    "max_open_files": 250,
+                    "autotile_size": 128,
+                    "deduplicate": False,
+                    "threads": 8,
+                    "max_image_size_mb": 8192,
+                    "failure_retries": 3,
+                }
+            }
+        ).openimageio
+
+        assert parsed.max_memory_mb == 4096  # noqa: PLR2004
+        assert parsed.max_open_files == 250  # noqa: PLR2004
+        assert parsed.autotile_size == 128  # noqa: PLR2004
+        assert parsed.deduplicate is False
+        assert parsed.threads == 8  # noqa: PLR2004
+        assert parsed.max_image_size_mb == 8192  # noqa: PLR2004
+        assert parsed.failure_retries == 3  # noqa: PLR2004
+
+    @pytest.mark.parametrize(
+        ("field_name", "bad_value", "expected_default"),
+        [
+            ("max_memory_mb", 32, 1024),
+            ("max_memory_mb", True, 1024),
+            ("max_memory_mb", "abc", 1024),
+            ("max_open_files", 5, 100),
+            ("max_open_files", 5000, 100),
+            ("autotile_size", 99, 64),
+            ("autotile_size", -64, 64),
+            ("deduplicate", "yes", True),
+            ("threads", -1, 0),
+            ("threads", 512, 0),
+            ("max_image_size_mb", -10, 4096),
+            ("failure_retries", -1, 0),
+            ("failure_retries", 20, 0),
+        ],
+    )
+    def test_invalid_persisted_field_falls_back_to_default_with_warning(
+        self,
+        field_name: str,
+        bad_value: object,
+        expected_default: object,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from griptape_nodes.retained_mode.managers import settings as settings_module
+
+        settings_module._reported_invalid_settings.discard((f"openimageio.{field_name}", repr(bad_value)))
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = Settings.model_validate({"openimageio": {field_name: bad_value}})
+
+        assert getattr(result.openimageio, field_name) == expected_default
+        assert f"openimageio.{field_name}" in caplog.text
+
+    def test_non_mapping_openimageio_falls_back_to_defaults(self, caplog: pytest.LogCaptureFixture) -> None:
+        from griptape_nodes.retained_mode.managers import settings as settings_module
+
+        settings_module._reported_invalid_settings.discard(("openimageio", repr("invalid")))
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = Settings.model_validate({"openimageio": "invalid"})
+
+        assert result.openimageio == OpenImageIOSettings()
+        assert "openimageio" in caplog.text
+
+    def test_environment_values_are_converted(self) -> None:
+        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
+
+        result = Settings.model_validate(
+            {
+                "openimageio": {
+                    "max_memory_mb": "2048",
+                    "max_open_files": "150",
+                    "autotile_size": "256",
+                    "deduplicate": "false",
+                    "threads": "4",
+                    "max_image_size_mb": "0",
+                    "failure_retries": "2",
+                }
+            },
+            context={FROM_ENV_CONTEXT: True},
+        ).openimageio
+
+        assert result.max_memory_mb == 2048  # noqa: PLR2004
+        assert result.max_open_files == 150  # noqa: PLR2004
+        assert result.autotile_size == 256  # noqa: PLR2004
+        assert result.deduplicate is False
+        assert result.threads == 4  # noqa: PLR2004
+        assert result.max_image_size_mb == 0
+        assert result.failure_retries == 2  # noqa: PLR2004
+
+    @pytest.mark.parametrize(
+        ("field_name", "bad_env_value"),
+        [
+            ("max_memory_mb", "32"),
+            ("max_open_files", "9"),
+            ("autotile_size", "100"),
+            ("deduplicate", "maybe"),
+            ("threads", "-1"),
+            ("max_image_size_mb", "-5"),
+            ("failure_retries", "11"),
+        ],
+    )
+    def test_invalid_environment_value_raises_validation_error(self, field_name: str, bad_env_value: str) -> None:
+        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
+
+        with pytest.raises(ValidationError, match=f"openimageio.{field_name}"):
+            Settings.model_validate(
+                {"openimageio": {field_name: bad_env_value}},
+                context={FROM_ENV_CONTEXT: True},
+            )

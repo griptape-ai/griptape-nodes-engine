@@ -52,6 +52,7 @@ from griptape_nodes.files.path_utils import (
     sanitize_path_string,
     strip_surrounding_quotes,
 )
+from griptape_nodes.image.oiio_config import invalidate_image_cache
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
@@ -1956,6 +1957,7 @@ class OSManager(EngineScoped):
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
         # Perform the rename operation
+        invalidate_image_cache(old_path)
         try:
             old_path.rename(new_path)
         except PermissionError as e:
@@ -2143,6 +2145,9 @@ class OSManager(EngineScoped):
                 msg = f"Attempted to send {'directory' if is_directory else 'file'} at path {path_to_delete} to the recycle bin. Failed due to unexpected error: {type(e).__name__}: {e}"
                 return DeleteFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
             return None
+
+        if not is_directory:
+            invalidate_image_cache(resolved_path)
 
         # Perform deletion based on requested behavior
         match request.deletion_behavior:
