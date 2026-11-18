@@ -220,7 +220,7 @@ async def test_workflow_node_runs_its_workflow_and_returns_outputs(
 
     # The workflow was imported as a child flow of the node's own flow so it can be inspected
     # during the session, and it is tagged transient so a save never bakes it in.
-    subflows_result = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=parent_flow))
+    subflows_result = engine.current_workflow().handle_request(ListFlowsInFlowRequest(parent_flow_name=parent_flow))
     assert isinstance(subflows_result, ListFlowsInFlowResultSuccess), subflows_result
     assert node.metadata["subflow_name"] in subflows_result.flow_names
 

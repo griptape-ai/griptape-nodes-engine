@@ -86,6 +86,7 @@ class TestLoadingAWorkflowIntoAnOccupiedFlowContext:
         # Workflow A is the session the artist is sitting in, with its top-level flow pushed onto
         # the Current Context the way the editor leaves it.
         engine.context_manager.push_workflow(workflow_name="workflow_a")
+        workflow_a = engine.current_workflow()
         flow_a = engine.handle_request(
             CreateFlowRequest(parent_flow_name=None, flow_name="ControlFlow_1", set_as_new_context=True)
         )
@@ -97,9 +98,9 @@ class TestLoadingAWorkflowIntoAnOccupiedFlowContext:
             "workflow B could not possibly hit the parent-flow fallback this test exists to pin."
         )
 
-        result = await engine.ahandle_request(RunWorkflowWithCurrentStateRequest(file_path=str(workflow_b)))
+        result = await workflow_a.ahandle_request(RunWorkflowWithCurrentStateRequest(file_path=str(workflow_b)))
 
-        children = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=flow_a.flow_name))
+        children = workflow_a.handle_request(ListFlowsInFlowRequest(parent_flow_name=flow_a.flow_name))
         assert isinstance(children, ListFlowsInFlowResultSuccess), children
         assert children.flow_names == [], (
             f"Loading '{workflow_b.name}' into an open flow context nested workflow B's top-level "

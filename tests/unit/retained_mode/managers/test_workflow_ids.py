@@ -378,7 +378,7 @@ class TestWritePathsKeepOrMintAnId:
     def test_save_subflow_keeps_the_parent_id(self, project_engine: Engine) -> None:
         workflow_id = _open_new_workflow(project_engine, "parent")
         saved = _save(project_engine)
-        top = project_engine.handle_request(GetTopLevelFlowRequest())
+        top = project_engine.open_workflows.get(workflow_id).handle_request(GetTopLevelFlowRequest())
         assert isinstance(top, GetTopLevelFlowResultSuccess)
         subflow = project_engine.handle_request(
             CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="Sub", set_as_new_context=False)
@@ -831,7 +831,7 @@ class TestIdsOnResults:
         engine = current_engine()
         workflow_id = _open_new_workflow(engine, "reported")
 
-        context = engine.handle_request(GetWorkflowContextRequest())
+        context = engine.open_workflows.get(workflow_id).handle_request(GetWorkflowContextRequest())
         heartbeat = engine.handle_request(EngineHeartbeatRequest(heartbeat_id="beat"))
 
         assert isinstance(context, GetWorkflowContextSuccess)
@@ -1284,9 +1284,9 @@ class TestLibraryWorkflowsOpenAsCopies:
 
     def test_asking_for_the_run_command_of_an_open_copy_asks_to_save_it_first(self, project_engine: Engine) -> None:
         library = _library_workflow(project_engine, "library_flow")
-        _open_library_workflow(project_engine, "open_by_id", library)
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
 
-        result = _run(project_engine, GetWorkflowRunCommandRequest())
+        result = asyncio.run(project_engine.open_workflows.get(copy_id).ahandle_request(GetWorkflowRunCommandRequest()))
 
         assert isinstance(result, GetWorkflowRunCommandResultFailure)
         assert "isn't saved" in str(result.result_details)
@@ -1299,7 +1299,7 @@ class TestSaveAsContinuingInTheCopy:
         """Open a workflow, save it, then add a flow the save doesn't hold, and return its id."""
         workflow_id = _open_new_workflow(engine, "original")
         _save(engine)
-        top_level = engine.handle_request(GetTopLevelFlowRequest())
+        top_level = engine.open_workflows.get(workflow_id).handle_request(GetTopLevelFlowRequest())
         assert isinstance(top_level, GetTopLevelFlowResultSuccess)
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=top_level.flow_name, flow_name="unsaved_edit", set_as_new_context=False)

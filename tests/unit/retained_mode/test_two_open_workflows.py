@@ -213,6 +213,8 @@ class _RawThreadNode(ControlNode):
 
     async def aprocess(self) -> None:
         engine = self.engine
+        workflow = self.workflow
+        assert workflow is not None
         built_in_node_code = File(_RAW_THREAD_FILE)
         _RawThreadNode.seen["in_node_code"] = built_in_node_code.resolve()
 
@@ -224,6 +226,7 @@ class _RawThreadNode(ControlNode):
             except WorkflowNotNamedError as err:
                 _RawThreadNode.seen["ambient"] = err
             _RawThreadNode.seen["ambient_resolve"] = engine.handle_request(_resolve(_RAW_THREAD_FILE))
+            _RawThreadNode.seen["resolve_in_the_nodes_workflow"] = workflow.handle_request(_resolve(_RAW_THREAD_FILE))
 
         thread = threading.Thread(target=in_raw_thread)
         thread.start()
@@ -649,7 +652,7 @@ class TestCloseOneWhileTheOtherRuns:
 
 # Requests the editor plausibly sends with no envelope id, each paired with whether it still works with
 # two workflows open. Ordered so the destructive ones come last; every one either fails or acts on
-# host state, so none of them changes A or B.
+# host state or on no workflow, so none of them changes A or B.
 _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
     ("EngineHeartbeatRequest", lambda: EngineHeartbeatRequest(heartbeat_id="hb")),
     ("GetEngineVersionRequest", GetEngineVersionRequest),
@@ -690,14 +693,10 @@ _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
     ("CancelFlowRequest", lambda: CancelFlowRequest(flow_name="canvas")),
     ("SaveWorkflowRequest", SaveWorkflowRequest),
     ("DeleteNodeRequest", lambda: DeleteNodeRequest(node_name="n")),
-    ("EnsureWorkflowAndFlowRequest", lambda: EnsureWorkflowAndFlowRequest(display_name="C")),
 ]
 
 # What the sweep found: the requests that fail with WorkflowNotNamedError when no id is sent.
 _FAIL_WITHOUT_AN_ID = {
-    "ResolveMacroPathRequest {workspace_dir}",
-    "ResolveMacroPathRequest {workflow_dir}",
-    "GetWorkflowContextRequest",
     "ListFlowsInCurrentContextRequest",
     "GetTopLevelFlowRequest",
     "ListNodesInFlowRequest",
@@ -710,7 +709,6 @@ _FAIL_WITHOUT_AN_ID = {
     "GetFlowStateRequest",
     "ListVariablesRequest",
     "GetVariableSubstitutionEnabledRequest",
-    "GetWorkflowRunCommandRequest",
     "SetParameterValueRequest",
     "CreateNodeRequest",
     "CreateFlowRequest",
@@ -720,7 +718,13 @@ _FAIL_WITHOUT_AN_ID = {
     "CancelFlowRequest",
     "SaveWorkflowRequest",
     "DeleteNodeRequest",
-    "EnsureWorkflowAndFlowRequest",
+}
+
+# The requests that work without a workflow and act on none when no id is sent, failing only where
+# they need one.
+_NEED_A_WORKFLOW_WITHOUT_AN_ID = {
+    "ResolveMacroPathRequest {workflow_dir}",
+    "GetWorkflowRunCommandRequest",
 }
 
 
@@ -761,8 +765,8 @@ class TestRequestsWithNoEnvelopeId:
                 outcomes[label] = f"other failure: {result.result_details}"
 
         failed = {label for label, outcome in outcomes.items() if outcome == "not named"}
-        other = {label: outcome for label, outcome in outcomes.items() if outcome.startswith("other")}
-        assert other == {}
+        other = {label for label, outcome in outcomes.items() if outcome.startswith("other")}
+        assert other == _NEED_A_WORKFLOW_WITHOUT_AN_ID
         assert failed == _FAIL_WITHOUT_AN_ID
         # Nothing an unnamed request did reached either workflow.
         assert engine.open_workflows.all_open() == [a, b]
@@ -1169,7 +1173,7 @@ class TestWorkerForTwoOrchestratorWorkflows:
 
 
 class TestRawThreadInNodeCode:
-    """Scenario (h): a plain thread does not carry the node's binding, so node code reaches its workflow through its files."""
+    """Scenario (h): a plain thread does not carry the node's binding, so node code reaches its workflow through its files or `self.workflow`."""
 
     @pytest.mark.asyncio
     async def test_files_node_code_builds_resolve_in_its_workflow_from_a_raw_thread(
@@ -1190,9 +1194,12 @@ class TestRawThreadInNodeCode:
         # An ambient read can't tell which workflow the thread works for, so it is refused, not guessed.
         assert isinstance(_RawThreadNode.seen["ambient"], WorkflowNotNamedError)
         assert _RawThreadNode.seen["ambient_resolve"].failed()
+        resolved = _RawThreadNode.seen["resolve_in_the_nodes_workflow"]
+        assert isinstance(resolved, ResolveMacroPathResultSuccess), resolved.result_details
+        assert str(resolved.resolved_path) == in_a
 
     @pytest.mark.asyncio
-    async def test_with_one_workflow_open_a_raw_thread_falls_back_to_it(
+    async def test_with_one_workflow_open_a_raw_threads_request_names_none(
         self,
         engine: Engine,
         spike_library: None,  # noqa: ARG002
@@ -1205,7 +1212,9 @@ class TestRawThreadInNodeCode:
 
         assert isinstance(result, StartFlowResultSuccess), result.result_details
         assert _RawThreadNode.seen["ambient"] is only
-        assert _RawThreadNode.seen["ambient_resolve"].succeeded()
+        # A request names the workflow it is sent through, never the only open one.
+        assert _RawThreadNode.seen["ambient_resolve"].failed()
+        assert _RawThreadNode.seen["resolve_in_the_nodes_workflow"].succeeded()
         assert _RawThreadNode.seen["built_in_node_code"] == _RawThreadNode.seen["in_node_code"]
 
 

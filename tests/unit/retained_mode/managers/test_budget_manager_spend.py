@@ -800,14 +800,28 @@ class TestWorkflowTag:
         assert _sent(http)["tags"]["workflow"] == workflow.name
 
     @pytest.mark.asyncio
-    async def test_a_check_naming_no_workflow_is_tagged_with_the_only_open_one(
+    async def test_a_check_naming_no_workflow_carries_no_workflow_tag_while_one_is_open(
         self, http: MagicMock, budget_engine: Engine
     ) -> None:
         """As a node calls from its library's own thread pool: no envelope id and no binding."""
         http.return_value = _response(200, {"allowed": True})
-        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+        push_unsaved_workflow(budget_engine, "poster_flow")
 
         result = await budget_engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
+
+        assert isinstance(result, BudgetAccessResultSuccess), result.result_details
+        assert "workflow" not in _sent(http)["tags"]
+
+    @pytest.mark.asyncio
+    async def test_a_check_sent_through_the_nodes_workflow_is_tagged_with_it(
+        self, http: MagicMock, budget_engine: Engine
+    ) -> None:
+        """What a node's own thread does instead: send through `self.workflow`."""
+        http.return_value = _response(200, {"allowed": True})
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+        runtime = budget_engine.open_workflows.get(workflow.workflow_id)
+
+        result = await runtime.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
 
         assert isinstance(result, BudgetAccessResultSuccess), result.result_details
         assert _sent(http)["tags"]["workflow"] == workflow.name

@@ -451,24 +451,9 @@ class TestDeclareModelInvocationCatalogEnrichment:
             "model_families": ["GPT Image"],
         }
 
-    def test_a_declaration_from_a_fresh_context_is_enriched_from_the_only_open_workflow(
-        self,
-        engine: Engine,
-    ) -> None:
+    def test_a_declaration_from_a_fresh_context_is_denied_while_one_is_open(self, engine: Engine) -> None:
         """As a node declares from its library's own thread pool: no envelope id and no binding."""
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
-        )
-
         self._register_node("Probe_1", engine)
-        seen: dict[str, object] = {}
-
-        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            seen["attributes"] = dict(checkpoint.attributes)
-            return None
-
-        engine.event_manager.add_authorization_hook(capture)
 
         result = (
             contextvars.Context()
@@ -477,6 +462,33 @@ class TestDeclareModelInvocationCatalogEnrichment:
                 DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"),
             )
             .result
+        )
+
+        assert isinstance(result, DeclareModelInvocationResultFailure)
+        assert "names no open workflow" in str(result.result_details)
+
+    def test_a_declaration_sent_through_the_nodes_workflow_from_a_fresh_context_is_enriched(
+        self,
+        engine: Engine,
+    ) -> None:
+        """What a node's own thread pool does instead: send through `self.workflow`."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        workflow = self._register_node("Probe_1", engine)
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        engine.event_manager.add_authorization_hook(capture)
+
+        result = contextvars.Context().run(
+            workflow.handle_request,
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1"),
         )
 
         assert isinstance(result, DeclareModelInvocationResultSuccess)

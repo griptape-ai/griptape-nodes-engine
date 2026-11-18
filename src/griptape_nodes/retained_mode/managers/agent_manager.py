@@ -268,7 +268,7 @@ _IMAGE_TOOL_INSTRUCTION = (
 
 _NO_WORKFLOW_INSTRUCTION = (
     "No workflow is open in this chat yet. Call GriptapeNodes_EnsureWorkflowAndFlowRequest before creating nodes: "
-    "it uses the workflow that's open, or opens one. Later calls act on that workflow."
+    "it opens a new workflow with a flow. Later calls act on that workflow."
 )
 
 _NO_FLOW_INSTRUCTION = "No flow is open yet. Call GriptapeNodes_EnsureWorkflowAndFlowRequest before creating nodes."
