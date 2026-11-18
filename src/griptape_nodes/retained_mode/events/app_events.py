@@ -133,8 +133,7 @@ class AppGetSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session information retrieved successfully, with the state of the engine holding it.
 
     A client takes this as its snapshot of the engine when it connects to the session, and again
-    when the session heartbeat reports a new run id. Discovery may not list the engine a client is
-    connected to, so the client reads these facts here rather than there.
+    when the session heartbeat reports a new run id, since discovery may not list that engine.
 
     Args:
         session_id: Current session identifier (None if no active session)
@@ -532,7 +531,7 @@ class SessionHeartbeatResultSuccess(ResultPayloadSuccess):
     the engine restarted, and the client takes a fresh `AppGetSessionRequest` snapshot.
 
     Args:
-        session_id: The active session, which is the one the client asked on
+        session_id: The engine's active session. A client that sees another one has lost its own.
         engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
         is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
     """
