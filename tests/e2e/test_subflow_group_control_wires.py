@@ -28,7 +28,14 @@ from griptape_nodes.retained_mode.events.execution_events import (
     StartFlowResultSuccess,
     StartLocalSubflowRequest,
 )
-from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    DeserializeFlowFromCommandsRequest,
+    DeserializeFlowFromCommandsResultSuccess,
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
+)
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
@@ -41,7 +48,11 @@ from griptape_nodes.retained_mode.events.node_events import (
     RemoveNodeFromNodeGroupRequest,
     RemoveNodeFromNodeGroupResultSuccess,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.object_events import (
+    ClearAllObjectStateRequest,
+    RenameObjectRequest,
+    RenameObjectResultSuccess,
+)
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 
 if TYPE_CHECKING:
@@ -543,3 +554,58 @@ class TestDataWiresAreUnchanged:
 
         assert _grown(engine, "G") == ["text"]
         assert _edges(engine, "G") == {"Child.text->G.text (internal)", "G.text->Down1.text", "G.text->Down2.text"}
+
+
+@pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
+class TestWireOwnerSurvivesSaveAndRename:
+    """_entry_wire_owner / _exit_wire_owner must outlive what a plain instance attribute would not.
+
+    A plain attribute set in __init__ is always None on a freshly-built Python object, so a saved
+    workflow would reload with release/absorb unable to recognize either port as any member's --
+    silently reverting the "ungroup restores wiring" behavior this PR exists to provide. The tuples
+    also name a member by (node_name, param_name), so they go stale across a rename unless the
+    rename path updates them too.
+    """
+
+    def test_the_recorded_entry_owner_survives_a_save_and_reload(self, engine: Engine, flow: str) -> None:
+        """A reloaded group has to recognize its own entry wire from metadata, not from __init__."""
+        _chain(engine)
+        _group(engine, ["Child"])
+
+        serialize_result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow))
+        assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
+        commands = serialize_result.serialized_flow_commands
+
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        engine.context_manager.push_workflow(workflow_name="control_wires_wf_restored")
+        deserialize_result = engine.handle_request(
+            DeserializeFlowFromCommandsRequest(serialized_flow_commands=commands)
+        )
+        assert isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess), deserialize_result
+        restored_up = deserialize_result.node_name_mappings["Up"]
+        restored_child = deserialize_result.node_name_mappings["Child"]
+        restored_group = deserialize_result.node_name_mappings["G"]
+
+        with engine.context_manager.flow(deserialize_result.flow_name):
+            remove_result = engine.handle_request(
+                RemoveNodeFromNodeGroupRequest(node_names=[restored_child], node_group_name=restored_group)
+            )
+        assert isinstance(remove_result, RemoveNodeFromNodeGroupResultSuccess), remove_result
+
+        assert f"{restored_up}.exec_out->{restored_child}.exec_in" in _edges(engine, restored_child, control_only=True)
+
+    def test_renaming_the_owned_member_keeps_restoration_targeting_it(self, engine: Engine, flow: str) -> None:
+        """The stored (node_name, param_name) tuple has to track a rename of the member it names."""
+        _ = flow
+        _chain(engine)
+        _group(engine, ["Child"])
+
+        rename_result = engine.handle_request(RenameObjectRequest(object_name="Child", requested_name="Renamed"))
+        assert isinstance(rename_result, RenameObjectResultSuccess), rename_result
+
+        remove_result = engine.handle_request(
+            RemoveNodeFromNodeGroupRequest(node_names=["Renamed"], node_group_name="G")
+        )
+        assert isinstance(remove_result, RemoveNodeFromNodeGroupResultSuccess), remove_result
+
+        assert "Up.exec_out->Renamed.exec_in" in _edges(engine, "Renamed", control_only=True)

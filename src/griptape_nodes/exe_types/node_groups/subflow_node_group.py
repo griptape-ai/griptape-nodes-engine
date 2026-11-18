@@ -131,14 +131,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         # the same wire meets control_in / control_out (see _connect_control_wire_through_group).
         self.inner_entry: ControlParameterOutput | None = None
         self.inner_exit: ControlParameterInput | None = None
-        # Which member's inner leg the outer control_in / control_out wire was drawn for, as
-        # (member_node_name, member_param_name), or None when the port carries no such wire (either
-        # nothing has crossed the boundary yet, or the port is a loop's own Start Loop / On Complete,
-        # wired directly by the artist rather than by _connect_control_wire_through_group). Release and
-        # absorb read this to decide whether the outer wire is theirs to move; a group's own permanent
-        # port is never touched based on wire count alone. See _connect_control_wire_through_group.
-        self._entry_wire_owner: tuple[str, str] | None = None
-        self._exit_wire_owner: tuple[str, str] | None = None
         if inner_control_ports:
             self.inner_entry = ControlParameterOutput(
                 name="on_start",
@@ -181,6 +173,70 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         # Add subprocess execution status component for real-time GUI updates
         self._add_subflow_execution_parameters()
+
+    @property
+    def _entry_wire_owner(self) -> tuple[str, str] | None:
+        """Which member's inner leg the outer control_in wire was drawn for.
+
+        (member_node_name, member_param_name), or None when the port carries no such wire (either
+        nothing has crossed the boundary yet, or the port is a loop's own Start Loop, wired directly
+        by the artist rather than by _connect_control_wire_through_group). Release and absorb read
+        this to decide whether the outer wire is theirs to move; a group's own permanent port is
+        never touched based on wire count alone. See _connect_control_wire_through_group.
+
+        Backed by self.metadata rather than a plain attribute, so it survives save/reopen: a fresh
+        Python object is built from saved metadata, and a plain attribute would always come back
+        None, silently reverting the "ungroup restores wiring" behavior this exists to provide.
+        """
+        owner = self.metadata.get("entry_wire_owner")
+        return tuple(owner) if owner is not None else None
+
+    @_entry_wire_owner.setter
+    def _entry_wire_owner(self, value: tuple[str, str] | None) -> None:
+        if value is None:
+            self.metadata.pop("entry_wire_owner", None)
+        else:
+            self.metadata["entry_wire_owner"] = list(value)
+
+    @property
+    def _exit_wire_owner(self) -> tuple[str, str] | None:
+        """Which member's inner leg the outer control_out wire was drawn for.
+
+        Same shape as _entry_wire_owner, for the exit side: see that property for the full
+        explanation of what is stored and why it is metadata-backed.
+        """
+        owner = self.metadata.get("exit_wire_owner")
+        return tuple(owner) if owner is not None else None
+
+    @_exit_wire_owner.setter
+    def _exit_wire_owner(self, value: tuple[str, str] | None) -> None:
+        if value is None:
+            self.metadata.pop("exit_wire_owner", None)
+        else:
+            self.metadata["exit_wire_owner"] = list(value)
+
+    def handle_child_node_rename(self, old_name: str, new_name: str) -> None:
+        """Keep a recorded wire owner pointing at a direct member after it is renamed.
+
+        _entry_wire_owner / _exit_wire_owner store (node_name, param_name) tuples, so a rename of
+        the member either one names would otherwise leave it stale -- release/absorb would then
+        fail to recognize the port as that member's. node_manager only calls a renamed node's
+        direct parent_group, and these tuples only ever reference a direct member of this group
+        (set from old_connection.target_node / old_connection.source_node in
+        _connect_control_wire_through_group, which is always a direct member), so no walk through
+        enclosing groups is needed here.
+
+        Args:
+            old_name: The child node's name before the rename
+            new_name: The child node's name after the rename
+        """
+        super().handle_child_node_rename(old_name, new_name)
+        entry_owner = self._entry_wire_owner
+        if entry_owner is not None and entry_owner[0] == old_name:
+            self._entry_wire_owner = (new_name, entry_owner[1])
+        exit_owner = self._exit_wire_owner
+        if exit_owner is not None and exit_owner[0] == old_name:
+            self._exit_wire_owner = (new_name, exit_owner[1])
 
     def _create_subflow(self) -> None:
         """Create the dedicated subflow that will hold this NodeGroup's nodes.
