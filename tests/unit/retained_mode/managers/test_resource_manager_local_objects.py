@@ -344,6 +344,25 @@ class TestDropForWorkflow:
         assert entry.workflow_id == workflow_id
         assert host_entry.workflow_id is None
 
+    def test_an_object_put_before_the_node_joined_is_released_with_its_workflow(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
+        released: list[str] = []
+        # Put from a node's __init__, which runs before the node joins a workflow.
+        manager.put_local_object(
+            Held("early"), owner="Lib A", source="N@1", key="early", on_drop=lambda value: released.append(value.label)
+        )
+        manager.put_local_object(Held("other"), owner="Lib A", source="M@1", key="other")
+
+        manager.tag_untagged_objects_for_workflow(owner="Lib A", source="N@1", workflow=workflow)
+        manager.drop_objects_for_workflow(workflow.workflow_id)
+
+        assert released == ["early"]
+        other_entry = manager.entry_for(manager.local_object_key("other", owner="Lib A"))
+        assert other_entry is not None
+        assert other_entry.workflow_id is None
+
     def test_parking_for_a_closed_workflow_is_refused_and_records_nothing(self, engine: Engine) -> None:
         manager = engine.resource_manager
         engine.context_manager.push_workflow("wf")

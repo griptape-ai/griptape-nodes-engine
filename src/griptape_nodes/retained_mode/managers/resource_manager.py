@@ -723,6 +723,17 @@ class ResourceManager(EngineScoped):
         self._invoke_hooks_once_per_object(to_release)
         return len(doomed)
 
+    def tag_untagged_objects_for_workflow(self, *, owner: str, source: str, workflow: "WorkflowRuntime") -> None:
+        """Hold what `source` put before it joined `workflow` for that workflow, so closing it releases them.
+
+        A node's `__init__` runs before the node joins a workflow, so an object it puts there has no workflow
+        to be tagged with. The node joining is the first moment its workflow is known.
+        """
+        with self._local_objects_lock:
+            for entry in self._local_objects.values():
+                if entry.owner == owner and entry.source == source and entry.workflow_id is None:
+                    entry.workflow_id = workflow.workflow_id
+
     def drop_objects_for_workflow(self, workflow_id: str) -> int:
         """Release everything held in this process for one workflow, returning how many went.
 

@@ -621,6 +621,12 @@ class WorkflowSaver(EngineScoped):
         self, request: SaveWorkflowFileFromSerializedFlowRequest
     ) -> ResultPayload:
         """Save a workflow file from serialized flow commands without registry overhead."""
+        return self._save_serialized_flow_file(request, workflow=None)
+
+    def _save_serialized_flow_file(
+        self, request: SaveWorkflowFileFromSerializedFlowRequest, *, workflow: WorkflowRuntime | None
+    ) -> ResultPayload:
+        """Write the file `request` describes, generating its code against `workflow` (None when it names none)."""
         # Determine write destination
         if request.file_path:
             # Callers that pre-resolved a file path (rename, failed-workflow saver,
@@ -646,7 +652,7 @@ class WorkflowSaver(EngineScoped):
             is_template=request.is_template,
             branched_from=request.branched_from,
             workflow_shape=request.workflow_shape,
-            workflow=None,
+            workflow=workflow,
         )
 
     @handles(SaveSubflowToWorkflowRequest)
@@ -726,7 +732,7 @@ class WorkflowSaver(EngineScoped):
             is_template=existing.is_template,
             workflow_shape=workflow_shape,
         )
-        save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
+        save_file_result = self._save_serialized_flow_file(save_file_request, workflow=workflow)
         if not isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             details = (
                 f"Attempted to save subflow '{request.flow_name}' to '{file_path}'. "

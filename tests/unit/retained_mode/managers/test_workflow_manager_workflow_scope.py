@@ -1041,12 +1041,14 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         source = _open(engine, "subflow source")
         saved_target = _write_saved_workflow(engine, tmp_path.resolve() / "target.py")
         recorded = _RecordedRequests(flow_name="unused")
-        written_paths: list[str | None] = []
+        written_paths: list[str] = []
+        generated_for: list[WorkflowRuntime | None] = []
 
-        async def save_file(request: Any) -> SaveWorkflowFileFromSerializedFlowResultSuccess:
-            written_paths.append(request.file_path)
+        def save_file(*, destination: Any, workflow: WorkflowRuntime | None, **_kwargs: Any) -> Any:
+            written_paths.append(destination.location)
+            generated_for.append(workflow)
             return SaveWorkflowFileFromSerializedFlowResultSuccess(
-                file_path=str(request.file_path), workflow_metadata=saved_target.metadata, result_details="ok"
+                file_path=destination.location, workflow_metadata=saved_target.metadata, result_details="ok"
             )
 
         with (
@@ -1054,7 +1056,7 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
             patch.object(engine.workflow_manager, "extract_workflow_shape_in", side_effect=ValueError("no shape")),
             patch.object(
                 engine.workflow_manager.saver,
-                "on_save_workflow_file_from_serialized_flow_request",
+                "_save_workflow_file_inline",
                 side_effect=save_file,
             ),
         ):
@@ -1067,6 +1069,8 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert isinstance(result, SaveSubflowToWorkflowResultSuccess), result.result_details
         assert recorded.bound == [(SerializeFlowToCommandsRequest, source)]
         assert written_paths == [str(saved_target.absolute_path)]
+        # The file's code is generated against the workflow being saved, so its substitution flag is kept.
+        assert generated_for == [source]
 
     def test_referenced_import_creates_its_flow_in_the_workflow_it_is_handed(
         self, engine: Engine, tmp_path: Path

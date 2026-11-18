@@ -594,6 +594,10 @@ class BaseNode(ABC):
     def _set_workflow(self, workflow: WorkflowRuntime) -> None:
         """Record the workflow whose objects this node joined. Only the ObjectManager calls this."""
         self._workflow = workflow
+        # Objects put from `__init__` had no workflow to belong to until now, so closing it releases them.
+        self.engine.resource_manager.tag_untagged_objects_for_workflow(
+            owner=self.local_objects.owner, source=self.local_object_source, workflow=workflow
+        )
 
     def _handle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
         """Send `request` through the workflow this node joined.

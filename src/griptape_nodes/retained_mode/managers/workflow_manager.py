@@ -914,9 +914,10 @@ class WorkflowManager(EngineScoped):
         return self.engine.workflow_registry.refresh_file(file_path, metadata)
 
     async def run_workflow(self, relative_file_path: str, workflow: WorkflowRuntime | None) -> WorkflowExecutionResult:
-        """Kept for node libraries that call it. See `WorkflowRunner.run_workflow`.
+        """Run the workflow file at `relative_file_path`. See `WorkflowRunner.run_workflow`.
 
-        Builds into `workflow`, else opens the file as one.
+        Builds into `workflow`, else opens the file as one. Node libraries that call it must pass `workflow`
+        (None to open the file as a new one).
         """
         return await self.runner.run_workflow(relative_file_path, workflow)
 
