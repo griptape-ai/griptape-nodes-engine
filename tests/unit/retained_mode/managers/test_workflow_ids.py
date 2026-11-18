@@ -10,7 +10,7 @@ import sys
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -88,6 +88,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
     SaveWorkflowRequest,
+    SaveWorkflowResultFailure,
     SaveWorkflowResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
@@ -1297,7 +1298,7 @@ class TestLibraryWorkflowsOpenAsCopies:
 
 
 class TestSaveAsContinuingInTheCopy:
-    """`continue_in_copy` keeps the open workflow, its id and its graph, on the file a Save As writes."""
+    """`continue_in_copy` closes the open workflow and opens the copy a Save As writes, under the copy's own id."""
 
     def _open_saved_workflow_with_an_unsaved_edit(self, engine: Engine) -> str:
         """Open a workflow, save it, then add a flow the save doesn't hold, and return its id."""
@@ -1311,39 +1312,39 @@ class TestSaveAsContinuingInTheCopy:
         assert isinstance(created, CreateFlowResultSuccess), created.result_details
         return workflow_id
 
-    def test_the_open_workflow_keeps_its_id_and_graph_and_names_the_new_file(self, project_engine: Engine) -> None:
+    def test_the_copy_opens_under_its_own_id_in_place_of_the_original(self, project_engine: Engine) -> None:
         workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
-        workflow = project_engine.open_workflows.get(workflow_id)
+        original = project_engine.open_workflows.get(workflow_id)
         original_path = project_engine.workflow_registry.get(workflow_id).absolute_path
 
         copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True))
 
-        assert copy.workflow_id == workflow_id
+        assert copy.workflow_id not in (None, workflow_id)
         assert copy.workflow_name == "the_copy"
         assert copy.open_workflow is not None
-        assert copy.open_workflow.workflow_id == workflow_id
+        assert copy.open_workflow.workflow_id == copy.workflow_id
         assert copy.open_workflow.name == "the_copy"
         assert copy.open_workflow.workflow_file_path == str(Path(copy.file_path).resolve())
-        assert _id_at(project_engine, copy.file_path) == workflow_id
-        # The same runtime, with the edit made after the last save.
-        assert project_engine.open_workflows.get(workflow_id) is workflow
-        assert "unsaved_edit" in workflow.flows.name_to_parent_name
-        assert project_engine.context_manager.get_current_workflow_id() == workflow_id
-        # The original file is a separate, closed workflow under a new id.
+        assert _id_at(project_engine, copy.file_path) == copy.workflow_id
+        assert _header_id(Path(copy.file_path)) == copy.workflow_id
+        # The original closed; the copy opened from its file, edit and all.
+        assert original.closed
+        assert project_engine.open_workflows.all_open() == [project_engine.open_workflows.get(copy.workflow_id)]  # type: ignore[arg-type]
+        assert "unsaved_edit" in project_engine.open_workflows.get(copy.workflow_id).flows.name_to_parent_name  # type: ignore[arg-type]
+        # The original file keeps its id, closed and still listed.
         assert original_path is not None
-        left_behind_id = _id_at(project_engine, original_path)
-        assert left_behind_id not in (None, workflow_id)
-        assert not project_engine.open_workflows.is_open(left_behind_id)  # type: ignore[arg-type]
-        assert any(listed["workflow_id"] == left_behind_id for listed in _listed(project_engine).values())
+        assert _id_at(project_engine, original_path) == workflow_id
+        assert _header_id(original_path) == workflow_id
+        assert any(listed["workflow_id"] == workflow_id for listed in _listed(project_engine).values())
 
     def test_the_next_save_lands_in_the_copy(self, project_engine: Engine) -> None:
-        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        self._open_saved_workflow_with_an_unsaved_edit(project_engine)
         copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True))
 
         again = _save(project_engine, SaveWorkflowRequest(file_name=copy.workflow_name))
 
         assert again.file_path == copy.file_path
-        assert again.workflow_id == workflow_id
+        assert again.workflow_id == copy.workflow_id
 
     def test_a_versioned_save_can_continue_in_the_version(self, project_engine: Engine) -> None:
         workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
@@ -1351,10 +1352,26 @@ class TestSaveAsContinuingInTheCopy:
 
         version = _save(project_engine, SaveWorkflowRequest(create_versioned=True, continue_in_copy=True))
 
-        assert version.workflow_id == workflow_id
-        assert _id_at(project_engine, version.file_path) == workflow_id
+        assert version.workflow_id not in (None, workflow_id)
+        assert version.open_workflow is not None
+        assert version.open_workflow.workflow_id == version.workflow_id
         assert original_path is not None
-        assert _id_at(project_engine, original_path) not in (None, workflow_id)
+        assert _id_at(project_engine, original_path) == workflow_id
+
+    def test_it_is_refused_while_the_workflow_runs(self, project_engine: Engine) -> None:
+        workflow_id = self._open_saved_workflow_with_an_unsaved_edit(project_engine)
+        workflow = project_engine.open_workflows.get(workflow_id)
+        workflow.flows.run_in_progress = MagicMock()
+
+        try:
+            result = _run(project_engine, SaveWorkflowRequest(file_name="the_copy", continue_in_copy=True))
+        finally:
+            workflow.flows.run_in_progress = None
+
+        assert isinstance(result, SaveWorkflowResultFailure)
+        assert "the workflow is running" in str(result.result_details)
+        assert not workflow.closed
+        assert project_engine.workflow_registry.find_by_name("the_copy") is None
 
     def test_it_changes_nothing_for_a_first_save(self, project_engine: Engine) -> None:
         workflow_id = _open_new_workflow(project_engine, "first")

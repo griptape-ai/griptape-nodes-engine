@@ -37,6 +37,19 @@ save it first.
 This change ships together with the editor (griptape-vsl-gui) release that sends `workflow_id` in
 these requests.
 
+## A save that continues in the copy opens the copy
+
+**Request API clients and MCP clients.** A Save As or versioned save with `continue_in_copy` used to
+keep the open workflow's `workflow_id` on the copy and give the original file a new id. Now that ids
+are saved in files, the copy gets its own id and the original keeps its. The save closes the open
+workflow and opens the copy in its place.
+
+- Clients get `WorkflowClosedEvent` for the original and `WorkflowOpenedEvent` for the copy.
+- Send the id in the result's `open_workflow` from then on, on request envelopes and in the
+    `X-Griptape-Workflow-Id` header. An MCP session with no header follows it on its own.
+- What the workflow held only in memory, such as node results the file doesn't store, doesn't carry
+    over. The save is refused while the workflow has a run in progress or waiting.
+
 ## Workflow ids are saved in the workflow file
 
 A saved workflow's `workflow_id` is now written to its file's metadata header, under

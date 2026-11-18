@@ -492,7 +492,7 @@ class SaveWorkflowRequest(RequestPayload):
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
         overwrite_existing: When False and ``file_name`` exactly matches the registry key of a *different* already-registered workflow, the save fails with ``FileIOFailureReason.POLICY_NO_OVERWRITE`` instead of clobbering that workflow's file. When True (default), proceed with the overwrite. Re-saving the workflow that is currently open always succeeds regardless of this flag. Scope is deliberately narrow — the guard covers exact registered registry keys only, so it does not catch a key that differs by case on a case-insensitive filesystem, nor an unregistered stray ``.py`` file sitting at the computed save path; those paths defer to the ``save_workflow`` situation's own collision policy. Also has no effect when ``create_versioned=True``, since versioned saves write a new file rather than overwriting in place.
-        continue_in_copy: What a save that writes a copy (a Save As, a versioned save) does with the open workflow. When False (default), the copy is a new workflow with its own id, and the open workflow stays on its original file. When True, the open workflow keeps its id and its graph and names the new file from then on, and the original file is registered as a separate, closed workflow with a new id. Has no effect on a save to the workflow's own file, or on the first save of an unsaved workflow, which always continue the open workflow.
+        continue_in_copy: What a save that writes a copy (a Save As, a versioned save) does with the open workflow. When False (default), the copy is a new workflow with its own id, and the open workflow stays on its original file. When True, the open workflow closes and the copy opens in its place, under the copy's own id; the original file keeps its id. Refused while the workflow has a run in progress or waiting. Has no effect on a save to the workflow's own file, or on the first save of an unsaved workflow, which always continue the open workflow.
 
     A save never writes over the file of another open workflow.
 
@@ -538,11 +538,12 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     Args:
         file_path: Path where the workflow was saved
         workflow_name: Registry key of the saved workflow, for use with workflow lookup requests
-        workflow_id: Id of the saved workflow. A Save As or versioned save
-            writes a copy, with a new id, unless it continues in the copy.
+        workflow_id: Id of the saved workflow. A Save As or versioned save writes a copy, with a
+            new id.
         open_workflow: The workflow open after the save, as `ListOpenWorkflowsRequest` lists it. When
-            its id is `workflow_id`, the open workflow is the file saved; otherwise the save wrote a
-            copy and the open workflow stays on its original file.
+            its id is `workflow_id`, the open workflow is the file saved: its own file, or a copy
+            the save continued in, which opened in place of the original. Otherwise the save wrote
+            a copy and the open workflow stays on its original file.
     """
 
     file_path: str

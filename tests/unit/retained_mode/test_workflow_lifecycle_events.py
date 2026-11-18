@@ -571,10 +571,10 @@ class TestOpeningWorkflow:
 
 
 class TestSavingAWorkflow:
-    def test_a_save_as_that_continues_in_the_copy_announces_nothing(
+    def test_a_save_as_that_continues_in_the_copy_closes_the_original_and_opens_the_copy(
         self, engine: Engine, queue: asyncio.Queue, saved_workflow_name: str
     ) -> None:
-        """The tab's workflow is the same workflow under a new name, so nothing opens or closes."""
+        """The copy has an id of its own, so clients hear the original close and the copy open."""
         loaded = asyncio.run(engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=saved_workflow_name)))
         assert isinstance(loaded, RunWorkflowFromRegistryResultSuccess), loaded.result_details
         _drain(queue)
@@ -584,9 +584,13 @@ class TestSavingAWorkflow:
         )
 
         assert isinstance(copy.result, SaveWorkflowResultSuccess), copy.result.result_details
-        assert copy.result.workflow_id == loaded.workflow_id
-        assert copy.open_workflow_id == loaded.workflow_id
-        assert _lifecycle_events(_drain(queue)) == []
+        assert copy.result.workflow_id not in (None, loaded.workflow_id)
+        assert copy.result.open_workflow is not None
+        assert copy.result.open_workflow.workflow_id == copy.result.workflow_id
+        assert _lifecycle_events(_drain(queue)) == [
+            WorkflowClosedEvent(workflow_id=loaded.workflow_id),  # type: ignore[arg-type]
+            WorkflowOpenedEvent(open_workflow=copy.result.open_workflow),
+        ]
 
 
 class TestWorkers:

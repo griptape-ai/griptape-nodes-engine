@@ -34,6 +34,9 @@ just a matter of opening that file.
     each subsequent save from that file keeps incrementing the same
     sequence.
 
+Save As and Save As New Version can't switch you to the new file while the
+workflow is running. Stop the run first.
+
 Autosave, when enabled, behaves like **Save**: it silently overwrites the
 currently open file on an interval, and never creates a versioned file on
 its own. See [Auto-save](editor/running_workflows.md#auto-save) for how to

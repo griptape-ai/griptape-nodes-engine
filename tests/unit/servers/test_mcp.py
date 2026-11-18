@@ -1148,10 +1148,10 @@ class TestToolCallWorkflow:
         assert mcp_module._session_workflow_ids == {}
 
     @pytest.mark.asyncio
-    async def test_a_header_keeps_reaching_its_workflow_after_a_save_as_continues_in_the_copy(
+    async def test_a_save_as_that_continues_in_the_copy_reports_the_copy_for_the_header(
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
-        """The open workflow keeps its id through any save, so a header never has to follow it."""
+        """The copy opens under its own id, which the result reports so a header client can follow it."""
         _, second = two_open
         header = _http_context({"X-Griptape-Workflow-Id": second.workflow_id})
         await call_tool(header, _create_flow_call("canvas"))
@@ -1167,12 +1167,16 @@ class TestToolCallWorkflow:
                 name="SaveWorkflowRequest", arguments={"file_name": f"{stem}_copy", "continue_in_copy": True}
             ),
         )
-        context = await call_tool(header, CallToolRequestParams(name="GetWorkflowContextRequest", arguments={}))
+        copy_id = _payload(copy)["open_workflow"]["workflow_id"]
+        followed = _http_context({"X-Griptape-Workflow-Id": copy_id})
+        context = await call_tool(followed, CallToolRequestParams(name="GetWorkflowContextRequest", arguments={}))
 
         assert _payload(copy)["ok"], copy
+        assert second.closed
+        assert copy_id != second.workflow_id
         assert _payload(context)["ok"], context
-        assert engine.open_workflows.find(second.workflow_id) is second
-        assert engine.workflow_registry.get(second.workflow_id).name == f"{stem}_copy"
+        assert engine.workflow_registry.get(copy_id).name == f"{stem}_copy"
+        assert engine.workflow_registry.get(second.workflow_id).name == stem
 
     @pytest.mark.asyncio
     async def test_the_header_wins_over_the_sessions_workflow(
