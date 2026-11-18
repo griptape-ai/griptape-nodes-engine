@@ -430,8 +430,10 @@ of them and leaves the rest alone:
     and leaves the others open.
 
 If your workflow is closed by someone else, such as the user closing its tab,
-every call fails with `WorkflowNotOpenResultFailure` until you open another one.
-Its `open_workflows` lists what is still open.
+every call that acts on it fails with `WorkflowNotOpenResultFailure`, including
+`EnsureWorkflowAndFlowRequest`. Its `open_workflows` lists what is still open.
+Recover with `OpenWorkflowRequest`: `workflow_id=...` for one of those, or
+`create_flow=True` for a new one.
 
 Do not reach for `ClearAllObjectStateRequest` to reset. It closes every open
 workflow, including the ones in the user's editor tabs.
