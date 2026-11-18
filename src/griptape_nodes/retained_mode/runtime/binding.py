@@ -35,6 +35,10 @@ bound_workflow: ContextVar[WorkflowRuntime | NoWorkflow | None] = ContextVar(
 )
 
 
+class WorkflowNotNamedError(Exception):
+    """Never raised. Kept so node libraries that catch it, such as released Nuke builds, still import."""
+
+
 class WorkflowNotOpenError(Exception):
     """Work bound to a workflow that has closed since, so it has no workflow to act on."""
 
