@@ -88,6 +88,35 @@ The two-argument `on_<name>_request_in_workflow` names are gone, renamed to the 
 `on_set_parameter_value_request(request, workflow)`. They are dispatch handlers too, so send the
 request rather than call them.
 
+## Requests that act on a workflow must name it
+
+**Everyone sending requests.** A request that acts on a workflow, such as `CreateNodeRequest` or
+`SaveWorkflowRequest`, used to act on the only open workflow when it named none. It now fails with
+`WorkflowNotNamedResultFailure`, even with one workflow open. Send `open_workflow_id` on the request
+envelope, or the `X-Griptape-Workflow-Id` header from an MCP client.
+
+**Library authors.** `GriptapeNodes.handle_request(...)` from `process()`, `aprocess()` and the code
+they call acts on the node's workflow, as before. From a thread or thread pool you start yourself,
+it acts on no workflow. Send through the node's workflow, or start the thread in a copy of the
+node's context:
+
+```python
+# Before
+result = GriptapeNodes.handle_request(request)
+
+# After
+result = self.workflow.handle_request(request)
+```
+
+The `GriptapeNodes` manager methods that read the current workflow, such as `ContextManager`,
+`ObjectManager` lookups, `FlowManager.get_flow_by_name`, `NodeManager.get_node_by_name`,
+`StaticFilesManager.save_static_file` and `WorkflowManager.extract_workflow_shape`, find the
+workflow the same way. On such a thread they find none.
+
+**Saved workflow files.** `python workflow.py` and the files `ContextManager.push_workflow` opens
+need no change: `push_workflow` now binds the workflow it opens, so the calls after it act on that
+workflow, and `pop_workflow` ends the binding.
+
 ## Parameter values keep their type
 
 **Library authors.** A field of your own request, result, or event payload that holds parameter
