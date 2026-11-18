@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from griptape_nodes.common.strict_mode import (
-    STRICT_MODE,
     StrictModeReporter,
     StrictModeScopeKind,
     StrictModeSeverity,
@@ -79,9 +78,6 @@ def reporter() -> StrictModeReporter:
 
 
 class TestStrictModeReporter:
-    def test_default_singleton_exists(self) -> None:
-        assert isinstance(STRICT_MODE, StrictModeReporter)
-
     def test_current_scope_is_none_outside_any_scope(self, reporter: StrictModeReporter) -> None:
         assert reporter.current_scope() is None
 

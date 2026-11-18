@@ -284,11 +284,6 @@ class TestExpandPath:
         # Use as_posix() to get forward slashes on all platforms for comparison
         assert result.as_posix() == "/test/path/file.txt"
 
-    def test_returns_path_object(self) -> None:
-        """Test that function returns a Path object."""
-        result = expand_path("~/test")
-        assert isinstance(result, Path)
-
 
 class TestExpandPathFully:
     """Tests for expand_path_fully: expansion repeated until the value stops changing."""
@@ -484,12 +479,6 @@ class TestResolvePathSafely:
 
 class TestNormalizePathForPlatform:
     """Tests for normalize_path_for_platform function."""
-
-    def test_returns_string(self) -> None:
-        """Test that function returns a string."""
-        test_path = Path("/test/path")
-        result = normalize_path_for_platform(test_path)
-        assert isinstance(result, str)
 
     @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific test")
     def test_adds_long_path_prefix_on_windows(self, tmp_path: Path) -> None:

@@ -84,14 +84,8 @@ class TestBase64FileDriver:
 
     def test_can_handle_accepts_base64_with_slash_and_padding(self, driver: Base64FileDriver) -> None:
         """Test can_handle accepts base64 that contains slashes and ends with padding."""
-        # Base64 can contain '/' as part of its alphabet
-        # This is a valid base64 string that contains '/' and has padding
-        valid_base64 = "SGVsbG8gV29ybGQhIFRoaXMgaXMgYSB0ZXN0Lg=="
-        assert "/" in valid_base64 or driver.can_handle(valid_base64)
-        # Create one that definitely has a slash
-        valid_with_slash = "abc/def+ghi" + "=" * 10
-        if driver.can_handle(valid_with_slash):
-            assert True
+        valid_with_slash = "aGVsbG8/PyB3b3JsZCwgdGhpcyBpcyBhIHRlc3Q="
+        assert driver.can_handle(valid_with_slash)
 
     def test_can_handle_rejects_invalid_characters(self, driver: Base64FileDriver) -> None:
         """Test can_handle rejects strings with invalid base64 characters."""
@@ -100,11 +94,9 @@ class TestBase64FileDriver:
 
     def test_can_handle_rejects_invalid_base64_decode_fails(self, driver: Base64FileDriver) -> None:
         """Test can_handle rejects strings that look like base64 but fail to decode."""
-        # String looks like base64 but isn't valid
-        invalid_base64 = "A" * 30  # Valid chars but invalid base64
-        result = driver.can_handle(invalid_base64)
-        # This might be valid base64 (all A's), so we just check it doesn't crash
-        assert isinstance(result, bool)
+        # Valid characters, but the length is not a multiple of 4.
+        invalid_base64 = "A" * 30
+        assert not driver.can_handle(invalid_base64)
 
     @pytest.mark.asyncio
     async def test_read_valid_base64(self, driver: Base64FileDriver) -> None:

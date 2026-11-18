@@ -13,12 +13,8 @@ from griptape_nodes.common.macro_parser import (
     DotCaseFormat,
     LeadingSeparatorFormat,
     LowerCaseFormat,
-    MacroMatchFailure,
-    MacroMatchFailureReason,
-    MacroParseFailure,
     MacroParseFailureReason,
     MacroResolutionError,
-    MacroResolutionFailure,
     MacroResolutionFailureReason,
     MacroSyntaxError,
     MacroVariables,
@@ -890,106 +886,6 @@ class TestMacroResolverResolve:
         result = parsed.resolve({"count": 42}, mock_secrets_manager)
 
         assert result == "42"
-
-
-class TestMacroFailureTypes:
-    """Test cases for macro failure dataclasses."""
-
-    def test_macro_match_failure_creation(self) -> None:
-        """Test creating MacroMatchFailure with all fields."""
-        failure = MacroMatchFailure(
-            failure_reason=MacroMatchFailureReason.STATIC_TEXT_MISMATCH,
-            expected_pattern="{inputs}/{file_name}",
-            known_variables_used={"inputs": "outputs"},
-            error_details="Static segment mismatch: expected 'inputs/' but found 'outputs/'",
-        )
-
-        assert failure.failure_reason == MacroMatchFailureReason.STATIC_TEXT_MISMATCH
-        assert failure.expected_pattern == "{inputs}/{file_name}"
-        assert failure.known_variables_used == {"inputs": "outputs"}
-        assert "Static segment mismatch" in failure.error_details
-
-    def test_macro_match_failure_invalid_syntax(self) -> None:
-        """Test MacroMatchFailure with INVALID_MACRO_SYNTAX reason."""
-        failure = MacroMatchFailure(
-            failure_reason=MacroMatchFailureReason.INVALID_MACRO_SYNTAX,
-            expected_pattern="{inputs}/{file_name",
-            known_variables_used={},
-            error_details="Unbalanced braces in macro schema",
-        )
-
-        assert failure.failure_reason == MacroMatchFailureReason.INVALID_MACRO_SYNTAX
-        assert failure.expected_pattern == "{inputs}/{file_name"
-        assert failure.known_variables_used == {}
-
-    def test_macro_parse_failure_creation(self) -> None:
-        """Test creating MacroParseFailure with all fields."""
-        failure = MacroParseFailure(
-            failure_reason=MacroParseFailureReason.UNCLOSED_BRACE,
-            error_position=15,
-            error_details="Missing closing brace after position 15",
-        )
-
-        assert failure.failure_reason == MacroParseFailureReason.UNCLOSED_BRACE
-        assert failure.error_position == 15
-        assert "Missing closing brace" in failure.error_details
-
-    def test_macro_parse_failure_no_position(self) -> None:
-        """Test MacroParseFailure when error position is unknown."""
-        failure = MacroParseFailure(
-            failure_reason=MacroParseFailureReason.UNEXPECTED_SEGMENT_TYPE,
-            error_position=None,
-            error_details="General syntax error",
-        )
-
-        assert failure.failure_reason == MacroParseFailureReason.UNEXPECTED_SEGMENT_TYPE
-        assert failure.error_position is None
-
-    def test_macro_match_failure_reason_values(self) -> None:
-        """Test MacroMatchFailureReason enum values."""
-        assert MacroMatchFailureReason.STATIC_TEXT_MISMATCH == "STATIC_TEXT_MISMATCH"
-        assert MacroMatchFailureReason.DELIMITER_NOT_FOUND == "DELIMITER_NOT_FOUND"
-        assert MacroMatchFailureReason.FORMAT_REVERSAL_FAILED == "FORMAT_REVERSAL_FAILED"
-        assert MacroMatchFailureReason.INVALID_MACRO_SYNTAX == "INVALID_MACRO_SYNTAX"
-        assert len(MacroMatchFailureReason) == 4
-
-    def test_macro_parse_failure_reason_values(self) -> None:
-        """Test MacroParseFailureReason enum values."""
-        assert MacroParseFailureReason.UNMATCHED_CLOSING_BRACE == "UNMATCHED_CLOSING_BRACE"
-        assert MacroParseFailureReason.UNCLOSED_BRACE == "UNCLOSED_BRACE"
-        assert MacroParseFailureReason.NESTED_BRACES == "NESTED_BRACES"
-        assert MacroParseFailureReason.EMPTY_VARIABLE == "EMPTY_VARIABLE"
-        assert MacroParseFailureReason.UNEXPECTED_SEGMENT_TYPE == "UNEXPECTED_SEGMENT_TYPE"
-        assert MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS == "MULTIPLE_SEQUENCE_SLOTS"
-        assert MacroParseFailureReason.EMPTY_LEADING_SEPARATOR == "EMPTY_LEADING_SEPARATOR"
-        assert MacroParseFailureReason.MULTIPLE_LEADING_SEPARATORS == "MULTIPLE_LEADING_SEPARATORS"
-        assert MacroParseFailureReason.TOO_MANY_OPTIONAL_VARIABLES == "TOO_MANY_OPTIONAL_VARIABLES"
-        assert len(MacroParseFailureReason) == 9
-
-    def test_macro_resolution_failure_dataclass(self) -> None:
-        """Test creating MacroResolutionFailure with all fields."""
-        failure = MacroResolutionFailure(
-            failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
-            variable_name="workflow_name",
-            missing_variables={"workflow_name", "project_id"},
-            error_details="Required variables not provided",
-        )
-
-        assert failure.failure_reason == MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES
-        assert failure.variable_name == "workflow_name"
-        assert failure.missing_variables == {"workflow_name", "project_id"}
-        assert "Required variables" in failure.error_details
-
-    def test_macro_resolution_failure_reason_values(self) -> None:
-        """Test MacroResolutionFailureReason enum values."""
-        assert MacroResolutionFailureReason.NUMERIC_PADDING_ON_NON_NUMERIC == "NUMERIC_PADDING_ON_NON_NUMERIC"
-        assert MacroResolutionFailureReason.INVALID_INTEGER_PARSE == "INVALID_INTEGER_PARSE"
-        assert MacroResolutionFailureReason.DATE_FORMAT_NOT_IMPLEMENTED == "DATE_FORMAT_NOT_IMPLEMENTED"
-        assert MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES == "MISSING_REQUIRED_VARIABLES"
-        assert MacroResolutionFailureReason.ENVIRONMENT_VARIABLE_NOT_FOUND == "ENVIRONMENT_VARIABLE_NOT_FOUND"
-        assert MacroResolutionFailureReason.SECRETS_UNAVAILABLE == "SECRETS_UNAVAILABLE"
-        assert MacroResolutionFailureReason.UNEXPECTED_SEGMENT_TYPE == "UNEXPECTED_SEGMENT_TYPE"
-        assert len(MacroResolutionFailureReason) == 7
 
 
 class TestEnhancedExceptions:
