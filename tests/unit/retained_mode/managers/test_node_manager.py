@@ -434,7 +434,7 @@ class TestGetParameterValueOutputPriority:
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="result", node_name="test_node")
-        result = node_manager.on_get_parameter_value_request(request)
+        result = node_manager.on_get_parameter_value_request(request, engine.current_workflow())
 
         assert isinstance(result, GetParameterValueResultSuccess)
         assert result.value == output_value
@@ -465,7 +465,7 @@ class TestGetParameterValueOutputPriority:
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="a", node_name="test_node")
-        result = node_manager.on_get_parameter_value_request(request)
+        result = node_manager.on_get_parameter_value_request(request, engine.current_workflow())
 
         assert isinstance(result, GetParameterValueResultSuccess)
         assert result.value == input_value
@@ -496,7 +496,7 @@ class TestGetParameterValueOutputPriority:
 
         node_manager = engine.node_manager
         request = GetParameterValueRequest(parameter_name="x", node_name="test_node")
-        result = node_manager.on_get_parameter_value_request(request)
+        result = node_manager.on_get_parameter_value_request(request, engine.current_workflow())
 
         assert isinstance(result, GetParameterValueResultSuccess)
         assert result.value == default_value

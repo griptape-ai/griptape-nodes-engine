@@ -349,7 +349,7 @@ class TestGroupCopyBackPreservesTemplate:
         with _gn_mock_with_variable():
             executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
-        mock_engine.node_manager.on_set_parameter_value_request_in_workflow.assert_not_called()
+        mock_engine.node_manager.on_set_parameter_value_request.assert_not_called()
         assert node.parameter_values["prompt"] == "{SHOT}"
         assert node.parameter_output_values["prompt"] == "hyperreal"
 
@@ -405,7 +405,7 @@ class TestGroupCopyBackPreservesTemplate:
         with _gn_mock_with_variable():
             executor._apply_parameter_values_to_node(node, {"PromptNode_prompt": "hyperreal"}, package_result)
 
-        request, request_workflow = mock_engine.node_manager.on_set_parameter_value_request_in_workflow.call_args.args
+        request, request_workflow = mock_engine.node_manager.on_set_parameter_value_request.call_args.args
         assert request_workflow is workflow
         assert request.is_output is False
         assert request.parameter_name == "prompt"

@@ -2362,20 +2362,8 @@ class NodeManager(EngineScoped):
             group_name=new_group.name, node_name=node_name, result_details=details
         )
 
-    def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
-        """Remove a parameter from a node of the open workflow, outside dispatch.
-
-        Edge method for code that calls the handler directly and is not handed a workflow (node
-        library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{request.node_name}'. Failed because no workflow is open."
-            return RemoveParameterFromNodeResultFailure(result_details=details)
-        return self.on_remove_parameter_from_node_request_in_workflow(request, workflow)
-
     @handles(RemoveParameterFromNodeRequest)
-    def on_remove_parameter_from_node_request_in_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_remove_parameter_from_node_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: RemoveParameterFromNodeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         node_name = request.node_name
@@ -2711,7 +2699,7 @@ class NodeManager(EngineScoped):
                 source_node = self.get_node_by_name_in(workflow, conn.source_node_name)
                 source_param = source_node.get_parameter_by_name(conn.source_parameter_name)
                 if source_param and not parameter.is_incoming_type_allowed(source_param.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=conn.source_node_name,
                             source_parameter_name=conn.source_parameter_name,
@@ -2730,7 +2718,7 @@ class NodeManager(EngineScoped):
                 target_node = self.get_node_by_name_in(workflow, conn.target_node_name)
                 target_param = target_node.get_parameter_by_name(conn.target_parameter_name)
                 if target_param and not target_param.is_incoming_type_allowed(parameter.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=node_name,
                             source_parameter_name=request.parameter_name,
@@ -2877,22 +2865,9 @@ class NodeManager(EngineScoped):
         details = f"Successfully altered details for ParameterGroup '{request.group_name}' from Node '{node_name}'."
         return AlterParameterGroupDetailsResultSuccess(result_details=details)
 
-    def on_get_parameter_value_request(self, request: GetParameterValueRequest) -> ResultPayload:
-        """Answer `request` for the open workflow, outside dispatch.
-
-        Kept for node libraries that call it directly. Engine code sends the request instead.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = (
-                f"Attempted to get value for Parameter '{request.parameter_name}'. Failed because no workflow is open."
-            )
-            return GetParameterValueResultFailure(result_details=details)
-        return self.on_get_parameter_value_request_in_workflow(request, workflow)
-
     # For C901 (too complex): Need to give customers explicit reasons for failure on each case.
     @handles(GetParameterValueRequest)
-    def on_get_parameter_value_request_in_workflow(
+    def on_get_parameter_value_request(
         self, request: GetParameterValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         node_name = request.node_name
@@ -2950,21 +2925,9 @@ class NodeManager(EngineScoped):
         value: Any
         modified: bool
 
-    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
-        """Set a parameter value on a node of the open workflow, outside dispatch.
-
-        Edge method for code that calls the handler directly and is not handed a workflow (node
-        library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = f"Attempted to set parameter value for '{request.node_name}.{request.parameter_name}'. Failed because no workflow is open."
-            return SetParameterValueResultFailure(result_details=details)
-        return self.on_set_parameter_value_request_in_workflow(request, workflow)
-
     # added ignoring C901 since this method is overly long because of granular error checking, not actual complexity.
     @handles(SetParameterValueRequest)
-    def on_set_parameter_value_request_in_workflow(
+    def on_set_parameter_value_request(
         self, request: SetParameterValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         if not request.initial_setup:
@@ -3414,7 +3377,7 @@ class NodeManager(EngineScoped):
 
         # Iterate through all nodes in this Flow (yes, this restriction still sucks)
         list_nodes_in_flow_request = ListNodesInFlowRequest(flow_name=flow_name)
-        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request_in_workflow(
+        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request(
             list_nodes_in_flow_request, workflow
         )
         if not list_nodes_in_flow_result.succeeded():
@@ -6632,9 +6595,7 @@ class NodeManager(EngineScoped):
                 target_node_name=new_node_name,
                 target_parameter_name=incoming_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
-                connection_request, workflow
-            )
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request, workflow)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_incoming.append(incoming_connection)
 
@@ -6645,9 +6606,7 @@ class NodeManager(EngineScoped):
                 target_node_name=outgoing_connection.target_node_name,
                 target_parameter_name=outgoing_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
-                connection_request, workflow
-            )
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request, workflow)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_outgoing.append(outgoing_connection)
 

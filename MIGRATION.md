@@ -59,6 +59,25 @@ They have no effect. While a library still asks for a worker and declares no
 - The fitness problems reporting that request handlers and post-dispatch hooks are unsupported in an
     isolated library. Both now work in every library.
 
+## Managers no longer have ambient-workflow request methods
+
+**Library authors.** `NodeManager.on_get_parameter_value_request`, `on_set_parameter_value_request`
+and `on_remove_parameter_from_node_request`, and `FlowManager.on_get_top_level_flow_request`,
+`on_list_nodes_in_flow_request`, `on_create_connection_request`, `on_delete_connection_request` and
+`on_start_local_subflow_request`, no longer take only a request and act on the open workflow. Each
+is now the handler `GriptapeNodes.handle_request(...)` dispatches to, and takes the workflow as its
+second argument. Send the request instead:
+
+```python
+# Before
+result = GriptapeNodes.NodeManager().on_get_parameter_value_request(request)
+
+# After
+result = GriptapeNodes.handle_request(request)
+```
+
+From a node, `self.workflow.handle_request(request)` sends it through the workflow the node joined.
+
 ## Parameter values keep their type
 
 **Library authors.** A field of your own request, result, or event payload that holds parameter
