@@ -805,7 +805,8 @@ class TestWorkflowTag:
     ) -> None:
         """As a node calls from its library's own thread pool: no envelope id and no binding."""
         http.return_value = _response(200, {"allowed": True})
-        push_unsaved_workflow(budget_engine, "poster_flow")
+        workflow = push_unsaved_workflow(budget_engine, "poster_flow")
+        budget_engine.unbind_opened_workflow(budget_engine.open_workflows.get(workflow.workflow_id))
 
         result = await budget_engine.ahandle_request(BudgetAccessRequest(model="gpt-5-nano"))
 

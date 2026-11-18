@@ -16,7 +16,6 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext, c
 from griptape_nodes.retained_mode.request_handlers import RequiredSender
 from griptape_nodes.retained_mode.runtime.binding import (
     NO_WORKFLOW,
-    WorkflowNotNamedError,
     WorkflowNotOpenError,
     bound_workflow,
     create_task_bound_to_no_workflow,
@@ -43,8 +42,9 @@ class _ProbeResult(ResultPayloadSuccess):
 
 
 def _open(engine: Engine, display_name: str) -> WorkflowRuntime:
-    engine.context_manager.push_workflow(workflow_name=display_name)
-    return engine.open_workflows.get(engine.context_manager.get_current_workflow_id())
+    """Open a workflow and bind nothing, as an engine-side open does."""
+    entry = engine.workflow_registry.register_unsaved(display_name, listed=False)
+    return engine.open_workflow(entry.workflow_id)
 
 
 def _count_handler_calls(engine: Engine) -> list[_ProbeRequest]:
@@ -66,25 +66,26 @@ def _record_current_workflow(engine: Engine) -> None:
 
 
 class TestCurrentWorkflow:
-    def test_unbound_work_acts_on_the_only_open_workflow(self, engine: Engine) -> None:
-        workflow = _open(engine, "only")
+    def test_unbound_work_acts_on_no_workflow_even_with_one_open(self, engine: Engine) -> None:
+        _open(engine, "only")
 
-        assert engine.current_workflow() is workflow
-        assert engine.current_workflow_or_none() is workflow
+        assert engine.current_workflow_or_none() is None
+        with pytest.raises(NoOpenWorkflowError, match="not bound to a workflow"):
+            engine.current_workflow()
 
     def test_with_none_open_reads_find_none_and_writes_raise(self, engine: Engine) -> None:
         assert engine.current_workflow_or_none() is None
-        with pytest.raises(NoOpenWorkflowError, match="no workflow is open"):
+        with pytest.raises(NoOpenWorkflowError, match="not bound to a workflow"):
             engine.current_workflow()
 
-    def test_the_bound_workflow_comes_before_the_open_one(self, engine: Engine) -> None:
+    def test_the_bound_workflow_is_the_current_one_not_an_open_one(self, engine: Engine) -> None:
         _open(engine, "open")
         bound = WorkflowRuntime("bound", MagicMock())
 
         with engine.bind_workflow(bound):
             assert engine.current_workflow() is bound
 
-        assert engine.current_workflow() is not bound
+        assert engine.current_workflow_or_none() is None
 
     def test_work_bound_to_no_workflow_has_none_even_with_one_open(self, engine: Engine) -> None:
         _open(engine, "open")
@@ -93,18 +94,6 @@ class TestCurrentWorkflow:
             assert engine.current_workflow_or_none() is None
             with pytest.raises(NoOpenWorkflowError):
                 engine.current_workflow()
-
-    def test_unbound_work_with_several_open_raises(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Several open cannot happen through `open`; force it to check the read refuses to guess.
-        several = [WorkflowRuntime("abc", MagicMock()), WorkflowRuntime("def", MagicMock())]
-        monkeypatch.setattr(engine.open_workflows, "all_open", lambda: several)
-
-        with pytest.raises(WorkflowNotNamedError, match="2 workflows are open"):
-            engine.current_workflow_or_none()
-        with pytest.raises(WorkflowNotNamedError):
-            engine.current_workflow()
-        with engine.bind_workflow(several[1]):
-            assert engine.current_workflow() is several[1]
 
 
 class TestClosedWorkflowBinding:
@@ -129,10 +118,26 @@ class TestClosedWorkflowBinding:
             with pytest.raises(WorkflowNotOpenError, match="was closed"):
                 engine.current_workflow_or_none()
 
-    def test_opening_a_workflow_binds_nothing(self, engine: Engine) -> None:
-        """A load acts on the workflow it opened only where it binds it (`Engine.bind_workflow`)."""
+    def test_the_work_that_closes_a_pushed_workflow_is_unbound_after(self, engine: Engine) -> None:
+        """`push_workflow` binds what it opens, and `pop_workflow` ends that binding and no other."""
+        engine.context_manager.push_workflow(workflow_name="opened")
+        assert bound_workflow.get() is engine.open_workflows.all_open()[0]
+
+        engine.context_manager.pop_workflow()
+
+        assert bound_workflow.get() is None
+        assert engine.current_workflow_or_none() is None
+
+    def test_a_push_inside_a_bind_block_ends_with_the_block(self, engine: Engine) -> None:
         with engine.bind_workflow(NO_WORKFLOW):
             engine.context_manager.push_workflow(workflow_name="opened")
+            assert bound_workflow.get() is engine.open_workflows.all_open()[0]
+
+        assert bound_workflow.get() is None
+
+    def test_an_engine_side_open_binds_nothing(self, engine: Engine) -> None:
+        with engine.bind_workflow(NO_WORKFLOW):
+            _open(engine, "opened")
             assert bound_workflow.get() is NO_WORKFLOW
 
     def test_a_nested_request_whose_caller_is_bound_to_a_closed_workflow_is_refused(self, engine: Engine) -> None:
@@ -198,14 +203,14 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             )
             assert engine.current_workflow_or_none() is None
 
-    def test_a_request_with_no_envelope_id_acts_on_the_only_open_workflow(self, engine: Engine) -> None:
-        workflow = _open(engine, "open")
+    def test_a_request_with_no_envelope_id_and_no_caller_binding_acts_on_no_workflow(self, engine: Engine) -> None:
+        _open(engine, "open")
         _record_current_workflow(engine)
 
         result_event = engine.event_manager.handle_request(_ProbeRequest())
 
         assert isinstance(result_event.result, _ProbeResult)
-        assert result_event.result.workflow is workflow
+        assert result_event.result.workflow is None
 
     def test_a_nested_request_with_no_envelope_id_keeps_the_callers_binding(self, engine: Engine) -> None:
         workflow = _open(engine, "open")
@@ -277,10 +282,8 @@ class TestDispatchBindsTheEnvelopeWorkflow:
             assert await spawned[0] is workflow
 
     @pytest.mark.asyncio
-    async def test_tasks_a_request_with_no_envelope_id_spawns_never_reach_the_next_workflow(
-        self, engine: Engine
-    ) -> None:
-        _open(engine, "first")
+    async def test_tasks_a_request_its_caller_bound_spawns_never_reach_the_next_workflow(self, engine: Engine) -> None:
+        first = _open(engine, "first")
         release = asyncio.Event()
         spawned: list[asyncio.Task[WorkflowRuntime | None]] = []
 
@@ -294,20 +297,22 @@ class TestDispatchBindsTheEnvelopeWorkflow:
 
         engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
 
-        await engine.event_manager.ahandle_request(_ProbeRequest())
-        engine.context_manager.pop_workflow()
-        second = _open(engine, "second")
+        with engine.bind_workflow(first):
+            await engine.event_manager.ahandle_request(_ProbeRequest())
+        engine.close_workflow(first)
+        _open(engine, "second")
         release.set()
 
         with pytest.raises(WorkflowNotOpenError):
             await asyncio.wait_for(spawned[0], timeout=5)
-        assert engine.current_workflow_or_none() is second
+        assert engine.current_workflow_or_none() is None
 
-    def test_a_request_that_opens_the_first_workflow_acts_on_it(self, engine: Engine) -> None:
+    def test_a_request_that_pushes_a_workflow_acts_on_it_and_leaves_nothing_bound(self, engine: Engine) -> None:
         opened: list[WorkflowRuntime] = []
 
         def handler(_request: _ProbeRequest) -> _ProbeResult:
-            opened.append(_open(engine, "opened"))
+            engine.context_manager.push_workflow(workflow_name="opened")
+            opened.append(engine.open_workflows.all_open()[0])
             return _ProbeResult(result_details="ok", workflow=engine.current_workflow_or_none())
 
         engine.event_manager.assign_manager_to_request_type(_ProbeRequest, handler, without_workflow=None)
@@ -316,6 +321,7 @@ class TestDispatchBindsTheEnvelopeWorkflow:
 
         assert isinstance(result_event.result, _ProbeResult)
         assert result_event.result.workflow is opened[0]
+        assert bound_workflow.get() is None
 
     def test_a_binding_the_handler_makes_with_none_open_ends_with_the_request(self, engine: Engine) -> None:
         bound = WorkflowRuntime("bound", MagicMock())
@@ -347,8 +353,9 @@ class TestDispatchBindsTheEnvelopeWorkflow:
         assert calls == []
 
     def test_an_envelope_id_of_a_closed_workflow_fails_without_running(self, engine: Engine) -> None:
-        closed_id = _open(engine, "closed").workflow_id
-        engine.context_manager.pop_workflow()
+        closed = _open(engine, "closed")
+        closed_id = closed.workflow_id
+        engine.close_workflow(closed)
         calls = _count_handler_calls(engine)
 
         result_event = engine.event_manager.handle_request(
@@ -363,8 +370,9 @@ class TestDispatchBindsTheEnvelopeWorkflow:
     ) -> None:
         # A check that still sees the workflow open, then a lookup that finds it gone, as when a close
         # on another thread lands between them.
-        closed_id = _open(engine, "closed").workflow_id
-        engine.context_manager.pop_workflow()
+        closed = _open(engine, "closed")
+        closed_id = closed.workflow_id
+        engine.close_workflow(closed)
         monkeypatch.setattr(OpenWorkflowSet, "is_open", lambda _self, _workflow_id: True)
         calls = _count_handler_calls(engine)
 

@@ -578,6 +578,7 @@ class TestMetadataInjection:
             if named:
                 result = workflow.handle_request(request)
             else:
+                engine.unbind_opened_workflow(workflow)
                 result = engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)

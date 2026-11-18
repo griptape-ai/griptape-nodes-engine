@@ -41,7 +41,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultSuccess,
@@ -89,6 +88,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from tests.workflow_context import clear_all_object_state, send_in_the_open_workflow_async
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -131,17 +131,18 @@ def _open_new_workflow(engine: Engine, display_name: str) -> str:
     result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
     assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
     assert result.workflow_id is not None
+    engine.bind_opened_workflow(engine.open_workflows.get(result.workflow_id))
     return result.workflow_id
 
 
 def _save(engine: Engine, request: SaveWorkflowRequest | None = None) -> SaveWorkflowResultSuccess:
-    result = _run(engine, request or SaveWorkflowRequest())
+    result = asyncio.run(send_in_the_open_workflow_async(engine, request or SaveWorkflowRequest()))
     assert isinstance(result, SaveWorkflowResultSuccess), result.result_details
     return result
 
 
 def _close(engine: Engine) -> None:
-    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    clear_all_object_state(engine)
 
 
 def _saved_workflow(engine: Engine, display_name: str) -> SaveWorkflowResultSuccess:
@@ -488,7 +489,7 @@ class TestIdsAcrossRescans:
         )
 
         assert failure is None
-        assert not engine.context_manager.has_current_workflow()
+        assert engine.open_workflows.all_open() == []
         assert _id_at(engine, opened_file) == opened_id
         assert _id_at(engine, closed_file) == closed_id
         assert engine.workflow_registry.get(closed_id or "").name == "closed"
@@ -818,7 +819,7 @@ class TestFirstSave:
         opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="Scratch"))
         assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess)
 
-        saved = _run(engine, SaveWorkflowRequest(file_name="current/comp"))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name="current/comp")))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert saved.workflow_id == opened.workflow_id
@@ -1010,7 +1011,7 @@ class TestIdentityAcrossTheWorkflowLifecycle:
         reopened = _run(engine, RunWorkflowFromRegistryRequest(workflow_name=moved.new_workflow_name))
         assert isinstance(reopened, RunWorkflowFromRegistryResultSuccess), reopened.result_details
         assert reopened.workflow_id == workflow_id
-        assert engine.context_manager.get_current_workflow_id() == workflow_id
+        assert [open_workflow.workflow_id for open_workflow in engine.open_workflows.all_open()] == [workflow_id]
         _close(engine)
 
         _scan(engine, workspace)

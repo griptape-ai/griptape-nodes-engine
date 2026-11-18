@@ -754,7 +754,7 @@ class StaticFilesManager(EngineScoped):
         *,
         skip_metadata_injection: bool = False,
     ) -> str:
-        """Save a static file for the open workflow; see `save_static_file_in`.
+        """Save a static file for the workflow the caller is bound to; see `save_static_file_in`.
 
         Edge method for node library code, which is not handed a workflow.
         """

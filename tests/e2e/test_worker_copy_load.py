@@ -70,6 +70,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
 from tests.simulated_worker import SimulatedWorker, sent_from_open_workflow, simulated_worker
+from tests.workflow_context import the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -650,6 +651,7 @@ class TestGraphAccessWhileLoading:
             reopened = await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=saved.workflow_name))
 
         assert isinstance(reopened, RunWorkflowFromRegistryResultSuccess), reopened
+        engine.bind_opened_workflow(the_open_workflow(engine))
         assert "while it was loading" not in caplog.text
         for name in names:
             assert engine.node_manager.get_node_by_name(name) is not None, name

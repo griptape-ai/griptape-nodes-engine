@@ -922,14 +922,14 @@ class WorkflowManager(EngineScoped):
         return await self.runner.run_workflow(relative_file_path, workflow)
 
     def extract_workflow_shape(self, workflow_name: str, flow_name: str | None = None) -> dict[str, Any]:
-        """Extracts the input and output shape of the open workflow. See `shape.extract_workflow_shape`.
+        """Extracts the input and output shape of the workflow the caller is bound to. See `shape.extract_workflow_shape`.
 
         Edge method for code not handed a workflow (node library publishers); engine code calls
         `extract_workflow_shape_in`.
 
         Raises:
-            KeyError: No workflow is open and `flow_name` names a flow, or no flow has that name.
-            ValueError: No workflow is open and no flow is named, or the flow has no Start or End node.
+            KeyError: The caller is bound to no workflow and `flow_name` names a flow, or no flow has that name.
+            ValueError: The caller is bound to no workflow and no flow is named, or the flow has no Start or End node.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None and flow_name is not None:

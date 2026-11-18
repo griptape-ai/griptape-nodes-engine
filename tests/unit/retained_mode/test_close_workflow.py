@@ -162,7 +162,9 @@ class TestASyncCloseStopsTheRun:
 
         with (
             patch.object(flow_manager, "cancel_all_runs_in", AsyncMock(side_effect=cancel)),
-            patch.object(flow_manager, "reset_global_execution_state", side_effect=lambda: calls.append("reset")),
+            patch.object(
+                flow_manager, "reset_global_execution_state_in", side_effect=lambda _workflow: calls.append("reset")
+            ),
         ):
             engine.context_manager.pop_workflow()
 

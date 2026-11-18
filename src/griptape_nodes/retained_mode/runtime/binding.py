@@ -28,14 +28,16 @@ class NoWorkflow(Enum):
 NO_WORKFLOW: Final = NoWorkflow.NO_WORKFLOW
 
 # None means nothing was bound, which is different from binding NO_WORKFLOW: unbound work acts on
-# the only open workflow (see `Engine.current_workflow`), and NO_WORKFLOW work acts on none.
+# no workflow, however many are open: nothing in the engine picks one for it. An edge that opens a
+# workflow binds it (`Engine.bind_opened_workflow`). NO_WORKFLOW work is bound to none on purpose.
 bound_workflow: ContextVar[WorkflowRuntime | NoWorkflow | None] = ContextVar(
     "griptape_nodes_bound_workflow", default=None
 )
 
-
-class WorkflowNotNamedError(Exception):
-    """Work that needs a workflow named none, and several are open, so none can be chosen for it."""
+# The workflow `Engine.bind_opened_workflow` bound, so that closing it ends that binding and only
+# that one: work that `Engine.bind_workflow` bound to a workflow stays bound to it after it closes,
+# and its reads are refused.
+opened_binding: ContextVar[WorkflowRuntime | None] = ContextVar("griptape_nodes_opened_workflow", default=None)
 
 
 class WorkflowNotOpenError(Exception):

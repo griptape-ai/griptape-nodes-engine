@@ -44,7 +44,7 @@ class WorkflowNotNamedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
     """The request names no workflow it can act on, so it was not handled.
 
     The one failure for every request that acts on a workflow (`RequestScope.WORKFLOW`) but names
-    none, or names nothing while none or several are open. A client subscribed to the request's own
+    none, whether or not a workflow is open. A client subscribed to the request's own
     failure type still receives it: the result envelope carries `request_type`, and the bridge routes
     on that.
     """

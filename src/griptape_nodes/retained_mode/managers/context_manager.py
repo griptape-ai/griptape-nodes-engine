@@ -53,8 +53,11 @@ class ContextManager(EngineScoped):
     """Context manager for Workflow, Flow, Node, and Element contexts.
 
     Workflows own Flows, Flows own Nodes, and Nodes own Elements.
-    The Workflow context is the current workflow (`Engine.current_workflow_or_none`), whose Flow,
-    Node and Element contexts live on its runtime. A worker opens none: while it runs a node, the
+    The Workflow context is the workflow the work is bound to (`Engine.current_workflow_or_none`),
+    whose Flow, Node and Element contexts live on its runtime. Saved workflow files and node
+    libraries reach this manager through the facade and are not handed a workflow: a file opens
+    itself with `push_workflow`, which binds it, and a node runs bound to its own. The manager never
+    picks a workflow for work bound to none. A worker opens none: while it runs a node, the
     current workflow is the runtime it keeps for the node's orchestrator workflow
     (`adopt_orchestrator_workflow`). Workflows do not nest.
     Clients can push/pop Workflow contexts, Flow contexts, Node contexts, and Element contexts.
@@ -746,8 +749,13 @@ class ContextManager(EngineScoped):
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
-        workflow is refused. Opening binds nothing: work that builds into the opened workflow binds
-        it (`Engine.bind_workflow`).
+        workflow is refused.
+
+        Binds the opened workflow for the rest of the current work (`Engine.bind_opened_workflow`),
+        so a saved workflow file run standalone, which pushes itself and then calls the
+        `GriptapeNodes` facade, acts on the workflow it opened. The binding is the caller's, in the
+        context it called from and the tasks started there. `pop_workflow` ends it. A request
+        handler that calls this has its own binding restored when dispatch returns.
 
         A library-provided workflow opens as a new unsaved copy of itself
         (`register_unsaved_copy`), so every open, a script's own included, leaves the library's
@@ -775,7 +783,9 @@ class ContextManager(EngineScoped):
             WorkflowAlreadyOpenError: If the current work is bound to a live workflow.
         """
         entry = self._entry_to_open(workflow_name, file_path=file_path, working_directory=working_directory)
-        return self.engine.open_workflow(entry.workflow_id)
+        workflow = self.engine.open_workflow(entry.workflow_id)
+        self.engine.bind_opened_workflow(workflow)
+        return workflow
 
     def _entry_to_open(
         self, workflow_name: str | None, *, file_path: str | None, working_directory: str | None
@@ -839,6 +849,8 @@ class ContextManager(EngineScoped):
     def pop_workflow(self) -> str:
         """Close the current workflow through `Engine.close_workflow`, which tears down what it holds.
 
+        Also ends the binding `push_workflow` made to it.
+
         Returns:
             The name of the Workflow that was closed. `get_current_workflow_id` gives its id
             beforehand.
@@ -861,6 +873,7 @@ class ContextManager(EngineScoped):
             raise self.WorkerWorkflowNotClosableError(msg)
 
         self.engine.close_workflow(workflow)
+        self.engine.unbind_opened_workflow(workflow)
         return name
 
     def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:

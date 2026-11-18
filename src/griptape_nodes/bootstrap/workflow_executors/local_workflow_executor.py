@@ -53,6 +53,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.drivers.storage import StorageBackend
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         self._skip_library_loading = skip_library_loading
         self._workflows_to_register = workflows_to_register or []
         self._save_on_failure_path = save_on_failure_path
+        self._workflow: WorkflowRuntime | None = None
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
@@ -115,8 +117,13 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     ) -> None:
         """Async context manager exit."""
         # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
-        if exc_val is not None and self._save_on_failure_path is not None:
-            await self._save_failed_workflow(exc_val)
+        try:
+            if exc_val is not None and self._save_on_failure_path is not None:
+                await self._save_failed_workflow(exc_val)
+        finally:
+            if self._workflow is not None:
+                GriptapeNodes.get_instance().unbind_opened_workflow(self._workflow)
+                self._workflow = None
 
     def _get_workflow_name(self) -> str:
         """The name a failed workflow's file starts with.
@@ -246,6 +253,13 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             msg = f"Failed to load workflow from path {workflow_path}"
             _raise_load_error(msg)
 
+        # The run acts on the workflow it opened, so bind it for the rest of the run: the requests
+        # and manager calls below, and `_save_failed_workflow`, name no workflow of their own.
+        if isinstance(result, RunWorkflowFromScratchResultSuccess) and result.workflow_id is not None:
+            engine = GriptapeNodes.get_instance()
+            self._workflow = engine.open_workflows.get(result.workflow_id)
+            engine.bind_opened_workflow(self._workflow)
+
         # A FLAWED load succeeded but is missing pieces -- placeholders stand in for nodes whose
         # library would not register. That trade is right in the editor, where an artist can see
         # the placeholders and decide; here there is nobody to see them, so a run would silently
@@ -368,22 +382,24 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             return
 
         try:
-            # _get_workflow_name() can fail if the context manager is in a bad state at failure time;
-            # fall back to a generic name rather than letting that secondary failure surface.
-            try:
-                workflow_name = self._get_workflow_name()
-            except Exception:
-                logger.warning("save_failed_workflow: could not retrieve workflow name; using 'workflow'.")
-                workflow_name = "workflow"
-
-            # The run's workflow is the only one this process opens. The executor runs unbound, so
-            # bind it for the save's requests, which name no workflow of their own.
+            # The workflow this executor opened, else the one the caller bound before running it
+            # (a saved workflow file opens and binds itself). It is bound again here, since the
+            # failure may surface in a context that binding did not reach.
             engine = GriptapeNodes.get_instance()
-            workflow = engine.current_workflow_or_none()
+            workflow = self._workflow
             if workflow is None:
-                logger.error("save_failed_workflow: no workflow is open; skipping save.")
+                workflow = engine.current_workflow_or_none()
+            if workflow is None:
+                logger.error("save_failed_workflow: the run is bound to no workflow; skipping save.")
                 return
             with engine.bind_workflow(workflow):
+                # _get_workflow_name() can fail if the context manager is in a bad state at failure time;
+                # fall back to a generic name rather than letting that secondary failure surface.
+                try:
+                    workflow_name = self._get_workflow_name()
+                except Exception:
+                    logger.warning("save_failed_workflow: could not retrieve workflow name; using 'workflow'.")
+                    workflow_name = "workflow"
                 await self._save_workflow_state(workflow_name, error)
         except Exception:
             logger.exception("save_failed_workflow: unexpected error during failure save (original error unchanged).")

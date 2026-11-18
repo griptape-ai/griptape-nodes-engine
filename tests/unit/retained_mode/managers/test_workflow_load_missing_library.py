@@ -84,7 +84,9 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
 from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.utils.version_utils import engine_version
+from tests.workflow_context import the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -331,6 +333,8 @@ def _restart_engine(tmp_path: Path) -> Engine:
     the workflows a restarted editor would find in its workspace.
     """
     reset_root_engine()
+    # A workflow the old engine opened bound this test to it, and that engine is gone.
+    bound_workflow.set(None)
     LibraryRegistry._clear()
     stale = [
         name for name in sys.modules if name.startswith(("gtn_dynamic_module_", LibraryManager.STABLE_NAMESPACE_PREFIX))
@@ -360,8 +364,12 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
 
 
 def _run(engine: Engine, relative_file_path: str) -> Any:
-    """Run a saved file into the current workflow, else opened as one."""
-    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path, engine.current_workflow_or_none()))
+    """Run a saved file into the current workflow, else opened as one and bound, as a client that opens it works in it."""
+    workflow = engine.current_workflow_or_none()
+    result = asyncio.run(engine.workflow_manager.run_workflow(relative_file_path, workflow))
+    if workflow is None and result.workflow_id is not None:
+        engine.bind_opened_workflow(engine.open_workflows.get(result.workflow_id))
+    return result
 
 
 def _register_workflow(engine: Engine, tmp_path: Path, relative_file_path: str) -> str:
@@ -668,6 +676,7 @@ class TestOpenWorkflowRequest:
         result = reopened.handle_request(RunWorkflowFromRegistryRequest(workflow_name=workflow_name))
 
         assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result
+        reopened.bind_opened_workflow(the_open_workflow(reopened))
         assert not isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
 
@@ -744,9 +753,12 @@ class TestHeadlessLoadRefusesPlaceholders:
         _register(restored, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
         _register(restored, tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json")
 
-        asyncio.run(LocalWorkflowExecutor()._load_workflow_from_path(relative_path))
+        async def load_and_find_the_node() -> Any:
+            # The executor binds the workflow it opens for the rest of its run, so its caller reads it.
+            await LocalWorkflowExecutor()._load_workflow_from_path(relative_path)
+            return _node(restored, "Vanishing")
 
-        assert not isinstance(_node(restored, "Vanishing"), ErrorProxyNode)
+        assert not isinstance(asyncio.run(load_and_find_the_node()), ErrorProxyNode)
 
 
 class TestNestedSubflowProblemsReachTheOuterLoad:

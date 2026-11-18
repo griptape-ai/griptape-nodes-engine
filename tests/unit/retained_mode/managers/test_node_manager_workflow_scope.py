@@ -388,8 +388,9 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
     @pytest.mark.asyncio
     async def test_an_unbound_request_finds_no_node_while_one_is_open(self, engine: Engine) -> None:
         """As an MCP client that names no workflow sends it: no envelope id and no binding."""
-        _open_workflow(engine)
+        workflow = _open_workflow(engine)
         node_name = _create_node(engine, _create_canvas(engine), "node")
+        engine.unbind_opened_workflow(workflow)
         process = MagicMock()
 
         with patch.object(_ValueNode, "process", process):
