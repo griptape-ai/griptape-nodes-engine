@@ -198,7 +198,7 @@ class TestOpenImageIOSettings:
         assert isinstance(defaults, OpenImageIOSettings)
         assert defaults.max_memory_mb == 1024  # noqa: PLR2004
         assert defaults.max_open_files == 100  # noqa: PLR2004
-        assert defaults.autotile_size == 64  # noqa: PLR2004
+        assert defaults.autotile_size == 0
         assert defaults.deduplicate is True
         assert defaults.threads == 0
         assert defaults.max_image_size_mb == 4096  # noqa: PLR2004
@@ -235,8 +235,8 @@ class TestOpenImageIOSettings:
             ("max_memory_mb", "abc", 1024),
             ("max_open_files", 5, 100),
             ("max_open_files", 5000, 100),
-            ("autotile_size", 99, 64),
-            ("autotile_size", -64, 64),
+            ("autotile_size", 99, 0),
+            ("autotile_size", -64, 0),
             ("deduplicate", "yes", True),
             ("threads", -1, 0),
             ("threads", 512, 0),

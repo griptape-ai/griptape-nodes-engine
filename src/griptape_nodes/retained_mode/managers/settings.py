@@ -55,7 +55,7 @@ MIN_OIIO_MAX_MEMORY_MB = 64
 DEFAULT_OIIO_MAX_OPEN_FILES = 100
 MIN_OIIO_MAX_OPEN_FILES = 10
 MAX_OIIO_MAX_OPEN_FILES = 4096
-DEFAULT_OIIO_AUTOTILE_SIZE = 64
+DEFAULT_OIIO_AUTOTILE_SIZE = 0
 VALID_OIIO_AUTOTILE_SIZES = frozenset({0, 64, 128, 256, 512})
 DEFAULT_OIIO_DEDUPLICATE = True
 DEFAULT_OIIO_THREADS = 0
@@ -747,9 +747,10 @@ class OpenImageIOSettings(BaseModel):
         category=IMAGE_PROCESSING,
         default=DEFAULT_OIIO_AUTOTILE_SIZE,
         description=(
-            "Scanline strip height in pixels used to split untiled images (such as PNG, JPEG, WebP, and scanline EXR) "
-            "in the image cache so max_memory_mb can evict parts of large images. Larger values reduce network-drive "
-            "reads; set to 0 to cache untiled images whole."
+            "Scanline strip height in pixels used to split untiled images in the image cache. 0 (the default) caches "
+            "untiled images in one pass, avoiding repeated decompression of non-seekable PNG and JPEG streams while "
+            "still caching tiled EXR and TIFF files by tile. Set to 64, 128, 256, or 512 to split giant uncompressed "
+            "scanline plates into smaller cache strips."
         ),
     )
     deduplicate: bool = Field(

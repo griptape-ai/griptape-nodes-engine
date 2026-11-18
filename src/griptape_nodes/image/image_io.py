@@ -7,7 +7,6 @@ import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
-import numpy as np
 import OpenImageIO as oiio  # noqa: N813
 
 from griptape_nodes.image.operations import GRAYSCALE_ALPHA_CHANNELS, alpha_channel, checked
@@ -66,16 +65,15 @@ def read_header_file(path: Path) -> Header:
 def read_cached_file(path: Path) -> Decoded:
     """Read an image file at ``path`` backed by OpenImageIO's shared ImageCache.
 
-    Persistent local files take this route so tile memory and open file handles follow the user's
-    configured ``openimageio.*`` settings.
+    Passing no per-call ``config`` spec keeps ``ImageBuf`` backed by ``ImageCache`` tiles rather
+    than copying into a local buffer; ``unassociatedalpha`` is set directly on the shared cache.
 
     Raises:
         ValueError: If OpenImageIO cannot decode it
     """
     oiio.attribute("imagebuf:use_imagecache", 1)
-    config = oiio.ImageSpec()
-    config.attribute(UNASSOCIATED_ALPHA, 1)
-    buf = oiio.ImageBuf(str(path), 0, 0, config)
+    oiio.ImageCache(shared=True).attribute("unassociatedalpha", 1)
+    buf = oiio.ImageBuf(str(path))
     if not buf.read(0, 0, force=False) or buf.has_error:
         msg = f"Attempted to decode an image. Failed because OpenImageIO could not read it: {buf.geterror()}"
         raise ValueError(msg)
@@ -84,39 +82,24 @@ def read_cached_file(path: Path) -> Decoded:
 
 
 def read_ephemeral_file(path: Path) -> Decoded:
-    """Decode a temporary staging file directly via ``ImageInput``, bypassing ``ImageCache``.
+    """Decode a temporary staging file into a local C++ ``ImageBuf`` and evict its temp path from ``ImageCache``.
 
-    Temporary files created for in-memory ``bytes`` payloads will be unlinked as soon as the read
-    finishes; bypassing ``ImageCache`` keeps ephemeral paths out of cache RAM and closes the file
-    handle immediately on Windows.
+    ``force=True`` decodes directly in C++ without a Python NumPy round-trip, and invalidating the
+    staging path afterward closes any open ``ImageInput`` handle before the temp file is unlinked.
 
     Raises:
         ValueError: If OpenImageIO cannot decode it
     """
     config = oiio.ImageSpec()
     config.attribute(UNASSOCIATED_ALPHA, 1)
-    image_input = oiio.ImageInput.open(str(path), config)
-    if image_input is None:
-        msg = f"Attempted to decode an image. Failed because OpenImageIO could not read it: {oiio.geterror()}"
-        raise ValueError(msg)
+    buf = oiio.ImageBuf(str(path), 0, 0, config)
     try:
-        spec = oiio.ImageSpec(image_input.spec())
-        file_format_name = image_input.format_name()
-        pixels = image_input.read_image(spec.format)
-        if not isinstance(pixels, np.ndarray):
-            msg = (
-                f"Attempted to decode an image. Failed because OpenImageIO could not read it: {image_input.geterror()}"
-            )
-            raise ValueError(msg)  # noqa: TRY004
+        if not buf.read(0, 0, force=True) or buf.has_error:
+            msg = f"Attempted to decode an image. Failed because OpenImageIO could not read it: {buf.geterror()}"
+            raise ValueError(msg)
+        file_format_name = buf.file_format_name
     finally:
-        image_input.close()
-
-    buf = oiio.ImageBuf(np.ascontiguousarray(pixels))
-    buf_spec = buf.specmod()
-    buf_spec.channelnames = spec.channelnames
-    buf_spec.alpha_channel = spec.alpha_channel
-    for attrib in spec.extra_attribs:
-        buf_spec.attribute(attrib.name, attrib.type, attrib.value)
+        oiio.ImageCache(shared=True).invalidate(str(path), True)
     return _normalized_decoded(buf, file_format_name)
 
 

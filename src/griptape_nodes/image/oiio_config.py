@@ -43,6 +43,7 @@ def apply_openimageio_settings(config_manager: ConfigManager) -> OpenImageIOSett
     cache.attribute("autotile", settings.autotile_size)
     cache.attribute("autoscanline", int(settings.autotile_size > 0))
     cache.attribute("deduplicate", int(settings.deduplicate))
+    cache.attribute("unassociatedalpha", 1)
     cache.attribute("failure_retries", settings.failure_retries)
     return settings
 

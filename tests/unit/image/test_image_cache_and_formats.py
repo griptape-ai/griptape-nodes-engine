@@ -185,22 +185,28 @@ class TestLazyHeaderAndImageCacheRouting:
             _ = preview.encode(ImageFormat.WEBP)
 
         # Then the file was opened and read through the shared ImageCache
+        bytes_after_cold = cache.getattribute("stat:bytes_read", oiio.INT64)
         assert cache.getattribute("stat:unique_files", oiio.INT) == unique_before + 1
-        assert cache.getattribute("stat:bytes_read", oiio.INT64) > bytes_before
+        assert bytes_after_cold > bytes_before
 
-    def test_decoding_from_ephemeral_bytes_does_not_pollute_image_cache(self, tmp_path: Path) -> None:
-        # Given raw image bytes in memory and recorded ImageCache counters
+        # And a second thumbnail from the same Path reuses cached pixels with zero extra disk reads
+        with GriptapeImage.open(exr_path) as img_warm:
+            preview_warm = GriptapeImagePipeline(img_warm).thumbnail(16, 16).end()
+            _ = preview_warm.encode(ImageFormat.WEBP)
+        assert cache.getattribute("stat:bytes_read", oiio.INT64) == bytes_after_cold
+
+    def test_decoding_from_ephemeral_bytes_leaves_no_cached_tiles_or_open_handles(self, tmp_path: Path) -> None:
+        # Given raw image bytes in memory and an invalidated shared ImageCache
         cache = oiio.ImageCache(shared=True)
         raw_bytes = _oiio_file_bytes(tmp_path, ".png")
         cache.invalidate_all(True)
-        unique_before = cache.getattribute("stat:unique_files", oiio.INT)
-        bytes_before = cache.getattribute("stat:bytes_read", oiio.INT64)
 
         # When decoding and thumbnailing from raw bytes
         with GriptapeImage.open(raw_bytes) as img:
             preview = GriptapeImagePipeline(img).thumbnail(16, 16).end()
             _ = preview.encode(ImageFormat.WEBP)
 
-        # Then no temporary file path was opened or read through the shared ImageCache
-        assert cache.getattribute("stat:unique_files", oiio.INT) == unique_before
-        assert cache.getattribute("stat:bytes_read", oiio.INT64) == bytes_before
+        # Then no temporary file handle or tile remains in the shared ImageCache
+        stats = cache.getstats(1)
+        assert "No images opened" in stats or "0 current" in stats
+        assert "Tiles : 0 B" in stats

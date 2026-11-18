@@ -212,7 +212,7 @@ The engine decodes image headers and generates previews through OpenImageIO, bac
 
 - `openimageio.max_memory_mb` (default `1024`): memory budget in megabytes for cached image tiles. Raise this when scrubbing multi-frame 4K or 8K float sequences; lower it on machines with limited RAM.
 - `openimageio.max_open_files` (default `100`): maximum number of image files kept open simultaneously by the cache.
-- `openimageio.autotile_size` (default `64`): scanline strip height (`0`, `64`, `128`, `256`, or `512`) used to split untiled images (PNG, JPEG, WebP, scanline EXR) so parts of a large image can be evicted within `max_memory_mb`.
+- `openimageio.autotile_size` (default `0`): scanline strip height (`0`, `64`, `128`, `256`, or `512`) used to split untiled images. `0` decodes untiled PNG and JPEG files in a single pass while still caching tiled EXR and TIFF files by tile; set a positive value to split large uncompressed scanline plates into strips.
 - `openimageio.deduplicate` (default `true`): shares cached tiles across identical files stored in multiple folders.
 - `openimageio.threads` (default `0`, meaning all CPU cores): caps OpenImageIO and OpenEXR worker threads when running parallel node execution alongside local models.
 - `openimageio.max_image_size_mb` (default `4096`): maximum uncompressed pixel buffer size in megabytes allowed for a single image (`0` disables the limit).

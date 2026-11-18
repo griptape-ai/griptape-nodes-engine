@@ -67,6 +67,7 @@ class TestApplyOpenImageIOSettings:
         assert cache.getattribute("autotile", oiio.INT) == 128  # noqa: PLR2004
         assert cache.getattribute("autoscanline", oiio.INT) == 1
         assert cache.getattribute("deduplicate", oiio.INT) == 0
+        assert cache.getattribute("unassociatedalpha", oiio.INT) == 1
         assert cache.getattribute("failure_retries", oiio.INT) == 4  # noqa: PLR2004
         assert oiio.get_int_attribute("threads") == 6  # noqa: PLR2004
         assert oiio.get_int_attribute("exr_threads") == 6  # noqa: PLR2004
