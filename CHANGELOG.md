@@ -12,6 +12,46 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.108.1] - 2026-11-18
+
+### Changed
+
+- Video features now use `ffmpeg` and `ffprobe` from your `PATH` when both are installed, instead
+  of downloading their own copy, so they work on networks that block the download. Binaries
+  supplied through the `ffmpeg_directory` setting still take priority over `PATH`.
+
+### Fixed
+
+- Load 3D's Save Snapshot fills the node's `image` output again: a serialized artifact dict
+  keeps its `metadata` when it's normalized into an artifact.
+  [#6311](https://github.com/griptape-ai/griptape-nodes-engine/issues/6311)
+- Reloading libraries, switching projects, or updating a library no longer marks a library that
+  registers an artifact provider as flawed with a "duplicate friendly name" error. Unloading a
+  library now removes its artifact providers, so the next load registers its current provider code.
+  [#6307](https://github.com/griptape-ai/griptape-nodes-engine/issues/6307)
+- Deleting the current flow with `DeleteFlowRequest(flow_name=...)` no longer leaves it as the
+  current flow, which sent later requests to a flow that no longer existed until the engine
+  restarted. [#6305](https://github.com/griptape-ai/griptape-nodes-engine/issues/6305)
+- A directory parameter set to an absolute, `~`, or `file://` folder containing `{###}`, such as
+  `/renders/shot_v{###}`, now creates the next free version (`shot_v001`, `shot_v002`, ...)
+  instead of failing with "missing required variables: _index". A folder without `{###}` is still
+  used exactly as given.
+  [griptape-nodes-library-standard#945](https://github.com/griptape-ai/griptape-nodes-library-standard/issues/945)
+- End Flow's `result_details` now shows only the current run's `[SUCCEEDED]` or `[FAILED]` status.
+  Before, it added another status line on every run when nothing was connected to it, and saving
+  kept the extra lines in the workflow.
+  [#6304](https://github.com/griptape-ai/griptape-nodes-engine/issues/6304)
+- Running a node again while another node is still running no longer fails with only the node's
+  name as the error. Before, the node also refused every later run until the other node finished,
+  and then ran by itself anyway.
+  [#5562](https://github.com/griptape-ai/griptape-nodes-engine/issues/5562)
+- On Windows, a second Griptape Nodes process no longer takes a port the first one is already
+  serving on. Both processes previously advertised the same address while only one answered, so
+  files saved by one — a diagnostics bundle, a generated image — could come back as "not found"
+  in the editor. A server that has to move to another port because the one it asked for is taken
+  now logs a warning naming both ports.
+  [#6186](https://github.com/griptape-ai/griptape-nodes-engine/issues/6186)
+
 ## [0.108.0] - 2026-11-10
 
 ### Added
@@ -1093,7 +1133,8 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.108.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.108.1...HEAD
+[0.108.1]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.108.0...v0.108.1
 [0.108.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.107.0...v0.108.0
 [0.107.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.106.0...v0.107.0
 [0.106.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.105.0...v0.106.0
