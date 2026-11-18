@@ -484,7 +484,7 @@ class TestSetInputForFlow:
 
 
 class TestSaveFailedWorkflow:
-    """The executor runs bound to no workflow, as a standalone run does, with its one workflow open."""
+    """The executor runs unbound, as a standalone run does, with its one workflow open."""
 
     @staticmethod
     def _executor(target: Path) -> LocalWorkflowExecutor:

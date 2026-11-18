@@ -376,8 +376,8 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                 logger.warning("save_failed_workflow: could not retrieve workflow name; using 'workflow'.")
                 workflow_name = "workflow"
 
-            # The run's workflow is the only one this process opens. The executor runs bound to none,
-            # so bind it for the save's requests, which name no workflow of their own.
+            # The run's workflow is the only one this process opens. The executor runs unbound, so
+            # bind it for the save's requests, which name no workflow of their own.
             engine = GriptapeNodes.get_instance()
             workflow = engine.current_workflow_or_none()
             if workflow is None:
