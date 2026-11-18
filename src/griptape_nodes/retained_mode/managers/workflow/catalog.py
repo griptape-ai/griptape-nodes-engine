@@ -103,9 +103,7 @@ class WorkflowCatalog(EngineScoped):
     @handles(GetWorkflowInfoRequest)
     def on_get_workflow_info_request(self, request: GetWorkflowInfoRequest) -> ResultPayload:
         try:
-            workflow = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="get info for"
-            )
+            workflow = self.engine.workflow_registry.resolve_address(request.workflow_id, action="get info for")
         except WorkflowAddressError as err:
             return GetWorkflowInfoResultFailure(result_details=str(err))
 
@@ -175,9 +173,7 @@ class WorkflowCatalog(EngineScoped):
         # Every open workflow has an entry (a file opened from outside the workspace registers
         # unlisted), so the registry answers for it too.
         try:
-            workflow = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="get metadata for"
-            )
+            workflow = self.engine.workflow_registry.resolve_address(request.workflow_id, action="get metadata for")
         except WorkflowAddressError as err:
             return GetWorkflowMetadataResultFailure(result_details=str(err))
         # Placeholder metadata stands in for a header that could not be read; report why.
@@ -201,9 +197,7 @@ class WorkflowCatalog(EngineScoped):
         await self.engine.workflow_manager.wait_for_workflows_loaded()
 
         try:
-            workflow = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="set metadata for"
-            )
+            workflow = self.engine.workflow_registry.resolve_address(request.workflow_id, action="set metadata for")
         except WorkflowAddressError as err:
             return SetWorkflowMetadataResultFailure(result_details=str(err))
 

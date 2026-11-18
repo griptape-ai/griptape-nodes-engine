@@ -54,9 +54,7 @@ class WorkflowFileOperations(EngineScoped):
     async def on_delete_workflows_request(self, request: DeleteWorkflowRequest) -> ResultPayload:
         registry = self.engine.workflow_registry
         try:
-            workflow = registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.name, action="delete"
-            )
+            workflow = registry.resolve_address(request.workflow_id, action="delete")
         except WorkflowAddressError as err:
             return DeleteWorkflowResultFailure(result_details=str(err))
         workflow_name = workflow.name
@@ -113,9 +111,7 @@ class WorkflowFileOperations(EngineScoped):
         file, and edits it has not saved stay unsaved.
         """
         try:
-            source = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="rename"
-            )
+            source = self.engine.workflow_registry.resolve_address(request.workflow_id, action="rename")
         except WorkflowAddressError as err:
             return RenameWorkflowResultFailure(result_details=str(err))
 
@@ -145,9 +141,7 @@ class WorkflowFileOperations(EngineScoped):
     @handles(MoveWorkflowRequest)
     def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911
         try:
-            workflow = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="move"
-            )
+            workflow = self.engine.workflow_registry.resolve_address(request.workflow_id, action="move")
         except WorkflowAddressError as err:
             return MoveWorkflowResultFailure(result_details=str(err))
         # The name before the move, for messages: the entry's name follows its file.

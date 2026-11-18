@@ -1,5 +1,42 @@
 # Unreleased
 
+## Saved-workflow requests take only `workflow_id`
+
+**Request API clients and node libraries.** These requests no longer take a workflow's name. Name
+the workflow by `workflow_id`, which `ListAllWorkflowsRequest` and every result that names a
+workflow report.
+
+| Request                                                                                                                             | Removed field                            |
+| ----------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| `RenameWorkflowRequest`, `MoveWorkflowRequest`, `BranchWorkflowRequest`, `MergeWorkflowBranchRequest`, `ResetWorkflowBranchRequest` | `workflow_name`                          |
+| `GetWorkflowMetadataRequest`, `SetWorkflowMetadataRequest`, `GetWorkflowInfoRequest`, `SaveSubflowToWorkflowRequest`                | `workflow_name`                          |
+| `GetWorkflowRunCommandRequest`, `GetWorkflowShapeRequest`                                                                           | `workflow_name`                          |
+| `CompareWorkflowsRequest`                                                                                                           | `workflow_name`, `compare_workflow_name` |
+| `DeleteWorkflowRequest`                                                                                                             | `name`                                   |
+
+```python
+# Before
+RenameWorkflowRequest(workflow_name="shots/sh010/comp", requested_name="comp_v2")
+# After
+RenameWorkflowRequest(workflow_id=workflow_id, requested_name="comp_v2")
+```
+
+`GetWorkflowShapeRequest` with no `workflow_id` names the open workflow in its messages.
+`RetainedMode.get_workflow_run_command()` takes `workflow_id` in place of `workflow_name`.
+
+`ImportWorkflowAsReferencedSubFlowRequest.workflow_name` is deprecated rather than removed, and
+goes in 0.111.0. Files saved by earlier versions need no change: loading them names their
+referenced subflows by id.
+
+`PublishWorkflowRequest` and `GetPublishOptionsRequest` keep `workflow_name`, but the engine sets it
+to the registry name of the workflow the request's `workflow_id` names before handing the request to
+the publisher, and ignores any value a client sends. For `PublishWorkflowRequest`, that is the open
+workflow. Publishers read it as before. Publishing an unsaved workflow fails and asks to
+save it first.
+
+This change ships together with the editor (griptape-vsl-gui) release that sends `workflow_id` in
+these requests.
+
 ## Workflow ids are saved in the workflow file
 
 A saved workflow's `workflow_id` is now written to its file's metadata header, under

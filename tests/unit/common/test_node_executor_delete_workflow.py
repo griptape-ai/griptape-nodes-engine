@@ -43,7 +43,6 @@ class TestDeleteWorkflowUsesTheRegisteredId:
         delete_request = mock_engine.ahandle_request.call_args.args[0]
         assert isinstance(delete_request, DeleteWorkflowRequest)
         assert delete_request.workflow_id == "registered-id"
-        assert delete_request.name is None
         mock_engine.workflow_registry.register_file.assert_not_called()
 
 

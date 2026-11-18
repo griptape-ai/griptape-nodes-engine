@@ -335,15 +335,12 @@ class GetWorkflowShapeRequest(RequestPayload, GraphAccessMixin):
     renamed on import, so the shape saved with the workflow no longer names them.
 
     Args:
-        workflow_name: Registry key of the imported workflow, used in messages
         flow_name: Flow to read the shape from (None for the top-level flow)
-        workflow_id: Id of the imported workflow, for messages. A request that gives both fails
-            unless they name the same workflow.
+        workflow_id: Id of the imported workflow, used in messages. None names the open workflow.
 
     Results: GetWorkflowShapeResultSuccess (with the shape) | GetWorkflowShapeResultFailure (flow not found, no Start or End node, unknown workflow_id)
     """
 
-    workflow_name: str | None = None
     flow_name: str | None = None
     workflow_id: str | None = None
 
@@ -374,17 +371,15 @@ class DeleteWorkflowRequest(RequestPayload):
     Use when: Removing obsolete workflows, cleaning up workflow libraries,
     unregistering workflows, workflow management.
 
-    Name the workflow by `workflow_id`, by `name`, or by both when they name the same one. It
-    ignores the envelope's `open_workflow_id`, and closes the workflow first if it is open.
+    Name the workflow by `workflow_id`. It ignores the envelope's `open_workflow_id`, and closes
+    the workflow first if it is open.
 
     Args:
-        name: Registry name of the workflow to delete
         workflow_id: Id of the workflow to delete
 
     Results: DeleteWorkflowResultSuccess | DeleteWorkflowResultFailure (workflow not found, deletion error)
     """
 
-    name: str | None = None
     workflow_id: str | None = None
 
 
@@ -436,15 +431,13 @@ class RenameWorkflowRequest(RequestPayload):
     Use when: Updating workflow names, organizing workflow libraries,
     fixing naming conflicts, workflow management.
 
-    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same
-    one. It ignores the envelope's `open_workflow_id`. The rename moves the workflow's file and
-    rewrites the name in its header, whether the workflow is open or not, and the workflow keeps its
-    id. An open workflow stays open on the renamed file, and edits it has not saved stay unsaved. An
-    unsaved workflow has no file, so renaming one is refused: save it under the name instead. A
-    rename never replaces another file.
+    Name the workflow by `workflow_id`. It ignores the envelope's `open_workflow_id`. The rename
+    moves the workflow's file and rewrites the name in its header, whether the workflow is open or
+    not, and the workflow keeps its id. An open workflow stays open on the renamed file, and edits
+    it has not saved stay unsaved. An unsaved workflow has no file, so renaming one is refused: save
+    it under the name instead. A rename never replaces another file.
 
     Args:
-        workflow_name: Current registry name of the workflow
         workflow_id: Id of the workflow
         requested_name: New name for the workflow (drives the on-disk filename)
         display_name_behavior: How to treat ``WorkflowMetadata.name`` on rename. Defaults to
@@ -458,7 +451,6 @@ class RenameWorkflowRequest(RequestPayload):
     Results: RenameWorkflowResultSuccess | RenameWorkflowResultFailure (workflow not found, name conflict)
     """
 
-    workflow_name: str | None = None
     workflow_id: str | None = None
     requested_name: str = field(kw_only=True)
     display_name_behavior: RenameDisplayNameBehavior = RenameDisplayNameBehavior.MATCH_FILE_NAME
@@ -617,19 +609,16 @@ class GetWorkflowRunCommandRequest(RequestPayload):
     Use when: Showing users how to run a workflow from a terminal, copying a run command,
     scripting workflow execution from the command line.
 
-    Name a saved workflow by `workflow_id`, by `workflow_name`, or by both when they name the same
-    one. Or give file_path (path to workflow file), or nothing to use the workflow in the current
-    context.
+    Name a saved workflow by `workflow_id`, or give file_path (path to workflow file), or nothing to
+    use the workflow in the current context.
 
     Args:
-        workflow_name: Name of the workflow in the registry (optional if file_path or current context)
-        file_path: Path to the workflow file, relative to workspace or absolute (optional if workflow_name or current context)
+        file_path: Path to the workflow file, relative to workspace or absolute (optional if workflow_id or current context)
         workflow_id: Id of the workflow in the registry
 
     Results: GetWorkflowRunCommandResultSuccess (with run_command) | GetWorkflowRunCommandResultFailure
     """
 
-    workflow_name: str | None = None
     file_path: str | None = None
     workflow_id: str | None = None
 
@@ -687,8 +676,8 @@ class GetPublishOptionsRequest(RequestPayload):
     Use when: Opening the publish dialog for a specific publisher, refreshing dependent
     options after a selection change.
 
-    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-    The publisher gets the request with `workflow_name` filled in.
+    Name the workflow by `workflow_id`. The publisher gets the request with `workflow_name` set to
+    that workflow's registry name; a value a client sends is ignored.
 
     Results: GetPublishOptionsResultSuccess (with fields) | GetPublishOptionsResultFailure
     """
@@ -765,9 +754,9 @@ class PublishWorkflowRequest(RequestPayload):
     Use when: Sharing workflows with others, creating workflow packages,
     distributing workflow templates, workflow publishing.
 
-    Publishes the open workflow the envelope's `open_workflow_id` names. Name it by `workflow_id`,
-    by `workflow_name`, or by both when they name the same one. A `workflow_id` must be that open
-    workflow's. A `workflow_name` the registry doesn't hold saves the workflow under it first.
+    Publishes the open workflow the envelope's `open_workflow_id` names, which must be saved. A
+    `workflow_id` must be that open workflow's. The publisher gets the request with
+    `workflow_name` set to that workflow's registry name; a value a client sends is ignored.
 
     Results: PublishWorkflowResultSuccess (with file path) | PublishWorkflowResultFailure (publish error)
     """
@@ -825,10 +814,10 @@ class BranchWorkflowRequest(RequestPayload):
     Use when: Creating workflow variants, branching workflows for experimentation,
     creating personal copies of shared workflows, preparing for workflow collaboration.
 
-    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
+    Name the workflow by `workflow_id`. The branch has an id of its own, and records the
+    workflow's id as its `branched_from`.
 
     Args:
-        workflow_name: Registry name of the workflow to branch
         workflow_id: Id of the workflow to branch
         branched_workflow_name: Registry key for the branched workflow (None for auto-generated)
         branched_workflow_display_name: Human-readable label (``metadata.name``) for the branch.
@@ -838,7 +827,6 @@ class BranchWorkflowRequest(RequestPayload):
     Results: BranchWorkflowResultSuccess (with branch name) | BranchWorkflowResultFailure (branch error)
     """
 
-    workflow_name: str | None = None
     workflow_id: str | None = None
     branched_workflow_name: str | None = None
     branched_workflow_display_name: str | None = None
@@ -918,16 +906,12 @@ class MergeWorkflowBranchRequest(RequestPayload):
     Use when: Integrating branch changes back into the original workflow, consolidating
     successful branch experiments, applying approved branch modifications to source.
 
-    Name the branch by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-
     Args:
-        workflow_name: Registry name of the branch workflow to merge back into its source
-        workflow_id: Id of the branch workflow
+        workflow_id: Id of the branch workflow to merge back into its source
 
     Results: MergeWorkflowBranchResultSuccess (with merge details) | MergeWorkflowBranchResultFailure (merge error)
     """
 
-    workflow_name: str | None = None
     workflow_id: str | None = None
 
 
@@ -959,16 +943,12 @@ class ResetWorkflowBranchRequest(RequestPayload):
     Use when: Discarding branch modifications, reverting branch to source state,
     abandoning branch experiments, syncing branch with latest source changes.
 
-    Name the branch by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-
     Args:
-        workflow_name: Registry name of the branch workflow to reset to its source
-        workflow_id: Id of the branch workflow
+        workflow_id: Id of the branch workflow to reset to its source
 
     Results: ResetWorkflowBranchResultSuccess (with reset details) | ResetWorkflowBranchResultFailure (reset error)
     """
 
-    workflow_name: str | None = None
     workflow_id: str | None = None
 
 
@@ -1000,19 +980,13 @@ class CompareWorkflowsRequest(RequestPayload):
     Use when: Checking if branched workflows need updates, determining if local changes exist,
     managing workflow synchronization, preparing for merge operations.
 
-    Name each workflow by id, by name, or by both when they name the same one.
-
     Args:
-        workflow_name: Registry name of the workflow to evaluate
-        compare_workflow_name: Registry name of the workflow to compare against
         workflow_id: Id of the workflow to evaluate
         compare_workflow_id: Id of the workflow to compare against
 
     Results: CompareWorkflowsResultSuccess (with status details) | CompareWorkflowsResultFailure (evaluation error)
     """
 
-    workflow_name: str | None = None
-    compare_workflow_name: str | None = None
     workflow_id: str | None = None
     compare_workflow_id: str | None = None
 
@@ -1057,17 +1031,13 @@ class MoveWorkflowRequest(RequestPayload):
     Use when: Organizing workflows into directories, restructuring workflow hierarchies,
     moving workflows to categorized folders, cleaning up workspace organization.
 
-    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-
     Args:
-        workflow_name: Registry name of the workflow to move
         workflow_id: Id of the workflow to move
         target_directory: Target directory path relative to workspace root
 
     Results: MoveWorkflowResultSuccess (with new path) | MoveWorkflowResultFailure (move error)
     """
 
-    workflow_name: str | None = None
     workflow_id: str | None = None
     target_directory: str = field(kw_only=True)
 
@@ -1097,12 +1067,8 @@ class MoveWorkflowResultFailure(ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class GetWorkflowMetadataRequest(RequestPayload):
-    """Get a workflow's metadata from the registry.
+    """Get the metadata of the workflow `workflow_id` names from the registry."""
 
-    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-    """
-
-    workflow_name: str | None = None
     workflow_id: str | None = None
 
 
@@ -1156,16 +1122,12 @@ class GetWorkflowInfoRequest(RequestPayload):
     Use when: Displaying workflow health warnings in the UI, checking whether a workflow
     has compatibility issues before loading it, showing dependency status.
 
-    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-
     Args:
-        workflow_name: Registry key for the workflow.
         workflow_id: Id of the workflow.
 
     Results: GetWorkflowInfoResultSuccess (with status and details) | GetWorkflowInfoResultFailure (not found)
     """
 
-    workflow_name: str | None = None
     workflow_id: str | None = None
 
 
@@ -1252,12 +1214,8 @@ class ListAllWorkflowInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 @dataclass
 @PayloadRegistry.register
 class SetWorkflowMetadataRequest(RequestPayload):
-    """Replace the workflow's metadata entirely and persist to file.
+    """Replace the metadata of the workflow `workflow_id` names entirely and persist to file."""
 
-    Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same one.
-    """
-
-    workflow_name: str | None = None
     workflow_id: str | None = None
     workflow_metadata: WorkflowMetadata = field(kw_only=True)
 
@@ -1412,19 +1370,14 @@ class SaveSubflowToWorkflowRequest(RequestPayload):
     Use when: Persisting changes made to a subflow in a modal editor back to
     the workflow file it was loaded from.
 
-    Name the target workflow by `workflow_id`, by `workflow_name`, or by both when they name the
-    same one.
-
     Args:
         flow_name: The engine flow name of the subflow to serialize
-        workflow_name: Registry key for the target workflow (used to derive file path and metadata)
-        workflow_id: Id of the target workflow
+        workflow_id: Id of the target workflow, whose file the subflow is saved into
 
     Results: SaveSubflowToWorkflowResultSuccess | SaveSubflowToWorkflowResultFailure
     """
 
     flow_name: str
-    workflow_name: str | None = None
     workflow_id: str | None = None
 
 

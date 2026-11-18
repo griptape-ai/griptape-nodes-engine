@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import semver
 
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
+from griptape_nodes.node_library.workflow_registry import UnknownWorkflowAddressError, WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -46,17 +46,8 @@ class ReferencedWorkflowImport(EngineScoped):
         self, request: ImportWorkflowAsReferencedSubFlowRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Import the saved workflow the request names as a new referenced sub flow of the open `workflow`."""
-        if request.workflow_id is None and request.workflow_name is not None:
-            logger.warning(
-                "ImportWorkflowAsReferencedSubFlowRequest.workflow_name is deprecated and will be removed in "
-                "version %s. Name workflow '%s' by its workflow_id instead.",
-                IMPORT_WORKFLOW_NAME_REMOVAL_VERSION,
-                request.workflow_name,
-            )
         try:
-            imported = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="import"
-            )
+            imported = self._imported_workflow(request)
         except WorkflowAddressError as err:
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=str(err))
 
@@ -72,6 +63,27 @@ class ReferencedWorkflowImport(EngineScoped):
 
         # Execute the import
         return await self._execute_workflow_import(workflow, request, imported, flow_name)
+
+    def _imported_workflow(self, request: ImportWorkflowAsReferencedSubFlowRequest) -> Workflow:
+        """The workflow the request imports: by `workflow_id`, else by the deprecated `workflow_name`.
+
+        Raises:
+            WorkflowAddressError: The request names no workflow, or none has that id or name.
+        """
+        registry = self.engine.workflow_registry
+        if request.workflow_id is not None or request.workflow_name is None:
+            return registry.resolve_address(request.workflow_id, action="import")
+        logger.warning(
+            "ImportWorkflowAsReferencedSubFlowRequest.workflow_name is deprecated and will be removed in "
+            "version %s. Name workflow '%s' by its workflow_id instead.",
+            IMPORT_WORKFLOW_NAME_REMOVAL_VERSION,
+            request.workflow_name,
+        )
+        imported = registry.find_by_name(request.workflow_name)
+        if imported is None:
+            msg = f"Attempted to import workflow '{request.workflow_name}'. Failed because no workflow has that name."
+            raise UnknownWorkflowAddressError(msg)
+        return imported
 
     def _validate_import_prerequisites(
         self, workflow: WorkflowRuntime, request: ImportWorkflowAsReferencedSubFlowRequest, imported: Workflow

@@ -630,8 +630,7 @@ class WorkflowSaver(EngineScoped):
         """Save a subflow of the open `workflow` back into the file of the saved workflow the request names."""
         try:
             target = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id,
-                workflow_name=request.workflow_name,
+                request.workflow_id,
                 action=f"save subflow '{request.flow_name}' into",
             )
         except WorkflowAddressError as err:

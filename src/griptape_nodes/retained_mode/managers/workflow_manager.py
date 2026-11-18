@@ -971,20 +971,16 @@ class WorkflowManager(EngineScoped):
     def on_get_workflow_shape_request(
         self, request: GetWorkflowShapeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
-        """Read the shape of `workflow`'s flow the request names. Its workflow names only label messages."""
-        workflow_name = request.workflow_name
-        if request.workflow_id is not None:
-            try:
-                workflow_name = self.engine.workflow_registry.resolve_address(
-                    workflow_id=request.workflow_id,
-                    workflow_name=request.workflow_name,
-                    action="read the inputs and outputs of",
-                ).name
-            except WorkflowAddressError as err:
-                return GetWorkflowShapeResultFailure(result_details=str(err))
-        if workflow_name is None:
-            details = "Attempted to read the inputs and outputs of a workflow. Failed because the request names no workflow. Pass workflow_id."
-            return GetWorkflowShapeResultFailure(result_details=details)
+        """Read the shape of `workflow`'s flow the request names. Its `workflow_id` only labels messages."""
+        workflow_id = request.workflow_id
+        if workflow_id is None:
+            workflow_id = workflow.workflow_id
+        try:
+            workflow_name = self.engine.workflow_registry.resolve_address(
+                workflow_id, action="read the inputs and outputs of"
+            ).name
+        except WorkflowAddressError as err:
+            return GetWorkflowShapeResultFailure(result_details=str(err))
 
         try:
             shape = self.extract_workflow_shape_in(workflow, workflow_name, flow_name=request.flow_name)

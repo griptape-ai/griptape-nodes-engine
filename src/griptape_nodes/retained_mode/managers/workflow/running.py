@@ -469,29 +469,28 @@ class WorkflowRunner(EngineScoped):
         self, request: GetWorkflowRunCommandRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """The command line that runs the saved workflow or file the request names, else the open `workflow`."""
-        workflow_name = request.workflow_name
         workflow_id = request.workflow_id
         file_path = request.file_path
 
         # Failure: no identifier and no current context
-        if workflow_name is None and workflow_id is None and file_path is None:
+        if workflow_id is None and file_path is None:
             if workflow is None:
                 return GetWorkflowRunCommandResultFailure(
                     result_details=(
-                        "Attempted to get workflow run command. Failed with workflow_name=None, file_path=None "
-                        "because no workflow is loaded in the current context. Provide workflow_name or file_path, or load a workflow."
+                        "Attempted to get workflow run command. Failed with workflow_id=None, file_path=None "
+                        "because no workflow is loaded in the current context. Provide workflow_id or file_path, or load a workflow."
                     )
                 )
-            # When neither workflow_name nor file_path is provided, use the open workflow as a fallback.
-            workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
+            # When neither workflow_id nor file_path is provided, use the open workflow as a fallback.
+            workflow_id = workflow.workflow_id
 
-        names_saved_workflow = workflow_name is not None or workflow_id is not None
+        names_saved_workflow = workflow_id is not None
         # Failure: both a saved workflow and file_path provided
         if names_saved_workflow and file_path is not None:
             return GetWorkflowRunCommandResultFailure(
                 result_details=(
-                    "Attempted to get workflow run command. Failed with both workflow_name and file_path provided "
-                    "because only one may be provided. Provide workflow_name or file_path, not both."
+                    "Attempted to get workflow run command. Failed with both workflow_id and file_path provided "
+                    "because only one may be provided. Provide workflow_id or file_path, not both."
                 )
             )
 
@@ -499,9 +498,7 @@ class WorkflowRunner(EngineScoped):
         workflow_shape: WorkflowShape | None = None
         if names_saved_workflow:
             try:
-                saved = self.engine.workflow_registry.resolve_address(
-                    workflow_id=workflow_id, workflow_name=workflow_name, action="get the run command for"
-                )
+                saved = self.engine.workflow_registry.resolve_address(workflow_id, action="get the run command for")
             except WorkflowAddressError as err:
                 return GetWorkflowRunCommandResultFailure(
                     result_details=f"{err} Save the workflow first, or provide file_path."
@@ -524,7 +521,7 @@ class WorkflowRunner(EngineScoped):
             return GetWorkflowRunCommandResultFailure(
                 result_details=(
                     "Attempted to get workflow run command. Failed with no resolvable file path "
-                    "because neither workflow_name nor file_path was provided. Provide workflow_name or file_path."
+                    "because neither workflow_id nor file_path was provided. Provide workflow_id or file_path."
                 )
             )
 

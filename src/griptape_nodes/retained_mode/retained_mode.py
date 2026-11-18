@@ -1719,29 +1719,29 @@ class RetainedMode:
     @classmethod
     def get_workflow_run_command(
         cls,
-        workflow_name: str | None = None,
+        workflow_id: str | None = None,
         file_path: str | None = None,
     ) -> ResultPayload:
         """Returns a command-line string to run a workflow using the engine's Python.
 
-        Provide workflow_name (from registry), file_path (path to workflow file), or neither to use
+        Provide workflow_id (from registry), file_path (path to workflow file), or neither to use
         the workflow in the current context.
 
         Args:
-            workflow_name: Name of the workflow in the registry (optional if file_path or current context).
-            file_path: Path to the workflow file, relative to workspace or absolute (optional if workflow_name or current context).
+            workflow_id: Id of the workflow in the registry (optional if file_path or current context).
+            file_path: Path to the workflow file, relative to workspace or absolute (optional if workflow_id or current context).
 
         Returns:
             ResultPayload: On success, result has run_command attribute (e.g. "/path/to/python /path/to/workflow.py").
 
         Example:
             result = cmd.get_workflow_run_command()  # uses current context workflow
-            result = cmd.get_workflow_run_command(workflow_name="My Workflow")
+            result = cmd.get_workflow_run_command(file_path="my_workflow.py")
             if result.succeeded():
                 print(result.run_command)  # /location/to/griptape/python /location/to/workflow.py
         """
         request = GetWorkflowRunCommandRequest(
-            workflow_name=workflow_name,
+            workflow_id=workflow_id,
             file_path=file_path,
         )
         result = GriptapeNodes().handle_request(request)

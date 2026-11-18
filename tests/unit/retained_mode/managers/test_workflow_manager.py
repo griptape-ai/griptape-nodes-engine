@@ -215,6 +215,16 @@ def _register_unsaved_workflow(name: str) -> str:
     return current_engine().workflow_registry.register_unsaved(name).name
 
 
+# Placeholder ids for tests that stub the registry's lookup, and one no workflow has.
+_MOCKED_WORKFLOW_ID = "0123456789abcdef0123456789abcdef"
+_UNKNOWN_WORKFLOW_ID = "fedcba9876543210fedcba9876543210"
+
+
+def _id_named(engine: Engine, name: str) -> str:
+    """The id of the registered workflow named `name`."""
+    return engine.workflow_registry.get_workflow_by_name(name).workflow_id
+
+
 class TestWorkflowManager:
     """Test WorkflowManager functionality including parameter serialization."""
 
@@ -395,7 +405,7 @@ class TestWorkflowManager:
     def test_get_workflow_metadata_success(self, engine: Engine) -> None:
         """Ensure GetWorkflowMetadataRequest returns workflow.metadata directly."""
         workflow_manager = engine.workflow_manager
-        request = GetWorkflowMetadataRequest(workflow_name="my_workflow")
+        request = GetWorkflowMetadataRequest(workflow_id=_MOCKED_WORKFLOW_ID)
 
         mock_metadata = MagicMock()
         mock_workflow = MagicMock()
@@ -411,10 +421,9 @@ class TestWorkflowManager:
     def test_get_workflow_metadata_not_found(self, engine: Engine) -> None:
         """Ensure GetWorkflowMetadataRequest returns failure when workflow missing."""
         workflow_manager = engine.workflow_manager
-        request = GetWorkflowMetadataRequest(workflow_name="missing_workflow")
+        request = GetWorkflowMetadataRequest(workflow_id=_UNKNOWN_WORKFLOW_ID)
 
-        with patch.object(engine.workflow_registry, "get_workflow_by_name", side_effect=KeyError("not found")):
-            result = workflow_manager.catalog.on_get_workflow_metadata_request(request)
+        result = workflow_manager.catalog.on_get_workflow_metadata_request(request)
 
         assert isinstance(result, GetWorkflowMetadataResultFailure)
 
@@ -425,10 +434,10 @@ class TestWorkflowManager:
         workflow_file = tmp_path / "outside_workspace.py"
         _write_minimal_workflow_header(workflow_file)
         context_manager = engine.context_manager
-        workflow_name = context_manager.push_workflow(file_path=str(workflow_file))
+        context_manager.push_workflow(file_path=str(workflow_file))
         try:
             result = engine.workflow_manager.catalog.on_get_workflow_metadata_request(
-                GetWorkflowMetadataRequest(workflow_name=workflow_name)
+                GetWorkflowMetadataRequest(workflow_id=context_manager.get_current_workflow_id())
             )
         finally:
             context_manager.pop_workflow()
@@ -437,17 +446,15 @@ class TestWorkflowManager:
         assert result.workflow_metadata.name == "Outside Workspace"
         assert result.workflow_metadata.description == "run directly"
 
-    def test_get_workflow_metadata_not_found_when_name_is_not_open_workflow(
-        self, engine: Engine, tmp_path: Path
-    ) -> None:
-        """The file fallback answers only for the open workflow, not for any unregistered name."""
+    def test_get_workflow_metadata_not_found_when_id_is_not_open_workflow(self, engine: Engine, tmp_path: Path) -> None:
+        """The file fallback answers only for the open workflow, not for any unregistered id."""
         workflow_file = tmp_path / "open_workflow.py"
         _write_minimal_workflow_header(workflow_file)
         context_manager = engine.context_manager
         context_manager.push_workflow(file_path=str(workflow_file))
         try:
             result = engine.workflow_manager.catalog.on_get_workflow_metadata_request(
-                GetWorkflowMetadataRequest(workflow_name="some_other_workflow")
+                GetWorkflowMetadataRequest(workflow_id=_UNKNOWN_WORKFLOW_ID)
             )
         finally:
             context_manager.pop_workflow()
@@ -461,10 +468,10 @@ class TestWorkflowManager:
         workflow_file = tmp_path / "no_header.py"
         workflow_file.write_text("print('no header')\n", encoding="utf-8")
         context_manager = engine.context_manager
-        workflow_name = context_manager.push_workflow(file_path=str(workflow_file))
+        context_manager.push_workflow(file_path=str(workflow_file))
         try:
             result = engine.workflow_manager.catalog.on_get_workflow_metadata_request(
-                GetWorkflowMetadataRequest(workflow_name=workflow_name)
+                GetWorkflowMetadataRequest(workflow_id=context_manager.get_current_workflow_id())
             )
         finally:
             context_manager.pop_workflow()
@@ -481,7 +488,7 @@ class TestWorkflowManager:
         # Provide a full metadata object (mock is fine as we stub header replacement)
         mock_new_metadata = MagicMock()
         mock_new_metadata.name = "my_workflow"
-        request = SetWorkflowMetadataRequest(workflow_name="my_workflow", workflow_metadata=mock_new_metadata)
+        request = SetWorkflowMetadataRequest(workflow_id=_MOCKED_WORKFLOW_ID, workflow_metadata=mock_new_metadata)
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "workflows/my_workflow.py"
@@ -691,17 +698,16 @@ class TestWorkflowManager:
 
     def test_on_move_workflow_request_workflow_not_found(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
-        request = MoveWorkflowRequest(workflow_name="nonexistent", target_directory="subdir")
+        request = MoveWorkflowRequest(workflow_id=_UNKNOWN_WORKFLOW_ID, target_directory="subdir")
 
-        with patch.object(engine.workflow_registry, "get_workflow_by_name", side_effect=KeyError("not found")):
-            result = workflow_manager.file_operations.on_move_workflow_request(request)
+        result = workflow_manager.file_operations.on_move_workflow_request(request)
 
         assert isinstance(result, MoveWorkflowResultFailure)
-        assert "nonexistent" in str(result.result_details)
+        assert "no workflow has that id" in str(result.result_details)
 
     def test_on_move_workflow_request_source_file_missing(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
-        request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+        request = MoveWorkflowRequest(workflow_id=_MOCKED_WORKFLOW_ID, target_directory="subdir")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "my_workflow.py"
@@ -718,7 +724,7 @@ class TestWorkflowManager:
 
     def test_on_move_workflow_request_target_already_exists(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
-        request = MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+        request = MoveWorkflowRequest(workflow_id=_MOCKED_WORKFLOW_ID, target_directory="subdir")
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "my_workflow.py"
@@ -761,7 +767,7 @@ class TestWorkflowManager:
                 original_id = workflow.workflow_id
 
                 result = workflow_manager.file_operations.on_move_workflow_request(
-                    MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                    MoveWorkflowRequest(workflow_id=original_id, target_directory="subdir")
                 )
 
                 assert isinstance(result, MoveWorkflowResultSuccess)
@@ -786,12 +792,12 @@ class TestWorkflowManager:
         config_manager.workspace_path = workspace
         try:
             with empty_workflow_registry(engine):
-                self._register_workspace_file(engine, workspace, "my_workflow.py")
+                moved = self._register_workspace_file(engine, workspace, "my_workflow.py")
                 open_workflow = self._register_workspace_file(engine, workspace, "other_workflow.py")
                 context_manager.push_workflow(open_workflow.name)
                 try:
                     result = workflow_manager.file_operations.on_move_workflow_request(
-                        MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                        MoveWorkflowRequest(workflow_id=moved.workflow_id, target_directory="subdir")
                     )
 
                     assert isinstance(result, MoveWorkflowResultSuccess)
@@ -841,7 +847,7 @@ class TestWorkflowManager:
                 context_manager.push_workflow(workflow_name="my_workflow")
                 try:
                     result = workflow_manager.file_operations.on_move_workflow_request(
-                        MoveWorkflowRequest(workflow_name="my_workflow", target_directory="subdir")
+                        MoveWorkflowRequest(workflow_id=_id_named(engine, "my_workflow"), target_directory="subdir")
                     )
 
                     assert isinstance(result, MoveWorkflowResultSuccess)
@@ -980,7 +986,7 @@ class TestWorkflowManager:
             result = asyncio.run(
                 workflow_manager.catalog.on_set_workflow_metadata_request(
                     SetWorkflowMetadataRequest(
-                        workflow_name=unsaved_key,
+                        workflow_id=workflow.workflow_id,
                         workflow_metadata={"name": "my_flow", "description": "hello"},  # type: ignore[arg-type]
                     )
                 )
@@ -1364,7 +1370,7 @@ class TestWorkflowManager:
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
                     RenameWorkflowRequest(
-                        workflow_name="my_workflow",
+                        workflow_id=_MOCKED_WORKFLOW_ID,
                         requested_name="my_workflow_renamed",
                         display_name_behavior=RenameDisplayNameBehavior[non_override_behavior],
                         display_name="Silently Ignored",
@@ -1401,7 +1407,7 @@ class TestWorkflowManager:
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
                     RenameWorkflowRequest(
-                        workflow_name="my_workflow",
+                        workflow_id=_MOCKED_WORKFLOW_ID,
                         requested_name="my_workflow_renamed",
                         display_name_behavior=RenameDisplayNameBehavior.OVERRIDE,
                         display_name=empty_display_name,
@@ -1563,7 +1569,7 @@ class TestWorkflowManager:
             try:
                 result = asyncio.run(
                     workflow_manager.file_operations.on_delete_workflows_request(
-                        DeleteWorkflowRequest(name=workflow_key)
+                        DeleteWorkflowRequest(workflow_id=context_manager.get_current_workflow_id())
                     )
                 )
 
@@ -1596,7 +1602,9 @@ class TestWorkflowManager:
 
             try:
                 result = asyncio.run(
-                    workflow_manager.file_operations.on_delete_workflows_request(DeleteWorkflowRequest(name=other_key))
+                    workflow_manager.file_operations.on_delete_workflows_request(
+                        DeleteWorkflowRequest(workflow_id=_id_named(engine, other_key))
+                    )
                 )
 
                 assert isinstance(result, DeleteWorkflowResultSuccess)
@@ -2424,20 +2432,19 @@ class TestWorkflowManager:
     # --- GetWorkflowInfoRequest ---
 
     def test_on_get_workflow_info_request_workflow_not_in_registry_fails(self, engine: Engine) -> None:
-        """GetWorkflowInfoRequest with unknown workflow_name returns failure."""
+        """GetWorkflowInfoRequest with an unknown workflow_id returns failure."""
         workflow_manager = engine.workflow_manager
-        request = GetWorkflowInfoRequest(workflow_name="missing_workflow")
+        request = GetWorkflowInfoRequest(workflow_id=_UNKNOWN_WORKFLOW_ID)
 
-        with patch.object(engine.workflow_registry, "get_workflow_by_name", side_effect=KeyError("not found")):
-            result = workflow_manager.catalog.on_get_workflow_info_request(request)
+        result = workflow_manager.catalog.on_get_workflow_info_request(request)
 
         assert isinstance(result, GetWorkflowInfoResultFailure)
-        assert "missing_workflow" in str(result.result_details)
+        assert "no workflow has that id" in str(result.result_details)
 
     def test_on_get_workflow_info_request_no_info_for_path_fails(self, engine: Engine) -> None:
         """GetWorkflowInfoRequest returns failure when no WorkflowInfo is stored for the resolved path."""
         workflow_manager = engine.workflow_manager
-        request = GetWorkflowInfoRequest(workflow_name="my_workflow")
+        request = GetWorkflowInfoRequest(workflow_id=_MOCKED_WORKFLOW_ID)
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "workflows/my_workflow.py"
@@ -2453,7 +2460,7 @@ class TestWorkflowManager:
         from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
         workflow_manager = engine.workflow_manager
-        request = GetWorkflowInfoRequest(workflow_name="my_workflow")
+        request = GetWorkflowInfoRequest(workflow_id=_MOCKED_WORKFLOW_ID)
 
         mock_workflow = MagicMock()
         mock_workflow.file_path = "workflows/my_workflow.py"
@@ -4147,7 +4154,7 @@ class TestWorkflowCreationHonorsSaveSituation:
         assert isinstance(created, CreateWorkflowFromTemplateResultSuccess), created.result_details
 
         opened = asyncio.run(
-            engine.ahandle_request(OpenWorkflowRequest(workflow_name=created.workflow_name, create_flow=True))
+            engine.ahandle_request(OpenWorkflowRequest(workflow_id=created.workflow_id, create_flow=True))
         )
         assert isinstance(opened, OpenWorkflowResultSuccess), opened.result_details
         saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=created.workflow_name)))
@@ -4166,7 +4173,7 @@ class TestWorkflowCreationHonorsSaveSituation:
         """
         source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
 
-        branched = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+        branched = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, source_key)))
 
         assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
         branch_path = self._registered_path(branched.branched_workflow_name)
@@ -4206,12 +4213,12 @@ class TestWorkflowCreationHonorsSaveSituation:
         """
         source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
 
-        first = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+        first = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, source_key)))
         assert isinstance(first, BranchWorkflowResultSuccess), first.result_details
         first_path = self._registered_path(first.branched_workflow_name)
         first_bytes = first_path.read_bytes()
 
-        second = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+        second = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, source_key)))
 
         assert isinstance(second, BranchWorkflowResultSuccess), second.result_details
         second_path = self._registered_path(second.branched_workflow_name)
@@ -4235,14 +4242,14 @@ class TestWorkflowCreationHonorsSaveSituation:
         source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
 
         first = engine.handle_request(
-            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+            BranchWorkflowRequest(workflow_id=_id_named(engine, source_key), branched_workflow_name="lighting_fix")
         )
         assert isinstance(first, BranchWorkflowResultSuccess), first.result_details
         first_path = self._registered_path(first.branched_workflow_name)
         first_bytes = first_path.read_bytes()
 
         second = engine.handle_request(
-            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+            BranchWorkflowRequest(workflow_id=_id_named(engine, source_key), branched_workflow_name="lighting_fix")
         )
 
         assert isinstance(second, BranchWorkflowResultFailure)
@@ -4257,7 +4264,7 @@ class TestWorkflowCreationHonorsSaveSituation:
         source_key = self._workspace_resident_source(engine, context_dir, temp_dir)
 
         branched = engine.handle_request(
-            BranchWorkflowRequest(workflow_name=source_key, branched_workflow_name="lighting_fix")
+            BranchWorkflowRequest(workflow_id=_id_named(engine, source_key), branched_workflow_name="lighting_fix")
         )
 
         assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
@@ -4335,7 +4342,7 @@ class TestWorkflowCreationHonorsSaveSituation:
         source_path = context_dir / "shot_lighting.py"
         source_content = source_path.read_text(encoding="utf-8")
 
-        branched = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+        branched = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, source_key)))
 
         assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
         assert source_path.read_text(encoding="utf-8") == source_content
@@ -4353,7 +4360,7 @@ class TestWorkflowCreationHonorsSaveSituation:
                 success=False, error_details="Attempted to write. Failed because the volume is read-only."
             ),
         ):
-            branched = engine.handle_request(BranchWorkflowRequest(workflow_name=source_key))
+            branched = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, source_key)))
 
         assert isinstance(branched, BranchWorkflowResultFailure)
         assert "read-only" in str(branched.result_details)
@@ -4574,7 +4581,7 @@ class TestWorkflowCreationOnTheDefaultProject:
         save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
 
-        branched = engine.handle_request(BranchWorkflowRequest(workflow_name=save_result.workflow_name))
+        branched = engine.handle_request(BranchWorkflowRequest(workflow_id=save_result.workflow_id))
 
         assert isinstance(branched, BranchWorkflowResultSuccess), branched.result_details
         branch_file_path = engine.workflow_registry.get_workflow_by_name(branched.branched_workflow_name).file_path
@@ -6367,7 +6374,7 @@ class TestWorkflowBranchDisplayNames:
         """
         self._register_source(engine, temp_dir)
 
-        result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        result = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, self.SOURCE_KEY)))
 
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch_key = result.branched_workflow_name
@@ -6385,7 +6392,7 @@ class TestWorkflowBranchDisplayNames:
         """Branching must not touch the source's label."""
         self._register_source(engine, temp_dir)
 
-        result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        result = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, self.SOURCE_KEY)))
 
         assert isinstance(result, BranchWorkflowResultSuccess)
         source = engine.workflow_registry.get_workflow_by_name(self.SOURCE_KEY)
@@ -6396,8 +6403,8 @@ class TestWorkflowBranchDisplayNames:
         """The label's counter tracks the key's counter, so branches stay distinguishable."""
         self._register_source(engine, temp_dir)
 
-        first = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
-        second = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        first = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, self.SOURCE_KEY)))
+        second = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, self.SOURCE_KEY)))
 
         assert isinstance(first, BranchWorkflowResultSuccess)
         assert isinstance(second, BranchWorkflowResultSuccess)
@@ -6415,7 +6422,9 @@ class TestWorkflowBranchDisplayNames:
         self._register_source(engine, temp_dir)
 
         result = engine.handle_request(
-            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="  Lighting Test  ")
+            BranchWorkflowRequest(
+                workflow_id=_id_named(engine, self.SOURCE_KEY), branched_workflow_display_name="  Lighting Test  "
+            )
         )
 
         assert isinstance(result, BranchWorkflowResultSuccess)
@@ -6428,7 +6437,7 @@ class TestWorkflowBranchDisplayNames:
         self._register_source(engine, temp_dir)
 
         result = engine.handle_request(
-            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="   ")
+            BranchWorkflowRequest(workflow_id=_id_named(engine, self.SOURCE_KEY), branched_workflow_display_name="   ")
         )
 
         assert isinstance(result, BranchWorkflowResultFailure)
@@ -6441,7 +6450,9 @@ class TestWorkflowBranchDisplayNames:
         self._register_source(engine, temp_dir)
 
         result = engine.handle_request(
-            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_name="shots/sh010/my_experiment")
+            BranchWorkflowRequest(
+                workflow_id=_id_named(engine, self.SOURCE_KEY), branched_workflow_name="shots/sh010/my_experiment"
+            )
         )
 
         assert isinstance(result, BranchWorkflowResultSuccess)
@@ -6459,7 +6470,9 @@ class TestWorkflowBranchDisplayNames:
             display_name="shots/sh010/comp_branch_1",
         )
 
-        result = engine.handle_request(BranchWorkflowRequest(workflow_name="shots/sh010/comp_branch_1"))
+        result = engine.handle_request(
+            BranchWorkflowRequest(workflow_id=_id_named(engine, "shots/sh010/comp_branch_1"))
+        )
 
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch_key = result.branched_workflow_name
@@ -6469,7 +6482,7 @@ class TestWorkflowBranchDisplayNames:
         """A corrupt (blank) source label falls back to the file name, not to emptiness."""
         self._register_workflow(engine, temp_dir, registry_key=self.SOURCE_KEY, display_name="   ")
 
-        result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        result = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, self.SOURCE_KEY)))
 
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch_key = result.branched_workflow_name
@@ -6482,12 +6495,10 @@ class TestWorkflowBranchDisplayNames:
         ``metadata.name``, overwriting a correct label with a path and writing it to disk.
         """
         self._register_source(engine, temp_dir)
-        branch_result = engine.handle_request(BranchWorkflowRequest(workflow_name=self.SOURCE_KEY))
+        branch_result = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, self.SOURCE_KEY)))
         assert isinstance(branch_result, BranchWorkflowResultSuccess)
 
-        merge_result = engine.handle_request(
-            MergeWorkflowBranchRequest(workflow_name=branch_result.branched_workflow_name)
-        )
+        merge_result = engine.handle_request(MergeWorkflowBranchRequest(workflow_id=branch_result.branched_workflow_id))
 
         assert isinstance(merge_result, MergeWorkflowBranchResultSuccess)
         source = engine.workflow_registry.get_workflow_by_name(self.SOURCE_KEY)
@@ -6502,12 +6513,14 @@ class TestWorkflowBranchDisplayNames:
         """
         self._register_source(engine, temp_dir)
         branch_result = engine.handle_request(
-            BranchWorkflowRequest(workflow_name=self.SOURCE_KEY, branched_workflow_display_name="Lighting Test")
+            BranchWorkflowRequest(
+                workflow_id=_id_named(engine, self.SOURCE_KEY), branched_workflow_display_name="Lighting Test"
+            )
         )
         assert isinstance(branch_result, BranchWorkflowResultSuccess)
         branch_key = branch_result.branched_workflow_name
 
-        reset_result = engine.handle_request(ResetWorkflowBranchRequest(workflow_name=branch_key))
+        reset_result = engine.handle_request(ResetWorkflowBranchRequest(workflow_id=branch_result.branched_workflow_id))
 
         assert isinstance(reset_result, ResetWorkflowBranchResultSuccess)
         assert engine.workflow_registry.get_workflow_by_name(branch_key).metadata.name == "Lighting Test"
@@ -6629,7 +6642,7 @@ class TestRepairPathShapedDisplayName:
             engine, temp_dir, relative_file_path="shots/sh010/comp.py", display_name="shots/sh010/comp"
         )
 
-        result = engine.handle_request(BranchWorkflowRequest(workflow_name="shots/sh010/comp"))
+        result = engine.handle_request(BranchWorkflowRequest(workflow_id=_id_named(engine, "shots/sh010/comp")))
 
         assert isinstance(result, BranchWorkflowResultSuccess)
         branch = engine.workflow_registry.get_workflow_by_name(result.branched_workflow_name)
@@ -6700,26 +6713,30 @@ class TestGetWorkflowShapeRequest:
             "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape",
             return_value={"input": {"Start Flow_1": {"text": param}}, "output": {"End Flow_1": {"text": param}}},
         ) as extract_mock:
-            result = engine.handle_request(GetWorkflowShapeRequest(workflow_name="child", flow_name="sub"))
+            result = engine.handle_request(GetWorkflowShapeRequest(flow_name="sub"))
 
         assert isinstance(result, GetWorkflowShapeResultSuccess)
         assert result.workflow_shape.inputs == {"Start Flow_1": {"text": param}}
         assert result.workflow_shape.outputs == {"End Flow_1": {"text": param}}
-        extract_mock.assert_called_once_with(engine.flow_manager, open_workflow, "child", "sub")
+        open_name = engine.workflow_registry.get(open_workflow.workflow_id).name
+        extract_mock.assert_called_once_with(engine.flow_manager, open_workflow, open_name, "sub")
 
-    def test_fails_naming_the_workflow_when_the_flow_has_no_start_node(self, engine: Engine) -> None:
+    def test_fails_naming_the_workflow_when_the_flow_has_no_start_node(
+        self, engine: Engine, open_workflow: WorkflowRuntime
+    ) -> None:
         with patch(
             "griptape_nodes.retained_mode.managers.workflow_manager.extract_workflow_shape",
-            side_effect=ValueError("Workflow 'child' does not have a StartNode."),
+            side_effect=ValueError("Workflow 'parent' does not have a StartNode."),
         ):
-            result = engine.handle_request(GetWorkflowShapeRequest(workflow_name="child", flow_name="sub"))
+            result = engine.handle_request(GetWorkflowShapeRequest(flow_name="sub"))
 
         assert isinstance(result, GetWorkflowShapeResultFailure)
-        assert "workflow 'child'" in str(result.result_details)
+        open_name = engine.workflow_registry.get(open_workflow.workflow_id).name
+        assert f"workflow '{open_name}'" in str(result.result_details)
         assert "does not have a StartNode" in str(result.result_details)
 
     def test_fails_when_the_flow_does_not_exist(self, engine: Engine) -> None:
-        result = engine.handle_request(GetWorkflowShapeRequest(workflow_name="child", flow_name="No Such Flow"))
+        result = engine.handle_request(GetWorkflowShapeRequest(flow_name="No Such Flow"))
 
         assert isinstance(result, GetWorkflowShapeResultFailure)
         assert "No Such Flow" in str(result.result_details)

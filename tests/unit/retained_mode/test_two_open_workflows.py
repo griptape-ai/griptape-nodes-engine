@@ -1475,9 +1475,7 @@ class TestOtherSharedState:
         self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
     ) -> None:
         a, b = two_open
-        b_name = engine.workflow_registry.get(b.workflow_id).name
-
-        deleted = _send(engine, DeleteWorkflowRequest(name=b_name), a)
+        deleted = _send(engine, DeleteWorkflowRequest(workflow_id=b.workflow_id), a)
 
         assert deleted.succeeded(), deleted.result_details
         assert engine.open_workflows.all_open() == [a]

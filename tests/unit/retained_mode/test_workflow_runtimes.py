@@ -185,9 +185,11 @@ class TestRuntimeLifecycle:
         assert engine.current_workflow_or_none() is None
 
     def test_deleting_the_open_workflow_closes_it(self, engine: Engine) -> None:
-        name = engine.context_manager.push_workflow(workflow_name="outer")
+        engine.context_manager.push_workflow(workflow_name="outer")
 
-        result = engine.handle_request(DeleteWorkflowRequest(name=name))
+        result = engine.handle_request(
+            DeleteWorkflowRequest(workflow_id=engine.context_manager.get_current_workflow_id())
+        )
 
         assert result.succeeded()
         assert engine.current_workflow_or_none() is None

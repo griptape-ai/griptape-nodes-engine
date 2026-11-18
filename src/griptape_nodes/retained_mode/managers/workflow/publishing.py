@@ -50,21 +50,12 @@ class WorkflowPublishing(EngineScoped):
         workflow: WorkflowRuntime | None = None,  # noqa: ARG002 - declares the scope dispatch binds for the callback
     ) -> ResultPayload:
         """Ask the publisher for its options, bound to `workflow`, whose graph its callback reads."""
-        options_request = request
-        if request.workflow_id is not None:
-            try:
-                named = self.engine.workflow_registry.resolve_address(
-                    workflow_id=request.workflow_id,
-                    workflow_name=request.workflow_name,
-                    action="get publish options for",
-                )
-            except WorkflowAddressError as err:
-                return GetPublishOptionsResultFailure(result_details=str(err))
-            # Publishers read the name.
-            options_request = replace(request, workflow_name=named.name)
-        if options_request.workflow_name is None:
-            details = "Attempted to get publish options for a workflow. Failed because the request names no workflow. Pass workflow_id."
-            return GetPublishOptionsResultFailure(result_details=details)
+        try:
+            named = self.engine.workflow_registry.resolve_address(request.workflow_id, action="get publish options for")
+        except WorkflowAddressError as err:
+            return GetPublishOptionsResultFailure(result_details=str(err))
+        # Publishers read the name.
+        options_request = replace(request, workflow_name=named.name)
 
         event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
             request_type=PublishWorkflowRequest
@@ -87,18 +78,20 @@ class WorkflowPublishing(EngineScoped):
     async def on_publish_workflow_request(
         self, request: PublishWorkflowRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
-        """Save and publish the open `workflow`, which the request names by its id or registry name.
+        """Save and publish the open `workflow`, handing the publisher its registry name in `workflow_name`.
 
         The publisher reads the graph through the bound workflow, which dispatch binds to `workflow`
         and `asyncio.to_thread` carries into the publisher's thread.
         """
-        publish_request = self._publish_request_by_name(request, workflow)
-        if isinstance(publish_request, PublishWorkflowResultFailure):
-            return publish_request
-        workflow_name = publish_request.workflow_name
-        if workflow_name is None:
-            details = "Attempted to publish a workflow. Failed because the request names no workflow. Pass workflow_id."
+        refusal = self._refuse_other_workflow(request.workflow_id, workflow, action="publish")
+        if refusal is not None:
+            return PublishWorkflowResultFailure(result_details=refusal)
+        saved = self.engine.workflow_registry.get(workflow.workflow_id)
+        workflow_name = saved.name
+        if saved.file_path is None:
+            details = f"Attempted to publish workflow '{workflow_name}'. Failed because it is unsaved. Save the workflow before publishing."
             return PublishWorkflowResultFailure(result_details=details)
+        publish_request = replace(request, workflow_name=workflow_name)
 
         try:
             publisher_name = request.publisher_name
@@ -112,30 +105,7 @@ class WorkflowPublishing(EngineScoped):
                 raise ValueError(msg)  # noqa: TRY301
 
             # Save the workflow before publishing to ensure the latest changes in memory are included.
-            # Unsaved (registry-only) workflows cannot be published because publish emits a file
-            # reference to the engine-registered workflow; the user must choose a save name first.
-            workflow_file_name = workflow_name
-            saved = self.engine.workflow_registry.find_by_name(workflow_name)
-            if saved is None:
-                details = (
-                    f"While publishing, workflow '{workflow_name}' had not been saved or could not be found in the Workflow Registry. "
-                    "Saving as a new and registered workflow before proceeding on publish attempt."
-                )
-                logger.info(details)
-            else:
-                # The publisher packages `workflow`'s graph, so another open workflow's name would
-                # publish one workflow's graph under the other's file.
-                if saved.workflow_id != workflow.workflow_id and self.engine.open_workflows.is_open(saved.workflow_id):
-                    msg = (
-                        f"Cannot publish workflow '{workflow_name}' from another workflow's tab. "
-                        "Publish it from its own tab."
-                    )
-                    raise ValueError(msg)  # noqa: TRY301
-                if saved.file_path is None:
-                    msg = f"Cannot publish unsaved workflow '{workflow_name}'. Save the workflow before publishing."
-                    raise ValueError(msg)  # noqa: TRY301
-                workflow_file_name = derive_registry_key(saved.file_path)
-            await workflow.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
+            await workflow.ahandle_request(SaveWorkflowRequest(file_name=derive_registry_key(saved.file_path)))
 
             result = await asyncio.to_thread(publishing_handler.handler, publish_request)
             if isinstance(result, PublishWorkflowResultSuccess) and not result.skip_published_workflow_registration:
@@ -148,29 +118,21 @@ class WorkflowPublishing(EngineScoped):
             logger.exception(details)
             return PublishWorkflowResultFailure(exception=e, result_details=details)
 
-    def _publish_request_by_name(
-        self, request: PublishWorkflowRequest, workflow: WorkflowRuntime
-    ) -> PublishWorkflowRequest | PublishWorkflowResultFailure:
-        """`request` with its `workflow_id`, which must be `workflow`'s, resolved to `workflow_name`, or why it can't publish.
+    def _refuse_other_workflow(self, workflow_id: str | None, workflow: WorkflowRuntime, *, action: str) -> str | None:
+        """Why a request that gives `workflow_id` can't act on `workflow`, or None.
 
-        Publishers read the name.
+        The publisher packages `workflow`'s graph, so a request can only name that workflow.
         """
-        if request.workflow_id is None:
-            return request
+        if workflow_id is None or workflow_id == workflow.workflow_id:
+            return None
         try:
-            named = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="publish"
-            )
+            named = self.engine.workflow_registry.resolve_address(workflow_id, action=action)
         except WorkflowAddressError as err:
-            return PublishWorkflowResultFailure(result_details=str(err))
-        # The publisher packages `workflow`'s graph, so it publishes only that workflow.
-        if named.workflow_id != workflow.workflow_id:
-            details = (
-                f"Attempted to publish workflow '{named.name}'. Failed because it isn't the workflow open in "
-                "this tab. Publish it from its own tab."
-            )
-            return PublishWorkflowResultFailure(result_details=details)
-        return replace(request, workflow_name=named.name)
+            return str(err)
+        return (
+            f"Attempted to {action} workflow '{named.name}'. Failed because it isn't the workflow open in "
+            "this tab. Do it from its own tab."
+        )
 
     async def _register_published_workflow_file(
         self, workflow_file: Path, result: PublishWorkflowResultSuccess

@@ -103,8 +103,7 @@ class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload, GraphAccessMixin)
 
     Args:
         workflow_name: Deprecated, removed in `IMPORT_WORKFLOW_NAME_REMOVAL_VERSION`. The imported
-            workflow's registry name, which a request giving `workflow_id` need not repeat and must
-            agree with if it does.
+            workflow's registry name, ignored when the request gives `workflow_id`.
 
     Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
     """

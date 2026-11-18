@@ -63,9 +63,7 @@ class WorkflowBranching(EngineScoped):
     def on_branch_workflow_request(self, request: BranchWorkflowRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a branch (copy) of an existing workflow with branch tracking."""
         try:
-            source_workflow = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="branch"
-            )
+            source_workflow = self.engine.workflow_registry.resolve_address(request.workflow_id, action="branch")
         except WorkflowAddressError as err:
             return BranchWorkflowResultFailure(result_details=str(err))
         source_workflow_name = source_workflow.name
@@ -281,9 +279,7 @@ class WorkflowBranching(EngineScoped):
     def on_merge_workflow_branch_request(self, request: MergeWorkflowBranchRequest) -> ResultPayload:  # noqa: PLR0911
         """Merge a branch back into its source workflow, removing the branch when complete."""
         try:
-            branch_workflow = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="merge"
-            )
+            branch_workflow = self.engine.workflow_registry.resolve_address(request.workflow_id, action="merge")
         except WorkflowAddressError as err:
             return MergeWorkflowBranchResultFailure(result_details=str(err))
         branch_workflow_name = branch_workflow.name
@@ -393,9 +389,7 @@ class WorkflowBranching(EngineScoped):
     def on_reset_workflow_branch_request(self, request: ResetWorkflowBranchRequest) -> ResultPayload:  # noqa: PLR0911
         """Reset a branch to match its source workflow, discarding branch changes."""
         try:
-            branch_workflow = self.engine.workflow_registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="reset"
-            )
+            branch_workflow = self.engine.workflow_registry.resolve_address(request.workflow_id, action="reset")
         except WorkflowAddressError as err:
             return ResetWorkflowBranchResultFailure(result_details=str(err))
         branch_workflow_name = branch_workflow.name
@@ -481,14 +475,12 @@ class WorkflowBranching(EngineScoped):
         """Compare two workflows to determine if one is ahead, behind, or up-to-date relative to the other."""
         registry = self.engine.workflow_registry
         try:
-            workflow = registry.resolve_address(
-                workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="compare"
-            )
+            workflow = registry.resolve_address(request.workflow_id, action="compare")
         except WorkflowAddressError as err:
             return CompareWorkflowsResultFailure(result_details=str(err))
         workflow_name = workflow.name
 
-        if request.compare_workflow_id is None and request.compare_workflow_name is None:
+        if request.compare_workflow_id is None:
             details = (
                 f"Attempted to compare workflow '{workflow_name}'. Failed because the request names no workflow "
                 "to compare it with. Pass compare_workflow_id."
@@ -496,20 +488,13 @@ class WorkflowBranching(EngineScoped):
             return CompareWorkflowsResultFailure(result_details=details)
 
         try:
-            source_workflow = registry.resolve_address(
-                workflow_id=request.compare_workflow_id,
-                workflow_name=request.compare_workflow_name,
-                action="compare with",
-            )
+            source_workflow = registry.resolve_address(request.compare_workflow_id, action="compare with")
         except UnknownWorkflowAddressError:
             # Source workflow no longer exists
-            missing_address = request.compare_workflow_name
-            if missing_address is None:
-                missing_address = request.compare_workflow_id
-            details = f"Source workflow '{missing_address}' for '{workflow_name}' no longer exists"
+            details = f"Source workflow '{request.compare_workflow_id}' for '{workflow_name}' no longer exists"
             return CompareWorkflowsResultSuccess(
                 workflow_name=workflow_name,
-                compare_workflow_name=request.compare_workflow_name,
+                compare_workflow_name=None,
                 status="no_source",
                 workflow_last_modified=workflow.metadata.last_modified_date.isoformat()
                 if workflow.metadata.last_modified_date

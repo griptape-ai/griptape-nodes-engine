@@ -383,11 +383,11 @@ class OpenWorkflowRemovalError(WorkflowRegistryError):
 
 
 class WorkflowAddressError(Exception):
-    """A request's `workflow_id` and `workflow_name` don't name exactly one registered workflow."""
+    """A request's `workflow_id` doesn't name a registered workflow."""
 
 
 class UnknownWorkflowAddressError(WorkflowAddressError):
-    """No registered workflow has the id or name a request gives."""
+    """No registered workflow has the id a request gives."""
 
 
 class WorkflowFileToRegister(NamedTuple):
@@ -522,43 +522,22 @@ class _WorkflowRegistry:
             return None
         return library_workflow
 
-    def resolve_address(self, *, workflow_id: str | None, workflow_name: str | None, action: str) -> Workflow:
-        """Return the workflow a request names by id, by legacy name, or by both when they agree.
+    def resolve_address(self, workflow_id: str | None, *, action: str) -> Workflow:
+        """Return the workflow a request names by `workflow_id`.
 
         `action` is the verb the request performs ("rename", "move"), for the error message.
 
         Raises:
-            UnknownWorkflowAddressError: Nothing given names a workflow: the id, or the name, or both,
-                match none.
-            WorkflowAddressError: Neither is given, or the id and the name don't name the same
-                workflow, including when only one of them matches one.
+            WorkflowAddressError: The request gives no id.
+            UnknownWorkflowAddressError: No workflow has the id.
         """
         if workflow_id is None:
-            if workflow_name is None:
-                msg = (
-                    f"Attempted to {action} a workflow. Failed because the request names no workflow. Pass workflow_id."
-                )
-                raise WorkflowAddressError(msg)
-            return self._resolve_name(workflow_name, action=action)
-        workflow = self._by_id.get(workflow_id)
-        by_name = None
-        if workflow_name is not None:
-            by_name = self.find_by_name(workflow_name)
-        if workflow is None and by_name is not None:
-            msg = (
-                f"Attempted to {action} workflow '{workflow_id}' named '{workflow_name}'. Failed because no "
-                "workflow has that id, though one has that name."
-            )
+            msg = f"Attempted to {action} a workflow. Failed because the request names no workflow. Pass workflow_id."
             raise WorkflowAddressError(msg)
+        workflow = self._by_id.get(workflow_id)
         if workflow is None:
             msg = f"Attempted to {action} workflow '{workflow_id}'. Failed because no workflow has that id."
             raise UnknownWorkflowAddressError(msg)
-        if workflow_name is not None and by_name is not workflow:
-            msg = (
-                f"Attempted to {action} workflow '{workflow_id}' named '{workflow_name}'. Failed because that id "
-                f"belongs to '{workflow.name}', not '{workflow_name}'."
-            )
-            raise WorkflowAddressError(msg)
         return workflow
 
     def find_by_path(self, path: str | Path) -> Workflow | None:
@@ -976,13 +955,6 @@ class _WorkflowRegistry:
         return [
             workflow.name for workflow in self._by_id.values() if workflow.metadata.branched_from == source.workflow_id
         ]
-
-    def _resolve_name(self, workflow_name: str, *, action: str) -> Workflow:
-        workflow = self.find_by_name(workflow_name)
-        if workflow is None:
-            msg = f"Attempted to {action} workflow '{workflow_name}'. Failed because no workflow has that name."
-            raise UnknownWorkflowAddressError(msg)
-        return workflow
 
     def _add(self, workflow: Workflow) -> None:
         keys = self._entry_keys(workflow.workflow_id, workflow.absolute_path, [])

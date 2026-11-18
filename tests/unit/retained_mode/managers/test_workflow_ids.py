@@ -272,19 +272,19 @@ class TestWritePathsKeepOrMintAnId:
     def test_branch_merge_and_reset(self, project_engine: Engine) -> None:
         source = _saved_workflow(project_engine, "source")
 
-        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_name=source.workflow_name))
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_id=source.workflow_id))
         assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
         assert branch.original_workflow_id == source.workflow_id
         assert branch.branched_workflow_id not in (None, source.workflow_id)
         branch_entry = project_engine.workflow_registry.get(branch.branched_workflow_id)  # type: ignore[arg-type]
         assert _id_at(project_engine, branch_entry.absolute_path) == branch.branched_workflow_id  # type: ignore[arg-type]
 
-        reset = project_engine.handle_request(ResetWorkflowBranchRequest(workflow_name=branch.branched_workflow_name))
+        reset = project_engine.handle_request(ResetWorkflowBranchRequest(workflow_id=branch.branched_workflow_id))
         assert isinstance(reset, ResetWorkflowBranchResultSuccess), reset.result_details
         assert reset.workflow_id == branch.branched_workflow_id
         assert _id_at(project_engine, branch_entry.absolute_path) == branch.branched_workflow_id  # type: ignore[arg-type]
 
-        merged = project_engine.handle_request(MergeWorkflowBranchRequest(workflow_name=branch.branched_workflow_name))
+        merged = project_engine.handle_request(MergeWorkflowBranchRequest(workflow_id=branch.branched_workflow_id))
         assert isinstance(merged, MergeWorkflowBranchResultSuccess), merged.result_details
         assert merged.workflow_id == source.workflow_id
         assert _id_at(project_engine, source.file_path) == source.workflow_id
@@ -294,7 +294,7 @@ class TestWritePathsKeepOrMintAnId:
         self, project_engine: Engine, open_side: str
     ) -> None:
         source = _saved_workflow(project_engine, "source")
-        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_name=source.workflow_name))
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_id=source.workflow_id))
         assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
         branch_entry = project_engine.workflow_registry.get(branch.branched_workflow_id)  # type: ignore[arg-type]
         branch_path = branch_entry.absolute_path
@@ -307,7 +307,7 @@ class TestWritePathsKeepOrMintAnId:
             open_entry = project_engine.workflow_registry.get(source.workflow_id)  # type: ignore[arg-type]
         project_engine.context_manager.push_workflow(open_entry.name)
 
-        merged = project_engine.handle_request(MergeWorkflowBranchRequest(workflow_name=branch.branched_workflow_name))
+        merged = project_engine.handle_request(MergeWorkflowBranchRequest(workflow_id=branch.branched_workflow_id))
 
         assert isinstance(merged, MergeWorkflowBranchResultFailure)
         assert "one of them is open" in str(merged.result_details)
@@ -332,14 +332,14 @@ class TestWritePathsKeepOrMintAnId:
         updated = _run(
             project_engine,
             SetWorkflowMetadataRequest(
-                workflow_name=saved.workflow_name,
+                workflow_id=saved.workflow_id,
                 workflow_metadata={"description": "now described"},  # type: ignore[arg-type]
             ),
         )
         ignored = _run(
             project_engine,
             SetWorkflowMetadataRequest(
-                workflow_name=saved.workflow_name,
+                workflow_id=saved.workflow_id,
                 workflow_metadata={"workflow_id": "someone_else"},  # type: ignore[arg-type]
             ),
         )
@@ -355,7 +355,7 @@ class TestWritePathsKeepOrMintAnId:
         saved = _saved_workflow(project_engine, "mover")
 
         moved = project_engine.handle_request(
-            MoveWorkflowRequest(workflow_name=saved.workflow_name, target_directory="elsewhere")
+            MoveWorkflowRequest(workflow_id=saved.workflow_id, target_directory="elsewhere")
         )
 
         assert isinstance(moved, MoveWorkflowResultSuccess), moved.result_details
@@ -367,7 +367,7 @@ class TestWritePathsKeepOrMintAnId:
         saved = _save(project_engine)
         flow_name = project_engine.context_manager.get_current_flow().name
 
-        renamed = _run(project_engine, RenameWorkflowRequest(workflow_name=saved.workflow_name, requested_name="after"))
+        renamed = _run(project_engine, RenameWorkflowRequest(workflow_id=saved.workflow_id, requested_name="after"))
 
         assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
         assert renamed.workflow_id == workflow_id
@@ -391,7 +391,7 @@ class TestWritePathsKeepOrMintAnId:
         )
         assert isinstance(subflow, CreateFlowResultSuccess), subflow.result_details
 
-        result = _run(project_engine, SaveSubflowToWorkflowRequest(flow_name="Sub", workflow_name=saved.workflow_name))
+        result = _run(project_engine, SaveSubflowToWorkflowRequest(flow_name="Sub", workflow_id=saved.workflow_id))
 
         assert isinstance(result, SaveSubflowToWorkflowResultSuccess), result.result_details
         assert result.workflow_metadata == project_engine.workflow_registry.get(workflow_id).metadata
@@ -413,10 +413,10 @@ class TestPlaceholderMetadataIsNeverWrittenBack:
         workflow = project_engine.context_manager.get_current_workflow()
         files_before = sorted(workspace.rglob("*"))
 
-        branched = project_engine.handle_request(BranchWorkflowRequest(workflow_name=workflow.name))
+        branched = project_engine.handle_request(BranchWorkflowRequest(workflow_id=workflow.workflow_id))
         updated = _run(
             project_engine,
-            SetWorkflowMetadataRequest(workflow_name=workflow.name, workflow_metadata={"description": "x"}),  # type: ignore[arg-type]
+            SetWorkflowMetadataRequest(workflow_id=workflow.workflow_id, workflow_metadata={"description": "x"}),  # type: ignore[arg-type]
         )
 
         assert isinstance(branched, BranchWorkflowResultFailure)
@@ -536,7 +536,7 @@ class TestIdsAcrossRescans:
 
     def test_a_workflow_deleted_through_the_engine_and_recreated_gets_a_new_id(self, project_engine: Engine) -> None:
         saved = _saved_workflow(project_engine, "again")
-        deleted = _run(project_engine, DeleteWorkflowRequest(name=saved.workflow_name))
+        deleted = _run(project_engine, DeleteWorkflowRequest(workflow_id=saved.workflow_id))
         assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
 
         recreated = _write_workflow_file(Path(saved.file_path))
@@ -779,7 +779,7 @@ class TestMoveWorkflow:
         # Deleted outside the engine: its entry stays until the next scan.
         stale.unlink()
 
-        moved = engine.handle_request(MoveWorkflowRequest(workflow_name="a/foo", target_directory="b"))
+        moved = engine.handle_request(MoveWorkflowRequest(workflow_id=mover_id, target_directory="b"))
 
         assert isinstance(moved, MoveWorkflowResultFailure)
         assert "already registered" in str(moved.result_details)
@@ -798,7 +798,7 @@ class TestMoveWorkflow:
         mover_id = _id_at(engine, mover)
         assert mover_id is not None
 
-        moved = engine.handle_request(MoveWorkflowRequest(workflow_name="a/foo", target_directory="b"))
+        moved = engine.handle_request(MoveWorkflowRequest(workflow_id=mover_id, target_directory="b"))
 
         assert isinstance(moved, MoveWorkflowResultFailure)
         assert "already registered" in str(moved.result_details)
@@ -955,7 +955,7 @@ class TestHostResultsNameNoWorkflow:
 
         result_event = asyncio.run(
             project_engine.event_manager.ahandle_request(
-                MoveWorkflowRequest(workflow_name=saved.workflow_name, target_directory="elsewhere"),
+                MoveWorkflowRequest(workflow_id=saved.workflow_id, target_directory="elsewhere"),
                 result_context=ResultContext(open_workflow_id=workflow_id),
             )
         )
@@ -969,7 +969,7 @@ class TestHostResultsNameNoWorkflow:
 
         result_event = asyncio.run(
             project_engine.event_manager.ahandle_request(
-                RenameWorkflowRequest(workflow_name=saved.workflow_name, requested_name="renamed_again"),
+                RenameWorkflowRequest(workflow_id=saved.workflow_id, requested_name="renamed_again"),
                 result_context=ResultContext(open_workflow_id=workflow_id),
             )
         )
@@ -983,7 +983,7 @@ class TestHostResultsNameNoWorkflow:
 
         result_event = asyncio.run(
             project_engine.event_manager.ahandle_request(
-                DeleteWorkflowRequest(name=saved.workflow_name),
+                DeleteWorkflowRequest(workflow_id=saved.workflow_id),
                 result_context=ResultContext(open_workflow_id=workflow_id),
             )
         )
@@ -1004,12 +1004,12 @@ class TestIdentityAcrossTheWorkflowLifecycle:
         saved = _save(engine)
         assert saved.workflow_id == workflow_id
 
-        renamed = _run(engine, RenameWorkflowRequest(workflow_name=saved.workflow_name, requested_name="renamed"))
+        renamed = _run(engine, RenameWorkflowRequest(workflow_id=saved.workflow_id, requested_name="renamed"))
         assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
         assert renamed.workflow_id == workflow_id
         _close(engine)
 
-        moved = engine.handle_request(MoveWorkflowRequest(workflow_name="renamed", target_directory="shots"))
+        moved = engine.handle_request(MoveWorkflowRequest(workflow_id=workflow_id, target_directory="shots"))
         assert isinstance(moved, MoveWorkflowResultSuccess), moved.result_details
         assert moved.workflow_id == workflow_id
 
@@ -1388,9 +1388,8 @@ class TestClosingAnUnsavedWorkflow:
 
     def test_deleting_it_while_open_succeeds(self, project_engine: Engine) -> None:
         workflow_id = _open_new_workflow(project_engine, "scratch")
-        name = project_engine.workflow_registry.get(workflow_id).name
 
-        deleted = _run(project_engine, DeleteWorkflowRequest(name=name))
+        deleted = _run(project_engine, DeleteWorkflowRequest(workflow_id=workflow_id))
 
         assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
         assert project_engine.open_workflows.all_open() == []
@@ -1426,7 +1425,7 @@ class TestIdsSavedInTheFile:
 
     def test_branch_merge_and_reset_write_the_ids_of_the_files_they_write(self, project_engine: Engine) -> None:
         source = _saved_workflow(project_engine, "source")
-        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_name=source.workflow_name))
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_id=source.workflow_id))
         assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
         assert branch.branched_workflow_id is not None
         branch_path = project_engine.workflow_registry.get(branch.branched_workflow_id).absolute_path
@@ -1522,7 +1521,7 @@ class TestOlderFilesLinkByName:
 
     def test_a_branch_naming_its_source_by_name_merges_into_it(self, project_engine: Engine, workspace: Path) -> None:
         source = _saved_workflow(project_engine, "source")
-        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_name=source.workflow_name))
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_id=source.workflow_id))
         assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
         branch_path = project_engine.workflow_registry.get(branch.branched_workflow_id).absolute_path  # type: ignore[arg-type]
         assert branch_path is not None

@@ -321,7 +321,7 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         saved = _send_async(project_engine, SaveWorkflowRequest(), tab)
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
 
-        deleted = _send_async(project_engine, DeleteWorkflowRequest(name=saved.workflow_name), None)
+        deleted = _send_async(project_engine, DeleteWorkflowRequest(workflow_id=saved.workflow_id), None)
 
         assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
         assert not project_engine.open_workflows.is_open(tab.workflow_id)
@@ -332,7 +332,7 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         other = _write_saved_workflow(project_engine, project_engine.config_manager.workspace_path / "other.py")
         tab = _open(project_engine, "tab")
 
-        deleted = _send_async(project_engine, DeleteWorkflowRequest(name=other.name), tab)
+        deleted = _send_async(project_engine, DeleteWorkflowRequest(workflow_id=other.workflow_id), tab)
 
         assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
         assert project_engine.open_workflows.is_open(tab.workflow_id)
@@ -344,7 +344,7 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         tab = _open_with_flow(project_engine, "tab")
 
         renamed = _send_async(
-            project_engine, RenameWorkflowRequest(workflow_name=closed.workflow_name, requested_name="renamed"), tab
+            project_engine, RenameWorkflowRequest(workflow_id=closed.workflow_id, requested_name="renamed"), tab
         )
 
         assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
@@ -582,13 +582,13 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert project_engine.workflow_registry.find_by_id(closed.workflow_id) is None
         assert project_engine.open_workflows.is_open(tab.workflow_id)
 
-    def test_renaming_a_name_no_workflow_has_fails(self, engine: Engine) -> None:
+    def test_renaming_an_id_no_workflow_has_fails(self, engine: Engine) -> None:
         tab = _open(engine, "tab")
 
-        renamed = _send_async(engine, RenameWorkflowRequest(workflow_name="gone", requested_name="renamed"), tab)
+        renamed = _send_async(engine, RenameWorkflowRequest(workflow_id="0" * 32, requested_name="renamed"), tab)
 
         assert isinstance(renamed, RenameWorkflowResultFailure)
-        assert "no workflow has that name" in str(renamed.result_details)
+        assert "no workflow has that id" in str(renamed.result_details)
 
     def test_publishing_saves_and_publishes_the_workflow_it_is_handed(self, engine: Engine, tmp_path: Path) -> None:
         _open(engine, "beside")
@@ -621,34 +621,43 @@ class TestSavedWorkflowRequestsActOnTheWorkflowTheyName:
         assert saved_in == [target]
         assert published_in == [target]
 
-    def test_publishing_another_open_workflow_by_name_is_refused(self, engine: Engine) -> None:
-        tab = _open(engine, "tab")
+    def test_publishing_ignores_a_name_the_client_sends(self, engine: Engine, tmp_path: Path) -> None:
+        tab = engine.open_workflow(_write_saved_workflow(engine, tmp_path.resolve() / "tab.py").workflow_id)
         other = _open(engine, "other")
-        publish = MagicMock()
+        published_names: list[str | None] = []
 
-        with patch.object(
-            engine.library_manager, "get_registered_event_handlers", return_value={"lib": _publisher(publish)}
+        async def save(_request: SaveWorkflowRequest, workflow: WorkflowRuntime) -> Any:  # noqa: ARG001
+            return SaveWorkflowResultSuccess(file_path="", workflow_name="", result_details="ok")
+
+        def publish(request: PublishWorkflowRequest) -> PublishWorkflowResultSuccess:
+            published_names.append(request.workflow_name)
+            return PublishWorkflowResultSuccess(
+                published_workflow_file_path="", skip_published_workflow_registration=True, result_details="ok"
+            )
+
+        with (
+            patch.object(
+                engine.library_manager, "get_registered_event_handlers", return_value={"lib": _publisher(publish)}
+            ),
+            _saves_answered_by(engine, save),
         ):
             published = _send_async(
                 engine, PublishWorkflowRequest(workflow_name=_name(engine, other), publisher_name="lib"), tab
             )
 
-        assert isinstance(published, PublishWorkflowResultFailure)
-        assert "from another workflow's tab" in str(published.result_details)
-        publish.assert_not_called()
+        assert isinstance(published, PublishWorkflowResultSuccess), published.result_details
+        assert published_names == [_name(engine, tab)]
 
 
 @dataclass(frozen=True)
 class _AddressedRequest:
-    """A saved-workflow request, built to name its workflow by the address fields a test passes."""
+    """A saved-workflow request, built to name its workflow by the `workflow_id` a test passes."""
 
     build: Callable[[dict[str, Any]], RequestPayload]
     success: type[ResultPayload]
     failure: type[ResultPayload]
     # The workflow id the success reports for the workflow the request named, or None if it reports none.
     reported_id: Callable[[Any], str | None] | None = None
-    # The field that holds the name: "workflow_name", or "name" for DeleteWorkflowRequest.
-    name_field: str = "workflow_name"
     # Merge and reset act on a branch.
     targets_branch: bool = False
 
@@ -671,7 +680,6 @@ _ADDRESSED_REQUESTS = {
         success=DeleteWorkflowResultSuccess,
         failure=DeleteWorkflowResultFailure,
         reported_id=lambda result: result.workflow_id,
-        name_field="name",
     ),
     "branch": _AddressedRequest(
         build=lambda address: BranchWorkflowRequest(**address),
@@ -693,7 +701,7 @@ _ADDRESSED_REQUESTS = {
         targets_branch=True,
     ),
     "compare": _AddressedRequest(
-        build=lambda address: CompareWorkflowsRequest(compare_workflow_name="other", **address),
+        build=lambda address: CompareWorkflowsRequest(compare_workflow_id=address.pop("other_id"), **address),
         success=CompareWorkflowsResultSuccess,
         failure=CompareWorkflowsResultFailure,
         reported_id=lambda result: result.workflow_id,
@@ -721,7 +729,7 @@ _ADDRESSED_REQUESTS = {
 
 
 class TestSavedWorkflowRequestsResolveTheirAddress:
-    """Each request names its workflow by id, by name, or by both when they agree, whatever the envelope names."""
+    """Each request names its workflow by `workflow_id`, whatever the envelope names."""
 
     @pytest.fixture
     def addressed(self, project_engine: Engine) -> dict[str, Any]:
@@ -744,18 +752,15 @@ class TestSavedWorkflowRequestsResolveTheirAddress:
             "tab": _open_with_flow(project_engine, "tab"),
         }
 
-    @pytest.mark.parametrize("address_by", ["id", "name", "both"])
     @pytest.mark.parametrize("request_kind", list(_ADDRESSED_REQUESTS))
-    def test_an_id_a_name_or_both_reach_the_workflow(
-        self, project_engine: Engine, addressed: dict[str, Any], request_kind: str, address_by: str
+    def test_an_id_reaches_the_workflow(
+        self, project_engine: Engine, addressed: dict[str, Any], request_kind: str
     ) -> None:
         spec = _ADDRESSED_REQUESTS[request_kind]
         target = addressed["branch"] if spec.targets_branch else addressed["source"]
-        address: dict[str, Any] = {}
-        if address_by in ("id", "both"):
-            address["workflow_id"] = target.workflow_id
-        if address_by in ("name", "both"):
-            address[spec.name_field] = target.name
+        address: dict[str, Any] = {"workflow_id": target.workflow_id, "other_id": addressed["other"].workflow_id}
+        if request_kind != "compare":
+            address.pop("other_id")
 
         result = _send_async(project_engine, spec.build(address), addressed["tab"])
 
@@ -767,28 +772,20 @@ class TestSavedWorkflowRequestsResolveTheirAddress:
     @pytest.mark.parametrize(
         ("address_by", "expected"),
         [
-            ("disagreeing", "belongs to"),
-            ("stale_name", "belongs to"),
             ("neither", "names no workflow"),
             ("unknown_id", "no workflow has that id"),
-            ("unknown_name", "no workflow has that name"),
         ],
     )
     @pytest.mark.parametrize("request_kind", list(_ADDRESSED_REQUESTS))
-    def test_an_address_naming_no_single_workflow_fails(
+    def test_an_address_naming_no_workflow_fails(
         self, project_engine: Engine, addressed: dict[str, Any], request_kind: str, address_by: str, expected: str
     ) -> None:
         spec = _ADDRESSED_REQUESTS[request_kind]
-        target = addressed["branch"] if spec.targets_branch else addressed["source"]
         address: dict[str, Any] = {}
-        if address_by == "disagreeing":
-            address = {"workflow_id": target.workflow_id, spec.name_field: addressed["other"].name}
-        if address_by == "stale_name":
-            address = {"workflow_id": target.workflow_id, spec.name_field: "gone"}
         if address_by == "unknown_id":
             address = {"workflow_id": "0" * 32}
-        if address_by == "unknown_name":
-            address = {spec.name_field: "gone"}
+        if request_kind == "compare":
+            address["other_id"] = addressed["other"].workflow_id
         listed_before = project_engine.workflow_registry.list_workflows()
 
         result = _send_async(project_engine, spec.build(address), addressed["tab"])
@@ -797,65 +794,20 @@ class TestSavedWorkflowRequestsResolveTheirAddress:
         assert expected in str(result.result_details)
         assert project_engine.workflow_registry.list_workflows() == listed_before
 
-    @pytest.mark.parametrize(
-        "compare_address",
-        [
-            {"compare_workflow_id": "0" * 32},
-            {"compare_workflow_name": "gone"},
-            {"compare_workflow_id": "0" * 32, "compare_workflow_name": "gone"},
-        ],
-        ids=["unknown_id", "unknown_name", "both_unknown"],
-    )
     def test_comparing_with_a_workflow_nothing_names_any_more_reports_no_source(
-        self, project_engine: Engine, addressed: dict[str, Any], compare_address: dict[str, str]
+        self, project_engine: Engine, addressed: dict[str, Any]
     ) -> None:
         source = addressed["source"]
 
         result = _send_async(
             project_engine,
-            CompareWorkflowsRequest(
-                workflow_id=source.workflow_id,
-                compare_workflow_id=compare_address.get("compare_workflow_id"),
-                compare_workflow_name=compare_address.get("compare_workflow_name"),
-            ),
+            CompareWorkflowsRequest(workflow_id=source.workflow_id, compare_workflow_id="0" * 32),
             None,
         )
 
         assert isinstance(result, CompareWorkflowsResultSuccess), result.result_details
         assert result.status == "no_source"
         assert result.compare_workflow_id is None
-
-    @pytest.mark.parametrize(
-        ("compare_address_by", "expected"),
-        [
-            ("stale_name", "belongs to"),
-            ("unknown_id_known_name", "though one has that name"),
-            ("disagreeing", "belongs to"),
-        ],
-    )
-    def test_comparing_with_an_id_and_a_name_that_disagree_fails(
-        self, project_engine: Engine, addressed: dict[str, Any], compare_address_by: str, expected: str
-    ) -> None:
-        source = addressed["source"]
-        other = addressed["other"]
-        compare_address = {"compare_workflow_id": other.workflow_id, "compare_workflow_name": "gone"}
-        if compare_address_by == "unknown_id_known_name":
-            compare_address = {"compare_workflow_id": "0" * 32, "compare_workflow_name": other.name}
-        if compare_address_by == "disagreeing":
-            compare_address = {"compare_workflow_id": other.workflow_id, "compare_workflow_name": source.name}
-
-        result = _send_async(
-            project_engine,
-            CompareWorkflowsRequest(
-                workflow_id=source.workflow_id,
-                compare_workflow_id=compare_address.get("compare_workflow_id"),
-                compare_workflow_name=compare_address.get("compare_workflow_name"),
-            ),
-            None,
-        )
-
-        assert isinstance(result, CompareWorkflowsResultFailure)
-        assert expected in str(result.result_details)
 
 
 def _publisher(handler: Any, get_publish_options: Any = None) -> RegisteredEventHandler:
@@ -887,45 +839,28 @@ class TestPublishOptions:
             "get_registered_event_handlers",
             return_value={"lib": _publisher(MagicMock(), get_publish_options)},
         ):
-            result = _send(engine, GetPublishOptionsRequest(workflow_name="open", publisher_name="lib"), workflow)
+            result = _send(
+                engine, GetPublishOptionsRequest(workflow_id=workflow.workflow_id, publisher_name="lib"), workflow
+            )
 
         assert isinstance(result, GetPublishOptionsResultSuccess), result.result_details
         assert seen == [workflow]
 
 
 class TestRequestsAboutOneMoreWorkflowTakeAnId:
-    """Requests that name a saved or imported workflow take its id too, resolved as the saved-workflow requests do."""
+    """Requests that name a saved or imported workflow take its id, resolved as the saved-workflow requests do."""
 
-    @pytest.mark.parametrize("address_by", ["id", "both"])
-    def test_a_run_command_reaches_the_workflow_by_id(self, engine: Engine, tmp_path: Path, address_by: str) -> None:
+    def test_a_run_command_reaches_the_workflow_by_id(self, engine: Engine, tmp_path: Path) -> None:
         workspace = tmp_path.resolve()
         engine.config_manager.workspace_path = workspace
         saved = _write_saved_workflow(
             engine, workspace / "run_me.py", workflow_shape=WorkflowShape(inputs={}, outputs={})
         )
-        name = None
-        if address_by == "both":
-            name = saved.name
 
-        result = _send_async(
-            engine, GetWorkflowRunCommandRequest(workflow_id=saved.workflow_id, workflow_name=name), None
-        )
+        result = _send_async(engine, GetWorkflowRunCommandRequest(workflow_id=saved.workflow_id), None)
 
         assert isinstance(result, GetWorkflowRunCommandResultSuccess), result.result_details
         assert "run_me.py" in result.run_command
-
-    def test_a_run_command_for_an_id_and_a_name_that_disagree_fails(self, engine: Engine, tmp_path: Path) -> None:
-        workspace = tmp_path.resolve()
-        engine.config_manager.workspace_path = workspace
-        first = _write_saved_workflow(engine, workspace / "first.py")
-        second = _write_saved_workflow(engine, workspace / "second.py")
-
-        result = _send_async(
-            engine, GetWorkflowRunCommandRequest(workflow_id=first.workflow_id, workflow_name=second.name), None
-        )
-
-        assert isinstance(result, GetWorkflowRunCommandResultFailure)
-        assert "belongs to" in str(result.result_details)
 
     def test_publishing_by_the_tabs_own_id_hands_the_publisher_its_name(self, engine: Engine, tmp_path: Path) -> None:
         tab = engine.open_workflow(_write_saved_workflow(engine, tmp_path.resolve() / "tab.py").workflow_id)
