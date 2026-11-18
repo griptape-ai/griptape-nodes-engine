@@ -1716,14 +1716,12 @@ class EventManager(EngineScoped):
         open workflow. Otherwise it names its caller's binding, if there is one.
 
         - HOST binds NO_WORKFLOW, whatever the request names, and never checks its envelope id.
-        - WORKFLOW binds the workflow the request names and hands it over. It never guesses: a
-          request that names none fails.
+        - WORKFLOW binds the workflow the request names and hands it over, and fails when it names
+          none.
         - OPTIONAL_WORKFLOW binds the workflow the request names and hands it over, else binds
           NO_WORKFLOW and hands over None.
         - With no scope (a library handler with no `workflow` parameter), the request binds what it
           names and hands over nothing. Naming none, it keeps the caller's binding, or none.
-
-        Dispatch never picks a workflow for a request that names none.
 
         Raises:
             _RequestWorkflowError: The envelope id names no open workflow, or the caller is bound to
@@ -1800,7 +1798,7 @@ class EventManager(EngineScoped):
     def _workflow_for_workflow_request(
         self, request: RequestPayload, named: WorkflowRuntime | NoWorkflow | None
     ) -> WorkflowRuntime:
-        """The workflow a WORKFLOW request acts on: the one it names, never a guess.
+        """The workflow a WORKFLOW request acts on: the one it names.
 
         Raises:
             _RequestWorkflowError: The request names no workflow, answered with

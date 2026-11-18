@@ -257,7 +257,6 @@ class FlowManager(EngineScoped):
         """Get the connections of the workflow the caller is bound to.
 
         Facade surface: node libraries call it with no workflow to pass, so it reads the bound workflow.
-        It never picks a workflow for an unbound caller.
 
         Raises:
             NoOpenWorkflowError: The caller is bound to no workflow.

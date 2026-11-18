@@ -24,8 +24,7 @@ class RequestScope(StrEnum):
     HOST: no `workflow` parameter. The engine rather than one workflow: dispatch binds no workflow,
         ignores a workflow id on the request envelope and never rejects one.
     WORKFLOW: `workflow: WorkflowRuntime`. One open workflow: the one the request envelope names, else
-        the caller's. A request that names none and has no caller's fails with
-        `WorkflowNotNamedResultFailure`: dispatch never picks one.
+        the caller's. Naming neither fails with `WorkflowNotNamedResultFailure`.
     OPTIONAL_WORKFLOW: `workflow: WorkflowRuntime | None = None`. Works without a workflow: the one the
         envelope names, else the caller's, else none.
 

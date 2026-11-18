@@ -27,9 +27,9 @@ class NoWorkflow(Enum):
 
 NO_WORKFLOW: Final = NoWorkflow.NO_WORKFLOW
 
-# None means nothing was bound, which is different from binding NO_WORKFLOW: unbound work acts on
-# no workflow, however many are open: nothing in the engine picks one for it. An edge that opens a
-# workflow binds it (`ContextManager.push_workflow`). NO_WORKFLOW work is bound to none on purpose.
+# None means nothing was bound. NO_WORKFLOW means bound to none on purpose, such as engine work that
+# outlives the request that started it (`create_task_bound_to_no_workflow`). Either way the work acts
+# on no workflow. An edge that opens a workflow binds it (`ContextManager.push_workflow`).
 bound_workflow: ContextVar[WorkflowRuntime | NoWorkflow | None] = ContextVar(
     "griptape_nodes_bound_workflow", default=None
 )

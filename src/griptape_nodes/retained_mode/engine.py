@@ -746,8 +746,7 @@ class Engine:
     def current_workflow(self) -> WorkflowRuntime:
         """The open workflow the current work acts on, for writes and runs that need one.
 
-        Only the workflow the current work is bound to: unbound work acts on none, however many
-        workflows are open. The engine never picks one. Edges that open a workflow bind it
+        The workflow the current work is bound to. Edges that open a workflow bind it
         (`ContextManager.push_workflow`, the workflow executors).
 
         Raises:

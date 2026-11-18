@@ -332,9 +332,8 @@ class EventRequest[P: Payload](BaseEvent):
             Left out, the request acts on the workflow its caller is bound to, such as a run's own
             workflow, and a WORKFLOW request with no such caller fails with
             `WorkflowNotNamedResultFailure`. An OPTIONAL_WORKFLOW request acts on none. A request
-            another engine sent acts on no workflow. The engine never picks the only open workflow
-            for a request that names none. A payload field named `workflow_id` is something else:
-            the workflow the request is about.
+            another engine sent acts on no workflow. A payload field named `workflow_id` is
+            something else: the workflow the request is about.
         origin_engine_id: The engine this request started at, set by the engine relaying it for the
             receiving engine. Today that engine is a remote worker the sender runs for the receiver,
             and the receiver answers the request as its own worker's.

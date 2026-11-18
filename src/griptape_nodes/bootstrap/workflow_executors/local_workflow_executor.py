@@ -254,8 +254,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             msg = f"Failed to load workflow from path {workflow_path}"
             _raise_load_error(msg)
 
-        # The run acts on the workflow it opened, so bind it for the rest of the run: the requests
-        # and manager calls below, and `_save_failed_workflow`, name no workflow of their own.
+        # The requests below and `_save_failed_workflow` name no workflow, so bind the one this run opened.
         if isinstance(result, RunWorkflowFromScratchResultSuccess) and result.workflow_id is not None:
             engine = GriptapeNodes.get_instance()
             self._workflow = engine.open_workflows.get(result.workflow_id)
@@ -383,9 +382,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             return
 
         try:
-            # The workflow this executor opened, else the one the caller bound before running it
-            # (a saved workflow file opens and binds itself). It is bound again here, since the
-            # failure may surface in a context that binding did not reach.
+            # Bound again here: the failure may surface in a context the run's binding didn't reach.
             engine = GriptapeNodes.get_instance()
             workflow = self._workflow
             if workflow is None:

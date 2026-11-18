@@ -57,8 +57,7 @@ class ContextManager(EngineScoped):
     The Workflow context is the workflow the work is bound to (`Engine.current_workflow_or_none`),
     whose Flow, Node and Element contexts live on its runtime. Saved workflow files and node
     libraries reach this manager through the facade and are not handed a workflow: a file opens
-    itself with `push_workflow`, which binds it, and a node runs bound to its own. The manager never
-    picks a workflow for work bound to none. A worker opens none: while it runs a node, the
+    itself with `push_workflow`, which binds it, and a node runs bound to its own. A worker opens none: while it runs a node, the
     current workflow is the runtime it keeps for the node's orchestrator workflow
     (`adopt_orchestrator_workflow`). Workflows do not nest.
     Clients can push/pop Workflow contexts, Flow contexts, Node contexts, and Element contexts.
@@ -850,7 +849,7 @@ class ContextManager(EngineScoped):
     def pop_workflow(self) -> str:
         """Close the current workflow through `Engine.close_workflow`, which tears down what it holds.
 
-        Also ends the binding `push_workflow` made to it.
+        Also unbinds it, if the current work is bound to it.
 
         Returns:
             The name of the Workflow that was closed. `get_current_workflow_id` gives its id
