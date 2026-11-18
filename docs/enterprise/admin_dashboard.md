@@ -156,7 +156,7 @@ Budgets are grouped into four sections: **Organization**, **Projects**, **Licens
 - **Period:** how often spending starts over.
 - **Resets In:** how long until the period ends and the spend goes back to zero.
 
-The chips above the table filter it by section, by status (**Past alert threshold**, **Reached 100%**, **Hard Limit**, **Soft Limit**), or to your **Favourites** or **Frozen** budgets. **Total Spent** is what your organization has spent in total. It comes from your credit history rather than adding up the rows, because a single call counts toward its project, its license key and its access groups at once. The search box matches names, amounts and periods, and also understands searches like `over 80%`.
+The chips above the table filter it by section, by status (**Past alert threshold**, **Reached 100%**, **Hard Limit**, **Soft Limit**), or to your **Favourites** or **Frozen** budgets. **Total Spent** is what your organization has spent in total. It comes from your credit history rather than adding up the rows, because a single call counts toward its project, its license key and its access groups at once. Because it comes from your credit history, it also leaves out calls on your own provider keys, which the rows include (see [What counts toward a budget](#what-counts-toward-a-budget)). The search box matches names, amounts and periods, and also understands searches like `over 80%`.
 
 To edit, favourite, freeze or delete a budget, hover its row and click **⋮**.
 
@@ -219,7 +219,14 @@ Freezing a budget stops all work under it straight away, whatever is left of its
 
 ### What counts toward a budget
 
-Budgets count calls paid for with your organization's **Griptape credits**. Calls that use your own provider API keys are not counted, whether they go through Griptape Cloud or straight to the provider.
+Every budget counts two kinds of call:
+
+- Calls paid for with your organization's **Griptape credits**.
+- Calls that go through Griptape Cloud on your organization's own provider API key.
+
+A call on your own key is valued at Griptape's price for that model, the same as if it had used credits, so it uses up a budget faster than the provider's own bill for it would suggest. A call on your own key to a model Griptape has no price for counts as $0. A **Hard Limit** budget, or a frozen one, stops calls on your own key just as it stops credit calls.
+
+Calls that go straight from the engine to a provider, without passing through Griptape Cloud, are not counted. There is no setting to change what a budget counts.
 
 ### What artists see when a budget stops them
 
