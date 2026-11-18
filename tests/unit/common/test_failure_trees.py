@@ -5,8 +5,13 @@ from __future__ import annotations
 import pytest
 
 from griptape_nodes.common import failure_trees
-from griptape_nodes.common.failure_trees import MAX_REPORTED_ITERATION_FAILURES, IterationFailure
-from griptape_nodes.exe_types.node_error import NodeError
+from griptape_nodes.common.failure_trees import (
+    FAILED_NODE_PATH_FIELD,
+    FAILED_NODE_PATH_SEPARATOR,
+    MAX_REPORTED_ITERATION_FAILURES,
+    IterationFailure,
+)
+from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultFailure,
@@ -357,6 +362,17 @@ class TestLoopFailureFromIterations:
 
         assert result.reasons[0].failure_tree is kept
 
+    def test_it_skips_failures_without_a_failure_tree_when_chaining_a_single_reason(self) -> None:
+        kept = _leaf("X", "kept")
+        failures = [
+            IterationFailure(iteration_index=0, detail="same"),
+            IterationFailure(iteration_index=1, detail="same", failure_tree=kept),
+        ]
+
+        result = failure_trees.loop_failure_from_iterations("Loop", 2, failures)
+
+        assert result.reasons[0].failure_tree is kept
+
     def test_a_reason_without_a_failure_tree_has_none(self) -> None:
         result = failure_trees.loop_failure_from_iterations("Loop", 1, _iteration_failures(["a"]))
 
@@ -434,3 +450,388 @@ class TestRenderLoopMessage:
         assert _loop_message(3, []) == (
             "Attempted to run all 3 iterations of loop 'Loop'. Failed because 0 of them did not finish."
         )
+
+
+def _workflow_node(name: str, inner: FailureTree) -> WorkflowNodeFailure:
+    return WorkflowNodeFailure(node_name=name, inner=inner)
+
+
+def _mixed_loop(name: str = "Loop") -> LoopFailure:
+    return failure_trees.loop_failure_from_iterations(
+        name,
+        4,
+        [
+            IterationFailure(iteration_index=0, detail="even refused", failure_tree=_leaf("Body", "even refused")),
+            IterationFailure(iteration_index=1, detail="odd refused", failure_tree=_leaf("Body", "odd refused")),
+            IterationFailure(iteration_index=2, detail="even refused", failure_tree=_leaf("Body", "even refused")),
+        ],
+    )
+
+
+def _path_below(workflow_node: WorkflowNodeFailure) -> list[str]:
+    details = failure_trees.render_error_details(workflow_node, text="", node_name=workflow_node.node_name)
+    return details.fields[FAILED_NODE_PATH_FIELD].split(FAILED_NODE_PATH_SEPARATOR)
+
+
+class TestFailedNodePath:
+    def test_follows_containers_down_to_the_leaf(self) -> None:
+        group = GroupFailure(node_name="Group", inner=_leaf("Failing"))
+
+        assert _path_below(_workflow_node("Outer", group)) == ["Group", "Failing"]
+
+    def test_follows_a_loop_whose_iterations_agree(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop",
+            2,
+            [
+                IterationFailure(iteration_index=0, detail="same", failure_tree=_leaf("Body")),
+                IterationFailure(iteration_index=1, detail="same", failure_tree=_leaf("Body")),
+            ],
+        )
+
+        assert _path_below(_workflow_node("Outer", loop)) == ["Loop", "Body"]
+
+    def test_stops_at_a_loop_whose_iterations_failed_for_different_reasons(self) -> None:
+        assert _path_below(_workflow_node("Outer", _mixed_loop())) == ["Loop"]
+
+    def test_stops_at_a_loop_whose_only_reason_names_no_failure(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop", 1, [IterationFailure(iteration_index=0, detail="said nothing")]
+        )
+
+        assert _path_below(_workflow_node("Outer", loop)) == ["Loop"]
+
+    def test_a_node_directly_inside_is_a_path_of_one(self) -> None:
+        assert _path_below(_workflow_node("Outer", _leaf("Node"))) == ["Node"]
+
+
+class TestNestedWorkflowMessage:
+    def test_a_node_directly_inside_reads_naturally(self) -> None:
+        message = failure_trees.nested_workflow_message(_workflow_node("Outer", _leaf("Inner")))
+
+        assert message == (
+            "Attempted to run the workflow behind node 'Outer'. Failed because node 'Inner' inside it failed: boom"
+        )
+
+    def test_a_node_inside_one_nested_workflow_node_is_not_pluralised(self) -> None:
+        failure = _workflow_node("Outer", _workflow_node("Middle", _leaf("Failing")))
+
+        assert failure_trees.nested_workflow_message(failure) == (
+            "Attempted to run the workflow behind node 'Outer'. "
+            "Failed because node 'Failing', inside a nested Workflow node, failed: boom"
+        )
+
+    def test_nested_workflow_nodes_are_counted(self) -> None:
+        failure = _workflow_node("Outer", _workflow_node("A", _workflow_node("B", _leaf("Failing"))))
+
+        assert failure_trees.nested_workflow_message(failure) == (
+            "Attempted to run the workflow behind node 'Outer'. "
+            "Failed because node 'Failing', inside 2 nested Workflow nodes, failed: boom"
+        )
+
+    def test_workflow_nodes_are_counted_through_groups_and_loops(self) -> None:
+        group = GroupFailure(node_name="Group", inner=_workflow_node("Inner", _leaf("Failing")))
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop", 1, [IterationFailure(iteration_index=0, detail="boom", failure_tree=group)]
+        )
+
+        assert failure_trees.nested_workflow_message(_workflow_node("Outer", loop)) == (
+            "Attempted to run the workflow behind node 'Outer'. "
+            "Failed because node 'Failing', inside a nested Workflow node, failed: boom"
+        )
+
+    def test_groups_and_loops_on_the_path_are_not_counted_as_workflow_nodes(self) -> None:
+        group = GroupFailure(node_name="Group", inner=_leaf("Failing"))
+
+        assert failure_trees.nested_workflow_message(_workflow_node("Outer", group)) == (
+            "Attempted to run the workflow behind node 'Outer'. Failed because node 'Failing' inside it failed: boom"
+        )
+
+    def test_loop_iterations_that_disagree_are_reported_by_the_loops_own_summary(self) -> None:
+        message = failure_trees.nested_workflow_message(_workflow_node("Outer", _mixed_loop()))
+
+        assert message == (
+            "Attempted to run the workflow behind node 'Outer'. Failed because node 'Loop' inside it failed: "
+            "Attempted to run all 4 iterations of loop 'Loop'. Failed because 3 of them did not finish.\n"
+            "  Iterations 1, 3: even refused\n"
+            "  Iteration 2: odd refused"
+        )
+
+    def test_a_renamed_loop_is_worded_by_its_canvas_name(self) -> None:
+        copy_loop = _mixed_loop("Loop_copy")
+
+        message = failure_trees.nested_workflow_message(
+            _workflow_node("Outer", failure_trees.renamed(copy_loop, {"Loop_copy": "Loop"}))
+        )
+
+        assert "node 'Loop' inside it failed" in message
+        assert "loop 'Loop'" in message
+        assert "Loop_copy" not in message
+
+
+class TestRenderErrorDetailsOfAWorkflowNodeFailure:
+    def test_the_leaf_type_is_reported_with_the_path_as_a_field(self) -> None:
+        details = failure_trees.render_error_details(
+            _workflow_node("Outer", _leaf("Inner")), text="", node_name="Outer"
+        )
+
+        assert details == NodeErrorDetails(
+            message=(
+                "Attempted to run the workflow behind node 'Outer'. Failed because node 'Inner' inside it failed: boom"
+            ),
+            fields={FAILED_NODE_PATH_FIELD: "Inner"},
+        )
+
+    def test_keeps_the_leaf_type_fields_response_and_links(self) -> None:
+        link = NodeErrorLink(label="Docs", url="https://example.com")
+        leaf = FailureLeaf(
+            node_name="Inner",
+            kind=FailureKind.RAISED,
+            details=NodeErrorDetails(
+                message="refused",
+                exception_type="builtins.KeyError",
+                fields={"request_id": "abc"},
+                response={"error": "nope"},
+                links=[link],
+            ),
+        )
+
+        details = failure_trees.render_error_details(_workflow_node("Outer", leaf), text="", node_name="Outer")
+
+        assert details.exception_type == "builtins.KeyError"
+        assert details.fields == {"request_id": "abc", FAILED_NODE_PATH_FIELD: "Inner"}
+        assert details.response == {"error": "nope"}
+        assert details.links == [link]
+
+    def test_does_not_carry_the_leaf_validation_messages(self) -> None:
+        leaf = failure_trees.failure_leaf_from_validation("Inner", [ValueError("bad input"), ValueError("worse input")])
+        assert leaf.details.messages == ["bad input", "worse input"]
+
+        details = failure_trees.render_error_details(_workflow_node("Outer", leaf), text="", node_name="Outer")
+
+        assert details.messages is None
+        assert details.exception_type == "builtins.ValueError"
+
+    def test_does_not_change_the_leaf_own_details(self) -> None:
+        leaf = _leaf("Inner")
+
+        failure_trees.render_error_details(_workflow_node("Outer", leaf), text="", node_name="Outer")
+
+        assert leaf.details.fields == {}
+
+    def test_the_path_replaces_a_path_field_the_leaf_already_carried(self) -> None:
+        leaf = FailureLeaf(
+            node_name="Inner",
+            kind=FailureKind.RAISED,
+            details=NodeErrorDetails(message="boom", fields={FAILED_NODE_PATH_FIELD: "stale"}),
+        )
+
+        details = failure_trees.render_error_details(_workflow_node("Outer", leaf), text="", node_name="Outer")
+
+        assert details.fields == {FAILED_NODE_PATH_FIELD: "Inner"}
+
+    def test_the_path_lists_every_node_below_the_workflow_node(self) -> None:
+        group = GroupFailure(node_name="Group", inner=_leaf("Failing"))
+        failure = _workflow_node("Outer", _workflow_node("Middle", group))
+
+        details = failure_trees.render_error_details(failure, text="", node_name="Outer")
+
+        assert details.fields[FAILED_NODE_PATH_FIELD].split(FAILED_NODE_PATH_SEPARATOR) == [
+            "Middle",
+            "Group",
+            "Failing",
+        ]
+
+    def test_a_long_path_keeps_both_ends_and_counts_the_middle(self) -> None:
+        failure = _leaf("Node 9")
+        for index in range(8, 0, -1):
+            failure = GroupFailure(node_name=f"Node {index}", inner=failure)
+        failure = _workflow_node("Outer", failure)
+
+        details = failure_trees.render_error_details(failure, text="", node_name="Outer")
+
+        assert details.fields[FAILED_NODE_PATH_FIELD].split(FAILED_NODE_PATH_SEPARATOR) == [
+            "Node 1",
+            "Node 2",
+            "\u2026 (5 more)",
+            "Node 8",
+            "Node 9",
+        ]
+
+    def test_a_path_of_exactly_the_longest_unshortened_length_is_listed_in_full(self) -> None:
+        failure = _leaf("Node 6")
+        for index in range(5, 0, -1):
+            failure = GroupFailure(node_name=f"Node {index}", inner=failure)
+
+        details = failure_trees.render_error_details(_workflow_node("Outer", failure), text="", node_name="Outer")
+
+        assert len(details.fields[FAILED_NODE_PATH_FIELD].split(FAILED_NODE_PATH_SEPARATOR)) == 6  # noqa: PLR2004
+
+    def test_a_loop_whose_iterations_disagree_is_text_only_and_the_path_ends_at_it(self) -> None:
+        details = failure_trees.render_error_details(_workflow_node("Outer", _mixed_loop()), text="", node_name="Outer")
+
+        assert details.exception_type == "builtins.RuntimeError"
+        assert details.fields == {FAILED_NODE_PATH_FIELD: "Loop"}
+        assert details.response is None
+        assert details.links == []
+        assert details.messages is None
+        assert details.message.count("even refused") == 1
+        assert details.message.count("odd refused") == 1
+
+    def test_a_loop_whose_iterations_agree_reports_the_node_that_failed_in_them_once(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop",
+            2,
+            [
+                IterationFailure(iteration_index=0, detail="same", failure_tree=_leaf("Body", "same")),
+                IterationFailure(iteration_index=1, detail="same", failure_tree=_leaf("Body", "same")),
+            ],
+        )
+
+        details = failure_trees.render_error_details(_workflow_node("Outer", loop), text="", node_name="Outer")
+
+        assert details.message == (
+            "Attempted to run the workflow behind node 'Outer'. Failed because node 'Body' inside it failed: same"
+        )
+        assert details.fields == {FAILED_NODE_PATH_FIELD: "Loop \u203a Body"}
+
+    def test_a_budget_halt_keeps_its_own_wording_and_gains_the_path(self) -> None:
+        halt = FailureLeaf(
+            node_name="Spender",
+            kind=FailureKind.BUDGET_HALT,
+            details=NodeErrorDetails(message="Budget stopped this run. Spender was blocked.", exception_type="x.Halt"),
+        )
+
+        details = failure_trees.render_error_details(
+            _workflow_node("Outer", _workflow_node("Middle", halt)), text="", node_name="Outer"
+        )
+
+        assert details.message == "Budget stopped this run. Spender was blocked."
+        assert details.exception_type == "x.Halt"
+        assert details.fields == {FAILED_NODE_PATH_FIELD: f"Middle{FAILED_NODE_PATH_SEPARATOR}Spender"}
+
+
+class TestRenderErrorDetailsOfAWorkflowNode:
+    def test_reports_the_failure_inside_it(self) -> None:
+        details = failure_trees.render_error_details(
+            _workflow_node("Outer", _leaf("Inner")), text="ignored", node_name="Outer"
+        )
+
+        assert details.fields == {FAILED_NODE_PATH_FIELD: "Inner"}
+
+    def test_a_group_is_still_text_only(self) -> None:
+        group = GroupFailure(node_name="Group", inner=_leaf("Inner"))
+
+        details = failure_trees.render_error_details(group, text="the words", node_name="Group")
+
+        assert (details.message, details.fields) == ("the words", {})
+
+    def test_error_details_from_a_workflow_nodes_exception_are_its_nested_details(self) -> None:
+        failure = _workflow_node("Outer", _leaf("Inner"))
+        error = FailureTreeError(failure, "words")
+
+        assert failure_trees.error_details_from_exception(error, "Outer") == failure_trees.render_error_details(
+            failure, text="", node_name="Outer"
+        )
+
+
+class TestBudgetHaltBehindWorkflowNode:
+    @pytest.fixture
+    def halt(self) -> FailureTree:
+        return FailureLeaf(
+            node_name="Spender",
+            kind=FailureKind.BUDGET_HALT,
+            details=NodeErrorDetails(message="Budget stopped this run."),
+        )
+
+    def test_gives_the_halts_wording(self, halt: FailureTree) -> None:
+        failure = _workflow_node("Outer", _workflow_node("Middle", halt))
+
+        assert failure_trees.budget_halt_behind_workflow_node(failure) == "Budget stopped this run."
+
+    def test_a_halt_inside_a_group_is_found(self, halt: FailureTree) -> None:
+        group = GroupFailure(node_name="Group", inner=halt)
+
+        assert (
+            failure_trees.budget_halt_behind_workflow_node(_workflow_node("Outer", group)) == "Budget stopped this run."
+        )
+
+    def test_another_failure_gives_none(self) -> None:
+        assert failure_trees.budget_halt_behind_workflow_node(_workflow_node("Outer", _leaf("Inner"))) is None
+
+    def test_a_halt_that_is_not_behind_a_workflow_node_gives_none(self, halt: FailureTree) -> None:
+        group = GroupFailure(node_name="Group", inner=halt)
+
+        assert failure_trees.budget_halt_behind_workflow_node(group) is None
+        assert failure_trees.budget_halt_behind_workflow_node(halt) is None
+
+    def test_a_halt_among_a_loops_several_reasons_is_not_the_end_of_the_path(self, halt: FailureTree) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop",
+            2,
+            [
+                IterationFailure(iteration_index=0, detail="halted", failure_tree=halt),
+                IterationFailure(iteration_index=1, detail="other", failure_tree=_leaf("Body")),
+            ],
+        )
+
+        assert failure_trees.budget_halt_behind_workflow_node(_workflow_node("Outer", loop)) is None
+
+
+class TestIterationFailureDetail:
+    NESTED = "Attempted to run the workflow behind node 'W'. Failed because node 'Deeper' inside it failed: boom"
+
+    def test_a_workflow_node_failure_is_described_by_its_nested_message(self) -> None:
+        tree = _workflow_node("W", _leaf("Deeper", "boom"))
+
+        assert failure_trees.iteration_failure_detail(tree, "flat text") == self.NESTED
+
+    def test_a_renamed_workflow_node_is_described_by_its_canvas_name(self) -> None:
+        tree = _workflow_node("W_1", _leaf("Deeper", "boom"))
+        renamed = failure_trees.renamed(tree, {"W_1": "W"})
+
+        assert failure_trees.iteration_failure_detail(renamed, "flat text") == self.NESTED
+
+    def test_a_group_holding_a_workflow_node_adds_one_frame(self) -> None:
+        tree = failure_trees.renamed(
+            GroupFailure(node_name="G_1", inner=_workflow_node("W_1", _leaf("Deeper", "boom"))),
+            {"G_1": "G", "W_1": "W"},
+        )
+
+        assert failure_trees.iteration_failure_detail(tree, "flat text") == (
+            f"Node 'G' encountered a problem: {self.NESTED}"
+        )
+
+    def test_a_group_inside_a_group_adds_a_frame_for_each_outermost_first(self) -> None:
+        tree = GroupFailure(
+            node_name="Outer",
+            inner=GroupFailure(node_name="Inner", inner=_workflow_node("W", _leaf("Deeper", "boom"))),
+        )
+
+        assert failure_trees.iteration_failure_detail(tree, "flat text") == (
+            f"Node 'Outer' encountered a problem: Node 'Inner' encountered a problem: {self.NESTED}"
+        )
+
+    def test_a_plain_leaf_inside_a_group_keeps_the_result_details(self) -> None:
+        tree = GroupFailure(node_name="G", inner=_leaf("Node"))
+
+        assert failure_trees.iteration_failure_detail(tree, "flat text") == "flat text"
+
+    def test_a_loop_inside_a_group_keeps_the_result_details(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop", 1, [IterationFailure(iteration_index=0, detail="nope", failure_tree=_leaf("Body"))]
+        )
+        tree = GroupFailure(node_name="G", inner=loop)
+
+        assert failure_trees.iteration_failure_detail(tree, "flat text") == "flat text"
+
+    def test_a_leaf_keeps_the_result_details(self) -> None:
+        assert failure_trees.iteration_failure_detail(_leaf("Node"), "flat text") == "flat text"
+
+    def test_a_failure_without_a_tree_keeps_the_result_details(self) -> None:
+        assert failure_trees.iteration_failure_detail(None, "flat text") == "flat text"
+
+
+class TestEncounteredAProblemMessage:
+    def test_names_the_node_and_the_text(self) -> None:
+        assert failure_trees.encountered_a_problem_message("G", "boom") == "Node 'G' encountered a problem: boom"

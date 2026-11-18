@@ -5,7 +5,7 @@
 # name = "fail_workflow"
 # schema_version = "0.21.0"
 # engine_version_created_with = "0.0.0"
-# node_libraries_referenced = [["Workflow Node Library", "0.1.0"], ["Worker Leaf Library", "0.1.0"]]
+# node_libraries_referenced = [["Worker Leaf Library", "0.1.0"], ["Workflow Node Library", "0.1.0"]]
 # node_types_used = []
 # description = "Runs a node that always fails."
 # is_griptape_provided = false
@@ -32,8 +32,8 @@ from griptape_nodes.serialization.values import decode_value
 from typing import Any
 
 async def build_workflow() -> None:
-    await GriptapeNodes.ahandle_request(RegisterLibraryFromFileRequest(library_name='Workflow Node Library', perform_discovery_if_not_found=True))
     await GriptapeNodes.ahandle_request(RegisterLibraryFromFileRequest(library_name='Worker Leaf Library', perform_discovery_if_not_found=True))
+    await GriptapeNodes.ahandle_request(RegisterLibraryFromFileRequest(library_name='Workflow Node Library', perform_discovery_if_not_found=True))
     # Every unique parameter value, stored once and keyed by a hash of its content.
     # Values that aren't plain data carry a '$type' naming their class; decode_value rebuilds them.
     top_level_unique_values_dict = {'12ae32cb1ec02d01eda3581b127c1fee': '', 'fcbcf165908dd18a9e49f7ff27810176': False}

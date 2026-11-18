@@ -53,6 +53,7 @@ FRAME_SOURCE_PREFIXES = ("    ", "\t")
 MASKED_RUN_ID = "<run id>"
 # `ResultDetail.level` of a failure's details, which is `logging.ERROR`.
 ERROR_LEVEL = 40
+DEBUG_LEVEL = 10
 
 
 @dataclass
@@ -364,10 +365,13 @@ def record_subflow_runs(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list
     return recorded
 
 
-def assert_subflow_failures(runs: list[RecordedSubflowRuns], expected: list[tuple[str, str]]) -> None:
+def assert_subflow_failures(
+    runs: list[RecordedSubflowRuns], expected: list[tuple[str, str]], *, level: int = ERROR_LEVEL
+) -> None:
     """Assert the subflows that failed, as ``(flow name, result details)``, and the whole MCP form of each failure.
 
-    A worker traceback in the details is masked on both sides of the comparison.
+    A worker traceback in the details is masked on both sides of the comparison. ``level`` is the log level
+    the failure's details carry, which is lower for a run whose requester reports the failure itself.
     """
     failed = [run for run in runs if run.result.failed()]
     assert [
@@ -380,7 +384,7 @@ def assert_subflow_failures(runs: list[RecordedSubflowRuns], expected: list[tupl
             "exception": None,
             "result_details": {
                 "result_details": [
-                    {"level": ERROR_LEVEL, "message": mask_worker_traceback(str(run.result.result_details)).text}
+                    {"level": level, "message": mask_worker_traceback(str(run.result.result_details)).text}
                 ]
             },
         }

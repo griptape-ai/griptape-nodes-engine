@@ -17,6 +17,7 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
+from griptape_nodes.common import failure_trees
 from griptape_nodes.common.nested_workflow_scope import entered_nested_workflow
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -28,8 +29,10 @@ from griptape_nodes.files.path_utils import (
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowRequest,
+    StartLocalSubflowResultFailure,
     StartLocalSubflowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.failure_tree import FailureTreeError, WorkflowNodeFailure
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     DeleteFlowRequest,
@@ -45,6 +48,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
+    from typing import NoReturn
 
     from griptape_nodes.node_library.workflow_registry import (
         NodeParametersMapping,
@@ -52,6 +56,7 @@ if TYPE_CHECKING:
         WorkflowMetadata,
         _WorkflowRegistry,
     )
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
@@ -347,15 +352,30 @@ class WorkflowNode(ControlNode):
         self._apply_inputs(subflow_name, live_routes)
 
         with entered_nested_workflow():
-            result = await self._ahandle_request_in_workflow(StartLocalSubflowRequest(flow_name=subflow_name))
-        if not isinstance(result, StartLocalSubflowResultSuccess):
-            msg = (
-                f"Attempted to run the workflow behind node '{self.name}'. "
-                f"Failed because the workflow did not finish: {result.result_details}"
+            result = await self._ahandle_request_in_workflow(
+                # The failure is raised below and reported by the caller, so logging it here would repeat
+                # it at every nesting level.
+                StartLocalSubflowRequest(flow_name=subflow_name, failure_log_level=logging.DEBUG)
             )
-            raise RuntimeError(msg)  # noqa: TRY004 - the workflow failed at run time; this is not a type error
+        if not isinstance(result, StartLocalSubflowResultSuccess):
+            self._raise_subflow_failure(result)
 
         self._collect_outputs(subflow_name, live_routes)
+
+    def _raise_subflow_failure(self, result: ResultPayload) -> NoReturn:
+        """Raise the failure of a subflow that did not finish, naming the node that failed inside it.
+
+        A result that says which node failed is reported as that node's failure, once, however many
+        Workflow nodes it passed through. Any other is reported by its text.
+        """
+        if isinstance(result, StartLocalSubflowResultFailure) and result.failure_tree is not None:
+            failure_tree = WorkflowNodeFailure(node_name=self.name, inner=result.failure_tree)
+            raise FailureTreeError(failure_tree, failure_trees.nested_workflow_message(failure_tree))
+        msg = (
+            f"Attempted to run the workflow behind node '{self.name}'. "
+            f"Failed because the workflow did not finish: {result.result_details}"
+        )
+        raise RuntimeError(msg)
 
     def _publish_workflow_registry_key(self) -> None:
         """Register the backing workflow and record its key so the editor can preview it.
@@ -406,6 +426,9 @@ class WorkflowNode(ControlNode):
                 workflow_name=registry_key,
                 flow_name=flow_result.flow_name,
                 imported_flow_metadata={TRANSIENT_KEY: True},
+                # The failure is raised below and reported by the caller, so logging it here would
+                # repeat it at every nesting level.
+                failure_log_level=logging.DEBUG,
             )
         )
         if not isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess):

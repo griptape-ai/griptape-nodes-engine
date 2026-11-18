@@ -2,8 +2,8 @@
 
 A Workflow node imports the workflow it stands for as a subflow and runs it. It fails in two ways: the
 import fails, or the imported workflow runs and a node in it fails. Neither is a failure of a node's own code,
-so the node raises a ``RuntimeError`` that frames the underlying text, and ``NodeErrorEvent.error`` has no
-node-built parts.
+so the node reports the failure of the node inside it once, under its own message, and ``NodeErrorEvent.error``
+has the node-built parts of that failure.
 
 Strict mode is switched off for most of them: while a Workflow node runs, it reads the context manager, and
 strict mode then appends its own warning to the node's failure text, once for every read. That is a separate
@@ -28,6 +28,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.utils.version_utils import engine_version
 from tests.e2e.node_failure_support import (
+    DEBUG_LEVEL,
     FIXTURES_DIR,
     FlowRun,
     assert_subflow_failures,
@@ -54,10 +55,11 @@ WORKFLOW_LIBRARY_DIR = FIXTURES_DIR / "workflow_node_library"
 HOST_LIBRARY_NAME = "Failing Workflow Host Library"
 WORKFLOW_NODE_TYPE = "FailingWorkflow"
 FLOW_FAILURE_PREFIX = "Attempted to run flow 'Flow'. Failed due to: "
+INNER_MESSAGE = "The fixture node refused to run"
 INNER_FAILURE = (
-    "Node 'Failing' execution failed: Attempted to execute node 'Failing'. "
-    "Failed with error: The fixture node refused to run"
+    f"Node 'Failing' execution failed: Attempted to execute node 'Failing'. Failed with error: {INNER_MESSAGE}"
 )
+INNER_TYPE = "griptape_nodes.exe_types.node_error.NodeError"
 HOST_PREFIX = "<host>/"
 
 
@@ -130,14 +132,16 @@ class TestWorkflowNodeWhoseInnerNodeFails:
     """Golden case 13: the workflow imported and ran, and a node in it failed.
 
     The inner node reports its own failure first, under its own name, with the type it raised. The Workflow node
-    then reports ``did not finish`` with the inner text after it, as a ``builtins.RuntimeError`` whose message
-    is its whole text. The run's recorded message is the node's text with no group-style framing.
+    then reports the node that failed inside it, once, with that node's message, type and fields, and the nodes
+    between them in a "Failed node path" field. The run's recorded message is the node's text with no
+    group-style framing.
     """
 
     WORKFLOW_NODE_WORDS = (
         "Attempted to run the workflow behind node 'Outer'. "
-        f"Failed because the workflow did not finish: {INNER_FAILURE}"
+        f"Failed because node 'Failing' inside it failed: {INNER_MESSAGE}"
     )
+    WORKFLOW_NODE_DETAILS = expected_details(WORKFLOW_NODE_WORDS, INNER_TYPE, fields={"Failed node path": "Failing"})
     OUTER_MESSAGE = (
         f"Node 'Outer' execution failed: Attempted to execute node 'Outer'. Failed with error: {WORKFLOW_NODE_WORDS}"
     )
@@ -156,8 +160,8 @@ class TestWorkflowNodeWhoseInnerNodeFails:
             ("Outer", self.OUTER_MESSAGE),
         ]
         assert [details_dict(event.error) for event in run.recorded.node_errors] == [
-            expected_details("The fixture node refused to run", "griptape_nodes.exe_types.node_error.NodeError"),
-            expected_details(self.WORKFLOW_NODE_WORDS, "builtins.RuntimeError"),
+            expected_details(INNER_MESSAGE, INNER_TYPE),
+            self.WORKFLOW_NODE_DETAILS,
         ]
         assert [
             (finish.node_name, finish.flow_name, finish.outcome, finish.error_message)
@@ -168,14 +172,15 @@ class TestWorkflowNodeWhoseInnerNodeFails:
             ("Outer", "Flow", NodeProcessOutcome.FAILED, self.OUTER_MESSAGE),
         ]
         assert [details_dict(finish.error) for finish in run.recorded.failed_finishes()] == [
-            expected_details("The fixture node refused to run", "griptape_nodes.exe_types.node_error.NodeError"),
-            expected_details(self.WORKFLOW_NODE_WORDS, "builtins.RuntimeError"),
+            expected_details(INNER_MESSAGE, INNER_TYPE),
+            self.WORKFLOW_NODE_DETAILS,
         ]
         run.recorded.assert_finish_errors_match_node_errors()
         assert run.client == client_run_failure(
             FLOW_FAILURE_PREFIX + self.OUTER_MESSAGE, [client_exception(self.OUTER_MESSAGE)]
         )
-        assert_subflow_failures(run.subflow_runs, [("ControlFlow_1", INNER_FAILURE)])
+        # The Workflow node reports the subflow's failure itself, so the subflow request logs it at DEBUG.
+        assert_subflow_failures(run.subflow_runs, [("ControlFlow_1", INNER_FAILURE)], level=DEBUG_LEVEL)
 
 
 class TestWorkflowNodeWithStrictModeOn:
@@ -189,12 +194,8 @@ class TestWorkflowNodeWithStrictModeOn:
         run = await _run_outer(engine, monkeypatch)
 
         golden = TestWorkflowNodeWhoseInnerNodeFails.OUTER_MESSAGE
-        inner_details = expected_details(
-            "The fixture node refused to run", "griptape_nodes.exe_types.node_error.NodeError"
-        )
-        outer_details = expected_details(
-            TestWorkflowNodeWhoseInnerNodeFails.WORKFLOW_NODE_WORDS, "builtins.RuntimeError"
-        )
+        inner_details = expected_details(INNER_MESSAGE, INNER_TYPE)
+        outer_details = TestWorkflowNodeWhoseInnerNodeFails.WORKFLOW_NODE_DETAILS
         assert isinstance(run.result, StartFlowResultFailure)
         assert run.run_message == golden
         assert run.result_details == FLOW_FAILURE_PREFIX + golden

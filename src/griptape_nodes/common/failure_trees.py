@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, replace
 from itertools import islice
-from typing import TYPE_CHECKING, Any, NamedTuple, assert_never
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, assert_never
 
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.retained_mode.events.execution_events import (
@@ -46,6 +46,13 @@ MAX_REPORTED_ITERATION_FAILURES = 5
 # the failed iterations are not a contiguous run, which is already summarised as "first-last".
 MAX_ENUMERATED_ITERATION_NUMBERS = 6
 
+# The field a Workflow node's failure lists the nodes between it and the one that failed in.
+FAILED_NODE_PATH_FIELD = "Failed node path"
+FAILED_NODE_PATH_SEPARATOR = " \u203a "
+# A path longer than this is shown with its middle left out, so the field stays readable.
+MAX_PATH_ENTRIES_SHOWN = 6
+PATH_ENTRIES_KEPT_AT_EACH_END = 2
+
 
 @dataclass(frozen=True)
 class IterationFailure:
@@ -80,6 +87,25 @@ class IterationOutcome:
     succeeded: bool
     detail: str
     failure_tree: FailureTree | None = None
+
+
+@dataclass(frozen=True)
+class _NestedReport:
+    """What a Workflow node reports about the failure inside it."""
+
+    # Not hashable: ``blamed_node_error_details`` and the path hold details.
+    __hash__ = None  # type: ignore[assignment]
+
+    path: list[FailureTree]
+    """The nodes below the Workflow node, down to the one it names as having failed."""
+
+    blamed_node_error_details: NodeErrorDetails
+    """The error details of the node the failure is blamed on, at the end of the path: the node that failed,
+    or a loop whose iterations failed for different reasons, where no single one can be followed further.
+    The Workflow node reports these as its own."""
+
+    message: str
+    """What the Workflow node says about the failure: the node that failed, how deep, and its message."""
 
 
 # --- Builders ---
@@ -216,16 +242,89 @@ def error_details_from_exception(exc: BaseException, node_name: str) -> NodeErro
 
 
 def render_error_details(failure_tree: FailureTree, *, text: str, node_name: str) -> NodeErrorDetails:
-    """A copy of the details of a leaf, or text-only details for a container, from its ``text``.
+    """A copy of the details of a leaf, or the details a container reports, from its ``text``.
 
-    A container has no details of its own: it failed because something inside it did, and reports
-    the text its raise point gave it as the message of a ``builtins.RuntimeError``. ``text`` is ignored
-    for a leaf, which already has its details.
+    A Workflow node reports the node that failed inside it, with its type, fields, response and links.
+    Any other container failed because something inside it did, and reports the text its raise point
+    gave it as the message of a ``builtins.RuntimeError``. ``text`` is ignored for a leaf, which
+    already has its details.
     """
-    # A leaf already has its details, so a copy is returned rather than text-only details built from ``text``.
-    if isinstance(failure_tree, FailureLeaf):
-        return copy.deepcopy(failure_tree.details)
-    return build_node_error_details(node_name, RuntimeError(text))
+    match failure_tree:
+        # A leaf already has its details, so a copy is returned rather than text-only details built from ``text``.
+        case FailureLeaf():
+            return copy.deepcopy(failure_tree.details)
+        case WorkflowNodeFailure():
+            return _nested_workflow_details(failure_tree)
+        # A group or loop has no details of its own, so it reports the text its raise point gave it.
+        case GroupFailure() | LoopFailure():
+            return build_node_error_details(node_name, RuntimeError(text))
+        case _:
+            assert_never(failure_tree)
+
+
+def nested_workflow_message(failure_tree: WorkflowNodeFailure) -> str:
+    """What a Workflow node says when something inside it failed.
+
+    The message names the node that failed and how many nested Workflow nodes it was inside, and
+    leads with that node's own message.
+    """
+    return _workflow_node_nested_report(failure_tree).message
+
+
+def _nested_workflow_details(failure_tree: WorkflowNodeFailure) -> NodeErrorDetails:
+    """The details a Workflow node reports for the failure inside it.
+
+    They are those of the node at the end of the path, with the nodes on the path added as a field. The
+    message is the Workflow node's own, except for a budget halt, whose wording leads. The validation
+    ``messages`` are not kept: they tell the editor a node never ran, which the Workflow node did.
+    """
+    report = _workflow_node_nested_report(failure_tree)
+    message = report.message
+    # A budget halt's own wording leads, so the run stops with the same message as a halt at the top level.
+    if _is_budget_halt(report.path[-1]):
+        message = report.blamed_node_error_details.message
+    fields = dict(report.blamed_node_error_details.fields)
+    fields[FAILED_NODE_PATH_FIELD] = _format_path([step.node_name for step in report.path])
+    return replace(copy.deepcopy(report.blamed_node_error_details), message=message, messages=None, fields=fields)
+
+
+def budget_halt_behind_workflow_node(failure_tree: FailureTree) -> str | None:
+    """The wording of the budget halt a Workflow node's failure ends at, or None when it ends at anything else."""
+    # A halt at the top level is already worded as the halt; only one under Workflow nodes needs its wording brought
+    # up.
+    if not isinstance(failure_tree, WorkflowNodeFailure):
+        return None
+    end = _failure_path(failure_tree)[-1]
+    if not _is_budget_halt(end):
+        return None
+    return end.details.message
+
+
+def iteration_failure_detail(failure_tree: FailureTree | None, result_details: str) -> str:
+    """Describe a failed iteration by its Workflow node's nested message when that failed, else by ``result_details``.
+
+    A failure inside a nested Workflow node is described by its nested message, which names the node that
+    failed, with a frame for each group it sits in. Any other failure keeps the generic text.
+    """
+    group_names: list[str] = []
+    current = failure_tree
+    # Each group the Workflow node sits in failed because of it, so their names are collected, outermost first.
+    while isinstance(current, GroupFailure):
+        group_names.append(current.node_name)
+        current = current.inner
+    # Only a failed Workflow node has a nested message; any other failure keeps the iteration's own text.
+    if not isinstance(current, WorkflowNodeFailure):
+        return result_details
+    message = nested_workflow_message(current)
+    # Each group adds the frame it raises with, wrapping innermost first so the outermost group leads.
+    for group_name in reversed(group_names):
+        message = encountered_a_problem_message(group_name, message)
+    return message
+
+
+def encountered_a_problem_message(node_name: str, text: str) -> str:
+    """The message for a node that failed with ``text`` but does not name itself in it."""
+    return f"Node '{node_name}' encountered a problem: {text}"
 
 
 def format_node_failure_message(node_name: str, result: Any, exc: BaseException | None) -> str:
@@ -422,6 +521,99 @@ def _describe_iterations(ranges: tuple[IterationRange, ...], total_iterations: i
 def _numbers_in(ranges: tuple[IterationRange, ...]) -> Iterator[int]:
     for iteration_range in ranges:
         yield from range(iteration_range.first, iteration_range.last + 1)
+
+
+def _workflow_node_nested_report(failure_tree: WorkflowNodeFailure) -> _NestedReport:
+    path = _failure_path(failure_tree)[1:]
+    blamed_node_error_details = _blamed_node_error_details(path[-1])
+    depth = _workflow_depth(path)
+    message = _nested_message(failure_tree.node_name, path, blamed_node_error_details, depth)
+    return _NestedReport(path=path, blamed_node_error_details=blamed_node_error_details, message=message)
+
+
+def _is_budget_halt(failure_tree: FailureTree) -> TypeGuard[FailureLeaf]:
+    return isinstance(failure_tree, FailureLeaf) and failure_tree.kind is FailureKind.BUDGET_HALT
+
+
+def _failure_path(failure_tree: FailureTree) -> list[FailureTree]:
+    """The failures from this one down to the node that failed.
+
+    The path continues through a Workflow node or group to what failed inside it, and through a loop
+    whose iterations failed for exactly one reason that says what failed. It ends at a leaf, and at a
+    loop whose iterations failed for several reasons or for one that says nothing more, because no one
+    node explains such a loop.
+    """
+    path = [failure_tree]
+    current = failure_tree
+    while True:
+        child = _reported_child(current)
+        if child is None:
+            return path
+        path.append(child)
+        current = child
+
+
+def _reported_child(failure_tree: FailureTree) -> FailureTree | None:
+    # A leaf has nothing inside it. A Workflow node or group fails because of its inner failure. A loop is explained
+    # by its reason when it has exactly one.
+    match failure_tree:
+        case FailureLeaf():
+            return None
+        case WorkflowNodeFailure() | GroupFailure():
+            return failure_tree.inner
+        case LoopFailure():
+            # A single reason says which failure explains the loop. With several, no one node does, so the path ends at
+            # the loop.
+            if len(failure_tree.reasons) == 1:
+                return failure_tree.reasons[0].failure_tree
+            return None
+        case _:
+            assert_never(failure_tree)
+
+
+def _workflow_depth(path: list[FailureTree]) -> int:
+    """How many Workflow nodes a path of failures passes through."""
+    return sum(1 for step in path if isinstance(step, WorkflowNodeFailure))
+
+
+def _blamed_node_error_details(end: FailureTree) -> NodeErrorDetails:
+    """The error details of the node the failure path ends at; a loop is worded by its own summary."""
+    # A leaf has details of its own. A loop has none, so its summary is the message.
+    match end:
+        case FailureLeaf():
+            return end.details
+        case LoopFailure():
+            return build_node_error_details(end.node_name, RuntimeError(render_loop_message(end)))
+        case WorkflowNodeFailure() | GroupFailure():
+            # The path continues through a Workflow node or group, so it cannot end at one.
+            msg = "a failure path never ends at a node that holds an inner failure"
+            raise AssertionError(msg)
+        case _:
+            assert_never(end)
+
+
+def _nested_message(
+    workflow_node_name: str, path: list[FailureTree], blamed_node_error_details: NodeErrorDetails, depth: int
+) -> str:
+    failed_node = path[-1].node_name
+    # The wording follows how many Workflow nodes the failure passed through below this one.
+    if depth == 0:
+        where = f"node '{failed_node}' inside it failed"
+    elif depth == 1:
+        where = f"node '{failed_node}', inside a nested Workflow node, failed"
+    else:
+        where = f"node '{failed_node}', inside {depth} nested Workflow nodes, failed"
+    return f"Attempted to run the workflow behind node '{workflow_node_name}'. Failed because {where}: {blamed_node_error_details.message}"
+
+
+def _format_path(names: list[str]) -> str:
+    # A short path reads fine whole. A long one keeps only its ends, so the field stays short.
+    if len(names) <= MAX_PATH_ENTRIES_SHOWN:
+        return FAILED_NODE_PATH_SEPARATOR.join(names)
+    kept = PATH_ENTRIES_KEPT_AT_EACH_END
+    left_out = len(names) - 2 * kept
+    shown = [*names[:kept], f"\u2026 ({left_out} more)", *names[-kept:]]
+    return FAILED_NODE_PATH_SEPARATOR.join(shown)
 
 
 def _renamed_or_none(failure_tree: FailureTree | None, names: Mapping[str, str]) -> FailureTree | None:

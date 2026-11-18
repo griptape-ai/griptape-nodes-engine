@@ -926,7 +926,7 @@ class ExecuteDagState(State):
                     if isinstance(exc, ExecuteNodeFailureError):
                         msg = str(exc)
                     else:
-                        msg = f"Node '{node_name}' encountered a problem: {exc}"
+                        msg = failure_trees.encountered_a_problem_message(node_name, str(exc))
 
                     await context.engine.event_manager.aput_event(
                         context.workflow.execution_event(

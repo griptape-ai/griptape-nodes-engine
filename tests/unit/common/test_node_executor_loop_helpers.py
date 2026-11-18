@@ -22,27 +22,41 @@ These tests cover small, near-pure helpers that decide loop control flow:
 
 import logging
 from typing import Any, cast
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
 from griptape_nodes.common import failure_trees
 from griptape_nodes.common.failure_trees import IterationFailure
+from griptape_nodes.common.loop_body_scope import LoopBodyScope
 from griptape_nodes.common.node_executor import IterationControlAction, NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.execution_events import StartLocalSubflowResultFailure
+from griptape_nodes.retained_mode.events.failure_tree import FailureKind, FailureLeaf, WorkflowNodeFailure
 from griptape_nodes.retained_mode.events.flow_events import (
+    DeserializeFlowFromCommandsResultSuccess,
     OriginalNodeParameter,
     PackagedNodeParameterMapping,
+    PackageNodesAsSerializedFlowResultSuccess,
     PassthroughConnection,
+    SerializedFlowCommands,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     ListConnectionsForNodeResultSuccess,
     NodeDependencies,
     SerializedNodeCommands,
 )
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
+from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
@@ -772,3 +786,194 @@ class TestExtractIterationResultsFromSubprocess:
 
         assert successful == [0, 2]
         assert results == {1: None}
+
+
+def _leaf(node_name: str, message: str = "boom") -> FailureLeaf:
+    details = NodeErrorDetails(message=message, exception_type="builtins.ValueError")
+    return FailureLeaf(node_name=node_name, kind=FailureKind.RAISED, details=details)
+
+
+def _holding_workflow() -> Mock:
+    """A workflow for the loop helpers to run against."""
+    workflow = Mock(spec=WorkflowRuntime)
+    workflow.nodes = Mock(spec=WorkflowNodes)
+    workflow.context = Mock(spec=WorkflowContextStack)
+    workflow.context.has_current_flow.return_value = False
+    workflow.ahandle_request = AsyncMock(spec=WorkflowRuntime.ahandle_request)
+    return workflow
+
+
+class LoopIterationFixtures:
+    """The collaborators every loop-iteration executor test mocks."""
+
+    @pytest.fixture
+    def workflow(self) -> Mock:
+        workflow = _holding_workflow()
+        workflow.handle_request.return_value = DeserializeFlowFromCommandsResultSuccess(
+            result_details="ok", flow_name="Iteration_flow", node_name_mappings={"Start": "Start_1"}
+        )
+        return workflow
+
+    @pytest.fixture
+    def engine(self) -> Mock:
+        engine = Mock(spec=Engine)
+        engine.node_manager = Mock(spec=NodeManager)
+        engine.flow_manager = Mock(spec=FlowManager)
+        engine.event_manager = Mock(spec=EventManager)
+        engine.config_manager = Mock(spec=ConfigManager)
+        return engine
+
+    @pytest.fixture
+    def executor(self, engine: Mock, monkeypatch: pytest.MonkeyPatch) -> NodeExecutor:
+        executor = NodeExecutor(engine=engine)
+        monkeypatch.setattr(
+            executor,
+            "_loop_body_scope",
+            Mock(
+                spec=executor._loop_body_scope,
+                return_value=LoopBodyScope(
+                    canvas_node_names={"Body_1": "Body"}, engine_node_names=frozenset({"Start_1"})
+                ),
+            ),
+        )
+        mapping = PackagedNodeParameterMapping(node_name="Start", parameter_mappings={})
+        monkeypatch.setattr(
+            executor,
+            "get_node_parameter_mappings",
+            Mock(spec=executor.get_node_parameter_mappings, return_value=mapping),
+        )
+        monkeypatch.setattr(
+            executor,
+            "_forget_control_source_that_reached_end",
+            Mock(spec=executor._forget_control_source_that_reached_end),
+        )
+        monkeypatch.setattr(
+            executor,
+            "_get_iteration_control_action",
+            Mock(spec=executor._get_iteration_control_action, return_value=IterationControlAction.ADD),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_parameter_values_from_iterations",
+            Mock(spec=executor.get_parameter_values_from_iterations, return_value={}),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_last_iteration_values_for_packaged_nodes",
+            Mock(spec=executor.get_last_iteration_values_for_packaged_nodes, return_value={}),
+        )
+        monkeypatch.setattr(executor, "_delete_iteration_flows", AsyncMock(spec=executor._delete_iteration_flows))
+        monkeypatch.setattr(
+            NodeExecutor,
+            "_silence_packaged_node_creation_broadcasts",
+            Mock(spec=NodeExecutor._silence_packaged_node_creation_broadcasts),
+        )
+        return executor
+
+    @pytest.fixture
+    def package_result(self) -> Mock:
+        package_result = Mock(spec=PackageNodesAsSerializedFlowResultSuccess)
+        package_result.serialized_flow_commands = Mock(spec=SerializedFlowCommands)
+        return package_result
+
+
+class TestExecuteLoopIterationsSequentially(LoopIterationFixtures):
+    """A sequential loop reuses one iteration flow, names failures as the artist sees them, and carries on."""
+
+    SEQUENTIAL_ITERATIONS = 3
+
+    async def _run(self, executor: NodeExecutor, workflow: Mock, package_result: Mock) -> Any:
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+        return await executor._execute_loop_iterations_sequentially(
+            package_result=package_result,
+            total_iterations=self.SEQUENTIAL_ITERATIONS,
+            parameter_values_per_iteration={index: {} for index in range(self.SEQUENTIAL_ITERATIONS)},
+            end_loop_node=end_node,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failing_iteration_names_the_original_node_not_its_own_iteration_copy(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        copy_failure = _leaf("Body_1")
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(copy_failure)
+
+        _results, _successful, _last, _skipped, _broke, failures = await self._run(executor, workflow, package_result)
+
+        assert len(failures) == self.SEQUENTIAL_ITERATIONS
+        for failure in failures:
+            assert failure.failure_tree == _leaf("Body")
+
+    @pytest.mark.asyncio
+    async def test_a_failing_workflow_node_is_described_by_its_nested_message_and_named_as_the_artist_sees_it(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow_node_failure = WorkflowNodeFailure(node_name="Body_1", inner=_leaf("Deeper", "boom"))
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(workflow_node_failure)
+
+        _results, _successful, _last, _skipped, _broke, failures = await self._run(executor, workflow, package_result)
+
+        assert {failure.detail for failure in failures} == {
+            "Attempted to run the workflow behind node 'Body'. Failed because node 'Deeper' inside it failed: boom"
+        }
+        for failure in failures:
+            assert failure.failure_tree == WorkflowNodeFailure(node_name="Body", inner=_leaf("Deeper", "boom"))
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_is_recorded_and_the_loop_carries_on(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_leaf("Body_1"))
+
+        _results, successful_iterations, _last, _skipped, _broke, failures = await self._run(
+            executor, workflow, package_result
+        )
+
+        assert workflow.ahandle_request.await_count == self.SEQUENTIAL_ITERATIONS
+        assert successful_iterations == []
+        assert [failure.iteration_index for failure in failures] == [0, 1, 2]
+
+
+class TestExecuteLoopIterationsLocally(LoopIterationFixtures):
+    """A parallel loop names the failures its iterations report as the artist sees them."""
+
+    PARALLEL_ITERATIONS = 2
+
+    @pytest.fixture
+    def failure_lines(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        lines = Mock(spec=failure_trees.format_iteration_failure_lines, return_value=[])
+        monkeypatch.setattr(failure_trees, "format_iteration_failure_lines", lines)
+        return lines
+
+    @pytest.fixture(autouse=True)
+    def unlimited_parallelism(self, engine: Mock) -> None:
+        engine.config_manager.get_config_value.return_value = 0
+
+    @pytest.mark.asyncio
+    async def test_a_failing_iteration_names_the_original_node_not_its_own_iteration_copy(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock, failure_lines: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_leaf("Body_1"))
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+
+        await executor._execute_loop_iterations_locally(
+            package_result=package_result,
+            total_iterations=self.PARALLEL_ITERATIONS,
+            parameter_values_per_iteration={index: {} for index in range(self.PARALLEL_ITERATIONS)},
+            end_loop_node=end_node,
+        )
+
+        iteration_failures = failure_lines.call_args.args[0]
+        assert [failure.failure_tree for failure in iteration_failures] == [_leaf("Body")] * self.PARALLEL_ITERATIONS

@@ -1432,13 +1432,16 @@ class NodeExecutor(EngineScoped):
                     )
                     # Don't immediately store None - try to extract results first in case there are partial results
                     # (e.g., nested loop that had some failures but still produced output)
+                    iteration_failure_tree = failure_trees.failure_tree_from_subflow_result(
+                        start_subflow_result, loop_body_scope.canvas_node_names
+                    )
                     iteration_failures.append(
                         failure_trees.IterationFailure(
                             iteration_index=iteration_index,
-                            detail=str(start_subflow_result.result_details),
-                            failure_tree=failure_trees.failure_tree_from_subflow_result(
-                                start_subflow_result, loop_body_scope.canvas_node_names
+                            detail=failure_trees.iteration_failure_detail(
+                                iteration_failure_tree, str(start_subflow_result.result_details)
                             ),
+                            failure_tree=iteration_failure_tree,
                         )
                     )
                 else:
@@ -3381,13 +3384,16 @@ class NodeExecutor(EngineScoped):
                                 )
                             # The reason travels out with the verdict: this closure is the only place that
                             # holds it, so anything narrower than IterationOutcome loses it for good.
+                            iteration_failure_tree = failure_trees.failure_tree_from_subflow_result(
+                                start_subflow_result, loop_body_scope.canvas_node_names
+                            )
                             return failure_trees.IterationOutcome(
                                 iteration_index=iteration_index,
                                 succeeded=False,
-                                detail=str(start_subflow_result.result_details),
-                                failure_tree=failure_trees.failure_tree_from_subflow_result(
-                                    start_subflow_result, loop_body_scope.canvas_node_names
+                                detail=failure_trees.iteration_failure_detail(
+                                    iteration_failure_tree, str(start_subflow_result.result_details)
                                 ),
+                                failure_tree=iteration_failure_tree,
                             )
 
                 # Step 3: Set input values on start nodes for each iteration

@@ -4325,7 +4325,21 @@ class NodeManager(EngineScoped):
         return sendable
 
     def execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
-        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
+        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call.
+
+        A halt found under Workflow nodes is reported in the halt's own wording, so the run stops exactly
+        as a halt at the top level does. The failure stays the Workflow node's, so a Workflow node above
+        adds itself to the path instead of starting a new one.
+        """
+        failure_tree = failure_trees.failure_tree_from_exception(node_name, exc)
+        nested_halt_wording = failure_trees.budget_halt_behind_workflow_node(failure_tree)
+        # A budget halt behind Workflow nodes is worded as the halt, while the failure stays the Workflow node's own.
+        if nested_halt_wording is not None:
+            return ExecuteNodeResultFailure(
+                result_details=nested_halt_wording,
+                exception=exc,
+                error=failure_trees.render_error_details(failure_tree, text=str(exc), node_name=node_name),
+            ).attach_failure_tree(failure_tree)
         budget_halt = self._budget_halt_for(exc, node_name)
         if budget_halt is not None:
             # The engine words the halt, so it carries no node-built details.
@@ -4335,7 +4349,6 @@ class NodeManager(EngineScoped):
             ).attach_failure_tree(failure_trees.failure_tree_from_exception(node_name, exc, budget_halt=budget_halt))
         # The raised exception itself, so its traceback crosses the worker boundary. The details are
         # built here, where the real exception and anything it attached still exist.
-        failure_tree = failure_trees.failure_tree_from_exception(node_name, exc)
         return ExecuteNodeResultFailure(
             result_details=f"Attempted to execute node '{node_name}'. Failed with error: {exc}",
             exception=exc,
