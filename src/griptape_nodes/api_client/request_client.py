@@ -119,6 +119,8 @@ class RequestClient:
         payload: dict[str, Any],
         topic: str | None = None,
         timeout_ms: int | None = None,
+        *,
+        open_workflow_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a request and wait for its response.
 
@@ -134,6 +136,8 @@ class RequestClient:
             payload: Request payload data
             topic: Optional per-call request topic override (defaults to request_topic_fn())
             timeout_ms: Optional timeout in milliseconds
+            open_workflow_id: Id of the open workflow the request runs in, sent on its envelope.
+                Left out, the engine decides, as `EventRequest.open_workflow_id` describes.
 
         Returns:
             Response data from the server
@@ -158,13 +162,7 @@ class RequestClient:
             self._subscribed_response_topics.add(response_topic)
 
         # Send the request as an EventRequest
-        event_payload = {
-            "event_type": "EventRequest",
-            "request_type": request_type,
-            "request_id": request_id,
-            "request": payload,
-            "response_topic": response_topic,
-        }
+        event_payload = _event_request(request_type, request_id, payload, response_topic, open_workflow_id)
 
         logger.debug("Sending request %s: %s", request_id, request_type)
 
@@ -197,6 +195,7 @@ class RequestClient:
         timeout_ms: int | None = None,
         *,
         return_exceptions: bool = False,
+        open_workflow_id: str | None = None,
     ) -> list[Any]:
         """Send a batch of requests in one frame and gather their responses.
 
@@ -212,6 +211,8 @@ class RequestClient:
             timeout_ms: Optional timeout applied to the whole batch.
             return_exceptions: If True, failures and timeouts are returned in
                 their slot instead of raising. Matches asyncio.gather semantics.
+            open_workflow_id: Id of the open workflow every inner request runs in, as `request`
+                takes it.
 
         Returns:
             Responses in submission order. When return_exceptions is False, a
@@ -245,15 +246,7 @@ class RequestClient:
             payload = {**raw_payload, "request_id": request_id}
             futures.append(await self._track_request(request_id))
             request_ids.append(request_id)
-            inner_events.append(
-                {
-                    "event_type": "EventRequest",
-                    "request_type": request_type,
-                    "request_id": request_id,
-                    "request": payload,
-                    "response_topic": response_topic,
-                }
-            )
+            inner_events.append(_event_request(request_type, request_id, payload, response_topic, open_workflow_id))
 
         batch_payload = {"event_type": "EventRequestBatch", "requests": inner_events}
         logger.debug("Sending batch of %d requests on %s", len(inner_events), request_topic)
@@ -515,3 +508,23 @@ class RequestClient:
                 return True
 
         return False
+
+
+def _event_request(
+    request_type: str,
+    request_id: str,
+    payload: dict[str, Any],
+    response_topic: str,
+    open_workflow_id: str | None,
+) -> dict[str, Any]:
+    """Build an EventRequest envelope, naming `open_workflow_id` only when there is one."""
+    event_request: dict[str, Any] = {
+        "event_type": "EventRequest",
+        "request_type": request_type,
+        "request_id": request_id,
+        "request": payload,
+        "response_topic": response_topic,
+    }
+    if open_workflow_id is not None:
+        event_request["open_workflow_id"] = open_workflow_id
+    return event_request

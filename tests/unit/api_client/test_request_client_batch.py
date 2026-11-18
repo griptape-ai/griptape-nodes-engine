@@ -240,3 +240,42 @@ class TestDefaultResponseTopic:
         _, payload, topic = fake_client.publish.await_args.args
         assert topic == "request"
         assert payload["requests"][0]["response_topic"] == own_topic
+
+
+class TestOpenWorkflowId:
+    @pytest.mark.asyncio
+    async def test_request_names_the_workflow_on_its_envelope(
+        self, request_client: RequestClient, fake_client: _FakeClient
+    ) -> None:
+        with pytest.raises(TimeoutError):
+            await request_client.request("CreateNodeRequest", {}, timeout_ms=1, open_workflow_id="workflow-1")
+
+        assert fake_client.publish.await_args is not None
+        _, envelope, _ = fake_client.publish.await_args.args
+        assert envelope["open_workflow_id"] == "workflow-1"
+
+    @pytest.mark.asyncio
+    async def test_request_naming_no_workflow_leaves_it_off_the_envelope(
+        self, request_client: RequestClient, fake_client: _FakeClient
+    ) -> None:
+        with pytest.raises(TimeoutError):
+            await request_client.request("CreateNodeRequest", {}, timeout_ms=1)
+
+        assert fake_client.publish.await_args is not None
+        _, envelope, _ = fake_client.publish.await_args.args
+        assert "open_workflow_id" not in envelope
+
+    @pytest.mark.asyncio
+    async def test_batch_names_the_workflow_on_every_inner_request(
+        self, request_client: RequestClient, fake_client: _FakeClient
+    ) -> None:
+        with pytest.raises(TimeoutError):
+            await request_client.request_batch(
+                [("CreateNodeRequest", {}), ("CreateConnectionRequest", {})],
+                timeout_ms=1,
+                open_workflow_id="workflow-1",
+            )
+
+        assert fake_client.publish.await_args is not None
+        _, batch, _ = fake_client.publish.await_args.args
+        assert [inner["open_workflow_id"] for inner in batch["requests"]] == ["workflow-1", "workflow-1"]
