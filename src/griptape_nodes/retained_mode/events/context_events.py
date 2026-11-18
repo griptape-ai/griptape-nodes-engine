@@ -278,27 +278,28 @@ class ListOpenWorkflowsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 @dataclass
 @PayloadRegistry.register
 class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
-    """Ensure a workflow + flow context exists, creating scratch ones if needed.
+    """Get a workflow with a top-level flow ready to build into, opening a new workflow if needed.
 
-    Use when: Bootstrapping from a cold engine state. This is the typical opening call from
-    an MCP client that is about to build a workflow from scratch. Idempotent: if both a
-    workflow and a flow are already in the current context, returns their names without
-    creating new ones. Only creates the pieces that are missing.
+    Use when: Starting to build. This is the typical opening call from an MCP client or script.
+    With the envelope's `open_workflow_id` set, it builds into that open workflow and creates its
+    flow only if it has none. With it left out, it opens the workflow `workflow_name` names, or a
+    new unsaved one, even while other workflows are open, so calling it twice without naming a
+    workflow opens two. Send the result's `workflow_id` as `open_workflow_id` on every later
+    request. An MCP session that sends no `X-Griptape-Workflow-Id` header remembers the workflow
+    for its later calls instead.
 
     Args:
-        workflow_name: Registered workflow to enter if no workflow is in context. Ignored
-            when a workflow is already in context. When None, the engine registers a new
-            unsaved workflow and returns its key in the success result. A name the registry
-            does not hold fails; pass display_name to name a new workflow. So does a workflow
-            with a file that isn't open, since this request doesn't load its nodes: open it
-            with OpenWorkflowRequest.
-        display_name: Human-readable name attached to the auto-registered unsaved
-            entry. Ignored when the workflow is already in context or when a saved
-            workflow_name is supplied.
-        flow_name: Name to use if a new flow must be created. Ignored when a flow is
-            already in context. Defaults to the engine-assigned name.
+        workflow_name: Registered workflow to open when the envelope names none. Ignored when it
+            names one. When None, the engine registers a new unsaved workflow and returns its key
+            in the success result. A name the registry does not hold fails; pass display_name to
+            name a new workflow. So does a workflow with a file that isn't open, since this request
+            doesn't load its nodes: open it with OpenWorkflowRequest.
+        display_name: Human-readable name attached to a new unsaved workflow. Ignored when the
+            workflow is already open or when a saved workflow_name is supplied.
+        flow_name: Name to use if a new flow must be created. Ignored when the workflow already
+            has a flow. Defaults to the engine-assigned name.
         working_directory: Folder the workflow belongs to until it is saved, forwarded to
-            SetWorkflowContextRequest. Ignored when a workflow is already in context. See
+            SetWorkflowContextRequest. Ignored when the workflow is already open. See
             SetWorkflowContextRequest for what the value means and how it is normalized.
 
     Results: EnsureWorkflowAndFlowResultSuccess | EnsureWorkflowAndFlowResultFailure
@@ -313,14 +314,15 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
 @dataclass
 @PayloadRegistry.register
 class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Workflow + flow context is ready for subsequent CreateNode calls.
+    """The workflow and its top-level flow are ready for CreateNode calls that name the workflow.
 
     Args:
-        workflow_name: Name of the workflow in the current context.
-        flow_name: Name of the flow in the current context.
-        created_workflow: True if this call created the workflow; False if an existing one was reused.
-        created_flow: True if this call created the flow; False if an existing one was reused.
-        workflow_id: Id of the workflow in the current context.
+        workflow_name: Name of the workflow the request used or opened.
+        flow_name: Name of the workflow's top-level flow.
+        created_workflow: True if this call opened a new workflow; False if it used one already open.
+        created_flow: True if this call created the flow; False if the workflow already had one.
+        workflow_id: Id of the workflow the request used or opened. Send it as `open_workflow_id`
+            on later requests.
         open_workflow: The workflow open after the request, as `ListOpenWorkflowsRequest` lists it: the
             one it used or opened.
     """
