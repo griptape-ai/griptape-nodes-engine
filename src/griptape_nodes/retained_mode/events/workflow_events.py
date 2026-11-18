@@ -437,9 +437,11 @@ class RenameWorkflowRequest(RequestPayload):
     fixing naming conflicts, workflow management.
 
     Name the workflow by `workflow_id`, by `workflow_name`, or by both when they name the same
-    one. It ignores the envelope's `open_workflow_id`. An open workflow saves its graph to the new
-    file. A closed one moves its file and rewrites the name in its header. Either way it keeps its
-    id, and the old file is removed. A rename never replaces another workflow's file.
+    one. It ignores the envelope's `open_workflow_id`. The rename moves the workflow's file and
+    rewrites the name in its header, whether the workflow is open or not, and the workflow keeps its
+    id. An open workflow stays open on the renamed file, and edits it has not saved stay unsaved. An
+    unsaved workflow has no file, so renaming one is refused: save it under the name instead. A
+    rename never replaces another file.
 
     Args:
         workflow_name: Current registry name of the workflow

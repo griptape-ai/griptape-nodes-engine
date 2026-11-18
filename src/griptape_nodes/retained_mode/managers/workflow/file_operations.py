@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from griptape_nodes.files.project_file import ProjectFileDestination
@@ -17,7 +17,6 @@ from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileResultFailure,
     DeletionBehavior,
     ExistingFilePolicy,
-    FileIOFailureReason,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
@@ -30,9 +29,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RenameWorkflowRequest,
     RenameWorkflowResultFailure,
     RenameWorkflowResultSuccess,
-    SaveWorkflowRequest,
-    SaveWorkflowResultFailure,
-    SaveWorkflowResultSuccess,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.string_utils import normalize_display_name
@@ -44,7 +40,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 logger = logging.getLogger("griptape_nodes")
@@ -112,10 +107,10 @@ class WorkflowFileOperations(EngineScoped):
 
     @handles(RenameWorkflowRequest)
     async def on_rename_workflow_request(self, request: RenameWorkflowRequest) -> ResultPayload:
-        """Rename the workflow the request names, keeping its id.
+        """Rename the workflow the request names, keeping its id: move its file and rewrite the name in its header.
 
-        An open workflow saves its own graph to the new file. A closed one moves its file and
-        rewrites the name in its header.
+        Open or closed, a rename only touches the file. An open workflow stays open on the renamed
+        file, and edits it has not saved stay unsaved.
         """
         try:
             source = self.engine.workflow_registry.resolve_address(
@@ -145,12 +140,7 @@ class WorkflowFileOperations(EngineScoped):
             )
             return RenameWorkflowResultFailure(result_details=details)
 
-        open_source = self.engine.open_workflows.find(source.workflow_id)
-        if open_source is not None:
-            return await self._rename_open_workflow(
-                open_source, source=source, sanitized_stem=sanitized_stem, display_name=display_name
-            )
-        return await self._rename_closed_workflow(source, sanitized_stem=sanitized_stem, display_name=display_name)
+        return await self._rename_workflow(source, sanitized_stem=sanitized_stem, display_name=display_name)
 
     @handles(MoveWorkflowRequest)
     def on_move_workflow_request(self, request: MoveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911
@@ -252,97 +242,24 @@ class WorkflowFileOperations(EngineScoped):
                 result_details=ResultDetails(message=details, level=logging.INFO),
             )
 
-    async def _rename_open_workflow(
-        self,
-        open_source: WorkflowRuntime,
-        *,
-        source: Workflow,
-        sanitized_stem: str,
-        display_name: str,
-    ) -> ResultPayload:
-        """Rename an open workflow: save its live graph to the new file under its own id, then delete the old file.
+    async def _rename_workflow(self, source: Workflow, *, sanitized_stem: str, display_name: str) -> ResultPayload:
+        """Move the saved `source`'s file to `sanitized_stem` and rewrite the name in its header.
 
-        `open_source` is the runtime of `source`. The workflow stays open and keeps its id; only its
-        file and name change.
-        """
-        previous_name = source.name
-        previous_absolute_path = source.absolute_path
-        previous_file_path = source.file_path
-
-        # Rename keeps the workflow's location (unlike Move). Inherit the source workflow's
-        # directory and prepend it to the sanitized stem so the renamed file stays put:
-        # a workspace sub-dir ("bar/new_name") or an external absolute path ("/ext/new_name").
-        # The combined name is NOT re-run through normalize_display_name, so its "/" survives.
-        requested_file_name = sanitized_stem
-        if previous_file_path:
-            source_dir = PurePosixPath(previous_file_path.replace("\\", "/")).parent
-            if str(source_dir) not in ("", "."):
-                requested_file_name = f"{source_dir}/{sanitized_stem}"
-
-        # Bound as dispatch binds a SaveWorkflowRequest's workflow: codegen reads some of its
-        # settings, such as variable substitution, through the binding. `overwrite_existing=False`
-        # refuses a new name that is another workflow's.
-        with self.engine.bind_workflow(open_source):
-            save_result = await self.engine.workflow_manager.saver.save_open_workflow(
-                open_source,
-                SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name, overwrite_existing=False),
-                keep_open_workflow_identity=True,
-            )
-        if not isinstance(save_result, SaveWorkflowResultSuccess):
-            reason = f"saving it there failed: {save_result.result_details}"
-            if (
-                isinstance(save_result, SaveWorkflowResultFailure)
-                and save_result.failure_reason == FileIOFailureReason.POLICY_NO_OVERWRITE
-            ):
-                reason = "another workflow or file already has that name"
-            details = (
-                f"Attempted to rename workflow '{previous_name}' to '{requested_file_name}'. Failed because {reason}."
-            )
-            return RenameWorkflowResultFailure(result_details=details)
-
-        # If the renamed file landed outside the workspace, keep it registered at its new path.
-        self.engine.workflow_manager.persist_external_workflow_registration(str(save_result.file_path))
-
-        cleanup_warnings: list[ResultDetail] = []
-        if previous_file_path is not None and previous_absolute_path is not None:
-            cleanup_warnings = await self._remove_file_renamed_from(
-                source,
-                previous_name=previous_name,
-                previous_file_path=previous_file_path,
-                previous_absolute_path=previous_absolute_path,
-            )
-
-        return RenameWorkflowResultSuccess(
-            new_workflow_name=save_result.workflow_name,
-            workflow_id=source.workflow_id,
-            result_details=ResultDetails(
-                ResultDetail(
-                    message=f"Successfully renamed workflow to: {save_result.workflow_name}", level=logging.INFO
-                ),
-                *cleanup_warnings,
-            ),
-        )
-
-    async def _rename_closed_workflow(
-        self, source: Workflow, *, sanitized_stem: str, display_name: str
-    ) -> ResultPayload:
-        """Rename a workflow that isn't open: move its file and rewrite the name in its header.
-
-        The file stays in its folder. No graph is involved, so the file's content is unchanged
-        apart from its header.
+        The file stays in its folder, and its content is unchanged apart from its header. An open
+        workflow's live graph is not saved.
         """
         previous_name = source.name
         previous_absolute_path = source.absolute_path
         previous_file_path = source.file_path
         if previous_absolute_path is None or previous_file_path is None:
             details = (
-                f"Attempted to rename workflow '{previous_name}'. Failed because it is neither saved nor open, "
-                "so it has no file or graph to rename."
+                f"Attempted to rename workflow '{previous_name}'. Failed because it isn't saved, so it has no "
+                "file to rename. Save it under the name you want instead."
             )
             return RenameWorkflowResultFailure(result_details=details)
         new_absolute_path = previous_absolute_path.with_name(f"{sanitized_stem}{previous_absolute_path.suffix}")
         moves_file = new_absolute_path != previous_absolute_path
-        refusal = self._refuse_closed_rename(source, sanitized_stem=sanitized_stem, new_absolute_path=new_absolute_path)
+        refusal = self._refuse_rename(source, sanitized_stem=sanitized_stem, new_absolute_path=new_absolute_path)
         if refusal is not None:
             return RenameWorkflowResultFailure(result_details=refusal)
 
@@ -396,13 +313,13 @@ class WorkflowFileOperations(EngineScoped):
             ),
         )
 
-    def _refuse_closed_rename(self, source: Workflow, *, sanitized_stem: str, new_absolute_path: Path) -> str | None:
-        """Return why the closed, saved `source` can't be renamed to `new_absolute_path`, or None if it can."""
+    def _refuse_rename(self, source: Workflow, *, sanitized_stem: str, new_absolute_path: Path) -> str | None:
+        """Return why the saved `source` can't be renamed to `new_absolute_path`, or None if it can."""
         # Rewriting the header would replace what it holds with made-up values.
         if source.metadata_is_placeholder:
             return (
                 f"Attempted to rename workflow '{source.name}'. Failed because its file's metadata header "
-                "could not be read. Open the workflow and save it to regenerate the header."
+                "could not be read. Save the workflow to regenerate the header."
             )
         if new_absolute_path == source.absolute_path:
             return None

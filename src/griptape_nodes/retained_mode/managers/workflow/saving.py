@@ -251,19 +251,15 @@ class WorkflowSaver(EngineScoped):
         return WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
     @handles(SaveWorkflowRequest)
-    async def on_save_workflow_request(self, request: SaveWorkflowRequest, workflow: WorkflowRuntime) -> ResultPayload:
-        return await self.save_open_workflow(workflow, request)
-
-    async def save_open_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
-        self, workflow: WorkflowRuntime, request: SaveWorkflowRequest, *, keep_open_workflow_identity: bool = False
+    async def on_save_workflow_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
+        self, request: SaveWorkflowRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Save the open `workflow` as `request` describes.
 
         Where the file lands decides which workflow it is. The workflow's own file, and the first
         save of an unsaved workflow, continue the workflow under its id; anything else is a copy
         with an id of its own, unless `request.continue_in_copy` keeps the workflow on the copy.
-        `keep_open_workflow_identity` makes the save move the workflow to the new file instead of
-        copying it, which is what a rename is. A save onto another open workflow's file is refused.
+        A save onto another open workflow's file is refused.
         """
         # Determine save target (file path, name, metadata)
         current_workflow = self.engine.workflow_registry.get(workflow.workflow_id)
@@ -319,19 +315,6 @@ class WorkflowSaver(EngineScoped):
             )
             return SaveWorkflowResultFailure(result_details=msg)
 
-        # A rename moves the workflow to the new file, so it must never replace one: the file
-        # there may be an unregistered module the policy above can't see.
-        if keep_open_workflow_identity and not is_self_save:
-            existing_path = self._existing_file_at(destination)
-            if existing_path is not None:
-                details = (
-                    f"Attempted to save workflow '{current_workflow_name}' to '{relative_file_path}'. "
-                    f"Failed because a file already exists at '{existing_path}'."
-                )
-                return SaveWorkflowResultFailure(
-                    result_details=details, failure_reason=FileIOFailureReason.POLICY_NO_OVERWRITE
-                )
-
         # Writing there would take the file, and so the identity, of a workflow open in another tab.
         workflow_at_destination = self._workflow_at_destination(destination)
         if (
@@ -386,9 +369,7 @@ class WorkflowSaver(EngineScoped):
             workflow_shape = None
 
         continues_open_workflow = self._save_continues_open_workflow(
-            destination=destination,
-            current_workflow=current_workflow,
-            keep_open_workflow_identity=keep_open_workflow_identity,
+            destination=destination, current_workflow=current_workflow
         )
         continues_in_copy = request.continue_in_copy and not continues_open_workflow
         # The file holds the open workflow, under its id, or a copy, which is a new workflow.
@@ -477,31 +458,17 @@ class WorkflowSaver(EngineScoped):
         *,
         destination: ProjectFileDestination,
         current_workflow: Workflow,
-        keep_open_workflow_identity: bool,
     ) -> bool:
         """Whether the file a save writes continues the open workflow, rather than being a copy of it.
 
         Decided before the write, while `destination` can still be compared with the workflow's
-        own file. The open workflow continues into its own file, into the first file an unsaved
-        workflow is saved to, and into the file a rename moves it to. Every other save is a copy
+        own file, and into the first file an unsaved workflow is saved to. Every other save is a copy
         (Save As, a versioned save), which is a new workflow with an id of its own unless the
         save continues in it.
         """
-        if keep_open_workflow_identity or not current_workflow.is_saved:
+        if not current_workflow.is_saved:
             return True
         return self._workflow_at_destination(destination) is current_workflow
-
-    def _existing_file_at(self, destination: ProjectFileDestination) -> Path | None:
-        """The file already at `destination`, or None when there is none or its macro can't resolve yet."""
-        if destination.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
-            return None
-        try:
-            resolved_path = Path(destination.resolve())
-        except FileLoadError:
-            return None
-        if not resolved_path.exists():
-            return None
-        return resolved_path
 
     def _workflow_at_destination(self, destination: ProjectFileDestination) -> Workflow | None:
         """The registered workflow whose file a write to `destination` lands on, or None.

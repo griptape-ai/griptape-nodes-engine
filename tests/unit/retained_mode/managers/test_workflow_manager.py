@@ -4,11 +4,12 @@ import contextlib
 import contextvars
 import logging
 import re
+import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
-from unittest.mock import AsyncMock, MagicMock, Mock, call, create_autospec, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, create_autospec, patch
 
 import anyio
 import pytest
@@ -1123,8 +1124,6 @@ class TestWorkflowManager:
         workflow_name: str
         requested_name: str
         source_file_path: str
-        save_file_path: str
-        save_workflow_name: str
         source_display_name: str = "source-display-name"
 
     def _run_rename(
@@ -1134,56 +1133,70 @@ class TestWorkflowManager:
         *,
         request_kwargs: dict[str, Any] | None = None,
     ) -> dict:
-        """Drive on_rename_workflow_request for an open workflow with a mocked save, capturing the SaveWorkflowRequest.
+        """Rename a real workflow file as `scenario` describes, and capture where it went and the name in its header.
 
-        ``request_kwargs`` is merged into the RenameWorkflowRequest constructor so individual tests can
-        exercise display_name_behavior / display_name without changing the shared scenario tuple.
+        A relative `source_file_path` is in the workspace; an absolute one ("/ext/...") is under a
+        folder outside it. ``request_kwargs`` is merged into the RenameWorkflowRequest constructor so
+        individual tests can exercise display_name_behavior / display_name.
         """
         from griptape_nodes.retained_mode.events.workflow_events import (
             RenameWorkflowRequest,
             RenameWorkflowResultSuccess,
-            SaveWorkflowRequest,
-            SaveWorkflowResultSuccess,
         )
 
         engine = workflow_manager.engine
-        mock_source = MagicMock()
-        mock_source.file_path = scenario.source_file_path
-        # No file to delete afterwards: these tests are about what the save is asked for.
-        mock_source.absolute_path = None
-        mock_source.metadata.name = scenario.source_display_name
-        mock_source.metadata.is_griptape_provided = False
-        captured: dict[str, object] = {}
-
-        async def fake_save(_workflow: WorkflowRuntime, req: SaveWorkflowRequest, **_: Any) -> object:
-            captured["save_file_name"] = req.file_name
-            captured["save_display_name"] = req.display_name
-            return SaveWorkflowResultSuccess(
-                file_path=scenario.save_file_path,
-                workflow_name=scenario.save_workflow_name,
-                result_details="ok",
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            workspace = root / "workspace"
+            workspace.mkdir()
+            source_path = Path(scenario.source_file_path)
+            if source_path.is_absolute():
+                source_path = root / source_path.relative_to(source_path.anchor)
+            else:
+                source_path = workspace / source_path
+            metadata = WorkflowMetadata(
+                name=scenario.source_display_name,
+                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                engine_version_created_with="0.0.0",
+                node_libraries_referenced=[],
             )
-
-        with (
-            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_source),
-            patch.object(engine.open_workflows, "find", return_value=WorkflowRuntime("renamed", engine)),
-            patch.object(workflow_manager.saver, "save_open_workflow", side_effect=fake_save),
-            patch.object(workflow_manager, "persist_external_workflow_registration") as mock_persist,
-        ):
-            result = asyncio.run(
-                workflow_manager.file_operations.on_rename_workflow_request(
-                    RenameWorkflowRequest(
-                        workflow_name=scenario.workflow_name,
-                        requested_name=scenario.requested_name,
-                        **(request_kwargs or {}),
-                    )
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_text(
+                workflow_manager.codegen.replace_workflow_metadata_header(
+                    "# /// script\n# ///\nprint('body')\n", metadata, workflow_id=new_workflow_id()
                 )
+                or "",
+                encoding="utf-8",
             )
-
-        assert isinstance(result, RenameWorkflowResultSuccess)
-        captured["result_new_name"] = result.new_workflow_name
-        captured["persist_calls"] = mock_persist.call_args_list
-        return captured
+            original_workspace = engine.config_manager.workspace_path
+            engine.config_manager.workspace_path = workspace
+            source = engine.workflow_registry.register_file(source_path, metadata)
+            try:
+                with patch.object(workflow_manager, "persist_external_workflow_registration") as mock_persist:
+                    result = asyncio.run(
+                        workflow_manager.file_operations.on_rename_workflow_request(
+                            RenameWorkflowRequest(
+                                workflow_id=source.workflow_id,
+                                requested_name=scenario.requested_name,
+                                **(request_kwargs or {}),
+                            )
+                        )
+                    )
+                assert isinstance(result, RenameWorkflowResultSuccess), result.result_details
+                assert source.absolute_path is not None
+                return {
+                    "new_name": result.new_workflow_name,
+                    "new_path": source.absolute_path.relative_to(root).as_posix(),
+                    "display_name": read_workflow_metadata(source.absolute_path).name,
+                    "source_still_there": source_path.exists(),
+                    "persist_calls": [
+                        Path(persisted.args[0]).relative_to(root).as_posix()
+                        for persisted in mock_persist.call_args_list
+                    ],
+                }
+            finally:
+                engine.workflow_registry.remove(source.workflow_id)
+                engine.config_manager.workspace_path = original_workspace
 
     def test_rename_preserves_workspace_subdir(self, engine: Engine) -> None:
         """Renaming a workflow in a sub-directory keeps it there (bar/workflow -> bar/new_name)."""
@@ -1193,11 +1206,11 @@ class TestWorkflowManager:
                 workflow_name="bar/workflow",
                 requested_name="new_name",
                 source_file_path="bar/workflow.py",
-                save_file_path="/workspace/bar/new_name.py",
-                save_workflow_name="bar/new_name",
             ),
         )
-        assert captured["save_file_name"] == "bar/new_name"
+        assert captured["new_name"] == "bar/new_name"
+        assert captured["new_path"] == "workspace/bar/new_name.py"
+        assert not captured["source_still_there"]
 
     def test_rename_root_workflow_has_no_directory(self, engine: Engine) -> None:
         """Renaming a workspace-root workflow has no directory prefix."""
@@ -1207,11 +1220,10 @@ class TestWorkflowManager:
                 workflow_name="workflow",
                 requested_name="new_name",
                 source_file_path="workflow.py",
-                save_file_path="/workspace/new_name.py",
-                save_workflow_name="new_name",
             ),
         )
-        assert captured["save_file_name"] == "new_name"
+        assert captured["new_name"] == "new_name"
+        assert captured["new_path"] == "workspace/new_name.py"
 
     def test_rename_preserves_absolute_dir_and_reregisters(self, engine: Engine) -> None:
         """Renaming an externally-registered (absolute path) workflow keeps it external and re-registers it."""
@@ -1221,14 +1233,11 @@ class TestWorkflowManager:
                 workflow_name="/ext/workflow",
                 requested_name="new_name",
                 source_file_path="/ext/workflow.py",
-                save_file_path="/ext/new_name.py",
-                save_workflow_name="/ext/new_name",
             ),
         )
-        assert captured["save_file_name"] == "/ext/new_name"
+        assert captured["new_path"] == "ext/new_name.py"
         # The new absolute path is handed to the external-registration helper.
-        persist_calls = captured["persist_calls"]
-        assert persist_calls == [call("/ext/new_name.py")]
+        assert captured["persist_calls"] == ["ext/new_name.py"]
 
     def test_rename_returns_new_registry_key(self, engine: Engine) -> None:
         """The returned new_workflow_name is the real directory-qualified key, not the bare stem."""
@@ -1238,11 +1247,9 @@ class TestWorkflowManager:
                 workflow_name="bar/workflow",
                 requested_name="new_name",
                 source_file_path="bar/workflow.py",
-                save_file_path="/workspace/bar/new_name.py",
-                save_workflow_name="bar/new_name",
             ),
         )
-        assert captured["result_new_name"] == "bar/new_name"
+        assert captured["new_name"] == "bar/new_name"
 
     def test_rename_default_matches_file_name(self, engine: Engine) -> None:
         """Default behavior (MATCH_FILE_NAME): display name tracks the new file basename.
@@ -1256,15 +1263,13 @@ class TestWorkflowManager:
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
                 source_file_path="my_workflow.py",
-                save_file_path="/workspace/my_workflow_renamed.py",
-                save_workflow_name="my_workflow_renamed",
                 source_display_name="My Cool Workflow",
             ),
         )
-        assert captured["save_display_name"] == "my_workflow_renamed"
+        assert captured["display_name"] == "my_workflow_renamed"
 
     def test_rename_preserve_existing_keeps_display_name(self, engine: Engine) -> None:
-        """PRESERVE_EXISTING opt-in: SaveWorkflowRequest receives the source's metadata.name, not the new file stem.
+        """PRESERVE_EXISTING opt-in: the renamed header keeps the source's metadata.name, not the new file stem.
 
         Fix for issue #4992 — with this enum value, renaming a workflow whose display name diverges
         from its filename no longer overwrites metadata.name.
@@ -1277,16 +1282,14 @@ class TestWorkflowManager:
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
                 source_file_path="my_workflow.py",
-                save_file_path="/workspace/my_workflow_renamed.py",
-                save_workflow_name="my_workflow_renamed",
                 source_display_name="My Cool Workflow",
             ),
             request_kwargs={"display_name_behavior": RenameDisplayNameBehavior.PRESERVE_EXISTING},
         )
-        assert captured["save_display_name"] == "My Cool Workflow"
+        assert captured["display_name"] == "My Cool Workflow"
 
     def test_rename_override_uses_provided_display_name(self, engine: Engine) -> None:
-        """OVERRIDE forwards the caller-supplied display_name to SaveWorkflowRequest."""
+        """OVERRIDE writes the caller-supplied display_name to the renamed header."""
         from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
 
         captured = self._run_rename(
@@ -1295,8 +1298,6 @@ class TestWorkflowManager:
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
                 source_file_path="my_workflow.py",
-                save_file_path="/workspace/my_workflow_renamed.py",
-                save_workflow_name="my_workflow_renamed",
                 source_display_name="My Cool Workflow",
             ),
             request_kwargs={
@@ -1304,7 +1305,7 @@ class TestWorkflowManager:
                 "display_name": "Renamed On Purpose",
             },
         )
-        assert captured["save_display_name"] == "Renamed On Purpose"
+        assert captured["display_name"] == "Renamed On Purpose"
 
     def test_rename_override_strips_surrounding_whitespace(self, engine: Engine) -> None:
         """OVERRIDE forwards ``display_name`` stripped so validation and resolution agree on the canonical form.
@@ -1322,8 +1323,6 @@ class TestWorkflowManager:
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
                 source_file_path="my_workflow.py",
-                save_file_path="/workspace/my_workflow_renamed.py",
-                save_workflow_name="my_workflow_renamed",
                 source_display_name="My Cool Workflow",
             ),
             request_kwargs={
@@ -1331,7 +1330,7 @@ class TestWorkflowManager:
                 "display_name": "  My Name  ",
             },
         )
-        assert captured["save_display_name"] == "My Name"
+        assert captured["display_name"] == "My Name"
 
     @pytest.mark.parametrize(
         "non_override_behavior",
@@ -1431,17 +1430,15 @@ class TestWorkflowManager:
                 workflow_name="my_workflow",
                 requested_name="my_workflow_renamed",
                 source_file_path="my_workflow.py",
-                save_file_path="/workspace/my_workflow_renamed.py",
-                save_workflow_name="my_workflow_renamed",
                 source_display_name="   ",  # whitespace-only: strip()==""
             ),
             request_kwargs={"display_name_behavior": RenameDisplayNameBehavior.PRESERVE_EXISTING},
         )
-        assert captured["save_display_name"] == "my_workflow_renamed"
+        assert captured["display_name"] == "my_workflow_renamed"
 
     @pytest.mark.parametrize("failing_cleanup", ["file", "config"])
     def test_rename_reports_a_failed_cleanup_of_the_old_file_as_a_warning(
-        self, engine: Engine, failing_cleanup: str
+        self, engine: Engine, failing_cleanup: str, tmp_path: Path
     ) -> None:
         """A rename whose old file or config entry can't be removed afterwards still succeeds, and says what is left.
 
@@ -1451,24 +1448,29 @@ class TestWorkflowManager:
         from griptape_nodes.retained_mode.events.workflow_events import (
             RenameWorkflowRequest,
             RenameWorkflowResultSuccess,
-            SaveWorkflowRequest,
-            SaveWorkflowResultSuccess,
         )
 
         workflow_manager = engine.workflow_manager
-        mock_source = MagicMock()
-        mock_source.name = "old"
-        mock_source.file_path = "old.py"
-        mock_source.absolute_path = Path("/workspace/old.py")
-        mock_source.metadata.name = "Old Display"
-        mock_source.metadata.is_griptape_provided = False
+        workspace = tmp_path.resolve()
+        engine.config_manager.workspace_path = workspace
+        metadata = WorkflowMetadata(
+            name="Old Display",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="0.0.0",
+            node_libraries_referenced=[],
+        )
+        old_path = workspace / "old.py"
+        old_path.write_text(
+            workflow_manager.codegen.replace_workflow_metadata_header(
+                "# /// script\n# ///\n", metadata, workflow_id=new_workflow_id()
+            )
+            or "",
+            encoding="utf-8",
+        )
+        source = engine.workflow_registry.register_file(old_path, metadata)
+        real_ahandle_request = engine.ahandle_request
 
-        async def fake_save(_workflow: WorkflowRuntime, _req: SaveWorkflowRequest, **_: Any) -> object:
-            mock_source.name = "new"
-            mock_source.absolute_path = Path("/workspace/new.py")
-            return SaveWorkflowResultSuccess(file_path="/workspace/new.py", workflow_name="new", result_details="ok")
-
-        async def fake_ahandle_request(req: object) -> object:
+        async def fake_ahandle_request(req: Any, **kwargs: Any) -> object:
             if isinstance(req, DeleteFileRequest) and failing_cleanup == "file":
                 return DeleteFileResultFailure(
                     failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details="file locked"
@@ -1476,20 +1478,15 @@ class TestWorkflowManager:
             if isinstance(req, DeleteFileRequest):
                 # Anything but a failure counts as deleted.
                 return MagicMock()
-            msg = f"Unexpected request in cleanup-failure test: {type(req).__name__}"
-            raise AssertionError(msg)
+            return await real_ahandle_request(req, **kwargs)
 
         with (
-            patch.object(engine.workflow_registry, "resolve_address", return_value=mock_source),
-            patch.object(engine.open_workflows, "find", return_value=WorkflowRuntime("renamed", engine)),
-            patch.object(workflow_manager.saver, "save_open_workflow", side_effect=fake_save),
-            patch.object(workflow_manager, "persist_external_workflow_registration"),
             patch.object(engine.config_manager, "delete_user_workflow", return_value=failing_cleanup != "config"),
             patch.object(engine, "ahandle_request", side_effect=fake_ahandle_request),
         ):
             result = asyncio.run(
                 workflow_manager.file_operations.on_rename_workflow_request(
-                    RenameWorkflowRequest(workflow_name="old", requested_name="new")
+                    RenameWorkflowRequest(workflow_id=source.workflow_id, requested_name="new")
                 )
             )
 
@@ -1498,7 +1495,7 @@ class TestWorkflowManager:
         warnings = [detail for detail in result.result_details.result_details if detail.level == logging.WARNING]
         assert len(warnings) == 1
         if failing_cleanup == "file":
-            assert str(Path("/workspace/old.py")) in warnings[0].message
+            assert str(old_path) in warnings[0].message
         else:
             assert "'old.py'" in warnings[0].message
 
