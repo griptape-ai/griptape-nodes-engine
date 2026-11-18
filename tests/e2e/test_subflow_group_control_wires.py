@@ -16,13 +16,18 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+from unittest.mock import patch
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import NodeResolutionState
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
-from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest, StartFlowResultSuccess
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartFlowRequest,
+    StartFlowResultSuccess,
+    StartLocalSubflowRequest,
+)
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
@@ -44,6 +49,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
     from griptape_nodes.retained_mode.engine import Engine
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # Timeout with thread dump.
 pytestmark = pytest.mark.timeout(300, method="thread")
@@ -331,11 +337,13 @@ class TestLoopGroup:
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
 class TestOnStartEntryResolution:
-    """NodeExecutor._resolve_on_each_entry reads On Start on any group, not just a loop's On Each.
+    """On Start now actually controls a plain group's entry, for every execution path that packages one.
 
-    This is the helper a group's non-local execution path asks for its entry node; it used to
-    answer (None, None) for anything that was not a BaseIterativeNodeGroup, so a plain group's
-    explicit On Start wiring was silently ignored in favor of implicit child-discovery.
+    NodeExecutor.resolve_inner_entry_node reads the inner entry's wiring on any SubflowNodeGroup,
+    not just a loop's On Each; it used to answer (None, None) for anything that was not a
+    BaseIterativeNodeGroup. SubflowNodeGroup.execute_subflow (local execution) and
+    NodeExecutor._publish_local_workflow (isolated/library execution) both now call it and act on
+    the result, instead of always leaving the group's entry at its implicit default.
     """
 
     def test_a_plain_groups_on_start_resolves_to_its_wired_target(self, engine: Engine, flow: str) -> None:
@@ -354,7 +362,7 @@ class TestOnStartEntryResolution:
         _connect(engine, "G", "on_start", "Child2", "exec_in")
 
         group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
-        entry = engine.flow_manager.node_executor._resolve_on_each_entry(group)
+        entry = engine.flow_manager.node_executor.resolve_inner_entry_node(group)
 
         assert entry == ("Child2", "exec_in")
 
@@ -368,9 +376,97 @@ class TestOnStartEntryResolution:
         _group(engine, ["Child"])
 
         group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
-        entry = engine.flow_manager.node_executor._resolve_on_each_entry(group)
+        entry = engine.flow_manager.node_executor.resolve_inner_entry_node(group)
 
         assert entry == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_on_start_is_passed_as_the_local_subflows_explicit_start_node(
+        self, engine: Engine, flow: str
+    ) -> None:
+        """End to end on the local execution path: On Start reaches StartLocalSubflowRequest itself.
+
+        An isolated subflow run resolves every independently-reachable node regardless of which one
+        is named `start_node` -- "a data-only subflow (or a group of independent nodes) resolves
+        all its leaf nodes in parallel instead of stopping at the start node" is the documented
+        contract of `ControlFlowMachine._process_nodes_for_dag`, confirmed empirically here: Child1
+        and Child2 both resolve whether or not this fix is in place, and their execution order is
+        set by control-vs-data classification, not by `start_node`. So resolution outcome isn't the
+        signal that distinguishes before/after; the request this fix constructs is. Before this fix,
+        `start_node` was always None (auto-detect); this asserts it now carries On Start's target.
+        """
+        _ = flow
+        for name in ("Child1", "Child2"):
+            _node(engine, "EchoNode", name)
+            assert engine.handle_request(
+                SetParameterValueRequest(parameter_name="text", node_name=name, value=name)
+            ).succeeded()
+        _group(engine, ["Child1", "Child2"])
+        _connect(engine, "G", "on_start", "Child2", "exec_in")
+
+        original = engine.flow_manager.on_start_local_subflow_request_in_workflow
+        captured_start_nodes: list[str | None] = []
+
+        async def spy(request: StartLocalSubflowRequest, workflow: WorkflowRuntime) -> object:
+            captured_start_nodes.append(request.start_node)
+            return await original(request, workflow)
+
+        with patch.object(engine.flow_manager, "on_start_local_subflow_request_in_workflow", side_effect=spy):
+            run_result = await engine.ahandle_request(StartFlowRequest(flow_name=flow, flow_node_name="G"))
+        assert isinstance(run_result, StartFlowResultSuccess), run_result
+
+        assert captured_start_nodes == ["Child2"]
+
+    @pytest.mark.asyncio
+    async def test_on_start_controls_the_packaged_entry_for_isolated_execution(
+        self, tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
+    ) -> None:
+        """End to end on the packaging side: the published flow's Start node wires to On Start's target.
+
+        _publish_local_workflow packages and saves the flow without running it in a subprocess, so
+        this is testable without a real worker or GT_CLOUD_API_KEY -- only _execute_subprocess /
+        _publish_library_workflow need those, and this stops short of calling them, the same way
+        test_isolated_execution_rename.py never runs a group to check its execution_environment.
+        """
+        flow_name = _start(engine, materialize_library, tmp_path, SUBFLOW_LIBRARY)
+        loop_library_json = materialize_library(
+            tmp_path / "loop_library", template=LOOP_LIBRARY_JSON, node_file=LOOP_NODE_FILE, name=LOOP_LIBRARY
+        )
+        register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(loop_library_json)))
+        assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
+        _ = flow_name
+
+        _node(engine, "EchoNode", "Child1")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Child1", value="Child1")
+        ).succeeded()
+        _node(engine, "EchoNode", "Child2")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Child2", value="Child2")
+        ).succeeded()
+        _group(engine, ["Child1", "Child2"])
+        _connect(engine, "G", "on_start", "Child2", "exec_in")
+
+        group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
+        publish_result = await engine.flow_manager.node_executor._publish_local_workflow(group)
+        assert publish_result is not None
+
+        serialized = publish_result.package_result.serialized_flow_commands
+        uuid_to_name = {
+            command.node_uuid: command.create_node_command.node_name for command in serialized.serialized_node_commands
+        }
+        start_uuids = {
+            command.node_uuid
+            for command in serialized.serialized_node_commands
+            if command.create_node_command.node_type == "StartFlow"
+        }
+        entry_targets = {
+            uuid_to_name[connection.target_node_uuid]
+            for connection in serialized.serialized_connections
+            if connection.source_node_uuid in start_uuids
+        }
+
+        assert entry_targets == {"Child2"}
 
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")

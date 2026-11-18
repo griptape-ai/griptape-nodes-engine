@@ -919,8 +919,13 @@ class NodeExecutor(EngineScoped):
 
         sanitized_library_name = library_name.replace(" ", "_")
         # If we are packaging a SubflowNodeGroup, that means that we are packaging multiple nodes together, so we have to get the list of nodes from the group node.
+        # A single, non-group node has no entry port of its own to resolve: it is the only node in
+        # the package, so there is nothing to point an explicit entry at.
+        entry_control_node_name: str | None = None
+        entry_control_parameter_name: str | None = None
         if isinstance(node, SubflowNodeGroup):
             node_names = list(node.get_all_nodes().keys())
+            entry_control_node_name, entry_control_parameter_name = self.resolve_inner_entry_node(node)
         else:
             # Otherwise, it's a list of one node!
             node_names = [node.name]
@@ -938,8 +943,8 @@ class NodeExecutor(EngineScoped):
             start_node_library_name=workflow_start_end_nodes.start_flow_node_library_name,
             end_node_library_name=workflow_start_end_nodes.end_flow_node_library_name,
             output_parameter_prefix=output_parameter_prefix,
-            entry_control_node_name=None,
-            entry_control_parameter_name=None,
+            entry_control_node_name=entry_control_node_name,
+            entry_control_parameter_name=entry_control_parameter_name,
             node_group_name=node_group_name,
         )
         package_result = workflow.handle_request(request)
@@ -2499,13 +2504,17 @@ class NodeExecutor(EngineScoped):
 
         return sources
 
-    def _resolve_on_each_entry(self, node: SubflowNodeGroup) -> tuple[str | None, str | None]:
+    def resolve_inner_entry_node(self, node: SubflowNodeGroup) -> tuple[str | None, str | None]:
         """Return (entry_node_name, entry_param_name) from the inner entry's connection, or (None, None).
 
         The inner entry is On Each on a loop, On Start on a plain group, or nothing at all on a
         group whose inner control inputs mean something else (a while-group's Done / Continue):
         node.inner_entry is None there, and this falls back to implicit child-discovery the same way
         an unconnected inner entry does.
+
+        Public (not an underscored helper) because SubflowNodeGroup.execute_subflow calls it too, to
+        resolve the same entry node for the local execution path -- the proxy-hop-walking below is
+        not something a second call site should re-derive.
         """
         workflow = node._require_workflow()
         if node.inner_entry is None:
@@ -2565,7 +2574,7 @@ class NodeExecutor(EngineScoped):
         sanitized_node_name = node.name.replace(" ", "_")
         output_parameter_prefix = f"{sanitized_node_name}_{label}_"
 
-        entry_control_node_name, entry_control_parameter_name = self._resolve_on_each_entry(node)
+        entry_control_node_name, entry_control_parameter_name = self.resolve_inner_entry_node(node)
 
         request = PackageNodesAsSerializedFlowRequest(
             node_names=node_names,

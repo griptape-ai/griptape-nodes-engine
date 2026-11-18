@@ -1616,8 +1616,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         subflow = self.metadata.get("subflow_name")
         if subflow is not None and isinstance(subflow, str):
+            entry_node_name, _entry_param_name = self.engine.flow_manager.node_executor.resolve_inner_entry_node(self)
             result = await self.engine.flow_manager.on_start_local_subflow_request_in_workflow(
-                StartLocalSubflowRequest(flow_name=subflow), self._require_workflow()
+                StartLocalSubflowRequest(flow_name=subflow, start_node=entry_node_name), self._require_workflow()
             )
 
             if isinstance(result, StartLocalSubflowResultFailure):
