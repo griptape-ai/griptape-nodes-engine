@@ -172,7 +172,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             set_as_new_context=False,
             metadata=subflow_metadata,
         )
-        result = self._handle_request_in_workflow(request)
+        result = self.handle_request(request)
         if not isinstance(result, CreateFlowResultSuccess):
             # Drop the name we optimistically recorded: no such flow exists, and leaving it set
             # makes every later lookup point at a phantom flow.
@@ -406,7 +406,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             serializable=original_param.serializable,
         )
         # Add with a request, because this will handle naming for us.
-        result = self._handle_request_in_workflow(request)
+        result = self.handle_request(request)
         if not isinstance(result, AddParameterToNodeResultSuccess):
             msg = "Failed to add parameter to node."
             raise TypeError(msg)
@@ -460,7 +460,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             conn.source_node.name,
             conn.target_node.name,
         )
-        result = self._handle_request_in_workflow(request)
+        result = self.handle_request(request)
         if not isinstance(result, DeleteConnectionResultSuccess):
             return False
         proxy_parameter = self._create_proxy_parameter_for_connection(grouped_parameter, is_incoming=is_incoming)
@@ -492,8 +492,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self._proxy_param_to_connections[proxy_parameter.name] = 2
         else:
             self._proxy_param_to_connections[proxy_parameter.name] += 2
-        self._handle_request_in_workflow(create_first_connection)
-        self._handle_request_in_workflow(create_second_connection)
+        self.handle_request(create_first_connection)
+        self.handle_request(create_second_connection)
 
     def unmap_node_connections(self, node: BaseNode, connections: Connections) -> None:  # noqa: C901
         """Remove tracking of an external connection, restore original connection, and clean up proxy parameter.
@@ -1045,7 +1045,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             )
             return
 
-        delete_result = self._handle_request_in_workflow(DeleteFlowRequest(flow_name=subflow_name))
+        delete_result = self.handle_request(DeleteFlowRequest(flow_name=subflow_name))
         if isinstance(delete_result, DeleteFlowResultFailure):
             # Not worth failing the add twice over: it is already failing, and the message the artist
             # gets should be why their nodes did not move, not a leftover flow they cannot see.
@@ -1070,7 +1070,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             NodeGroupMembershipError: If the engine refused the move, carrying the reason it gave
         """
         move_request = MoveNodeToNewFlowRequest(node_name=node.name, target_flow_name=flow_name)
-        move_result = self._handle_request_in_workflow(move_request)
+        move_result = self.handle_request(move_request)
         if not isinstance(move_result, MoveNodeToNewFlowResultSuccess):
             # Carry the engine's own reason rather than only logging it: this is the innermost thing
             # that knows why the move was refused, and the caller turns it into what the artist reads.
@@ -1194,7 +1194,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 conn.source_node.name,
                 conn.target_node.name,
             )
-            result = self._handle_request_in_workflow(request)
+            result = self.handle_request(request)
             if not isinstance(result, DeleteConnectionResultSuccess):
                 logger.warning(
                     "%s failed to delete connection from %s.%s to %s.%s",
@@ -1291,8 +1291,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         else:
             self._proxy_param_to_connections[proxy_parameter.name] += 2
 
-        self._handle_request_in_workflow(create_first_connection)
-        self._handle_request_in_workflow(create_second_connection)
+        self.handle_request(create_first_connection)
+        self.handle_request(create_second_connection)
 
     def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Move nodes back out to this group's own flow and stop claiming them.
@@ -1432,7 +1432,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if subflow_name is not None:
             subflow = self._require_workflow().objects.get_as_type(subflow_name, ControlFlow)
             if subflow is not None:
-                delete_result = self._handle_request_in_workflow(DeleteFlowRequest(flow_name=subflow_name))
+                delete_result = self.handle_request(DeleteFlowRequest(flow_name=subflow_name))
                 if isinstance(delete_result, DeleteFlowResultFailure):
                     # This will propagate up to DeleteNodeRequest, and prevent the node from deleting.
                     msg = f"Failed to delete subflow {subflow_name} when deleting node {self.name}"

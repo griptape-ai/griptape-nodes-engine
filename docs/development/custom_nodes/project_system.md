@@ -142,7 +142,7 @@ with ThreadPoolExecutor() as pool:
 
 Code on a plain thread or in a pool doesn't know which workflow it works for, so a handle built there with `ProjectFileDestination.from_situation()` or `File(...)` has no workflow of its own. Build it in `process()` or `aprocess()` and hand it to the thread, or name the workflow: call `ProjectFileDestination.from_situation_in_workflow(self.workflow, ...)`, or pass `workflow=self.workflow` to the `File`, `FileDestination`, `Directory`, or `FileSequence` constructor.
 
-The same applies to requests you send from such a thread yourself, such as `ResolveMacroPathRequest` or `CreateStaticFileDownloadUrlFromPathRequest`. They name no workflow there, so `{workflow_dir}` is left out and the default project's `{outputs}` resolves under the workspace instead of the workflow's folder. Send them with `self.workflow.handle_request(...)`, or start the thread in a copy of the node's context:
+The same applies to requests you send from such a thread yourself, such as `ResolveMacroPathRequest` or `CreateStaticFileDownloadUrlFromPathRequest`. They name no workflow there, so `{workflow_dir}` is left out and the default project's `{outputs}` resolves under the workspace instead of the workflow's folder. Send them with `self.handle_request(...)`, or start the thread in a copy of the node's context:
 
 ```python
 threading.Thread(target=contextvars.copy_context().run, args=(work,)).start()

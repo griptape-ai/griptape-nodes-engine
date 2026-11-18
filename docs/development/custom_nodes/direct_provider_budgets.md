@@ -28,7 +28,7 @@ if isinstance(check, BudgetAccessResultFailure):
 ```
 
 - In `aprocess()`, `await GriptapeNodes.ahandle_request(...)` as shown, so the engine keeps running while the check waits on Griptape Cloud. In a synchronous `process()`, call `GriptapeNodes.handle_request(...)` instead.
-- Send both from `process()` or `aprocess()`, or from code they call. A thread or thread pool you start yourself doesn't know which workflow the node is in, so the request names none and isn't tagged with the node's workflow. Send it with `self.workflow.handle_request(...)` there instead.
+- Send both from `process()` or `aprocess()`, or from code they call. A thread or thread pool you start yourself doesn't know which workflow the node is in, so the request names none and isn't tagged with the node's workflow. Send it with `self.handle_request(...)` there instead.
 - A **failure** means a budget refused the call. Do not make it. Raise `check.exception`: the run stops with a message naming the node and every budget that refused, and the editor shows its "Run blocked" bar.
 - A **success** means go ahead. `checked` is `False` when Cloud could not be reached or no Griptape Cloud credential is set; the call is still cleared. A network problem must never stop work.
 - `estimated_cost_micro_usd` is optional. Without it, only a budget with no headroom left refuses the call.

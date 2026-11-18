@@ -222,7 +222,7 @@ def _saver_node(engine: Engine, workflow: _RecordingWorkflow, *, connected: obje
     def answer(request: RequestPayload) -> ResultPayload:
         return _CONNECTED_DESTINATION_RESULTS[type(request)](destination=connected, result_details="ok")
 
-    node._handle_request_in_workflow.side_effect = answer
+    node.handle_request.side_effect = answer
     return node
 
 

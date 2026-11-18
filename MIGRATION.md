@@ -64,9 +64,10 @@ They have no effect. While a library still asks for a worker and declares no
 **Library authors.** `NodeManager.on_get_parameter_value_request`, `on_set_parameter_value_request`
 and `on_remove_parameter_from_node_request`, and `FlowManager.on_get_top_level_flow_request`,
 `on_list_nodes_in_flow_request`, `on_create_connection_request`, `on_delete_connection_request` and
-`on_start_local_subflow_request`, no longer take only a request and act on the open workflow. Each
-is now the handler `GriptapeNodes.handle_request(...)` dispatches to, and takes the workflow as its
-second argument. Send the request instead:
+`on_start_local_subflow_request`, used to take only a request and act on the open workflow. Those
+names now belong to the handlers the engine dispatches requests to, which require the workflow as a
+second argument. Don't call them, even with a workflow: calling a handler directly skips dispatch,
+including its hooks and result broadcast. Send the request instead:
 
 ```python
 # Before
@@ -76,12 +77,10 @@ result = GriptapeNodes.NodeManager().on_get_parameter_value_request(request)
 result = GriptapeNodes.handle_request(request)
 ```
 
-From a node, `self.workflow.handle_request(request)` sends it through the workflow the node joined.
-
-If you called the two-argument `on_<name>_request_in_workflow` forms, those names are now the bare
-`on_<name>_request` names, with the same arguments. For example,
-`on_set_parameter_value_request_in_workflow(request, workflow)` is now
-`on_set_parameter_value_request(request, workflow)`.
+From a node, send it with `self.handle_request(request)`, or `await self.ahandle_request(request)`
+in async code such as `aprocess()`. These send the request through the workflow the node is in.
+They also work in a node that isn't in a workflow yet, such as during its `__init__`: requests about
+the engine still answer, and a request that needs a workflow fails cleanly.
 
 ## Parameter values keep their type
 

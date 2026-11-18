@@ -160,7 +160,7 @@ class ProjectOutputParameter(abc.ABC):
         # A node in no workflow has no connections, so no settings node can be wired to it.
         if self._node.workflow is None:
             return None
-        result = self._node._handle_request_in_workflow(request)
+        result = self._node.handle_request(request)
         if not result.succeeded():
             raise ValueError(str(result.result_details))
         if not isinstance(result, success_type):
@@ -182,9 +182,7 @@ class ProjectOutputParameter(abc.ABC):
         node_name = self._node.name
 
         has_incoming = False
-        result = self._node._handle_request_in_workflow(
-            connection_events.ListConnectionsForNodeRequest(node_name=node_name)
-        )
+        result = self._node.handle_request(connection_events.ListConnectionsForNodeRequest(node_name=node_name))
         if isinstance(result, connection_events.ListConnectionsForNodeResultSuccess):
             has_incoming = any(conn.target_parameter_name == self._name for conn in result.incoming_connections)
 
@@ -238,7 +236,7 @@ class ProjectOutputParameter(abc.ABC):
         # facade re-export, so going through it resolves the ambient engine -- which the TID251
         # ban does not catch, and which would answer from a different engine than the request
         # above it.
-        connection_result = self._node._handle_request_in_workflow(
+        connection_result = self._node.handle_request(
             connection_events.CreateConnectionRequest(
                 source_node_name=configure_node_name,
                 source_parameter_name=self._settings_source_param_name,

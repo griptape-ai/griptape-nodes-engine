@@ -595,7 +595,7 @@ class BaseNode(ABC):
         """Record the workflow whose objects this node joined. Only the ObjectManager calls this."""
         self._workflow = workflow
 
-    def _handle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
+    def handle_request(self, request: RequestPayload) -> ResultPayload:
         """Send `request` through the workflow this node joined.
 
         A node that never joined one, such as during its ``__init__`` or a helper a library builds
@@ -608,8 +608,8 @@ class BaseNode(ABC):
                 return self.engine.handle_request(request)
         return self._workflow.handle_request(request)
 
-    async def _ahandle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
-        """Like `_handle_request_in_workflow`, awaiting the request."""
+    async def ahandle_request(self, request: RequestPayload) -> ResultPayload:
+        """Like `handle_request`, awaiting the request."""
         if self._workflow is None:
             with self.engine.bind_workflow(NO_WORKFLOW):
                 return await self.engine.ahandle_request(request)
@@ -1307,9 +1307,7 @@ class BaseNode(ABC):
 
     def kill_parameter_children(self, parameter: Parameter) -> None:
         for child in parameter.find_elements_by_type(Parameter):
-            self._handle_request_in_workflow(
-                RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name)
-            )
+            self.handle_request(RemoveParameterFromNodeRequest(parameter_name=child.name, node_name=self.name))
 
     def get_parameter_value(self, param_name: str) -> Any:
         """The value a node reads, with a held object substituted for the key standing in for it.
@@ -1985,9 +1983,7 @@ class BaseNode(ABC):
         executing in an isolated process holds only a transient copy of itself, so reading
         its own process's connection index would answer from almost nothing.
         """
-        result = self._handle_request_in_workflow(
-            ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False)
-        )
+        result = self.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
         if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
         return any(connection.target_parameter_name == param_name for connection in result.incoming_connections)
@@ -2682,9 +2678,7 @@ class SuccessFailureNode(BaseNode):
 
     def _has_outgoing_connections(self, parameter: Parameter) -> bool:
         """Check if a specific parameter has outgoing connections."""
-        result = self._handle_request_in_workflow(
-            ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False)
-        )
+        result = self.handle_request(ListConnectionsForNodeRequest(node_name=self.name, broadcast_result=False))
         if not isinstance(result, ListConnectionsForNodeResultSuccess):
             return False
         return any(connection.source_parameter_name == parameter.name for connection in result.outgoing_connections)
@@ -2976,7 +2970,7 @@ class ErrorProxyNode(BaseNode):
                 is_user_defined=False,  # Don't serialize this parameter
                 initial_setup=True,  # Allows setting non-settable parameters and prevents resolution cascades during workflow loading
             )
-            result = self._handle_request_in_workflow(request)
+            result = self.handle_request(request)
 
             # Check if parameter creation was successful
             from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess

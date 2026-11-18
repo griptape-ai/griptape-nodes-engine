@@ -40,9 +40,7 @@ def _outgoing_connection_exists(asker: BaseNode, source_node: str, source_param:
     Asked as a request rather than read from a local connection index: connections are
     workflow state, and the orchestrator is the only place that holds all of it.
     """
-    result = asker._handle_request_in_workflow(
-        ListConnectionsForNodeRequest(node_name=source_node, broadcast_result=False)
-    )
+    result = asker.handle_request(ListConnectionsForNodeRequest(node_name=source_node, broadcast_result=False))
     if not isinstance(result, ListConnectionsForNodeResultSuccess):
         return False
 
@@ -63,9 +61,7 @@ def _incoming_connection_exists(asker: BaseNode, target_node: str, target_param:
     Asked as a request rather than read from a local connection index: connections are
     workflow state, and the orchestrator is the only place that holds all of it.
     """
-    result = asker._handle_request_in_workflow(
-        ListConnectionsForNodeRequest(node_name=target_node, broadcast_result=False)
-    )
+    result = asker.handle_request(ListConnectionsForNodeRequest(node_name=target_node, broadcast_result=False))
     if not isinstance(result, ListConnectionsForNodeResultSuccess):
         return False
 
@@ -992,7 +988,7 @@ class BaseIterativeEndNode(BaseNode):
         # Create the hidden signal connections and default control flow:
 
         # 1. Start → End: loop_end_condition_met_signal → loop_end_condition_met_signal_input
-        self._handle_request_in_workflow(
+        self.handle_request(
             CreateConnectionRequest(
                 source_node_name=start_node.name,
                 source_parameter_name=IterativeNodeParam.LOOP_END_CONDITION_MET_SIGNAL.value,
@@ -1002,7 +998,7 @@ class BaseIterativeEndNode(BaseNode):
         )
 
         # 2. End → Start: trigger_next_iteration_signal_output → trigger_next_iteration_signal
-        self._handle_request_in_workflow(
+        self.handle_request(
             CreateConnectionRequest(
                 source_node_name=self.name,
                 source_parameter_name=IterativeNodeParam.TRIGGER_NEXT_ITERATION_SIGNAL_OUTPUT.value,
@@ -1012,7 +1008,7 @@ class BaseIterativeEndNode(BaseNode):
         )
 
         # 3. End → Start: break_loop_signal_output → break_loop_signal
-        self._handle_request_in_workflow(
+        self.handle_request(
             CreateConnectionRequest(
                 source_node_name=self.name,
                 source_parameter_name=IterativeNodeParam.BREAK_LOOP_SIGNAL_OUTPUT.value,
@@ -1024,7 +1020,7 @@ class BaseIterativeEndNode(BaseNode):
         # 4. Default control flow: Start → End: exec_out → add_item (default "happy path")
         # Only create this connection if the exec_out parameter doesn't already have a connection
         if not _outgoing_connection_exists(self, start_node.name, IterativeNodeParam.EXEC_OUT.value):
-            self._handle_request_in_workflow(
+            self.handle_request(
                 CreateConnectionRequest(
                     source_node_name=start_node.name,
                     source_parameter_name=IterativeNodeParam.EXEC_OUT.value,
@@ -1036,9 +1032,7 @@ class BaseIterativeEndNode(BaseNode):
     def _remove_hidden_signal_connections(self, start_node: BaseNode) -> None:
         """Remove all hidden signal connections when the main tethering connection is removed."""
         # Get current connections for start node to check what still exists
-        list_connections_result = self._handle_request_in_workflow(
-            ListConnectionsForNodeRequest(node_name=start_node.name)
-        )
+        list_connections_result = self.handle_request(ListConnectionsForNodeRequest(node_name=start_node.name))
         if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
             return  # Cannot determine what connections exist, exit gracefully
 
@@ -1073,7 +1067,7 @@ class BaseIterativeEndNode(BaseNode):
             self.name,
             IterativeNodeParam.LOOP_END_CONDITION_MET_SIGNAL_INPUT.value,
         ):
-            self._handle_request_in_workflow(
+            self.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=start_node.name,
                     source_parameter_name=IterativeNodeParam.LOOP_END_CONDITION_MET_SIGNAL.value,
@@ -1089,7 +1083,7 @@ class BaseIterativeEndNode(BaseNode):
             start_node.name,
             IterativeNodeParam.TRIGGER_NEXT_ITERATION_SIGNAL.value,
         ):
-            self._handle_request_in_workflow(
+            self.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=self.name,
                     source_parameter_name=IterativeNodeParam.TRIGGER_NEXT_ITERATION_SIGNAL_OUTPUT.value,
@@ -1105,7 +1099,7 @@ class BaseIterativeEndNode(BaseNode):
             start_node.name,
             IterativeNodeParam.BREAK_LOOP_SIGNAL.value,
         ):
-            self._handle_request_in_workflow(
+            self.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=self.name,
                     source_parameter_name=IterativeNodeParam.BREAK_LOOP_SIGNAL_OUTPUT.value,
