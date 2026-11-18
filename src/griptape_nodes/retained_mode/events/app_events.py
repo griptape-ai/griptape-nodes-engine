@@ -130,13 +130,24 @@ class AppGetSessionRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class AppGetSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Session information retrieved successfully.
+    """Session information retrieved successfully, with the state of the engine holding it.
+
+    A client takes this as its snapshot of the engine when it connects to the session, and again
+    when the session heartbeat reports a new run id, since discovery may not list that engine.
 
     Args:
         session_id: Current session identifier (None if no active session)
+        engine_version: Current engine version string
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
     """
 
     session_id: str | None
+    engine_version: str
+    engine_run_id: str
+    engine_os: str
+    is_initializing: bool
 
 
 @dataclass
@@ -514,7 +525,20 @@ class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 @dataclass
 @PayloadRegistry.register
 class SessionHeartbeatResultSuccess(ResultPayloadSuccess):
-    """Session heartbeat successful. Session is active and responsive."""
+    """Session heartbeat successful. Session is active and responsive.
+
+    Also carries the engine state that changes while a client stays connected. A new run id means
+    the engine restarted, and the client takes a fresh `AppGetSessionRequest` snapshot.
+
+    Args:
+        session_id: The engine's active session. A client that sees another one has lost its own.
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
+    """
+
+    session_id: str
+    engine_run_id: str
+    is_initializing: bool
 
 
 @dataclass
@@ -527,6 +551,9 @@ class SessionHeartbeatResultFailure(ResultPayloadFailure):
 @PayloadRegistry.register
 class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Request clients can use to discover active engines and their status.
+
+    A client connected to a session follows the engine with `AppGetSessionRequest` and
+    `SessionHeartbeatRequest` instead, since discovery may not list that engine.
 
     Attributes:
         heartbeat_id: Unique identifier for the heartbeat request, used to correlate requests and responses.

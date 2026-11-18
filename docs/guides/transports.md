@@ -133,7 +133,9 @@ A client with a tab for each workflow uses three requests and the two events abo
 
 Opening a Griptape-provided workflow, by any request, opens a new unsaved copy with its own `workflow_id`. The copy's first save is named after the library's file.
 
-Workflow ids last until the engine restarts, which changes the `engine_run_id` that `ListOpenWorkflowsRequest`, `EngineHeartbeatRequest` and `AppInitializationComplete` report; drop your ids when it changes. `AppInitializationComplete` goes out once, when the engine finishes starting, so only a client that stays connected through the restart, such as one on a relay, receives it. A client whose own connection dropped sends one of the requests after it reconnects. Each worker engine sends its own `AppInitializationComplete`, with `is_worker` set; skip those.
+Workflow ids last until the engine restarts, which changes the `engine_run_id` that `ListOpenWorkflowsRequest`, `AppGetSessionRequest`, `SessionHeartbeatRequest` and `AppInitializationComplete` report; drop your ids when it changes. `AppInitializationComplete` goes out once, when the engine finishes starting, so only a client that stays connected through the restart, such as one on a relay, receives it. A client whose own connection dropped sends one of the requests after it reconnects. Each worker engine sends its own `AppInitializationComplete`, with `is_worker` set; skip those.
+
+To follow the engine while connected to a session, send `AppGetSessionRequest` when you connect. It reports the `session_id`, `engine_version`, `engine_os`, `engine_run_id` and `is_initializing`, which stays true while the engine loads libraries and workflows, at startup or on a library reload. Then send `SessionHeartbeatRequest` on an interval. It reports the `session_id`, `engine_run_id` and `is_initializing`, and fails when the engine holds no session. When `engine_run_id` changes, send `AppGetSessionRequest` again, since a restarted engine may run another version. When `session_id` names another session, the engine no longer holds yours.
 
 Older requests open and close workflows too:
 
@@ -156,7 +158,7 @@ A connection gets only the topics it subscribes to:
 | `sessions/<session_id>/clients/<client_id>/response` | Results for a client that uses it as its `response_topic`, as `gtn request` and `RequestClient` do |
 | `sessions/<session_id>/response`                     | Engine events such as `WorkflowOpenedEvent`, execution events, and results a worker engine sends   |
 
-`EngineHeartbeatRequest` reports the `session_id` and `engine_id`. Without a session, the session topic starts with `engines/<engine_id>/` instead, and a client that knows no session uses `clients/<client_id>/response`.
+`AppGetSessionRequest` reports the `session_id`, and `EngineHeartbeatRequest` reports the `engine_id`. Without a session, the session topic starts with `engines/<engine_id>/` instead, and a client that knows no session uses `clients/<client_id>/response`.
 
 The session topic carries every open workflow's execution events. To show one workflow, keep the messages whose `open_workflow_id` names it or is `null`, and skip the rest. To see the results of other clients' requests too, name the session topic as your `response_topic` and filter results the same way.
 
