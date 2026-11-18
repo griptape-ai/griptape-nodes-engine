@@ -543,54 +543,56 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         of the pair is never at risk: control_in is an input and inner_exit is an input, and neither
         is single-target.
 
+        Goes through _create_connection, which raises if a connection could not be made, rather than
+        building CreateConnectionRequest objects and discarding the result: a failed connection must
+        not leave an owner recorded for a wire that does not exist. Ownership is set only once the
+        leg it names has actually been drawn, never ahead of the call that draws it.
+
         Args:
             old_connection: The member's connection that crossed the boundary, already deleted
             is_incoming: True if the wire came into the group
+
+        Raises:
+            RuntimeError: If either leg could not be connected
         """
         connections = self._require_workflow().flows.connections
         if is_incoming:
-            outer = CreateConnectionRequest(
-                source_node_name=old_connection.source_node.name,
-                source_parameter_name=old_connection.source_parameter.name,
-                target_node_name=self.name,
-                target_parameter_name=self.control_in.name,
+            self._create_connection(
+                old_connection.source_node.name,
+                old_connection.source_parameter.name,
+                self.name,
+                self.control_in.name,
             )
-            inner = None
             entry_already_wired = self.inner_entry is not None and connections.get_outgoing_connections_from_parameter(
                 self, self.inner_entry
             )
             if self.inner_entry is not None and not entry_already_wired:
-                inner = CreateConnectionRequest(
-                    source_node_name=self.name,
-                    source_parameter_name=self.inner_entry.name,
-                    target_node_name=old_connection.target_node.name,
-                    target_parameter_name=old_connection.target_parameter.name,
+                self._create_connection(
+                    self.name,
+                    self.inner_entry.name,
+                    old_connection.target_node.name,
+                    old_connection.target_parameter.name,
                     is_node_group_internal=True,
                 )
                 self._entry_wire_owner = (old_connection.target_node.name, old_connection.target_parameter.name)
         else:
-            outer = None
             exit_already_wired = connections.get_outgoing_connections_from_parameter(self, self.control_out)
             if not exit_already_wired:
-                outer = CreateConnectionRequest(
-                    source_node_name=self.name,
-                    source_parameter_name=self.control_out.name,
-                    target_node_name=old_connection.target_node.name,
-                    target_parameter_name=old_connection.target_parameter.name,
+                self._create_connection(
+                    self.name,
+                    self.control_out.name,
+                    old_connection.target_node.name,
+                    old_connection.target_parameter.name,
                 )
-            inner = None
             if self.inner_exit is not None:
-                inner = CreateConnectionRequest(
-                    source_node_name=old_connection.source_node.name,
-                    source_parameter_name=old_connection.source_parameter.name,
-                    target_node_name=self.name,
-                    target_parameter_name=self.inner_exit.name,
+                self._create_connection(
+                    old_connection.source_node.name,
+                    old_connection.source_parameter.name,
+                    self.name,
+                    self.inner_exit.name,
                     is_node_group_internal=True,
                 )
                 self._exit_wire_owner = (old_connection.source_node.name, old_connection.source_parameter.name)
-        for request in (outer, inner):
-            if request is not None:
-                self._handle_request_in_workflow(request)
 
     def _delete_connection(self, source: str, source_param: str, target: str, target_param: str) -> None:
         result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
@@ -606,13 +608,16 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             msg = f"{self.name}: Failed to delete connection from {source}.{source_param} to {target}.{target_param}: {result.result_details}"
             raise RuntimeError(msg)
 
-    def _create_connection(self, source: str, source_param: str, target: str, target_param: str) -> None:
+    def _create_connection(
+        self, source: str, source_param: str, target: str, target_param: str, *, is_node_group_internal: bool = False
+    ) -> None:
         result = self.engine.flow_manager.on_create_connection_request_in_workflow(
             CreateConnectionRequest(
                 source_parameter_name=source_param,
                 target_parameter_name=target_param,
                 source_node_name=source,
                 target_node_name=target,
+                is_node_group_internal=is_node_group_internal,
             ),
             self._require_workflow(),
         )

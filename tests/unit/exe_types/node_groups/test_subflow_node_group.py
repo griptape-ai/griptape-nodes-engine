@@ -15,6 +15,10 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     SubflowNodeGroup,
 )
 from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LEGACY_PRIVATE_EXECUTION, LOCAL_EXECUTION
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionResultFailure,
+    CreateConnectionResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -55,6 +59,42 @@ class TestSubflowNodeGroupCreateSubflow:
         )
         # ...but the group must record the flow it ACTUALLY got back, not the requested name.
         assert group.metadata["subflow_name"] == "G_subflow_1"
+
+
+class TestConnectControlWireThroughGroupRaisesOnFailure:
+    """A connection that fails to create must not leave an owner recorded for a wire never drawn."""
+
+    def test_a_failed_inner_leg_raises_and_records_no_ownership(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The outer leg (control_in) succeeds; the inner leg (on_start) is the one that fails."""
+        group = _MiniSubflowGroup(name="G")
+        group._set_workflow(WorkflowRuntime("wf", engine))
+
+        caller = MockNode("Caller")
+        member = MockNode("Member")
+        old_connection = Mock(
+            source_node=caller,
+            source_parameter=Parameter(name="exec_out", tooltip=""),
+            target_node=member,
+            target_parameter=Parameter(name="exec_in", tooltip=""),
+        )
+
+        mock_create_connection = create_autospec(
+            engine.flow_manager.on_create_connection_request_in_workflow,
+            side_effect=[
+                CreateConnectionResultSuccess(result_details="outer leg created"),
+                CreateConnectionResultFailure(result_details="no such parameter 'exec_in' on 'Member'"),
+            ],
+        )
+        monkeypatch.setattr(engine.flow_manager, "on_create_connection_request_in_workflow", mock_create_connection)
+
+        with pytest.raises(RuntimeError):
+            group._connect_control_wire_through_group(old_connection, is_incoming=True)
+
+        assert group._entry_wire_owner is None
+        expected_attempts = 2  # the outer leg (succeeds) and the inner leg (fails)
+        assert mock_create_connection.call_count == expected_attempts
 
 
 class TestGetAllNodes:
