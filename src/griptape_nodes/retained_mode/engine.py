@@ -72,6 +72,7 @@ from griptape_nodes.utils.version_utils import engine_version
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.engine_transports import EngineTransports
     from griptape_nodes.retained_mode.events.base_events import (
         AppPayload,
@@ -283,8 +284,9 @@ class Engine:
             WorkflowManager,
         )
 
-        # Workflow ids live only as long as this engine, so clients compare this to notice a
-        # restart and drop the ids they kept. Never saved; unlike session_id it does not survive one.
+        # Open sessions and unsaved workflows live only as long as this engine, so clients compare
+        # this to notice a restart and drop the `open_workflow_id`s and unsaved workflow ids they
+        # kept. Never saved; unlike session_id it does not survive one.
         self._engine_run_id = uuid.uuid4().hex
         self._open_workflows = OpenWorkflowSet(self)
         # Each open workflow still being built, which clients have not been told of, set once its
@@ -303,7 +305,11 @@ class Engine:
                 self._config_manager, self._event_manager, read_secret=worker.read_secret
             )
         self._os_manager = OSManager(self._event_manager, engine=self)
-        self._workflow_registry = _WorkflowRegistry(self._config_manager, is_workflow_open=self._holds_workflow)
+        self._workflow_registry = _WorkflowRegistry(
+            self._config_manager,
+            is_workflow_open=self._holds_workflow,
+            migrate_metadata=self._migrate_workflow_metadata,
+        )
         self._object_manager = ObjectManager(self._event_manager, engine=self)
         self._node_manager = NodeManager(self._event_manager, engine=self)
         self._flow_manager = FlowManager(self._event_manager, engine=self)
@@ -485,7 +491,7 @@ class Engine:
 
     @property
     def engine_run_id(self) -> str:
-        """Id minted when this engine started, never saved. A new one means workflow ids from before name nothing."""
+        """Id minted when this engine started, never saved. A new one means open sessions and unsaved workflows from before are gone."""
         return self._engine_run_id
 
     # Node libraries and saved workflows do `app = GriptapeNodes()` and then call these
@@ -1123,6 +1129,10 @@ class Engine:
         await asyncio.wrap_future(
             asyncio.run_coroutine_threadsafe(self._worker_manager.on_engine_lost(engine_id), engine_loop)
         )
+
+    def _migrate_workflow_metadata(self, workflow_metadata: WorkflowMetadata) -> WorkflowMetadata:
+        """Bring metadata read from a workflow file up to date, for the registry (`WorkflowMigration`)."""
+        return self._version_compatibility_manager.migrate_workflow_metadata(workflow_metadata)
 
     def _holds_workflow(self, workflow_id: str) -> bool:
         """Whether the workflow with this id is open here, or is one a worker keeps a runtime for.

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from griptape_nodes.exe_types.node_types import NodeDependencies
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, SerializedFlowCommands
 
@@ -50,7 +51,7 @@ def _generate(engine: Engine, *, workflow_shape: WorkflowShape | None = None) ->
         workflow_shape=workflow_shape,
     )
     return engine.workflow_manager.codegen.generate_workflow_file_content(
-        serialized_flow_commands=serialized_flow_commands, workflow_metadata=metadata
+        serialized_flow_commands=serialized_flow_commands, workflow_metadata=metadata, workflow_id=new_workflow_id()
     )
 
 

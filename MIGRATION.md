@@ -1,5 +1,25 @@
 # Unreleased
 
+## Workflow ids are saved in the workflow file
+
+A saved workflow's `workflow_id` is now written to its file's metadata header, under
+`[tool.griptape-nodes]`, so it stays the same after the engine restarts.
+
+**Request API clients.** You can keep a saved workflow's `workflow_id` across restarts and reopen it
+with `OpenWorkflowRequest(workflow_id=...)`. `engine_run_id` changing now means only that open
+workflows were closed, so reopen the ones you need, and that unsaved workflows were lost.
+
+**Saved workflows.** Workflows are saved with schema 0.22.0. A file from an earlier version opens as
+before: it gets an id derived from its path until its next save writes one, and its links to other
+workflows by registry name are read as ids. A workflow saved with 0.22.0 links to other workflows by
+id, which earlier versions of Griptape Nodes do not save in files, so open it in an earlier version
+only if it imports no referenced subflows.
+
+**Node library authors.** `NodeDependencies.referenced_workflows` holds workflow ids, and a
+workflow file's header holds a `workflow_id`. Read ids from the registry rather than writing them to
+headers yourself. Name the workflow `ImportWorkflowAsReferencedSubFlowRequest` imports by
+`workflow_id`; its `workflow_name` is deprecated and goes in 0.111.0.
+
 ## Execution events name their workflow in `open_workflow_id`
 
 **Request API clients.** `ExecutionEvent` and streamed `ProgressEvent` carried the open workflow

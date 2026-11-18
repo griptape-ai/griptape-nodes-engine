@@ -17,6 +17,7 @@ from uuid import uuid4
 import pytest
 
 from griptape_nodes.exe_types.node_types import NodeDependencies
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, SerializedFlowCommands
 from griptape_nodes.retained_mode.events.node_events import (
@@ -594,6 +595,7 @@ class TestGenerateWorkflowFileContentIntegration:
         content = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._composite_flow_commands(),
             workflow_metadata=_minimal_metadata(),
+            workflow_id=new_workflow_id(),
         )
         ast.parse(content)  # raises SyntaxError if codegen left invalid source behind
 
@@ -601,6 +603,7 @@ class TestGenerateWorkflowFileContentIntegration:
         content = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._composite_flow_commands(),
             workflow_metadata=_minimal_metadata(),
+            workflow_id=new_workflow_id(),
         )
         assert content.index("flow0_name = ") < content.index("flow1_name = ")
         assert "parent_flow_name=flow0_name" in content
@@ -609,6 +612,7 @@ class TestGenerateWorkflowFileContentIntegration:
         content = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._composite_flow_commands(),
             workflow_metadata=_minimal_metadata(),
+            workflow_id=new_workflow_id(),
         )
         assert content.count("'shared-value'") == 1
         assert "from griptape_nodes.serialization.values import decode_value" in content
@@ -627,11 +631,12 @@ class TestGenerateWorkflowFileContentIntegration:
         """Re-saving an unchanged graph must not churn the diff."""
         flow_commands = self._composite_flow_commands()
         metadata = _minimal_metadata()
+        workflow_id = new_workflow_id()
         first = engine.workflow_manager.codegen.generate_workflow_file_content(
-            serialized_flow_commands=flow_commands, workflow_metadata=metadata
+            serialized_flow_commands=flow_commands, workflow_metadata=metadata, workflow_id=workflow_id
         )
         second = engine.workflow_manager.codegen.generate_workflow_file_content(
-            serialized_flow_commands=flow_commands, workflow_metadata=metadata
+            serialized_flow_commands=flow_commands, workflow_metadata=metadata, workflow_id=workflow_id
         )
         assert first == second
 

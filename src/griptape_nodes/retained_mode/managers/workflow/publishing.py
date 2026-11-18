@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from griptape_nodes.files.path_utils import derive_registry_key
-from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
+from griptape_nodes.node_library.workflow_registry import (
+    WorkflowAddressError,
+    WorkflowMetadataError,
+    read_workflow_header,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -192,7 +196,9 @@ class WorkflowPublishing(EngineScoped):
                 # and takes the metadata just read.
                 try:
                     self.engine.workflow_manager.refresh_workflow_file(
-                        workflow_file.name, load_metadata_result.metadata
+                        workflow_file.name,
+                        load_metadata_result.metadata,
+                        header_id=self._header_id_of(workflow_file),
                     )
                 except ValueError as err:
                     failure_message = f"Failed to register workflow with file '{workflow_file.name}': {err}"
@@ -218,3 +224,11 @@ class WorkflowPublishing(EngineScoped):
             final_result = PublishWorkflowResultFailure(result_details=ResultDetails(*result_messages))
 
         return final_result
+
+    @staticmethod
+    def _header_id_of(workflow_file: Path) -> str | None:
+        """The id a published file's header carries, which a publisher may have copied from the workflow it published."""
+        try:
+            return read_workflow_header(workflow_file).workflow_id
+        except WorkflowMetadataError:
+            return None

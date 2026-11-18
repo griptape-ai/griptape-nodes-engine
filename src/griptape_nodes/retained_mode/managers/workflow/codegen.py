@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, cast
 import tomlkit
 
 from griptape_nodes.node_library.workflow_registry import (
+    WORKFLOW_ID_HEADER_KEY,
     WorkflowMetadata,
     WorkflowShape,
 )
@@ -224,9 +225,11 @@ class WorkflowCodeGenerator(EngineScoped):
         self,
         serialized_flow_commands: SerializedFlowCommands,
         workflow_metadata: WorkflowMetadata,
+        *,
+        workflow_id: str,
     ) -> str:
-        """Generate workflow file content from serialized commands and metadata."""
-        metadata_block = self._generate_workflow_metadata_header(workflow_metadata=workflow_metadata)
+        """Generate the file content of the workflow `workflow_id` names from serialized commands and metadata."""
+        metadata_block = self._generate_workflow_metadata_header(workflow_metadata, workflow_id)
         if metadata_block is None:
             details = f"Failed to generate metadata block for workflow '{workflow_metadata.name}'."
             raise ValueError(details)
@@ -331,12 +334,15 @@ class WorkflowCodeGenerator(EngineScoped):
         import_output = import_recorder.generate_imports()
         return f"{metadata_block}\n\n{import_output}\n\n{ast_output}\n"
 
-    def replace_workflow_metadata_header(self, workflow_content: str, new_metadata: WorkflowMetadata) -> str | None:
+    def replace_workflow_metadata_header(
+        self, workflow_content: str, new_metadata: WorkflowMetadata, *, workflow_id: str
+    ) -> str | None:
         """Replace the metadata header in a workflow file with new metadata.
 
         Args:
             workflow_content: The full content of the workflow file
             new_metadata: The new metadata to replace the existing header with
+            workflow_id: The id of the workflow the file holds, which the header saves
 
         Returns:
             The workflow content with updated metadata header, or None if replacement failed
@@ -344,7 +350,7 @@ class WorkflowCodeGenerator(EngineScoped):
         import re
 
         # Generate the new metadata header
-        new_metadata_header = self._generate_workflow_metadata_header(new_metadata)
+        new_metadata_header = self._generate_workflow_metadata_header(new_metadata, workflow_id)
         if new_metadata_header is None:
             return None
 
@@ -402,7 +408,8 @@ class WorkflowCodeGenerator(EngineScoped):
             for attr_value in obj.__dict__.values():
                 self.walk_object_tree(attr_value, process_class_fn, visited)
 
-    def _generate_workflow_metadata_header(self, workflow_metadata: WorkflowMetadata) -> str | None:
+    def _generate_workflow_metadata_header(self, workflow_metadata: WorkflowMetadata, workflow_id: str) -> str | None:
+        """The metadata header of the workflow `workflow_id` names, which saves its id beside its metadata."""
         try:
             toml_doc = tomlkit.document()
             toml_doc.add("dependencies", tomlkit.item([]))
@@ -412,6 +419,12 @@ class WorkflowCodeGenerator(EngineScoped):
             # this preserves the nil/null/None values that we WANT, but for all of the
             # Python-related Nones, TOML will flip out if they are not stripped.
             metadata_dict = workflow_metadata.model_dump(exclude_none=True)
+            # Right after the name, where a reader of the file finds it.
+            metadata_dict = {
+                "name": metadata_dict.pop("name"),
+                WORKFLOW_ID_HEADER_KEY: workflow_id,
+                **metadata_dict,
+            }
             for key, value in metadata_dict.items():
                 griptape_tool_table.add(key=key, value=value)
             toml_doc["tool"] = tomlkit.table()

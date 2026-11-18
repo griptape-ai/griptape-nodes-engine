@@ -283,7 +283,7 @@ class NodeDependencies:
     for workflow packaging, dependency resolution, and deployment planning.
 
     Attributes:
-        referenced_workflows: Set of workflow names that this node references
+        referenced_workflows: Set of ids of the workflows this node references
         static_files: Set of static file names that this node depends on
         imports: Set of Python imports that this node requires
         libraries: Set of library names and versions that this node uses
@@ -1765,7 +1765,7 @@ class BaseNode(ABC):
                     deps = NodeDependencies()
 
                 # Add this node's specific dependencies
-                deps.referenced_workflows.update({"image_processing_workflow", "validation_workflow"})
+                deps.referenced_workflows.update({self.image_processing_workflow_id})
                 deps.static_files.update({"config.json", "model_weights.pkl"})
                 deps.imports.update({
                     ImportDependency("numpy"),

@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -98,6 +99,7 @@ def _generate_echo_workflow_source(engine: Engine, library_json: Path) -> str:
     return engine.workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         workflow_metadata=metadata,
+        workflow_id=new_workflow_id(),
     )
 
 

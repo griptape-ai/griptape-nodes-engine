@@ -4,7 +4,6 @@ import json
 import logging
 import re
 import tomllib
-import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -21,18 +20,23 @@ from griptape_nodes.files.path_utils import (
 from griptape_nodes.node_library.library_registry import (
     LibraryNameAndVersion,
 )
+from griptape_nodes.node_library.workflow_ids import (
+    FoundWorkflowFile,
+    RegisteredWorkflowFile,
+    WorkflowIdDecision,
+    WorkflowIdReason,
+    is_workflow_id,
+    new_workflow_id,
+    path_workflow_id,
+    reconcile_workflow_ids,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable, Iterable, Sequence
 
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 
 logger = logging.getLogger("griptape_nodes")
-
-
-def new_workflow_id() -> str:
-    """Mint a workflow id. It lasts while the engine runs, and is never written to the workflow's file."""
-    return uuid.uuid4().hex
 
 
 # Name of the inline metadata block that carries a workflow's metadata header.
@@ -51,6 +55,9 @@ _TOOL_TABLE = "tool"
 _GRIPTAPE_NODES_TABLE = "griptape-nodes"
 # How the required table is spelled in messages and in the editor's workflow-load report.
 METADATA_TABLE_PATH = f"[{_TOOL_TABLE}.{_GRIPTAPE_NODES_TABLE}]"
+# Key of the workflow's id in that table. It is not part of `WorkflowMetadata`: the registry entry
+# holds a workflow's id, and every write of the header takes it from there.
+WORKFLOW_ID_HEADER_KEY = "workflow_id"
 
 
 class WorkflowMetadataError(Exception):
@@ -129,13 +136,16 @@ class WorkflowShape(BaseModel):
 
 
 class WorkflowMetadata(BaseModel):
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.21.0"
+    # 0.22.0 saves the workflow's id in the header, and links to other workflows (`branched_from`,
+    # `workflows_referenced`, referenced subflow imports) by id instead of by registry name.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.22.0"
 
     name: str
     schema_version: str
     engine_version_created_with: str
     node_libraries_referenced: list[LibraryNameAndVersion]
     node_types_used: set[LibraryNameAndNodeType] = Field(default_factory=set)
+    # Ids of the workflows this one imports as referenced subflows.
     workflows_referenced: list[str] | None = None
     description: str | None = None
     image: str | None = None
@@ -146,6 +156,7 @@ class WorkflowMetadata(BaseModel):
     is_internal: bool | None = False
     creation_date: datetime | None = Field(default=None)
     last_modified_date: datetime | None = Field(default=None)
+    # Id of the workflow this one is a branch of.
     branched_from: str | None = Field(default=None)
     workflow_shape: WorkflowShape | None = Field(default=None)
 
@@ -235,7 +246,25 @@ def strip_metadata_comment_prefixes(metadata_block: re.Match[str]) -> str:
     )
 
 
+class WorkflowHeader(NamedTuple):
+    """A workflow file's metadata header.
+
+    Args:
+        metadata: The header's metadata.
+        workflow_id: The id the header carries. None for a file saved before ids were written, or
+            one whose id is not 32 lowercase hex digits.
+    """
+
+    metadata: WorkflowMetadata
+    workflow_id: str | None
+
+
 def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
+    """Read the metadata out of a workflow file's header. See `read_workflow_header`."""
+    return read_workflow_header(workflow_file_path).metadata
+
+
+def read_workflow_header(workflow_file_path: Path) -> WorkflowHeader:
     """Read the metadata header out of a workflow file.
 
     Pure file parsing: no registry lookups, no engine requests, and no waiting on library
@@ -258,7 +287,18 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
             f"Failed because the file could not be read: {err}"
         )
         raise WorkflowMetadataFileError(msg) from err
+    return parse_workflow_header(workflow_content, workflow_file_path)
 
+
+def parse_workflow_header(workflow_content: str, workflow_file_path: Path) -> WorkflowHeader:
+    """Parse the metadata header out of the content of the workflow file at `workflow_file_path`.
+
+    Raises:
+        WorkflowMetadataSectionCountError: The content does not carry exactly one metadata header.
+        WorkflowMetadataTomlError: The header is not valid TOML.
+        WorkflowMetadataMissingTableError: The header has no `[tool.griptape-nodes]` table.
+        WorkflowMetadataSchemaError: That table does not match the expected schema.
+    """
     matches = find_metadata_blocks(workflow_content, WORKFLOW_METADATA_BLOCK_NAME)
     if len(matches) != 1:
         msg = (
@@ -292,13 +332,30 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
         raise WorkflowMetadataMissingTableError(msg, section_path=METADATA_TABLE_PATH) from err
 
     try:
-        return WorkflowMetadata.model_validate(tool_section)
+        metadata = WorkflowMetadata.model_validate(tool_section)
     except ValidationError as err:
         msg = (
             f"Attempted to read workflow metadata from '{workflow_file_path}'. Failed because the "
             f"'{METADATA_TABLE_PATH}' table does not match the expected schema: {err}"
         )
         raise WorkflowMetadataSchemaError(msg, section_path=METADATA_TABLE_PATH, error_message=str(err)) from err
+    return WorkflowHeader(metadata=metadata, workflow_id=_header_workflow_id(tool_section, workflow_file_path))
+
+
+def _header_workflow_id(tool_section: dict[str, Any], workflow_file_path: Path) -> str | None:
+    """The workflow id a header's table carries, or None when it carries none or one in the wrong form."""
+    header_id = tool_section.get(WORKFLOW_ID_HEADER_KEY)
+    if header_id is None:
+        return None
+    if not isinstance(header_id, str) or not is_workflow_id(header_id):
+        logger.warning(
+            "Workflow file '%s' carries '%s' as its workflow id, which is not 32 lowercase hex digits. "
+            "Using an id derived from its path; its next save writes that one.",
+            workflow_file_path,
+            header_id,
+        )
+        return None
+    return header_id
 
 
 class WorkflowRegistryError(ValueError):
@@ -333,6 +390,21 @@ class UnknownWorkflowAddressError(WorkflowAddressError):
     """No registered workflow has the id or name a request gives."""
 
 
+class WorkflowFileToRegister(NamedTuple):
+    """A workflow file a scan found, with the header read from it."""
+
+    file: FoundWorkflowFile
+    metadata: WorkflowMetadata
+
+
+class RefreshedWorkflowFile(NamedTuple):
+    """What `_WorkflowRegistry.refresh_files` made of one file: its entry, or why it has none."""
+
+    path: Path
+    workflow: Workflow | None = None
+    error: str = ""
+
+
 class _EntryKeys(NamedTuple):
     """The path and names a registry entry answers to, derived from its file."""
 
@@ -352,11 +424,17 @@ class _WorkflowRegistry:
     Owned by `Engine` and reached through `engine.workflow_registry`. Node libraries, which have
     no engine reference, use the `WorkflowRegistry` classmethods.
 
-    The registry mints a workflow's id when the workflow is registered, and the id lasts while the
-    engine runs. It is never written to the workflow's file, so another engine process gives the
-    same file an id of its own. A rescan keeps each file's id because it refreshes entries in
-    place: `refresh_file` keeps the entry a file already has, and `remove_saved_workflows_except`
-    drops only the entries the rescan did not find.
+    A workflow's id is saved in its file's header, so it survives restarts, renames and moves, and
+    every engine that reads the file calls it by the same id. The entry is the only place an id is
+    held in memory: `WorkflowMetadata` has none, and every write of a header takes it from the
+    entry. Every file registered goes through `reconcile_workflow_ids`, which decides its id from
+    its header, its library or its path, and settles copies and files moved outside the editor.
+    Registering only reads files: an id a file gets that its header lacks is written on its next
+    save. A rescan keeps each file's entry because it refreshes entries in place, and
+    `remove_saved_workflows_except` drops only the entries the rescan did not find.
+
+    Metadata read from a file passes through `migrate_metadata` before an entry holds it, so files
+    from older schemas are brought up to date in memory.
 
     Lookups by name or path scan the entries. Each entry caches the keys derived from its paths,
     which the registry sets whenever an entry's paths change: `set_file_path` is the only way
@@ -373,9 +451,11 @@ class _WorkflowRegistry:
         config_manager: ConfigManager,
         *,
         is_workflow_open: Callable[[str], bool],
+        migrate_metadata: Callable[[WorkflowMetadata], WorkflowMetadata] | None = None,
     ) -> None:
         self._config_manager = config_manager
         self._is_workflow_open = is_workflow_open
+        self._migrate_metadata = migrate_metadata
         self._by_id: dict[str, Workflow] = {}
 
     def is_open(self, workflow_id: str) -> bool:
@@ -410,7 +490,7 @@ class _WorkflowRegistry:
         if not name.startswith(self.UNSAVED_KEY_PREFIX):
             return None
         candidate = name.removeprefix(self.UNSAVED_KEY_PREFIX)
-        if not self._is_workflow_id(candidate):
+        if not is_workflow_id(candidate):
             return None
         return candidate
 
@@ -489,22 +569,29 @@ class _WorkflowRegistry:
                     return workflow
         return None
 
-    def register_file(
+    def register_file(  # noqa: PLR0913
         self,
         path: str | Path,
         metadata: WorkflowMetadata,
         *,
-        workflow_id: str | None = None,
+        header_id: str | None = None,
+        library_id: str | None = None,
+        peer_id: str | None = None,
         listed: bool = True,
         metadata_is_placeholder: bool = False,
     ) -> Workflow:
         """Register the workflow file at `path` (workspace-relative or absolute) and return its entry.
 
+        The file's id comes from `reconcile_workflow_ids`.
+
         Args:
             path: The workflow file. A link to a file already registered under another path
                 returns that file's entry.
             metadata: The workflow's header.
-            workflow_id: The id to register it under. Defaults to a new id.
+            header_id: The id the file's header carries, if any.
+            library_id: The id of the library workflow the file is, if a library provides it.
+            peer_id: The id another engine knows the file by, which it is registered under
+                whatever else holds the file or the id.
             listed: False keeps the entry out of `list_workflows`. Registering an unlisted file
                 again with True lists its entry and keeps its id.
             metadata_is_placeholder: `metadata` was made up because the header could not be read.
@@ -512,7 +599,7 @@ class _WorkflowRegistry:
         Raises:
             ValueError: The file is not on disk.
             WorkflowPathTakenError: Another entry holds the path, or the name derived from it.
-            DuplicateWorkflowIdError: `workflow_id` is already registered.
+            OpenWorkflowRemovalError: `peer_id` displaces an entry for the file that is open.
         """
         absolute_path = self.canonical_path(path)
         if not absolute_path.is_file():
@@ -520,83 +607,76 @@ class _WorkflowRegistry:
             raise ValueError(msg)
 
         holder = self.find_by_path(absolute_path)
-        promotes_holder = (
-            holder is not None
-            and listed
-            and not holder.listed
-            and (workflow_id is None or workflow_id == holder.workflow_id)
-        )
-        if holder is not None and absolute_path in holder.known_paths and not promotes_holder:
-            msg = f"Attempted to register the workflow at '{absolute_path}'. Failed because '{holder.name}' is already registered there."
-            raise WorkflowPathTakenError(msg, existing=holder)
-        if holder is not None and workflow_id is not None and holder.workflow_id != workflow_id:
-            msg = (
-                f"Attempted to register the workflow at '{absolute_path}' as '{workflow_id}'. Failed because "
-                f"'{holder.name}' is already registered for the same file."
-            )
-            raise WorkflowPathTakenError(msg, existing=holder)
-        if holder is None and workflow_id is not None and workflow_id in self._by_id:
-            existing = self._by_id[workflow_id]
-            msg = (
-                f"Attempted to register the workflow at '{absolute_path}'. Failed because '{existing.name}' "
-                f"already has the workflow id '{workflow_id}'."
-            )
-            raise DuplicateWorkflowIdError(msg, existing=existing)
-
-        # The registry already knows the file: under another path, through a link, which becomes
-        # one more path of that workflow, or unlisted, which this registration lists.
-        if holder is not None:
+        if holder is not None and (peer_id is None or peer_id == holder.workflow_id):
+            promotes_holder = listed and not holder.listed
+            if absolute_path in holder.known_paths and not promotes_holder:
+                msg = f"Attempted to register the workflow at '{absolute_path}'. Failed because '{holder.name}' is already registered there."
+                raise WorkflowPathTakenError(msg, existing=holder)
+            # The registry already knows the file: under another path, through a link, which becomes
+            # one more path of that workflow, or unlisted, which this registration lists.
             if absolute_path not in holder.known_paths:
                 self._add_alias(holder, absolute_path)
             if promotes_holder:
                 holder.listed = True
-                if not self.is_open(holder.workflow_id):
-                    holder.metadata = metadata
-                    holder.metadata_is_placeholder = metadata_is_placeholder
+                self._take_file_metadata(holder, metadata, metadata_is_placeholder=metadata_is_placeholder)
             return holder
 
-        if workflow_id is None:
-            workflow_id = new_workflow_id()
-        workflow = Workflow(
-            registry=self,
-            workflow_id=workflow_id,
-            metadata=metadata,
-            absolute_path=absolute_path,
-            listed=listed,
-            metadata_is_placeholder=metadata_is_placeholder,
-        )
-        self._add(workflow)
-        return workflow
+        found = FoundWorkflowFile(path=absolute_path, header_id=header_id, library_id=library_id, peer_id=peer_id)
+        (decision,) = reconcile_workflow_ids([found], self._registered_files_for([found]))
+        return self._apply_decision(decision, metadata, listed=listed, metadata_is_placeholder=metadata_is_placeholder)
 
-    def refresh_file(self, path: str | Path, metadata: WorkflowMetadata) -> Workflow:
-        """Register the workflow file at `path` as a rescan finds it, keeping the entry it already has.
+    def refresh_files(self, files: Sequence[WorkflowFileToRegister]) -> list[RefreshedWorkflowFile]:
+        """Register the workflow files a scan found, keeping the entries they already have, and report each.
 
-        A file the registry does not hold is registered with a new id. A file it holds, under
-        this path or through a link, keeps its entry and its id, becomes listed, and takes
-        `metadata`, freshly read from its header. An open workflow keeps the metadata it has in
-        memory, which is what its next save writes. A link the entry is not yet known by becomes
-        an alias of it, as in `register_file`, so the name derived from the link keeps resolving.
+        The ids of all of them are decided together (`reconcile_workflow_ids`), so which of two
+        files carrying one id keeps it never depends on the order they were found in. A file the
+        registry holds, under its path or through a link, keeps its entry and its id, becomes
+        listed, and takes its freshly read metadata. An open workflow keeps the metadata it has in
+        memory, which is what its next save writes. A link the entry is not yet known by becomes an
+        alias of it, so the name derived from the link keeps resolving.
+        """
+        missing: list[RefreshedWorkflowFile] = []
+        to_reconcile: dict[Path, WorkflowFileToRegister] = {}
+        for to_register in files:
+            absolute_path = self.canonical_path(to_register.file.path)
+            if not absolute_path.is_file():
+                missing.append(
+                    RefreshedWorkflowFile(path=absolute_path, error=f"File path '{absolute_path}' does not exist.")
+                )
+                continue
+            to_reconcile[absolute_path] = to_register._replace(file=to_register.file._replace(path=absolute_path))
+
+        found = [to_register.file for to_register in to_reconcile.values()]
+        refreshed: list[RefreshedWorkflowFile] = []
+        for decision in reconcile_workflow_ids(found, self._registered_files_for(found)):
+            to_register = to_reconcile[decision.file.path]
+            try:
+                workflow = self._apply_decision(decision, to_register.metadata, listed=True)
+            except WorkflowRegistryError as err:
+                refreshed.append(RefreshedWorkflowFile(path=decision.file.path, error=str(err)))
+                continue
+            refreshed.append(RefreshedWorkflowFile(path=decision.file.path, workflow=workflow))
+        return [*missing, *refreshed]
+
+    def refresh_file(
+        self,
+        path: str | Path,
+        metadata: WorkflowMetadata,
+        *,
+        header_id: str | None = None,
+        library_id: str | None = None,
+    ) -> Workflow:
+        """Register one workflow file as `refresh_files` does, and return its entry.
 
         Raises:
-            ValueError: The file is not on disk.
-            WorkflowPathTakenError: The file is new, or found through a new link, and another entry
-                holds the name derived from it.
+            ValueError: The file is not on disk, or it is new, or found through a new link, and
+                another entry holds the name derived from it.
         """
-        absolute_path = self.canonical_path(path)
-        holder = self.find_by_path(absolute_path)
-        if holder is None:
-            return self.register_file(absolute_path, metadata)
-        if not absolute_path.is_file():
-            msg = f"File path '{absolute_path}' does not exist."
-            raise ValueError(msg)
-
-        if absolute_path not in holder.known_paths:
-            self._add_alias(holder, absolute_path)
-        holder.listed = True
-        if not self.is_open(holder.workflow_id):
-            holder.metadata = metadata
-            holder.metadata_is_placeholder = False
-        return holder
+        found = FoundWorkflowFile(path=Path(path), header_id=header_id, library_id=library_id)
+        (refreshed,) = self.refresh_files([WorkflowFileToRegister(file=found, metadata=metadata)])
+        if refreshed.workflow is None:
+            raise WorkflowRegistryError(refreshed.error)
+        return refreshed.workflow
 
     def register_unsaved(
         self,
@@ -617,7 +697,7 @@ class _WorkflowRegistry:
             WorkflowRegistryError: `workflow_id` is not 32 lowercase hex digits.
             DuplicateWorkflowIdError: `workflow_id` is already registered.
         """
-        if workflow_id is not None and not self._is_workflow_id(workflow_id):
+        if workflow_id is not None and not is_workflow_id(workflow_id):
             msg = f"Attempted to register an unsaved workflow as '{workflow_id}'. Failed because a workflow id is 32 lowercase hex digits."
             raise WorkflowRegistryError(msg)
         if workflow_id is None:
@@ -699,7 +779,7 @@ class _WorkflowRegistry:
     def remove(self, workflow_id: str) -> Workflow:
         """Remove the entry with this id and return it. An open workflow's entry is refused: close it first.
 
-        A file registered at its path later gets an id of its own.
+        A file registered at its path later takes the id `reconcile_workflow_ids` gives it, as any file does.
 
         Raises:
             KeyError: No workflow has that id.
@@ -889,8 +969,13 @@ class _WorkflowRegistry:
         self.set_file_path(workflow, f"{new_key}{workflow.absolute_path.suffix}")
 
     def get_branches_of_workflow(self, workflow_name: str) -> list[str]:
-        """Get all workflows that are branches of the specified workflow."""
-        return [workflow.name for workflow in self._by_id.values() if workflow.metadata.branched_from == workflow_name]
+        """The names of the workflows that are branches of the workflow named `workflow_name`."""
+        source = self.find_by_name(workflow_name)
+        if source is None:
+            return []
+        return [
+            workflow.name for workflow in self._by_id.values() if workflow.metadata.branched_from == source.workflow_id
+        ]
 
     def _resolve_name(self, workflow_name: str, *, action: str) -> Workflow:
         workflow = self.find_by_name(workflow_name)
@@ -911,6 +996,105 @@ class _WorkflowRegistry:
         self._raise_if_taken(workflow, keys, self._by_id.values())
         workflow._alias_paths = alias_paths
         workflow._keys = keys
+
+    def _registered_files_for(self, found: Sequence[FoundWorkflowFile]) -> list[RegisteredWorkflowFile]:
+        """The entries `reconcile_workflow_ids` needs for `found`: those holding its paths, and those holding the ids it could take.
+
+        An entry that holds a found file through a link answers for the found path too.
+        """
+        entries: dict[str, RegisteredWorkflowFile] = {}
+
+        def add(workflow: Workflow, *extra_paths: Path) -> None:
+            known = entries.get(workflow.workflow_id)
+            paths = tuple(dict.fromkeys([*(known.paths if known else workflow.known_paths), *extra_paths]))
+            file_present = any(path.is_file() for path in workflow.known_paths) or bool(extra_paths)
+            entries[workflow.workflow_id] = RegisteredWorkflowFile(
+                workflow_id=workflow.workflow_id, paths=paths, file_present=file_present
+            )
+
+        for file in found:
+            holder = self.find_by_path(file.path)
+            if holder is not None:
+                add(holder, file.path)
+            for candidate in (file.peer_id, file.library_id, file.header_id, path_workflow_id(file.path)):
+                if candidate is None:
+                    continue
+                workflow = self._by_id.get(candidate)
+                if workflow is not None and workflow.workflow_id not in entries:
+                    add(workflow)
+        return list(entries.values())
+
+    def _apply_decision(
+        self,
+        decision: WorkflowIdDecision,
+        metadata: WorkflowMetadata,
+        *,
+        listed: bool,
+        metadata_is_placeholder: bool = False,
+    ) -> Workflow:
+        """Register the file `decision` is about under the id it decided, and return its entry.
+
+        Raises:
+            WorkflowPathTakenError: Another entry holds the path, or the name derived from it.
+            OpenWorkflowRemovalError: The entry `decision` displaces is open.
+        """
+        path = decision.file.path
+        if decision.displaced_id is not None:
+            listed = listed or self.get(decision.displaced_id).listed
+            self.remove(decision.displaced_id)
+        if decision.entry_id is None:
+            workflow = Workflow(
+                registry=self,
+                workflow_id=decision.workflow_id,
+                metadata=self._migrated(metadata),
+                absolute_path=path,
+                listed=listed,
+                metadata_is_placeholder=metadata_is_placeholder,
+            )
+            self._add(workflow)
+            self._log_decision(decision, workflow)
+            return workflow
+
+        workflow = self.get(decision.entry_id)
+        if decision.reason is WorkflowIdReason.REGISTERED:
+            if path not in workflow.known_paths:
+                self._add_alias(workflow, path)
+        elif path not in workflow.known_paths:
+            self.set_file_path(workflow, path)
+        workflow.listed = workflow.listed or listed
+        self._take_file_metadata(workflow, metadata, metadata_is_placeholder=metadata_is_placeholder)
+        self._log_decision(decision, workflow)
+        return workflow
+
+    def _take_file_metadata(
+        self, workflow: Workflow, metadata: WorkflowMetadata, *, metadata_is_placeholder: bool
+    ) -> None:
+        """Give `workflow` the metadata read from its file, unless it is open: an open workflow keeps what its next save writes."""
+        if self.is_open(workflow.workflow_id):
+            return
+        workflow.metadata = self._migrated(metadata)
+        workflow.metadata_is_placeholder = metadata_is_placeholder
+
+    def _migrated(self, metadata: WorkflowMetadata) -> WorkflowMetadata:
+        if self._migrate_metadata is None:
+            return metadata
+        return self._migrate_metadata(metadata)
+
+    @staticmethod
+    def _log_decision(decision: WorkflowIdDecision, workflow: Workflow) -> None:
+        if decision.reason is WorkflowIdReason.MOVED:
+            logger.info(
+                "Workflow '%s' carries the id of a workflow whose file is gone, so it was moved outside the editor. "
+                "It keeps that id.",
+                decision.file.path,
+            )
+        elif decision.reason is WorkflowIdReason.DUPLICATE:
+            logger.info(
+                "Workflow file '%s' has the same id as another workflow, as a copy made outside the editor does. "
+                "Giving it the id '%s', which its next save writes.",
+                decision.file.path,
+                workflow.workflow_id,
+            )
 
     @staticmethod
     def _raise_if_taken(workflow: Workflow, keys: _EntryKeys, others: Iterable[Workflow]) -> None:
@@ -960,15 +1144,6 @@ class _WorkflowRegistry:
         if followed == kept:
             return [kept]
         return [kept, followed]
-
-    @staticmethod
-    def _is_workflow_id(candidate: str) -> bool:
-        """Whether `candidate` is in the form `new_workflow_id` mints: 32 lowercase hex digits."""
-        try:
-            workflow_id = uuid.UUID(hex=candidate).hex
-        except ValueError:
-            return False
-        return workflow_id == candidate
 
 
 # The engine version that removes the deprecated `WorkflowRegistry` classmethods.
@@ -1069,8 +1244,8 @@ class Workflow:
     - **Unsaved**: in-memory only. `file_path` and `absolute_path` are None. Becomes saved when
       the registry's `set_file_path` gives it a file.
 
-    `workflow_id` never changes while the engine runs. Only the registry changes the path, so the
-    keys it caches on the entry stay right.
+    `workflow_id` never changes, and every save of the workflow writes it to the file's header.
+    Only the registry changes the path, so the keys it caches on the entry stay right.
     """
 
     metadata: WorkflowMetadata

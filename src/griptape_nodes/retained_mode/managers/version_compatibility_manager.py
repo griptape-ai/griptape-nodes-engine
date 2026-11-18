@@ -93,6 +93,28 @@ class WorkflowVersionCompatibilityCheck(EngineScoped, ABC):
         """Perform the workflow compatibility check."""
 
 
+class WorkflowMigration(EngineScoped, ABC):
+    """Brings a workflow saved on an older schema up to date as it loads, without writing its file.
+
+    The engine applies every migration that applies to a workflow's header when it reads the file:
+    `migrate_metadata` before a registry entry holds the metadata, and `migrate_source` before the
+    file's code runs. The workflow's next save writes the result in the latest schema. A migration
+    reads the registry to resolve what the file names, so it changes only what it can resolve.
+    """
+
+    @abstractmethod
+    def applies_to_workflow(self, workflow_metadata: WorkflowMetadata) -> bool:
+        """Return True if this migration applies to a workflow with this header."""
+
+    @abstractmethod
+    def migrate_metadata(self, workflow_metadata: WorkflowMetadata) -> WorkflowMetadata:
+        """Return the header as the latest schema holds it. Leaves `workflow_metadata` unchanged."""
+
+    @abstractmethod
+    def migrate_source(self, workflow_source: str) -> str:
+        """Return the workflow file's code as the latest schema writes it."""
+
+
 class SetParameterVersionCompatibilityCheck(EngineScoped, ABC):
     """Abstract base class for runtime parameter set version compatibility checks."""
 
@@ -145,6 +167,7 @@ class VersionCompatibilityManager(EngineScoped):
         self._event_manager = event_manager
         self._compatibility_checks: list[LibraryVersionCompatibilityCheck] = []
         self._workflow_compatibility_checks: list[WorkflowVersionCompatibilityCheck] = []
+        self._workflow_migrations: list[WorkflowMigration] = []
         self._set_parameter_compatibility_checks: list[SetParameterVersionCompatibilityCheck] = []
         self._discover_version_checks()
 
@@ -209,6 +232,10 @@ class VersionCompatibilityManager(EngineScoped):
                 check_instance = attr(engine=self.engine)
                 self._workflow_compatibility_checks.append(check_instance)
                 logger.debug("Registered workflow version compatibility check: %s", attr_name)
+            elif issubclass(attr, WorkflowMigration):
+                migration_instance = attr(engine=self.engine)
+                self._workflow_migrations.append(migration_instance)
+                logger.debug("Registered workflow migration: %s", attr_name)
             elif issubclass(attr, SetParameterVersionCompatibilityCheck):
                 check_instance = attr(engine=self.engine)
                 self._set_parameter_compatibility_checks.append(check_instance)
@@ -266,6 +293,22 @@ class VersionCompatibilityManager(EngineScoped):
         version_issues.extend(self._check_library_for_beta_feature_problems(library_data))
 
         return version_issues
+
+    def migrate_workflow_metadata(self, workflow_metadata: WorkflowMetadata) -> WorkflowMetadata:
+        """Return a workflow's header with every migration that applies to it applied (`WorkflowMigration`)."""
+        migrated = workflow_metadata
+        for migration in self._workflow_migrations:
+            if migration.applies_to_workflow(workflow_metadata):
+                migrated = migration.migrate_metadata(migrated)
+        return migrated
+
+    def migrate_workflow_source(self, workflow_metadata: WorkflowMetadata, workflow_source: str) -> str:
+        """Return a workflow file's code with every migration that applies to its header applied (`WorkflowMigration`)."""
+        migrated = workflow_source
+        for migration in self._workflow_migrations:
+            if migration.applies_to_workflow(workflow_metadata):
+                migrated = migration.migrate_source(migrated)
+        return migrated
 
     async def check_workflow_version_compatibility(
         self, workflow_metadata: WorkflowMetadata, *, registered_libraries: list[str] | None = None

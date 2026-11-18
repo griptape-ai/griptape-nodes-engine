@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 import shutil
 import sys
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
 
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.node_library.workflow_ids import path_workflow_id
 from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
+    read_workflow_header,
     read_workflow_metadata,
 )
 from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
@@ -40,6 +44,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowResultSuccess,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
@@ -57,6 +62,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowResultSuccess,
     GetWorkflowRunCommandRequest,
     GetWorkflowRunCommandResultFailure,
+    ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
     ImportWorkflowResultSuccess,
     ListAllWorkflowsRequest,
@@ -646,9 +652,9 @@ class TestRegistryRefresh:
         imported_file = _write_workflow_file(tmp_path / "elsewhere" / "imported.py")
         real_scan = engine.workflow_manager._process_workflows_for_registration
 
-        async def scan_with_an_import(workflows_to_register: list[str]) -> object:
+        async def scan_with_an_import(workflows_to_register: list[str], **kwargs: Any) -> object:
             engine.workflow_registry.register_file(imported_file, read_workflow_metadata(imported_file))
-            return await real_scan(workflows_to_register)
+            return await real_scan(workflows_to_register, **kwargs)
 
         with patch.object(engine.workflow_manager, "_process_workflows_for_registration", scan_with_an_import):
             _scan(engine, workspace)
@@ -664,8 +670,8 @@ class TestRegistryRefresh:
         saved_file = _write_workflow_file(tmp_path / "elsewhere" / "scratch.py")
         real_scan = engine.workflow_manager._process_workflows_for_registration
 
-        async def scan_with_a_first_save(workflows_to_register: list[str]) -> object:
-            result = await real_scan(workflows_to_register)
+        async def scan_with_a_first_save(workflows_to_register: list[str], **kwargs: Any) -> object:
+            result = await real_scan(workflows_to_register, **kwargs)
             engine.workflow_registry.set_file_path(unsaved, saved_file)
             return result
 
@@ -684,11 +690,11 @@ class TestRegistryRefresh:
         moved_file = tmp_path / "elsewhere" / "flow.py"
         real_scan = engine.workflow_manager._process_workflows_for_registration
 
-        async def scan_with_a_move(workflows_to_register: list[str]) -> object:
+        async def scan_with_a_move(workflows_to_register: list[str], **kwargs: Any) -> object:
             moved_file.parent.mkdir(parents=True)
             workflow_file.rename(moved_file)
             engine.workflow_registry.set_file_path(workflow, moved_file)
-            return await real_scan(workflows_to_register)
+            return await real_scan(workflows_to_register, **kwargs)
 
         with patch.object(engine.workflow_manager, "_process_workflows_for_registration", scan_with_a_move):
             _scan(engine, workspace)
@@ -1017,16 +1023,14 @@ class TestIdentityAcrossTheWorkflowLifecycle:
         assert engine.workflow_registry.get(workflow_id).name == "shots/renamed"
         engine.handle_request(SetCurrentProjectRequest(project_id=None))
 
-        # Restart: a new engine finds the workflow by scanning, and gives it an id of its own,
-        # which then lasts while that engine runs.
+        # Restart: a new engine finds the workflow by scanning, under the id its file saves.
         reset_root_engine()
         restarted = current_engine()
         _use_default_project(restarted, workspace)
         _scan(restarted, workspace)
         found = restarted.workflow_registry.find_by_name("shots/renamed")
         assert found is not None
-        assert found.workflow_id != workflow_id
-        assert restarted.workflow_registry.find_by_id(workflow_id) is None
+        assert found.workflow_id == workflow_id
 
         _scan(restarted, workspace)
         assert restarted.workflow_registry.get(found.workflow_id).name == "shots/renamed"
@@ -1391,3 +1395,221 @@ class TestClosingAnUnsavedWorkflow:
         assert isinstance(deleted, DeleteWorkflowResultSuccess), deleted.result_details
         assert project_engine.open_workflows.all_open() == []
         assert project_engine.workflow_registry.find_by_id(workflow_id) is None
+
+
+def _header_id(path: str | Path) -> str | None:
+    """The id the header of the workflow file at `path` saves."""
+    return read_workflow_header(Path(path)).workflow_id
+
+
+def _as_older_schema(path: str | Path, **header_lines: str) -> None:
+    """Rewrite a saved file's header as a file from before schema 0.22.0: no id, and these keys as given."""
+    content = Path(path).read_text(encoding="utf-8")
+    content = re.sub(r'(?m)^# workflow_id = ".*"\n', "", content)
+    content = re.sub(r'(?m)^# schema_version = ".*"$', '# schema_version = "0.21.0"', content)
+    for key, value in header_lines.items():
+        content = re.sub(rf"(?m)^# {key} = .*$", f"# {key} = {value}", content)
+    Path(path).write_text(content, encoding="utf-8")
+
+
+class TestIdsSavedInTheFile:
+    """A workflow's id is saved in its file's header, which every write of the file keeps."""
+
+    def test_a_first_save_and_a_copy_write_their_own_ids(self, project_engine: Engine) -> None:
+        workflow_id = _open_new_workflow(project_engine, "first")
+
+        saved = _save(project_engine)
+        copy = _save(project_engine, SaveWorkflowRequest(file_name="the_copy"))
+
+        assert _header_id(saved.file_path) == workflow_id
+        assert _header_id(copy.file_path) == copy.workflow_id != workflow_id
+
+    def test_branch_merge_and_reset_write_the_ids_of_the_files_they_write(self, project_engine: Engine) -> None:
+        source = _saved_workflow(project_engine, "source")
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_name=source.workflow_name))
+        assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
+        assert branch.branched_workflow_id is not None
+        branch_path = project_engine.workflow_registry.get(branch.branched_workflow_id).absolute_path
+        assert branch_path is not None
+
+        assert _header_id(branch_path) == branch.branched_workflow_id
+        assert read_workflow_metadata(branch_path).branched_from == source.workflow_id
+
+        reset = project_engine.handle_request(ResetWorkflowBranchRequest(workflow_id=branch.branched_workflow_id))
+        assert isinstance(reset, ResetWorkflowBranchResultSuccess), reset.result_details
+        assert _header_id(branch_path) == branch.branched_workflow_id
+
+        merged = project_engine.handle_request(MergeWorkflowBranchRequest(workflow_id=branch.branched_workflow_id))
+        assert isinstance(merged, MergeWorkflowBranchResultSuccess), merged.result_details
+        assert _header_id(source.file_path) == source.workflow_id
+
+    def test_setting_metadata_keeps_the_id_in_the_header(self, project_engine: Engine) -> None:
+        saved = _saved_workflow(project_engine, "described")
+
+        updated = _run(
+            project_engine,
+            SetWorkflowMetadataRequest(
+                workflow_id=saved.workflow_id,
+                workflow_metadata={"description": "now described"},  # type: ignore[arg-type]
+            ),
+        )
+
+        assert updated.succeeded(), updated.result_details
+        assert _header_id(saved.file_path) == saved.workflow_id
+
+    def test_a_saved_file_moved_outside_the_engine_keeps_its_id(self, project_engine: Engine, workspace: Path) -> None:
+        saved = _saved_workflow(project_engine, "mover")
+        moved_file = workspace / "shots" / Path(saved.file_path).name
+        moved_file.parent.mkdir()
+        shutil.move(saved.file_path, moved_file)
+
+        _scan(project_engine, workspace)
+
+        assert saved.workflow_id is not None
+        assert _id_at(project_engine, moved_file) == saved.workflow_id
+        assert project_engine.workflow_registry.get(saved.workflow_id).absolute_path == moved_file
+
+    def test_a_copy_of_a_saved_file_gets_a_new_id_and_the_original_keeps_its_own(
+        self, project_engine: Engine, workspace: Path
+    ) -> None:
+        saved = _saved_workflow(project_engine, "original")
+        copy = workspace / "aa_copy.py"
+        shutil.copy(saved.file_path, copy)
+        copy_content = copy.read_text(encoding="utf-8")
+
+        _scan(project_engine, workspace)
+
+        assert _id_at(project_engine, saved.file_path) == saved.workflow_id
+        assert _id_at(project_engine, copy) == path_workflow_id(copy)
+        # The scan only reads; the copy's next save writes its new id.
+        assert copy.read_text(encoding="utf-8") == copy_content
+
+    def test_a_restarted_engine_keeps_the_original_and_the_copy_apart_the_same_way(
+        self, project_engine: Engine, workspace: Path
+    ) -> None:
+        saved = _saved_workflow(project_engine, "original")
+        copy = workspace / "aa_copy.py"
+        shutil.copy(saved.file_path, copy)
+
+        reset_root_engine()
+        restarted = current_engine()
+        _use_default_project(restarted, workspace)
+        _scan(restarted, workspace)
+
+        # Found together, the files settle by path, not by which was registered first.
+        assert _id_at(restarted, copy) == saved.workflow_id
+        assert _id_at(restarted, saved.file_path) == path_workflow_id(Path(saved.file_path))
+        restarted.handle_request(SetCurrentProjectRequest(project_id=None))
+
+    def test_the_first_save_of_a_file_without_an_id_writes_the_one_derived_from_its_path(
+        self, project_engine: Engine, workspace: Path
+    ) -> None:
+        legacy = _write_workflow_file(workspace / "legacy.py")
+        _scan(project_engine, workspace)
+        assert _id_at(project_engine, legacy) == path_workflow_id(legacy)
+        project_engine.context_manager.push_workflow(file_path=str(legacy))
+        top = project_engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=True))
+        assert isinstance(top, CreateFlowResultSuccess), top.result_details
+
+        saved = _save(project_engine, SaveWorkflowRequest(file_name="legacy"))
+
+        assert saved.workflow_id == path_workflow_id(legacy)
+        assert _header_id(legacy) == path_workflow_id(legacy)
+
+
+class TestOlderFilesLinkByName:
+    """Files from before schema 0.22.0 name other workflows by registry name, which loading turns into ids."""
+
+    def test_a_branch_naming_its_source_by_name_merges_into_it(self, project_engine: Engine, workspace: Path) -> None:
+        source = _saved_workflow(project_engine, "source")
+        branch = project_engine.handle_request(BranchWorkflowRequest(workflow_name=source.workflow_name))
+        assert isinstance(branch, BranchWorkflowResultSuccess), branch.result_details
+        branch_path = project_engine.workflow_registry.get(branch.branched_workflow_id).absolute_path  # type: ignore[arg-type]
+        assert branch_path is not None
+        _as_older_schema(branch_path, branched_from=f'"{source.workflow_name}"')
+
+        _scan(project_engine, workspace)
+        branch_entry = project_engine.workflow_registry.find_by_path(branch_path)
+        assert branch_entry is not None
+        assert branch_entry.metadata.branched_from == source.workflow_id
+        merged = project_engine.handle_request(MergeWorkflowBranchRequest(workflow_id=branch_entry.workflow_id))
+
+        assert isinstance(merged, MergeWorkflowBranchResultSuccess), merged.result_details
+        assert merged.workflow_id == source.workflow_id
+
+    def test_a_name_no_workflow_has_is_left_as_it_is(self, project_engine: Engine, workspace: Path) -> None:
+        legacy = _write_workflow_file(workspace / "legacy.py")
+        _as_older_schema(legacy)
+        legacy.write_text(
+            legacy.read_text(encoding="utf-8").replace(
+                "# [tool.griptape-nodes]\n", '# [tool.griptape-nodes]\n# branched_from = "gone/workflow"\n'
+            ),
+            encoding="utf-8",
+        )
+
+        _scan(project_engine, workspace)
+
+        entry = project_engine.workflow_registry.find_by_path(legacy)
+        assert entry is not None
+        assert entry.metadata.branched_from == "gone/workflow"
+
+
+class TestReferencedSubflowsLinkById:
+    """A saved workflow imports its referenced subflows by id, so renaming the referenced workflow keeps the link."""
+
+    def _save_host_referencing(self, engine: Engine, inner: SaveWorkflowResultSuccess) -> SaveWorkflowResultSuccess:
+        _open_new_workflow(engine, "host")
+        top = engine.handle_request(GetTopLevelFlowRequest())
+        assert isinstance(top, GetTopLevelFlowResultSuccess)
+        imported = _run(
+            engine, ImportWorkflowAsReferencedSubFlowRequest(workflow_id=inner.workflow_id, flow_name=top.flow_name)
+        )
+        assert isinstance(imported, ImportWorkflowAsReferencedSubFlowResultSuccess), imported.result_details
+        host = _save(engine, SaveWorkflowRequest(file_name="host"))
+        _close(engine)
+        return host
+
+    def _referenced_names(self, engine: Engine, result: RunWorkflowFromRegistryResultSuccess) -> list[str | None]:
+        assert result.open_workflow is not None
+        runtime = engine.open_workflows.get(result.open_workflow.workflow_id)
+        return [
+            engine.flow_manager.get_referenced_workflow_name(runtime, flow)
+            for flow in runtime.flows.flow_to_referenced_workflow_id
+        ]
+
+    def test_a_host_still_opens_after_its_referenced_workflow_is_renamed(self, project_engine: Engine) -> None:
+        inner = _saved_workflow(project_engine, "inner")
+        host = self._save_host_referencing(project_engine, inner)
+
+        assert f"workflow_id='{inner.workflow_id}'" in Path(host.file_path).read_text(encoding="utf-8")
+        assert read_workflow_metadata(Path(host.file_path)).workflows_referenced == [inner.workflow_id]
+
+        renamed = _run(project_engine, RenameWorkflowRequest(workflow_id=inner.workflow_id, requested_name="renamed"))
+        assert isinstance(renamed, RenameWorkflowResultSuccess), renamed.result_details
+        reopened = _run(project_engine, RunWorkflowFromRegistryRequest(workflow_name=host.workflow_name))
+
+        assert isinstance(reopened, RunWorkflowFromRegistryResultSuccess), reopened.result_details
+        assert self._referenced_names(project_engine, reopened) == ["renamed"]
+
+    def test_an_older_host_importing_by_name_loads_and_links_by_id(
+        self, project_engine: Engine, workspace: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        inner = _saved_workflow(project_engine, "inner")
+        host = self._save_host_referencing(project_engine, inner)
+        content = Path(host.file_path).read_text(encoding="utf-8")
+        Path(host.file_path).write_text(
+            content.replace(f"workflow_id='{inner.workflow_id}'", f"workflow_name='{inner.workflow_name}'"),
+            encoding="utf-8",
+        )
+        _as_older_schema(host.file_path, workflows_referenced=f'["{inner.workflow_name}"]')
+        _scan(project_engine, workspace)
+        host_entry = project_engine.workflow_registry.find_by_path(host.file_path)
+        assert host_entry is not None
+        assert host_entry.metadata.workflows_referenced == [inner.workflow_id]
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            reopened = _run(project_engine, RunWorkflowFromRegistryRequest(workflow_name=host_entry.name))
+
+        assert isinstance(reopened, RunWorkflowFromRegistryResultSuccess), reopened.result_details
+        assert self._referenced_names(project_engine, reopened) == [inner.workflow_name]
+        assert "is deprecated" not in caplog.text

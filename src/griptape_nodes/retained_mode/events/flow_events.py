@@ -86,6 +86,10 @@ class CreateFlowResultFailure(ResultPayloadFailure):
     """Flow creation failed. Common causes: parent flow not found, name conflicts, invalid parameters."""
 
 
+# The engine version that removes `ImportWorkflowAsReferencedSubFlowRequest.workflow_name`.
+IMPORT_WORKFLOW_NAME_REMOVAL_VERSION = "0.111.0"
+
+
 @dataclass
 @PayloadRegistry.register
 class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload, GraphAccessMixin):
@@ -94,8 +98,13 @@ class ImportWorkflowAsReferencedSubFlowRequest(RequestPayload, GraphAccessMixin)
     Use when: Reusing workflows as components, creating modular workflows,
     importing workflow templates, building composite workflows.
 
-    Name the imported workflow by `workflow_id`, by `workflow_name`, or by both when they name the
-    same one.
+    Name the imported workflow by `workflow_id`. Saved workflows import their referenced subflows
+    this way, so renaming or moving the referenced workflow keeps the link.
+
+    Args:
+        workflow_name: Deprecated, removed in `IMPORT_WORKFLOW_NAME_REMOVAL_VERSION`. The imported
+            workflow's registry name, which a request giving `workflow_id` need not repeat and must
+            agree with if it does.
 
     Results: ImportWorkflowAsReferencedSubFlowResultSuccess (with flow name) | ImportWorkflowAsReferencedSubFlowResultFailure (import error)
     """
@@ -619,6 +628,8 @@ class GetFlowDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     Attributes:
         referenced_workflow_name (str | None): The name of the workflow that was
             imported to create this flow. None if this flow was created standalone.
+        referenced_workflow_id (str | None): The id of the workflow that was imported to create
+            this flow. None if this flow was created standalone.
         parent_flow_name (str | None): The name of the parent flow, or None if this is a
             top-level flow.
     """
@@ -626,6 +637,7 @@ class GetFlowDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     referenced_workflow_name: str | None
     parent_flow_name: str | None
     flow_type: str | None
+    referenced_workflow_id: str | None = None
 
 
 @dataclass

@@ -1353,6 +1353,8 @@ class SaveWorkflowFileFromSerializedFlowRequest(RequestPayload):
         workflow_shape: Optional workflow shape defining inputs and outputs for external callers
         file_path: Optional specific file path to use (defaults to workspace path if not provided)
         pickle_control_flow_result: Deprecated and ignored. Flow results always travel as plain data.
+        workflow_id: Id the file's header saves, for a file written for a workflow that already has
+            one. A new id when None.
 
     Results: SaveWorkflowFileFromSerializedFlowResultSuccess (with file path) | SaveWorkflowFileFromSerializedFlowResultFailure (save error)
     """
@@ -1368,6 +1370,7 @@ class SaveWorkflowFileFromSerializedFlowRequest(RequestPayload):
     branched_from: str | None = None
     workflow_shape: WorkflowShape | None = None
     pickle_control_flow_result: bool = False
+    workflow_id: str | None = None
 
 
 @dataclass

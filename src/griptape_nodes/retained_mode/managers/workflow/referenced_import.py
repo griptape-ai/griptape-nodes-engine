@@ -10,6 +10,7 @@ from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import (
+    IMPORT_WORKFLOW_NAME_REMOVAL_VERSION,
     DeleteFlowRequest,
     DeleteFlowResultSuccess,
     ImportWorkflowAsReferencedSubFlowRequest,
@@ -45,6 +46,13 @@ class ReferencedWorkflowImport(EngineScoped):
         self, request: ImportWorkflowAsReferencedSubFlowRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Import the saved workflow the request names as a new referenced sub flow of the open `workflow`."""
+        if request.workflow_id is None and request.workflow_name is not None:
+            logger.warning(
+                "ImportWorkflowAsReferencedSubFlowRequest.workflow_name is deprecated and will be removed in "
+                "version %s. Name workflow '%s' by its workflow_id instead.",
+                IMPORT_WORKFLOW_NAME_REMOVAL_VERSION,
+                request.workflow_name,
+            )
         try:
             imported = self.engine.workflow_registry.resolve_address(
                 workflow_id=request.workflow_id, workflow_name=request.workflow_name, action="import"
@@ -201,7 +209,7 @@ class ReferencedWorkflowImport(EngineScoped):
             workflow.context.flow(target_flow),
         ):
             if request.track_as_referenced:
-                with workflow_manager.referenced_workflow(imported.name):
+                with workflow_manager.referenced_workflow(imported.workflow_id):
                     return await workflow_manager.runner.run_workflow(workflow_file_path, workflow)
             return await workflow_manager.runner.run_workflow(workflow_file_path, workflow)
 

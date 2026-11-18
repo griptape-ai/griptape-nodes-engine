@@ -14,7 +14,11 @@ import anyio
 from griptape_nodes.files.path_utils import (
     resolve_workspace_path,
 )
-from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
+from griptape_nodes.node_library.workflow_registry import (
+    WorkflowAddressError,
+    WorkflowMetadataError,
+    parse_workflow_header,
+)
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
 from griptape_nodes.retained_mode.events.context_events import (
@@ -698,7 +702,7 @@ class WorkflowRunner(EngineScoped):
         """Read, resolve libraries for, and exec one workflow file into `workflow`, recording problems in `frame`."""
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
-                workflow_content = await file.read()
+                workflow_content = self._migrated_source(await file.read(), complete_file_path)
 
             # Resolve the workflow's declared library dependencies before exec.
             # The metadata header lists every library the workflow uses; each must
@@ -755,6 +759,17 @@ class WorkflowRunner(EngineScoped):
             problems=tuple(frame.problems),
             workflow_id=workflow.workflow_id,
         )
+
+    def _migrated_source(self, workflow_content: str, complete_file_path: Path) -> str:
+        """The file's code brought up to the latest schema (`WorkflowMigration`), or as it is when its header can't be read.
+
+        A header that can't be read leaves the run to fail, or to run the code as it stands.
+        """
+        try:
+            header = parse_workflow_header(workflow_content, complete_file_path)
+        except WorkflowMetadataError:
+            return workflow_content
+        return self.engine.version_compatibility_manager.migrate_workflow_source(header.metadata, workflow_content)
 
     async def _ensure_libraries_for_workflow(self, *, relative_file_path: str) -> list[WorkflowProblem]:
         """Register every library the workflow declares before exec, tolerating the ones that won't.

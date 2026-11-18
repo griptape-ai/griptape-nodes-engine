@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.files.path_utils import derive_registry_key
+from griptape_nodes.node_library.workflow_ids import path_workflow_id
 from griptape_nodes.node_library.workflow_registry import (
     DuplicateWorkflowIdError,
     OpenWorkflowRemovalError,
@@ -212,16 +213,16 @@ def _workflow_file(path: Path) -> Path:
 class TestWorkflowRegistryOperations:
     """Tests for the id-keyed registry and its path and name indexes."""
 
-    def test_register_file_mints_an_id_and_indexes_the_file(self, tmp_path: Path) -> None:
-        """Never derived from the path, so the same file registered by another registry gets another id."""
+    def test_register_file_without_a_header_id_takes_its_path_id_and_indexes_the_file(self, tmp_path: Path) -> None:
+        """Derived from the path, so the same file registered by another registry gets the same id."""
         registry = _registry(tmp_path)
         _workflow_file(tmp_path / "sub" / "flow.py")
 
         workflow = registry.register_file("sub/flow.py", _metadata())
         other = _registry(tmp_path).register_file("sub/flow.py", _metadata())
 
-        assert uuid.UUID(hex=workflow.workflow_id).hex == workflow.workflow_id
-        assert other.workflow_id != workflow.workflow_id
+        assert workflow.workflow_id == path_workflow_id(tmp_path / "sub" / "flow.py")
+        assert other.workflow_id == workflow.workflow_id
         assert registry.get(workflow.workflow_id) is workflow
         assert registry.find_by_name("sub/flow") is workflow
         assert registry.find_by_path(tmp_path / "sub" / "flow.py") is workflow
@@ -267,42 +268,41 @@ class TestWorkflowRegistryOperations:
         assert registry.find_by_path(tmp_path / "flow.txt") is None
         assert registry.find_by_name("flow") is holder
 
-    def test_register_file_keys_by_the_id_it_is_given(self, tmp_path: Path) -> None:
+    def test_register_file_keys_by_the_peers_id(self, tmp_path: Path) -> None:
         """Only a mirror of another engine's workflow gives an id, so both engines call it the same."""
         registry = _registry(tmp_path)
         _workflow_file(tmp_path / "flow.py")
         workflow_id = uuid.uuid4().hex
 
-        workflow = registry.register_file("flow.py", _metadata(), workflow_id=workflow_id, listed=False)
+        workflow = registry.register_file("flow.py", _metadata(), peer_id=workflow_id, listed=False)
 
         assert workflow.workflow_id == workflow_id
         assert registry.get(workflow_id) is workflow
         assert registry.find_by_path(tmp_path / "flow.py") is workflow
 
-    def test_an_id_another_file_has_is_refused(self, tmp_path: Path) -> None:
+    def test_a_header_id_another_file_has_gives_the_copy_its_path_id(self, tmp_path: Path) -> None:
         registry = _registry(tmp_path)
         _workflow_file(tmp_path / "original.py")
         _workflow_file(tmp_path / "copy.py")
-        original = registry.register_file("original.py", _metadata())
+        header_id = uuid.uuid4().hex
+        original = registry.register_file("original.py", _metadata(), header_id=header_id)
 
-        with pytest.raises(DuplicateWorkflowIdError) as raised:
-            registry.register_file("copy.py", _metadata(), workflow_id=original.workflow_id)
+        copy = registry.register_file("copy.py", _metadata(), header_id=header_id)
 
-        assert raised.value.existing is original
-        assert registry.find_by_path(tmp_path / "copy.py") is None
+        assert original.workflow_id == header_id
+        assert copy.workflow_id == path_workflow_id(tmp_path / "copy.py")
 
     @pytest.mark.skipif(platform.system() == "Windows", reason="symlink creation needs privileges on Windows")
-    def test_an_explicit_id_for_a_file_another_entry_holds_through_a_link_is_refused(self, tmp_path: Path) -> None:
+    def test_a_header_id_for_a_file_another_entry_holds_through_a_link_keeps_that_entry(self, tmp_path: Path) -> None:
         registry = _registry(tmp_path)
         _workflow_file(tmp_path / "real" / "flow.py")
         (tmp_path / "linked").symlink_to(tmp_path / "real", target_is_directory=True)
         holder = registry.register_file("real/flow.py", _metadata())
 
-        with pytest.raises(WorkflowPathTakenError) as raised:
-            registry.register_file("linked/flow.py", _metadata(), workflow_id=uuid.uuid4().hex)
+        linked = registry.register_file("linked/flow.py", _metadata(), header_id=uuid.uuid4().hex)
 
-        assert raised.value.existing is holder
-        assert holder.known_paths == [tmp_path / "real" / "flow.py"]
+        assert linked is holder
+        assert holder.known_paths == [tmp_path / "real" / "flow.py", tmp_path / "linked" / "flow.py"]
 
     @pytest.mark.skipif(platform.system() == "Windows", reason="symlink creation needs privileges on Windows")
     def test_same_file_through_a_link_is_an_alias(self, tmp_path: Path) -> None:
@@ -575,15 +575,16 @@ class TestWorkflowRegistryOperations:
         with pytest.raises(ValueError, match="does not exist"):
             registry.refresh_file("flow.py", _metadata())
 
-    def test_a_file_registered_again_after_a_remove_gets_a_new_id(self, tmp_path: Path) -> None:
+    def test_a_file_registered_again_after_a_remove_gets_the_same_id(self, tmp_path: Path) -> None:
         registry = _registry(tmp_path)
         _workflow_file(tmp_path / "flow.py")
-        first = registry.register_file("flow.py", _metadata())
+        header_id = uuid.uuid4().hex
+        first = registry.register_file("flow.py", _metadata(), header_id=header_id)
 
         registry.remove(first.workflow_id)
-        recreated = registry.refresh_file("flow.py", _metadata())
+        recreated = registry.refresh_file("flow.py", _metadata(), header_id=header_id)
 
-        assert recreated.workflow_id != first.workflow_id
+        assert recreated.workflow_id == first.workflow_id == header_id
 
     @pytest.mark.skipif(platform.system() == "Windows", reason="symlink creation needs privileges on Windows")
     def test_refresh_file_through_a_link_keeps_the_entry(self, tmp_path: Path) -> None:
@@ -646,16 +647,17 @@ class TestWorkflowRegistryOperations:
         assert registered.listed
         assert registered.metadata.name == "Opened"
 
-    def test_an_explicit_id_for_an_unlisted_file_another_entry_holds_is_refused(self, tmp_path: Path) -> None:
+    def test_a_peers_id_for_a_file_another_entry_holds_replaces_that_entry(self, tmp_path: Path) -> None:
         registry = _registry(tmp_path)
         _workflow_file(tmp_path / "opened.py")
         opened = registry.register_file("opened.py", _metadata(), listed=False)
+        peer_id = uuid.uuid4().hex
 
-        with pytest.raises(WorkflowPathTakenError) as raised:
-            registry.register_file("opened.py", _metadata(), workflow_id=uuid.uuid4().hex)
+        mirrored = registry.register_file("opened.py", _metadata(), peer_id=peer_id, listed=False)
 
-        assert raised.value.existing is opened
-        assert not opened.listed
+        assert mirrored.workflow_id == peer_id
+        assert registry.find_by_id(opened.workflow_id) is None
+        assert registry.find_by_path(tmp_path / "opened.py") is mirrored
 
     def test_listed_entries_carry_their_id(self, tmp_path: Path) -> None:
         registry = _registry(tmp_path)

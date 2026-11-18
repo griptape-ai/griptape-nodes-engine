@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.node_types import NodeDependencies
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import (
     LibraryNameAndNodeType,
     WorkflowMetadata,
@@ -75,7 +76,7 @@ def _generate(engine: Engine, serialized_flow_commands: SerializedFlowCommands) 
         workflow_shape=None,
     )
     return engine.workflow_manager.codegen.generate_workflow_file_content(
-        serialized_flow_commands=serialized_flow_commands, workflow_metadata=metadata
+        serialized_flow_commands=serialized_flow_commands, workflow_metadata=metadata, workflow_id=new_workflow_id()
     )
 
 

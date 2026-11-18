@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, NamedTuple
 
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import (
     UnknownWorkflowAddressError,
     Workflow,
@@ -133,8 +134,9 @@ class WorkflowBranching(EngineScoped):
                 is_template=False,
                 creation_date=datetime.now(tz=UTC),
                 last_modified_date=source_workflow.metadata.last_modified_date,
-                branched_from=source_workflow_name,
+                branched_from=source_workflow.workflow_id,
             )
+            branch_id = new_workflow_id()
 
             # Read source workflow content and replace metadata header
             source_file_path = self.engine.workflow_registry.get_complete_file_path(source_file_path_rel)
@@ -146,7 +148,7 @@ class WorkflowBranching(EngineScoped):
 
             # Replace the metadata header with branch metadata
             branch_content = self.engine.workflow_manager.codegen.replace_workflow_metadata_header(
-                source_content, branch_metadata
+                source_content, branch_metadata, workflow_id=branch_id
             )
             if branch_content is None:
                 details = f"Failed to replace metadata header for branch workflow '{branch_name}'"
@@ -162,7 +164,9 @@ class WorkflowBranching(EngineScoped):
 
             # Register the path actually written, and report its name: callers open the branch by
             # the name they get back.
-            branch_workflow = self.engine.workflow_registry.register_file(created.relative_file_path, branch_metadata)
+            branch_workflow = self.engine.workflow_registry.register_file(
+                created.relative_file_path, branch_metadata, header_id=branch_id
+            )
 
             details = f"Successfully branched workflow '{source_workflow_name}' as '{branch_name}'"
             return BranchWorkflowResultSuccess(
@@ -243,8 +247,9 @@ class WorkflowBranching(EngineScoped):
         )
 
         source_content = Path(source_file_path).read_text(encoding="utf-8")
+        new_id = new_workflow_id()
         new_content = self.engine.workflow_manager.codegen.replace_workflow_metadata_header(
-            source_content, new_metadata
+            source_content, new_metadata, workflow_id=new_id
         )
         if new_content is None:
             details = (
@@ -260,7 +265,9 @@ class WorkflowBranching(EngineScoped):
 
         # Register the path actually written, and hand its name back: the caller puts the new
         # workflow into context by this name, so it has to be the name the registry holds.
-        created_workflow = self.engine.workflow_registry.register_file(created.relative_file_path, new_metadata)
+        created_workflow = self.engine.workflow_registry.register_file(
+            created.relative_file_path, new_metadata, header_id=new_id
+        )
 
         details = f"Successfully created workflow '{new_file_name}' from template '{request.template_name}'"
         return CreateWorkflowFromTemplateResultSuccess(
@@ -281,18 +288,17 @@ class WorkflowBranching(EngineScoped):
             return MergeWorkflowBranchResultFailure(result_details=str(err))
         branch_workflow_name = branch_workflow.name
 
-        # Get source workflow name from branch metadata
-        source_workflow_name = branch_workflow.metadata.branched_from
-        if not source_workflow_name:
+        # The branch's metadata names its source by id.
+        source_workflow_id = branch_workflow.metadata.branched_from
+        if not source_workflow_id:
             details = f"Failed to merge workflow branch '{branch_workflow_name}' because it has no source workflow"
             return MergeWorkflowBranchResultFailure(result_details=details)
 
-        # Validate source workflow exists
-        try:
-            source_workflow = self.engine.workflow_registry.get_workflow_by_name(source_workflow_name)
-        except KeyError:
-            details = f"Failed to merge workflow branch '{branch_workflow_name}' because source workflow '{source_workflow_name}' does not exist"
+        source_workflow = self.engine.workflow_registry.find_by_id(source_workflow_id)
+        if source_workflow is None:
+            details = f"Failed to merge workflow branch '{branch_workflow_name}' because its source workflow '{source_workflow_id}' does not exist"
             return MergeWorkflowBranchResultFailure(result_details=details)
+        source_workflow_name = source_workflow.name
 
         # Merge rewrites both files on disk; both sides must be saved. The branch relation
         # is only ever established between saved workflows today, but narrow defensively.
@@ -318,10 +324,8 @@ class WorkflowBranching(EngineScoped):
         try:
             # Create updated metadata for source workflow - update timestamp
             merged_metadata = WorkflowMetadata(
-                # Carry the source's existing display name across. `source_workflow_name` came from
-                # the branch's `branched_from`, which holds a registry key (a file path), so using it
-                # here would overwrite the source's correct title with a path and persist that to disk.
-                # A merge changes the source's contents, never what it is called.
+                # Carry the source's existing display name across. A merge changes the source's
+                # contents, never what it is called.
                 name=source_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
@@ -346,7 +350,7 @@ class WorkflowBranching(EngineScoped):
 
             # Replace the metadata header with merged metadata
             merged_content = self.engine.workflow_manager.codegen.replace_workflow_metadata_header(
-                branch_content, merged_metadata
+                branch_content, merged_metadata, workflow_id=source_workflow.workflow_id
             )
             if merged_content is None:
                 details = f"Failed to replace metadata header for merged workflow '{source_workflow_name}'"
@@ -396,18 +400,17 @@ class WorkflowBranching(EngineScoped):
             return ResetWorkflowBranchResultFailure(result_details=str(err))
         branch_workflow_name = branch_workflow.name
 
-        # Get source workflow name from branch metadata
-        source_workflow_name = branch_workflow.metadata.branched_from
-        if not source_workflow_name:
+        # The branch's metadata names its source by id.
+        source_workflow_id = branch_workflow.metadata.branched_from
+        if not source_workflow_id:
             details = f"Failed to reset workflow branch '{branch_workflow_name}' because it has no source workflow"
             return ResetWorkflowBranchResultFailure(result_details=details)
 
-        # Validate source workflow exists
-        try:
-            source_workflow = self.engine.workflow_registry.get_workflow_by_name(source_workflow_name)
-        except KeyError:
-            details = f"Failed to reset workflow branch '{branch_workflow_name}' because source workflow '{source_workflow_name}' does not exist"
+        source_workflow = self.engine.workflow_registry.find_by_id(source_workflow_id)
+        if source_workflow is None:
+            details = f"Failed to reset workflow branch '{branch_workflow_name}' because its source workflow '{source_workflow_id}' does not exist"
             return ResetWorkflowBranchResultFailure(result_details=details)
+        source_workflow_name = source_workflow.name
 
         # Reset rewrites the branch file from the source file; both sides must be saved.
         branch_file_path_rel = branch_workflow.file_path
@@ -428,8 +431,7 @@ class WorkflowBranching(EngineScoped):
             reset_metadata = WorkflowMetadata(
                 # Keep the branch's own display name. A reset discards the branch's *content* changes;
                 # its identity fields below (creation_date, branched_from, is_template) are likewise
-                # kept from the branch, and its title belongs with them. `branch_workflow_name` is a
-                # registry key, so using it would overwrite the branch's title with a path on disk.
+                # kept from the branch, and its title belongs with them.
                 name=branch_workflow.metadata.name,
                 schema_version=source_workflow.metadata.schema_version,
                 engine_version_created_with=source_workflow.metadata.engine_version_created_with,
@@ -445,12 +447,12 @@ class WorkflowBranching(EngineScoped):
                 is_internal=branch_workflow.metadata.is_internal,
                 creation_date=branch_workflow.metadata.creation_date,
                 last_modified_date=source_workflow.metadata.last_modified_date,
-                branched_from=source_workflow_name,  # Preserve branch relationship
+                branched_from=source_workflow.workflow_id,  # Preserve branch relationship
             )
 
             # Replace the metadata header with reset metadata
             reset_content = self.engine.workflow_manager.codegen.replace_workflow_metadata_header(
-                source_content, reset_metadata
+                source_content, reset_metadata, workflow_id=branch_workflow.workflow_id
             )
             if reset_content is None:
                 details = f"Failed to replace metadata header for reset branch workflow '{branch_workflow_name}'"

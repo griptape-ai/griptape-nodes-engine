@@ -11,7 +11,7 @@ from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
     WorkflowMetadataError,
-    read_workflow_metadata,
+    read_workflow_header,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.context_events import (
@@ -501,9 +501,12 @@ class ContextManager(EngineScoped):
     ) -> None:
         """Make this engine's registry describe the orchestrator's workflow under the orchestrator's id.
 
-        The peer's id is the authority. Ids last only while an engine runs and each engine mints
-        its own, so this engine usually holds the peer's file under an id of its own. That entry is
-        dropped and the file is registered again under the peer's id.
+        The peer's id is the authority (`FoundWorkflowFile.peer_id`). Both engines usually decide
+        the same id for the file, from its header, its library or its path, but an id the peer
+        decided otherwise, such as for a copy it found first, can differ from the one this engine
+        gave the file. That entry is dropped and the file is registered under the peer's id, which
+        keeps it listed if this engine's scan listed it. An entry under the peer's id at another
+        path follows the file there, as when the peer saved or moved the workflow since.
 
         A file that no longer exists is registered as a workflow without a file, in that file's folder.
 
@@ -525,36 +528,30 @@ class ContextManager(EngineScoped):
         known = registry.find_by_path(file_path)
         if known is not None and known.workflow_id == workflow_id:
             return
-        # An entry this engine's scan listed stays listed under the peer's id, so closing the
-        # runtime kept for it later does not drop the file from this engine's workflows.
-        keeps_listing = known is not None and known.listed
         if known is not None:
-            self._drop_stale_orchestrator_entry(known, workflow_id, name)
+            self._close_stale_orchestrator_runtime(known, workflow_id, name)
 
         try:
-            if workflow is not None:
-                # The peer saved or moved the workflow since this engine last ran a node for it.
-                registry.set_file_path(workflow, file_path)
-                if keeps_listing:
-                    workflow.listed = True
-            else:
-                opened = read_metadata_for_open_file(Path(file_path))
-                registry.register_file(
-                    file_path,
-                    opened.metadata,
-                    workflow_id=workflow_id,
-                    listed=keeps_listing,
-                    metadata_is_placeholder=opened.metadata_is_placeholder,
-                )
+            opened = read_metadata_for_open_file(Path(file_path))
+            registry.register_file(
+                file_path,
+                opened.metadata,
+                header_id=opened.header_id,
+                peer_id=workflow_id,
+                listed=False,
+                metadata_is_placeholder=opened.metadata_is_placeholder,
+            )
         except ValueError as err:
             logger.debug("Could not register workflow '%s' from '%s': %s", workflow_id, file_path, err)
             self._register_unregistrable_file(err, workflow_id, name, file_path, known_here=workflow is not None)
 
-    def _drop_stale_orchestrator_entry(self, known: Workflow, workflow_id: str, name: str | None) -> None:
-        """Drop the entry this engine holds the peer's file under, an id other than the peer's, and its runtime.
+    def _close_stale_orchestrator_runtime(self, known: Workflow, workflow_id: str, name: str | None) -> None:
+        """Close the runtime kept for the entry this engine holds the peer's file under, an id other than the peer's.
+
+        Registering the file under the peer's id drops that entry.
 
         Raises:
-            OrchestratorWorkflowError: A node is still running in the runtime kept under that id.
+            OrchestratorWorkflowError: A node is still running in that runtime.
         """
         logger.debug(
             "Workflow '%s' was registered here as '%s'; the peer engine knows it as '%s'.",
@@ -562,21 +559,17 @@ class ContextManager(EngineScoped):
             known.workflow_id,
             workflow_id,
         )
-        # A runtime kept under the stale id goes with it; the caller keeps one under the peer's id.
         stale = self.engine.worker_workflows.find(known.workflow_id)
-        if stale is not None:
-            if self.engine.worker_workflows.is_running(stale):
-                msg = (
-                    f"Attempted to run a node of workflow '{name or workflow_id}'. Failed because a run of this "
-                    "workflow from before its engine restarted is still running on this worker. Wait for it to "
-                    "finish and try again."
-                )
-                raise self.OrchestratorWorkflowError(msg)
-            self.engine.close_worker_workflow(stale)
-        # Closing the runtime drops an unlisted entry; a listed one is dropped here.
-        registry = self.engine.workflow_registry
-        if registry.find_by_id(known.workflow_id) is not None:
-            registry.remove(known.workflow_id)
+        if stale is None:
+            return
+        if self.engine.worker_workflows.is_running(stale):
+            msg = (
+                f"Attempted to run a node of workflow '{name or workflow_id}'. Failed because an earlier run "
+                "of this workflow's file, under another id, is still running on this worker. Wait for it to "
+                "finish and try again."
+            )
+            raise self.OrchestratorWorkflowError(msg)
+        self.engine.close_worker_workflow(stale)
 
     def _register_unregistrable_file(
         self, err: ValueError, workflow_id: str, name: str | None, file_path: str, *, known_here: bool
@@ -833,7 +826,11 @@ class ContextManager(EngineScoped):
             return registry.register_unsaved(path.stem, str(path.parent), listed=False)
         opened = read_metadata_for_open_file(path)
         return registry.register_file(
-            path, opened.metadata, listed=False, metadata_is_placeholder=opened.metadata_is_placeholder
+            path,
+            opened.metadata,
+            header_id=opened.header_id,
+            listed=False,
+            metadata_is_placeholder=opened.metadata_is_placeholder,
         )
 
     def pop_workflow(self) -> str:
@@ -1201,10 +1198,11 @@ class OpenedWorkflow:
 
 
 class OpenedFileMetadata(NamedTuple):
-    """The metadata a workflow file opens with, and whether it is a placeholder for a header that could not be read."""
+    """The metadata a workflow file opens with, the id its header carries, and whether the metadata is a placeholder for a header that could not be read."""
 
     metadata: WorkflowMetadata
     metadata_is_placeholder: bool
+    header_id: str | None = None
 
 
 def read_metadata_for_open_file(file_path: Path) -> OpenedFileMetadata:
@@ -1213,7 +1211,7 @@ def read_metadata_for_open_file(file_path: Path) -> OpenedFileMetadata:
     A file opens whether or not its header reads, so a header problem never blocks opening it.
     """
     try:
-        return OpenedFileMetadata(metadata=read_workflow_metadata(file_path), metadata_is_placeholder=False)
+        header = read_workflow_header(file_path)
     except WorkflowMetadataError as err:
         logger.debug("Opening '%s' without its metadata header: %s", file_path, err)
         placeholder = WorkflowMetadata(
@@ -1223,3 +1221,4 @@ def read_metadata_for_open_file(file_path: Path) -> OpenedFileMetadata:
             node_libraries_referenced=[],
         )
         return OpenedFileMetadata(metadata=placeholder, metadata_is_placeholder=True)
+    return OpenedFileMetadata(metadata=header.metadata, metadata_is_placeholder=False, header_id=header.workflow_id)

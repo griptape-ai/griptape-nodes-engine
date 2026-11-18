@@ -649,7 +649,7 @@ class LibrarySandbox(EngineScoped):
         workflow_node_definition = self._create_sandbox_workflow_node_definition(workflow_header, str(workflow_path))
         node_type = workflow_node_definition.node_type
         node_class = self.engine.library_manager.module_loading.build_workflow_node_class_from_definition(
-            workflow_node_definition, sandbox_dir
+            workflow_node_definition, sandbox_dir, library_name=None
         )
         if isinstance(node_class, WorkflowNodeLoadProblem):
             details = (

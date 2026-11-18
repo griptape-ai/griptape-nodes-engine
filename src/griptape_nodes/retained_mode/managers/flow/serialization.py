@@ -464,9 +464,9 @@ class FlowSerialization(EngineScoped):
             if request.include_create_flow_command:
                 # Check if this flow is a referenced workflow
                 if self.engine.flow_manager.is_referenced_workflow(workflow, flow):
-                    referenced_workflow_name = self.engine.flow_manager.get_referenced_workflow_name(workflow, flow)
+                    referenced_workflow_id = self.engine.flow_manager.get_referenced_workflow_id(workflow, flow)
                     create_flow_request = ImportWorkflowAsReferencedSubFlowRequest(
-                        workflow_name=referenced_workflow_name,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
+                        workflow_id=referenced_workflow_id,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
                         imported_flow_metadata=flow.metadata,
                     )
                 else:
@@ -566,17 +566,17 @@ class FlowSerialization(EngineScoped):
                 # Check if this is a referenced workflow
                 if self.engine.flow_manager.is_referenced_workflow(workflow, child_flow_obj):
                     # For referenced workflows, create a minimal SerializedFlowCommands with just the import command
-                    referenced_workflow_name = self.engine.flow_manager.get_referenced_workflow_name(
+                    referenced_workflow_id = self.engine.flow_manager.get_referenced_workflow_id(
                         workflow, child_flow_obj
                     )
                     import_command = ImportWorkflowAsReferencedSubFlowRequest(
-                        workflow_name=referenced_workflow_name,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
+                        workflow_id=referenced_workflow_id,  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
                         imported_flow_metadata=child_flow_obj.metadata,
                     )
 
                     # Create NodeDependencies with just the referenced workflow
                     sub_flow_dependencies = NodeDependencies(
-                        referenced_workflows={referenced_workflow_name}  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
+                        referenced_workflows={referenced_workflow_id}  # type: ignore[arg-type] # is_referenced_workflow() guarantees this is not None
                     )
 
                     serialized_flow = SerializedFlowCommands(

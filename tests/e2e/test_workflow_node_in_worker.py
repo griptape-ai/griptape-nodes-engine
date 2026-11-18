@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from griptape_nodes.exe_types.workflow_node import WorkflowNode
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
@@ -215,7 +216,7 @@ class _WorkflowNodeInWorkerBase:
             workflow_shape=WorkflowShape(inputs=shape["input"], outputs=shape["output"]),
         )
         content = workflow_manager.codegen.generate_workflow_file_content(
-            serialized_flow_commands=commands, workflow_metadata=metadata
+            serialized_flow_commands=commands, workflow_metadata=metadata, workflow_id=new_workflow_id()
         )
         (host_dir / f"{FAILING_WORKFLOW_NAME}.py").write_text(content)
 

@@ -10,6 +10,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibrarySchema,
 )
+from griptape_nodes.node_library.workflow_ids import library_workflow_id
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
@@ -495,13 +496,13 @@ class LibraryManager(EngineScoped):
                 "\n".join(reconcile_failures),
             )
 
-    async def collect_library_workflow_files(self) -> list[str]:
-        """Collect workflow file paths declared by all registered libraries.
+    async def collect_library_workflow_files(self) -> dict[str, str]:
+        """Collect the workflow files declared by all registered libraries, with the id each one is registered under.
 
-        Returns absolute paths to workflow files, adding each library's base directory
-        to sys.path so relative imports work when the workflow is loaded.
+        Returns each workflow file's absolute path and its `library_workflow_id`, adding each
+        library's base directory to sys.path so relative imports work when the workflow is loaded.
         """
-        workflow_files: list[str] = []
+        workflow_files: dict[str, str] = {}
         library_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
         if not isinstance(library_result, ListRegisteredLibrariesResultSuccess):
             return workflow_files
@@ -525,7 +526,8 @@ class LibraryManager(EngineScoped):
                     if str(base_dir) in sys.path:
                         sys.path.remove(str(base_dir))
                     sys.path.insert(0, str(base_dir))
-                    workflow_files.extend(str(base_dir / workflow) for workflow in library_data.workflows)
+                    for workflow in library_data.workflows:
+                        workflow_files[str(base_dir / workflow)] = library_workflow_id(library_name, workflow)
                     break
         return workflow_files
 

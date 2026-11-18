@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from griptape_nodes.exe_types.workflow_node import WorkflowNode
+from griptape_nodes.exe_types.workflow_node import WorkflowNode, ensure_workflow_registered
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.node_library.library_registry import (
     Library,
@@ -19,6 +19,7 @@ from griptape_nodes.node_library.library_registry import (
     NodeMetadata,
     WorkflowNodeDefinition,
 )
+from griptape_nodes.node_library.workflow_ids import library_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import WorkflowNodeLoadProblem
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
@@ -446,7 +447,7 @@ class TestWorkflowIdAcrossALibraryReload:
         # The reload builds the node type again, with metadata of its own, then refreshes the registry.
         reloaded_info = _register(engine, library_dir, _library_info(library_json))
         monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_json, reloaded_info)
-        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=[])):
+        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value={})):
             asyncio.run(engine.workflow_manager.refresh_workflow_registry())
 
         again = engine.workflow_registry.find_by_path(workflow_path)
@@ -471,7 +472,7 @@ class TestWorkflowIdAcrossALibraryReload:
         assert first is not None
 
         monkeypatch.delitem(engine.library_manager._library_file_path_to_info, library_json)
-        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=[])):
+        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value={})):
             asyncio.run(engine.workflow_manager.refresh_workflow_registry())
 
         assert engine.workflow_registry.find_by_id(first.workflow_id) is None
@@ -487,14 +488,74 @@ class TestWorkflowIdAcrossALibraryReload:
         library_json = str(library_dir / "griptape_nodes_library.json")
         library_info = _register(engine, library_dir, _library_info(library_json))
         monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_json, library_info)
-        node_metadata = library_info.workflow_node_classes[0].workflow_metadata
+        node_class = library_info.workflow_node_classes[0]
+        node_metadata = node_class.workflow_metadata
+        assert node_class.library_workflow_id is not None
+        listed = {str(workflow_path): node_class.library_workflow_id}
 
-        with patch.object(
-            engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=[str(workflow_path)])
-        ):
+        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=listed)):
             asyncio.run(engine.workflow_manager.refresh_workflow_registry())
 
         workflow = engine.workflow_registry.find_by_path(workflow_path)
         assert workflow is not None
         assert workflow.metadata is not node_metadata
         assert workflow.metadata.is_griptape_provided is False
+
+
+class TestLibraryWorkflowIds:
+    """A library's workflows take ids derived from the library and path, whoever registers them first."""
+
+    def test_the_workflow_behind_a_workflow_node_takes_its_library_id(self, engine: Engine, tmp_path: Path) -> None:
+        library_dir = tmp_path / "library"
+        library_dir.mkdir()
+        workflow_path = _write_workflow(library_dir, shape=_SHAPE)
+
+        _register(engine, library_dir)
+
+        workflow = engine.workflow_registry.find_by_path(workflow_path)
+        assert workflow is not None
+        assert workflow.workflow_id == library_workflow_id("TestLib", "demo_workflow.py")
+
+    def test_a_node_registering_the_workflow_before_the_library_lists_it_takes_the_library_id(
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        library_dir = tmp_path / "library"
+        library_dir.mkdir()
+        workflow_path = _write_workflow(library_dir, shape=_SHAPE)
+        library_json = str(library_dir / "griptape_nodes_library.json")
+        library_info = _register(engine, library_dir, _library_info(library_json))
+        node_class = library_info.workflow_node_classes[0]
+        engine.workflow_registry.remove(library_workflow_id("TestLib", "demo_workflow.py"))
+
+        registered = ensure_workflow_registered(
+            engine.config_manager.workspace_path, engine.workflow_registry, node_class
+        )
+
+        assert registered.workflow_id == library_workflow_id("TestLib", "demo_workflow.py")
+        monkeypatch.setitem(engine.library_manager._library_file_path_to_info, library_json, library_info)
+        listed = {str(workflow_path): library_workflow_id("TestLib", "demo_workflow.py")}
+        with patch.object(engine.library_manager, "collect_library_workflow_files", AsyncMock(return_value=listed)):
+            asyncio.run(engine.workflow_manager.refresh_workflow_registry())
+        assert engine.workflow_registry.find_by_path(workflow_path) is registered
+
+    def test_a_sandbox_workflow_takes_the_id_its_header_carries(self, engine: Engine, tmp_path: Path) -> None:
+        sandbox_dir = tmp_path / "sandbox"
+        sandbox_dir.mkdir()
+        workflow_path = _write_workflow(sandbox_dir, shape=_SHAPE)
+        header_id = "0123456789abcdef0123456789abcdef"
+        content = workflow_path.read_text(encoding="utf-8")
+        workflow_path.write_text(
+            content.replace('# name = "demo"\n', f'# name = "demo"\n# workflow_id = "{header_id}"\n'),
+            encoding="utf-8",
+        )
+
+        node_class = engine.library_manager.module_loading.build_workflow_node_class_from_definition(
+            _definition("demo_workflow.py"), sandbox_dir, library_name=None
+        )
+
+        assert not isinstance(node_class, WorkflowNodeLoadProblem)
+        assert node_class.library_workflow_id is None
+        registered = ensure_workflow_registered(
+            engine.config_manager.workspace_path, engine.workflow_registry, node_class
+        )
+        assert registered.workflow_id == header_id

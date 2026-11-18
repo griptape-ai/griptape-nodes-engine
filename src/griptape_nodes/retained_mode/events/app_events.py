@@ -556,8 +556,9 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         engine_version: Current engine version string
         engine_id: Unique engine identifier (None if not set)
         session_id: Current session identifier (None if no session)
-        engine_run_id: Id minted when this engine started, never saved. Workflow ids are only
-            valid while it stays the same; a new value means the engine restarted.
+        engine_run_id: Id minted when this engine started, never saved. A new value means the
+            engine restarted, which closed every open workflow and lost every unsaved one, so the
+            `open_workflow_id`s and unsaved workflows' ids from before name nothing.
         timestamp: Heartbeat timestamp
         instance_type: Cloud instance type (None if not applicable)
         instance_region: Cloud instance region (None if not applicable)

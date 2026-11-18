@@ -236,7 +236,9 @@ class WorkflowCatalog(EngineScoped):
         new_metadata.last_modified_date = datetime.now(tz=UTC)
 
         # Persist header
-        write_error = await self._write_metadata_header(file_path=resolution.file_path, workflow_metadata=new_metadata)
+        write_error = await self._write_metadata_header(
+            file_path=resolution.file_path, workflow_metadata=new_metadata, workflow_id=workflow.workflow_id
+        )
         if write_error is not None:
             return SetWorkflowMetadataResultFailure(result_details=write_error)
 
@@ -304,15 +306,17 @@ class WorkflowCatalog(EngineScoped):
 
         return WorkflowPathResolution(file_path=file_path_obj, error=None)
 
-    async def _write_metadata_header(self, file_path: Path, workflow_metadata: WorkflowMetadata) -> str | None:
-        """Replace the workflow header and persist changes to disk."""
+    async def _write_metadata_header(
+        self, file_path: Path, workflow_metadata: WorkflowMetadata, *, workflow_id: str
+    ) -> str | None:
+        """Replace the header of the workflow `workflow_id` names and persist changes to disk."""
         try:
             existing_content = await anyio.Path(file_path).read_text(encoding="utf-8")
         except OSError as e:
             return f"Failed to read workflow file '{file_path}': {e!s}"
 
         updated_content = self.engine.workflow_manager.codegen.replace_workflow_metadata_header(
-            existing_content, workflow_metadata
+            existing_content, workflow_metadata, workflow_id=workflow_id
         )
         if updated_content is None:
             return "Failed to update metadata header."

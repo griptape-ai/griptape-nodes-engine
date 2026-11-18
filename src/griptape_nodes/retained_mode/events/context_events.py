@@ -261,8 +261,9 @@ class ListOpenWorkflowsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
     Args:
         open_workflows: Every open workflow, in the order they were opened. One still opening is
             left out until it has finished.
-        engine_run_id: Changes each time the engine restarts. Workflow ids last only until a
-            restart, so drop the ids you kept when it changes.
+        engine_run_id: Changes each time the engine restarts. A restart closes every open workflow
+            and loses every unsaved one, so when it changes, drop the `open_workflow_id`s and the
+            unsaved workflows' ids you kept. Saved workflows keep their `workflow_id`.
     """
 
     open_workflows: list[OpenWorkflowInfo]

@@ -26,7 +26,7 @@ class WorkflowFlows:
         """Make empty run state for `workflow`, or for a line of runs that belongs to no workflow."""
         self._workflow = workflow
         self.name_to_parent_name: dict[str, str | None] = {}
-        self.flow_to_referenced_workflow_name: dict[ControlFlow, str] = {}
+        self.flow_to_referenced_workflow_id: dict[ControlFlow, str] = {}
         self.connections = Connections()
 
         self.global_flow_queue: Queue[QueueItem] = Queue()

@@ -255,10 +255,6 @@ class FlowManager(EngineScoped):
         return self._current_flows().name_to_parent_name
 
     @property
-    def _flow_to_referenced_workflow_name(self) -> dict[ControlFlow, str]:
-        return self._current_flows().flow_to_referenced_workflow_name
-
-    @property
     def _connections(self) -> Connections:
         return self._current_flows().connections
 
@@ -505,15 +501,24 @@ class FlowManager(EngineScoped):
         Returns True if this flow originated from a workflow import operation,
         False if it was created standalone.
         """
-        return flow in workflow.flows.flow_to_referenced_workflow_name
+        return flow in workflow.flows.flow_to_referenced_workflow_id
+
+    def get_referenced_workflow_id(self, workflow: WorkflowRuntime, flow: ControlFlow) -> str | None:
+        """Get the id of the workflow imported to create this flow, or None if it was created standalone."""
+        return workflow.flows.flow_to_referenced_workflow_id.get(flow)
 
     def get_referenced_workflow_name(self, workflow: WorkflowRuntime, flow: ControlFlow) -> str | None:
-        """Get the name of the referenced workflow, if any.
+        """Get the current name of the workflow imported to create this flow.
 
-        Returns the workflow name that was imported to create this flow,
-        or None if this flow was created standalone.
+        None if the flow was created standalone, or that workflow is no longer registered.
         """
-        return workflow.flows.flow_to_referenced_workflow_name.get(flow)
+        workflow_id = self.get_referenced_workflow_id(workflow, flow)
+        if workflow_id is None:
+            return None
+        referenced = self.engine.workflow_registry.find_by_id(workflow_id)
+        if referenced is None:
+            return None
+        return referenced.name
 
     def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:
         """Find the open workflow's top-level flow, outside dispatch.
@@ -574,15 +579,15 @@ class FlowManager(EngineScoped):
             details = f"Attempted to get Flow details for '{flow_name}'. Failed because Flow does not exist in parent mapping."
             return GetFlowDetailsResultFailure(result_details=details)
 
-        referenced_workflow_name = None
-        if self.is_referenced_workflow(workflow, flow):
-            referenced_workflow_name = self.get_referenced_workflow_name(workflow, flow)
+        referenced_workflow_name = self.get_referenced_workflow_name(workflow, flow)
+        referenced_workflow_id = self.get_referenced_workflow_id(workflow, flow)
 
         flow_type = flow.metadata.get("flow_type")
 
         details = f"Successfully retrieved Flow details for '{flow_name}'."
         return GetFlowDetailsResultSuccess(
             referenced_workflow_name=referenced_workflow_name,
+            referenced_workflow_id=referenced_workflow_id,
             parent_flow_name=parent_flow_name,
             flow_type=flow_type,
             result_details=details,
@@ -693,8 +698,8 @@ class FlowManager(EngineScoped):
 
         # Track referenced workflow if this flow was created within a referenced workflow context
         if workflow_manager.has_current_referenced_workflow():
-            referenced_workflow_name = workflow_manager.get_current_referenced_workflow()
-            workflow.flows.flow_to_referenced_workflow_name[flow] = referenced_workflow_name
+            referenced_workflow_id = workflow_manager.get_current_referenced_workflow()
+            workflow.flows.flow_to_referenced_workflow_id[flow] = referenced_workflow_id
 
         # See if we need to push it as the current context.
         if request.set_as_new_context:
@@ -835,8 +840,8 @@ class FlowManager(EngineScoped):
         del flows.name_to_parent_name[flow.name]
 
         # Clean up referenced workflow tracking
-        if flow in flows.flow_to_referenced_workflow_name:
-            del flows.flow_to_referenced_workflow_name[flow]
+        if flow in flows.flow_to_referenced_workflow_id:
+            del flows.flow_to_referenced_workflow_id[flow]
 
     @handles(GetIsFlowRunningRequest)
     def on_get_is_flow_running_request(

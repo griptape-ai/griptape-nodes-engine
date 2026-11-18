@@ -622,9 +622,7 @@ class TestAdoptOrchestratorWorkflow:
     ) -> None:
         workflow_file = tmp_path / "shared.py"
         workflow_file.write_text("print('body')\n", encoding="utf-8")
-        engine.workflow_registry.register_file(
-            workflow_file, _metadata("shared"), workflow_id=self.LOCAL_ID, listed=False
-        )
+        engine.workflow_registry.register_file(workflow_file, _metadata("shared"), peer_id=self.LOCAL_ID, listed=False)
         engine.context_manager.adopt_orchestrator_workflow(self.LOCAL_ID, "shared", str(workflow_file), None)
 
         workflow = engine.context_manager.adopt_orchestrator_workflow(self.PEER_ID, "shared", str(workflow_file), None)
@@ -640,9 +638,7 @@ class TestAdoptOrchestratorWorkflow:
         """A run from before the peer restarted keeps its runtime and entry; the new id waits for it to end."""
         workflow_file = tmp_path / "shared.py"
         workflow_file.write_text("print('body')\n", encoding="utf-8")
-        engine.workflow_registry.register_file(
-            workflow_file, _metadata("shared"), workflow_id=self.LOCAL_ID, listed=False
-        )
+        engine.workflow_registry.register_file(workflow_file, _metadata("shared"), peer_id=self.LOCAL_ID, listed=False)
         stale = engine.context_manager.adopt_orchestrator_workflow(self.LOCAL_ID, "shared", str(workflow_file), None)
 
         with engine.run_in_worker_workflow(stale):
@@ -665,7 +661,7 @@ class TestAdoptOrchestratorWorkflow:
         """Closing the stale runtime keeps a listed entry, which then moves to the peer's id."""
         workflow_file = tmp_path / "shared.py"
         workflow_file.write_text("print('body')\n", encoding="utf-8")
-        engine.workflow_registry.register_file(workflow_file, _metadata("shared"), workflow_id=self.LOCAL_ID)
+        engine.workflow_registry.register_file(workflow_file, _metadata("shared"), peer_id=self.LOCAL_ID)
         engine.context_manager.adopt_orchestrator_workflow(self.LOCAL_ID, "shared", str(workflow_file), None)
 
         try:
@@ -682,7 +678,7 @@ class TestAdoptOrchestratorWorkflow:
         holder_file.write_text("print('body')\n", encoding="utf-8")
         peer_file = tmp_path / "taken.txt"
         peer_file.write_text("print('body')\n", encoding="utf-8")
-        engine.workflow_registry.register_file(holder_file, _metadata("taken"), workflow_id=self.LOCAL_ID, listed=False)
+        engine.workflow_registry.register_file(holder_file, _metadata("taken"), peer_id=self.LOCAL_ID, listed=False)
 
         try:
             with pytest.raises(ContextManager.OrchestratorWorkflowError) as exc_info:
@@ -851,7 +847,7 @@ def _recording_library() -> Iterator[None]:
 
 
 class TestRunningANodeForAnotherEngineProcess:
-    """An orchestrator and a worker are separate engines: each gives the files it scans ids of its own."""
+    """An orchestrator and a worker are separate engines that each scan the workspace."""
 
     def test_the_worker_takes_the_orchestrators_id_for_the_file_and_runs_the_node_in_it(self, tmp_path: Path) -> None:
         workspace = tmp_path.resolve() / "workspace"
@@ -875,12 +871,16 @@ class TestRunningANodeForAnotherEngineProcess:
         worker_entry = worker.workflow_registry.find_by_path(workflow_file)
         assert orchestrator_entry is not None
         assert worker_entry is not None
-        assert worker_entry.workflow_id != orchestrator_entry.workflow_id
+        # A file with no id in its header gets the id derived from its path, in every engine.
+        assert worker_entry.workflow_id == orchestrator_entry.workflow_id
+        # Engines can still disagree, as when the orchestrator found a copy of the file first. The
+        # orchestrator's id wins.
+        peer_id = "0000000000000000000000000000beef"
 
         request = ExecuteNodeRequest(
             node_name="node",
             node_metadata={"node_type": _RecordsWorkflowContextNode.__name__, "library": _RECORDING_LIBRARY_NAME},
-            orchestrator_workflow_id=orchestrator_entry.workflow_id,
+            orchestrator_workflow_id=peer_id,
             workflow_name=orchestrator_entry.name,
             workflow_file_path=str(workflow_file),
         )
@@ -894,11 +894,11 @@ class TestRunningANodeForAnotherEngineProcess:
 
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
         assert result.parameter_output_values == {
-            "workflow_id": orchestrator_entry.workflow_id,
+            "workflow_id": peer_id,
             "file_path": str(workflow_file),
         }
         rekeyed = worker.workflow_registry.find_by_path(workflow_file)
-        assert rekeyed is worker.workflow_registry.get(orchestrator_entry.workflow_id)
+        assert rekeyed is worker.workflow_registry.get(peer_id)
         assert rekeyed is not None
         assert rekeyed.listed
         assert worker.workflow_registry.find_by_id(worker_entry.workflow_id) is None

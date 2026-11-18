@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.workflow_registry import (
         NodeParametersMapping,
         ParameterMinimalDict,
+        Workflow,
         WorkflowMetadata,
         _WorkflowRegistry,
     )
@@ -266,12 +267,12 @@ def pair_shape_nodes(declared_names: Sequence[str], live_names: Sequence[str], r
 def ensure_workflow_registered(
     workspace_path: Path,
     workflow_registry: _WorkflowRegistry,
-    workflow_file_path: Path,
-    workflow_metadata: WorkflowMetadata,
-) -> str:
-    """Register `workflow_file_path` in `workflow_registry` if it is not there already.
+    node_class: type[WorkflowNode],
+) -> Workflow:
+    """Register the workflow behind `node_class` in `workflow_registry` if it is not there already.
 
-    Returns the registry key the workflow is available under. Registration is idempotent, and is
+    Returns the workflow's entry. A library's workflow is registered under its library id, as the
+    library's own listing registers it, whichever comes first. Registration is idempotent, and is
     also re-attempted before each run, because the registry is cleared and rebuilt when the
     workspace changes while a library's node types survive that reload.
 
@@ -283,12 +284,17 @@ def ensure_workflow_registered(
     Raises:
         ValueError: The workflow file is no longer on disk, or its path or key was claimed concurrently.
     """
-    path_for_key = _workspace_relative_workflow_path(workspace_path, workflow_file_path)
-    registry_key = derive_registry_key(path_for_key)
-    if workflow_registry.has_workflow_with_name(registry_key):
-        return registry_key
+    path_for_key = _workspace_relative_workflow_path(workspace_path, node_class.workflow_file_path)
+    registered = workflow_registry.find_by_name(derive_registry_key(path_for_key))
+    if registered is not None:
+        return registered
 
-    return workflow_registry.register_file(path_for_key, workflow_metadata).name
+    return workflow_registry.register_file(
+        path_for_key,
+        node_class.workflow_metadata,
+        header_id=node_class.workflow_header_id,
+        library_id=node_class.library_workflow_id,
+    )
 
 
 def _workspace_relative_workflow_path(workspace_path: Path, workflow_file_path: Path) -> str:
@@ -319,6 +325,11 @@ class WorkflowNode(ControlNode):
     workflow_file_path: ClassVar[Path]
     # Metadata read from that workflow's header at library load time.
     workflow_metadata: ClassVar[WorkflowMetadata]
+    # The id that header carries, if any.
+    workflow_header_id: ClassVar[str | None] = None
+    # The id of the workflow as a library workflow (`library_workflow_id`), or None for a sandbox's,
+    # which is the user's own file.
+    library_workflow_id: ClassVar[str | None] = None
     # The parameter surface and Start/End node lists derived from the workflow's saved shape.
     workflow_surface: ClassVar[WorkflowNodeSurface]
 
@@ -364,11 +375,8 @@ class WorkflowNode(ControlNode):
         """
         try:
             self.metadata[WORKFLOW_FILE_VALUE_KEY] = ensure_workflow_registered(
-                self.engine.config_manager.workspace_path,
-                self.engine.workflow_registry,
-                self.workflow_file_path,
-                self.workflow_metadata,
-            )
+                self.engine.config_manager.workspace_path, self.engine.workflow_registry, type(self)
+            ).name
         except (KeyError, ValueError):
             logger.warning(
                 "Node '%s' could not register its workflow '%s' for preview; it will be registered on the next run.",
@@ -398,10 +406,10 @@ class WorkflowNode(ControlNode):
             )
             raise RuntimeError(msg)  # noqa: TRY004 - the lookup failed at run time; this is not a type error
 
-        registry_key = self._register_workflow()
+        workflow_id = self._register_workflow()
         import_result = await self._ahandle_request_in_workflow(
             ImportWorkflowAsReferencedSubFlowRequest(
-                workflow_name=registry_key,
+                workflow_id=workflow_id,
                 flow_name=flow_result.flow_name,
                 imported_flow_metadata={TRANSIENT_KEY: True},
             )
@@ -437,14 +445,11 @@ class WorkflowNode(ControlNode):
         return import_result.created_flow_name
 
     def _register_workflow(self) -> str:
-        """Return the backing workflow's registry key, registering it if it is not registered yet."""
+        """Return the backing workflow's id, registering it if it is not registered yet."""
         try:
             return ensure_workflow_registered(
-                self.engine.config_manager.workspace_path,
-                self.engine.workflow_registry,
-                self.workflow_file_path,
-                self.workflow_metadata,
-            )
+                self.engine.config_manager.workspace_path, self.engine.workflow_registry, type(self)
+            ).workflow_id
         except (KeyError, ValueError) as err:
             msg = (
                 f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
@@ -567,8 +572,13 @@ def build_workflow_node_class(
     node_type: str,
     workflow_file_path: Path,
     workflow_metadata: WorkflowMetadata,
+    workflow_header_id: str | None = None,
+    library_workflow_id: str | None = None,
 ) -> type[WorkflowNode]:
     """Generate a node type named `node_type` that runs the workflow at `workflow_file_path`.
+
+    `workflow_header_id` is the id the workflow's header carries, and `library_workflow_id` its id
+    as a library workflow, which the node registers the workflow under when it is not registered yet.
 
     Raises:
         WorkflowNodeDefinitionError: The workflow has no saved input and output shape to build a
@@ -581,6 +591,8 @@ def build_workflow_node_class(
         {
             "workflow_file_path": workflow_file_path,
             "workflow_metadata": workflow_metadata,
+            "workflow_header_id": workflow_header_id,
+            "library_workflow_id": library_workflow_id,
             "workflow_surface": surface,
             "__doc__": workflow_metadata.description or f"Runs the '{workflow_metadata.name}' workflow.",
         },

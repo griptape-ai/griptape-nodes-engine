@@ -37,6 +37,7 @@ from griptape_nodes.node_library.library_registry import (
     NodeTypeEntry,
     get_declared_models,
 )
+from griptape_nodes.node_library.workflow_ids import library_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
@@ -1831,7 +1832,11 @@ class TestCollectLibraryWorkflowFiles:
             first = await library_manager.collect_library_workflow_files()
             second = await library_manager.collect_library_workflow_files()
 
-        assert first == second == [str(tmp_path / "templates/demo.py")]
+        assert (
+            first
+            == second
+            == {str(tmp_path / "templates/demo.py"): library_workflow_id("TestLib", "templates/demo.py")}
+        )
         assert sys.path[0] == base_dir
         assert sys.path.count(base_dir) == 1
 

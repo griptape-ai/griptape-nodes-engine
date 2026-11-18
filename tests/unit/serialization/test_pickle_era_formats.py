@@ -23,6 +23,7 @@ from griptape.artifacts import ImageUrlArtifact
 from griptape.mixins.serializable_mixin import SerializableMixin
 from griptape.rules import Rule, Ruleset
 
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
 from griptape_nodes.retained_mode.events.flow_events import (
     ExtractFlowCommandsFromImageMetadataRequest,
@@ -135,6 +136,7 @@ class TestPickleEraFormats:
                 engine_version_created_with="0.0.0",
                 node_libraries_referenced=[],
             ),
+            workflow_id=new_workflow_id(),
         )
         assert "pickle.loads" not in resaved_source
         engine.clear_current_workflow_data()

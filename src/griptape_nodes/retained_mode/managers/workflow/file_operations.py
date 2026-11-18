@@ -355,7 +355,7 @@ class WorkflowFileOperations(EngineScoped):
             return RenameWorkflowResultFailure(result_details=details)
         renamed_metadata = source.metadata.model_copy(update={"name": display_name})
         renamed_content = self.engine.workflow_manager.codegen.replace_workflow_metadata_header(
-            content, renamed_metadata
+            content, renamed_metadata, workflow_id=source.workflow_id
         )
         if renamed_content is None:
             details = f"Attempted to rename workflow '{previous_name}'. Failed because its metadata header could not be rewritten."

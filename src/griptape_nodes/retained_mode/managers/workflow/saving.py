@@ -18,6 +18,7 @@ from griptape_nodes.files.path_utils import (
 )
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.files.situation_resolver import SITUATION_TO_FILE_POLICY
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowAddressError,
@@ -390,6 +391,10 @@ class WorkflowSaver(EngineScoped):
             keep_open_workflow_identity=keep_open_workflow_identity,
         )
         continues_in_copy = request.continue_in_copy and not continues_open_workflow
+        # The file holds the open workflow, under its id, or a copy, which is a new workflow.
+        saved_workflow_id = new_workflow_id()
+        if continues_open_workflow:
+            saved_workflow_id = current_workflow.workflow_id
 
         # Build save request inline (preserve existing display_name/description/image/is_template if present)
         existing = self._get_existing_metadata(registry_key)
@@ -429,6 +434,7 @@ class WorkflowSaver(EngineScoped):
             is_template=existing.is_template,
             branched_from=branched_from,
             workflow_shape=workflow_shape,
+            workflow_id=saved_workflow_id,
         )
         # _save_workflow_file_inline returns a SaveWorkflowFileFromSerializedFlowResult*
         # (its native result family). on_save_workflow_request's public contract
@@ -452,6 +458,7 @@ class WorkflowSaver(EngineScoped):
             workflow,
             written_path=save_file_result.file_path,
             workflow_metadata=save_file_result.workflow_metadata,
+            workflow_id=saved_workflow_id,
             continues_open_workflow=continues_open_workflow,
             continues_in_copy=continues_in_copy,
         )
@@ -516,6 +523,7 @@ class WorkflowSaver(EngineScoped):
         *,
         written_path: str,
         workflow_metadata: WorkflowMetadata,
+        workflow_id: str,
         continues_open_workflow: bool,
         continues_in_copy: bool,
     ) -> Workflow:
@@ -523,9 +531,9 @@ class WorkflowSaver(EngineScoped):
 
         A file that continues the open workflow is the open workflow's: its entry moves there if
         it was not already. So is a copy the save continues in, and the file it leaves behind is
-        registered as a new workflow. Any other file is a new workflow. Either way, a different
-        workflow registered at that path is removed, since the file that was its identity now holds
-        another workflow.
+        registered as a new workflow. Any other file is a copy, registered under the new id
+        `workflow_id` its header saves. Either way, a different workflow registered at that path is
+        removed, since the file that was its identity now holds another workflow.
         """
         registry = self.engine.workflow_registry
         current_workflow = registry.get(workflow.workflow_id)
@@ -550,7 +558,7 @@ class WorkflowSaver(EngineScoped):
 
         if displaced is not None:
             registry.remove(displaced.workflow_id)
-        return registry.register_file(written_path, workflow_metadata)
+        return registry.register_file(written_path, workflow_metadata, header_id=workflow_id)
 
     def _register_file_left_behind(self, path: Path, *, listed: bool) -> None:
         """Register the file a save that continued in its copy left behind, as a closed workflow with a new id."""
@@ -645,6 +653,7 @@ class WorkflowSaver(EngineScoped):
             is_template=request.is_template,
             branched_from=request.branched_from,
             workflow_shape=request.workflow_shape,
+            workflow_id=request.workflow_id if request.workflow_id is not None else new_workflow_id(),
         )
 
     @handles(SaveSubflowToWorkflowRequest)
@@ -723,6 +732,7 @@ class WorkflowSaver(EngineScoped):
             image_path=existing.image,
             is_template=existing.is_template,
             workflow_shape=workflow_shape,
+            workflow_id=target.workflow_id,
         )
         save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
         if not isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
@@ -1195,8 +1205,9 @@ class WorkflowSaver(EngineScoped):
         is_template: bool | None,
         branched_from: str | None,
         workflow_shape: WorkflowShape | None,
+        workflow_id: str,
     ) -> ResultPayload:
-        """Generate the workflow file content and write it to ``destination``.
+        """Generate the file content of the workflow ``workflow_id`` names and write it to ``destination``.
 
         Shared by ``on_save_workflow_request`` and
         ``on_save_workflow_file_from_serialized_flow_request``. Callers with a
@@ -1226,6 +1237,7 @@ class WorkflowSaver(EngineScoped):
             final_code_output = self.engine.workflow_manager.codegen.generate_workflow_file_content(
                 serialized_flow_commands=serialized_flow_commands,
                 workflow_metadata=workflow_metadata,
+                workflow_id=workflow_id,
             )
         except Exception as err:
             details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during content generation: {err}"

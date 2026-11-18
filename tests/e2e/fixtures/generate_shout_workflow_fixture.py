@@ -17,6 +17,7 @@ import json
 import tempfile
 from pathlib import Path
 
+from griptape_nodes.node_library.workflow_ids import new_workflow_id
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
@@ -141,6 +142,7 @@ def _generate() -> None:
     content = workflow_manager.codegen.generate_workflow_file_content(
         serialized_flow_commands=serialized.serialized_flow_commands,
         workflow_metadata=metadata,
+        workflow_id=new_workflow_id(),
     )
     WORKFLOW_PATH.write_text(content, encoding="utf-8")
     print(f"Wrote {WORKFLOW_PATH}")  # noqa: T201

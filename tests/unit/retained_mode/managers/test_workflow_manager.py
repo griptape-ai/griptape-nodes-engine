@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call, create_autospec, pat
 import anyio
 import pytest
 
+from griptape_nodes.node_library.workflow_ids import library_workflow_id, new_workflow_id
+
 if TYPE_CHECKING:
     from collections.abc import Generator
 
@@ -1785,7 +1787,7 @@ class TestWorkflowManager:
         with patch.object(
             engine.library_manager,
             "collect_library_workflow_files",
-            AsyncMock(return_value=[str(template_path)]),
+            AsyncMock(return_value={str(template_path): library_workflow_id("TemplateLib", "template.py")}),
         ):
             # Startup: library templates register, then the workspace scan runs.
             engine.config_manager.workspace_path = startup_workspace
@@ -1888,12 +1890,12 @@ class TestWorkflowManager:
                 _valid_workflow_source(f"workflow_{index:02}"), encoding="utf-8"
             )
 
-        original_process = workflow_manager._process_single_workflow_file
+        original_check = workflow_manager._check_workflow_file
 
         async def fail_one(workflow_file: Path, **kwargs: Any) -> Any:
             if workflow_file.name == "workflow_07.py":
                 return None
-            return await original_process(workflow_file, **kwargs)
+            return await original_check(workflow_file, **kwargs)
 
         sent: list[tuple[EngineInitializationProgress, Any]] = []
 
@@ -1902,7 +1904,7 @@ class TestWorkflowManager:
                 sent.append((event.payload, coalesce_key))
 
         with (
-            patch.object(workflow_manager, "_process_single_workflow_file", side_effect=fail_one),
+            patch.object(workflow_manager, "_check_workflow_file", side_effect=fail_one),
             patch.object(engine.event_manager, "put_event", side_effect=record),
         ):
             result = await workflow_manager._process_workflows_for_registration([str(tmp_path)])
@@ -2623,6 +2625,7 @@ class TestWorkflowManager:
         return workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._empty_serialized_flow_commands(),
             workflow_metadata=self._minimal_workflow_metadata(with_shape=with_shape),
+            workflow_id=new_workflow_id(),
         )
 
     def test_generate_workflow_file_content_wraps_graph_building_in_async_build_workflow(self, engine: Engine) -> None:
@@ -2696,6 +2699,7 @@ class TestWorkflowManager:
         content = workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=self._empty_serialized_flow_commands(),
             workflow_metadata=metadata,
+            workflow_id=new_workflow_id(),
         )
 
         module = ast.parse(content)
@@ -2785,6 +2789,7 @@ class TestWorkflowManager:
         script_source = workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=flow,
             workflow_metadata=metadata,
+            workflow_id=new_workflow_id(),
         )
 
         dispatched: list[object] = []
@@ -2832,6 +2837,7 @@ class TestWorkflowManager:
             content = workflow_manager.codegen.generate_workflow_file_content(
                 serialized_flow_commands=self._empty_serialized_flow_commands(),
                 workflow_metadata=self._minimal_workflow_metadata(),
+                workflow_id=new_workflow_id(),
             )
 
         module = ast.parse(content)
@@ -3209,6 +3215,7 @@ class TestWorkflowVariablePersistence:
         script_source = workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=serialized_commands,
             workflow_metadata=metadata,
+            workflow_id=new_workflow_id(),
         )
 
         # Script must reference CreateVariableRequest for the flow-scoped variable.
@@ -3902,6 +3909,7 @@ class TestWorkflowSaveSituationMacro:
             is_template=None,
             branched_from=None,
             workflow_shape=None,
+            workflow_id=new_workflow_id(),
         )
         from griptape_nodes.retained_mode.events.workflow_events import (
             SaveWorkflowFileFromSerializedFlowResultSuccess,
@@ -3945,6 +3953,7 @@ class TestWorkflowSaveSituationMacro:
             is_template=None,
             branched_from=None,
             workflow_shape=None,
+            workflow_id=new_workflow_id(),
         )
         from griptape_nodes.retained_mode.events.workflow_events import (
             SaveWorkflowFileFromSerializedFlowResultSuccess,
@@ -5650,6 +5659,7 @@ class TestScrubForAstConstant:
         content = engine.workflow_manager.codegen.generate_workflow_file_content(
             serialized_flow_commands=flow_commands,
             workflow_metadata=metadata,
+            workflow_id=new_workflow_id(),
         )
 
         # The generated file must be valid, reopenable Python with no leaked function repr,
@@ -6040,8 +6050,8 @@ class TestReferencedWorkflowTagging:
 
         flow_x = flow_manager.get_flow_by_name(flow_x_name)
         flow_y = flow_manager.get_flow_by_name(flow_y_name)
-        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_x) == "workflow_x"
-        assert flow_manager.get_referenced_workflow_name(engine.current_workflow(), flow_y) == "workflow_y"
+        assert flow_manager.get_referenced_workflow_id(engine.current_workflow(), flow_x) == "workflow_x"
+        assert flow_manager.get_referenced_workflow_id(engine.current_workflow(), flow_y) == "workflow_y"
 
     def test_imports_in_one_engine_do_not_leak_into_another(self, engine: Engine) -> None:
         """An import running in one engine does not tag flows created in another engine."""
@@ -6327,7 +6337,9 @@ class TestWorkflowBranchDisplayNames:
             node_libraries_referenced=[],
             creation_date=datetime.now(UTC),
         )
-        header = engine.workflow_manager.codegen._generate_workflow_metadata_header(metadata)
+        header = engine.workflow_manager.codegen._generate_workflow_metadata_header(
+            metadata, workflow_id=new_workflow_id()
+        )
         assert header is not None
 
         relative_file_path = f"{registry_key}.py"
@@ -6367,8 +6379,10 @@ class TestWorkflowBranchDisplayNames:
         branch = engine.workflow_registry.get_workflow_by_name(branch_key)
         assert branch.metadata.name == "Shot 010 Comp (branch 1)"
         assert self._persisted_display_name(temp_dir, branch_key) == "Shot 010 Comp (branch 1)"
-        # The branch relationship is keyed on the registry key, not the label.
-        assert branch.metadata.branched_from == self.SOURCE_KEY
+        # The branch relationship is keyed on the source's id, not the label.
+        assert (
+            branch.metadata.branched_from == engine.workflow_registry.get_workflow_by_name(self.SOURCE_KEY).workflow_id
+        )
 
     def test_branch_leaves_source_display_name_alone(self, engine: Engine, temp_dir: Path) -> None:
         """Branching must not touch the source's label."""
@@ -6537,7 +6551,9 @@ class TestRepairPathShapedDisplayName:
             node_libraries_referenced=[],
             creation_date=datetime.now(UTC),
         )
-        header = engine.workflow_manager.codegen._generate_workflow_metadata_header(metadata)
+        header = engine.workflow_manager.codegen._generate_workflow_metadata_header(
+            metadata, workflow_id=new_workflow_id()
+        )
         assert header is not None
 
         file_path = temp_dir / relative_file_path

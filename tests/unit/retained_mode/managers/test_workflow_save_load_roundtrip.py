@@ -249,6 +249,9 @@ def _get_value(engine: Engine, node_name: str, parameter_name: str) -> Any:
     return result.value
 
 
+_SAVED_WORKFLOW_ID = "5a7ed000000000000000000000000001"
+
+
 def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem: str) -> str:
     """Serialize ``flow_name`` and write it to ``tmp_path`` via the same low-level writer ``SaveWorkflowRequest`` uses."""
     engine.config_manager.workspace_path = tmp_path
@@ -268,6 +271,8 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
         is_template=None,
         branched_from=None,
         workflow_shape=None,
+        # Every save here is of one workflow, so the files differ only where the graph does.
+        workflow_id=_SAVED_WORKFLOW_ID,
     )
     assert isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess), save_result
     return save_result.file_path

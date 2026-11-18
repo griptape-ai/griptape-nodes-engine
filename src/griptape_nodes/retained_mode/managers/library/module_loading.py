@@ -30,7 +30,8 @@ from griptape_nodes.node_library.library_registry import (
     NodeDefinition,
     WorkflowNodeDefinition,
 )
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
+from griptape_nodes.node_library.workflow_ids import library_workflow_id
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_header
 from griptape_nodes.retained_mode.beta_features import library_config_slug
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import AppPayload, ExecutionPayload
@@ -701,17 +702,24 @@ class LibraryModuleLoading(EngineScoped):
         library_info.lifecycle_state = LibraryLifecycleState.LOADED
 
     def build_workflow_node_class_from_definition(
-        self, workflow_node_definition: WorkflowNodeDefinition, base_dir: Path
+        self, workflow_node_definition: WorkflowNodeDefinition, base_dir: Path, *, library_name: str | None
     ) -> type[WorkflowNode] | WorkflowNodeLoadProblem:
-        """Generate the node type a saved workflow file describes, or the problem that prevents it."""
+        """Generate the node type a saved workflow file describes, or the problem that prevents it.
+
+        `library_name` names the library that provides the workflow, whose workflows are registered
+        under their library id. None for a sandbox's, which are the user's own files.
+        """
         # Deliberately not `canonicalize_for_identity`: the workspace scan registers a linked
         # workflow under the link's path, and resolving it would key it by a full machine-specific
         # path instead.
         workflow_file_path = canonicalize_for_identity_preserving_symlinks(
             workflow_node_definition.workflow_path, base=base_dir
         )
+        library_id = None
+        if library_name is not None:
+            library_id = library_workflow_id(library_name, workflow_node_definition.workflow_path)
         try:
-            workflow_metadata = read_workflow_metadata(workflow_file_path)
+            workflow_header = read_workflow_header(workflow_file_path)
         except WorkflowMetadataError as err:
             return WorkflowNodeLoadProblem(
                 node_type=workflow_node_definition.node_type,
@@ -723,7 +731,9 @@ class LibraryModuleLoading(EngineScoped):
             node_class = build_workflow_node_class(
                 node_type=workflow_node_definition.node_type,
                 workflow_file_path=workflow_file_path,
-                workflow_metadata=workflow_metadata,
+                workflow_metadata=workflow_header.metadata,
+                workflow_header_id=workflow_header.workflow_id,
+                library_workflow_id=library_id,
             )
         except WorkflowNodeDefinitionError as err:
             return WorkflowNodeLoadProblem(
@@ -1115,7 +1125,12 @@ class LibraryModuleLoading(EngineScoped):
         parameters. Returns False (recording a library problem) when the header cannot be read or
         carries no shape.
         """
-        node_class = self.build_workflow_node_class_from_definition(workflow_node_definition, base_dir)
+        library_name = None
+        if not library_info.is_sandbox:
+            library_name = library_info.library_name
+        node_class = self.build_workflow_node_class_from_definition(
+            workflow_node_definition, base_dir, library_name=library_name
+        )
         if isinstance(node_class, WorkflowNodeLoadProblem):
             library_info.problems.append(node_class)
             return False
@@ -1158,7 +1173,12 @@ class LibraryModuleLoading(EngineScoped):
         if existing is not None and existing.workflow_id in found_workflow_ids:
             return existing.workflow_id
         try:
-            workflow = workflow_registry.refresh_file(node_class.workflow_file_path, node_class.workflow_metadata)
+            workflow = workflow_registry.refresh_file(
+                node_class.workflow_file_path,
+                node_class.workflow_metadata,
+                header_id=node_class.workflow_header_id,
+                library_id=node_class.library_workflow_id,
+            )
         except ValueError:
             logger.warning(
                 "Library '%s' could not list the workflow '%s' behind node type '%s'.",
