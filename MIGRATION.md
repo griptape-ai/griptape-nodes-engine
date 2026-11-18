@@ -78,6 +78,11 @@ result = GriptapeNodes.handle_request(request)
 
 From a node, `self.workflow.handle_request(request)` sends it through the workflow the node joined.
 
+If you called the two-argument `on_<name>_request_in_workflow` forms, those names are now the bare
+`on_<name>_request` names, with the same arguments. For example,
+`on_set_parameter_value_request_in_workflow(request, workflow)` is now
+`on_set_parameter_value_request(request, workflow)`.
+
 ## Parameter values keep their type
 
 **Library authors.** A field of your own request, result, or event payload that holds parameter
