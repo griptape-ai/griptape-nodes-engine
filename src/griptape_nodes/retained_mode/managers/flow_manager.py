@@ -2432,6 +2432,7 @@ class FlowManager(EngineScoped):
         flows.run_queue.enqueue(run)
         self._start_next_run_if_idle(flows)
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
         return run
 
     async def cancel_run_in(self, workflow: WorkflowRuntime, run_id: str) -> bool:
@@ -2508,6 +2509,7 @@ class FlowManager(EngineScoped):
             self._leave_line(run)
             self._on_run_loop(run, self._end_without_executing, run, f"The run did not start: {reason}")
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
 
     def _end_without_executing(self, run: Run, details: str) -> None:
         """End a run that left the line without executing; its request returns `details`."""
@@ -2552,6 +2554,8 @@ class FlowManager(EngineScoped):
         run.state = RunState.RUNNING
         flows.run_in_progress = run
         flows.driving = True
+        if flows.workflow is not None:
+            flows.workflow.last_run_error = None
         # The run that just ended may have ended on a short-lived loop, such as a synchronous request's.
         self._on_run_loop(run, self._create_driver, run)
 
@@ -2616,9 +2620,28 @@ class FlowManager(EngineScoped):
         if flows.run_in_progress is not run:
             return
         flows.run_in_progress = None
+        if flows.workflow is not None and run.state is RunState.FAILED:
+            flows.workflow.last_run_error = self._failure_text(run)
         self._on_run_loop(run, run.ended.set_result, None)
         self._start_next_run_if_idle(flows)
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
+
+    def _report_workflow_state(self, flows: WorkflowFlows) -> None:
+        """Tell clients of the runs of the workflow `flows` belongs to, if it belongs to one."""
+        if flows.workflow is not None:
+            self.engine.report_workflow_state(flows.workflow)
+
+    @staticmethod
+    def _failure_text(run: Run) -> str:
+        """Why the failed `run` failed, from what its request returned or raised."""
+        outcome = run.outcome
+        if not outcome.done() or outcome.cancelled():
+            return f"The run of flow '{run.flow_name}' failed."
+        exception = outcome.exception()
+        if exception is not None:
+            return f"Attempted to run flow '{run.flow_name}'. Failed due to: {exception}"
+        return str(outcome.result().result_details)
 
     @staticmethod
     def _on_run_loop(run: Run, callback: Callable[..., object], *args: object) -> None:
