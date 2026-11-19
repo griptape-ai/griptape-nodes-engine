@@ -15,6 +15,8 @@ These shapes are exercised:
 - The same flows run a second time. Every node is still RESOLVED from the first run when seeding
   starts, so the upstream data walk has to tell a feeder that already holds this run's value from one
   control is about to run again: a node wired into a control flow, or a data node reading one.
+- Two entry points that both lead into one node, where one feeds the other, so a single graph holds
+  both entry points and the node they lead into must still wait for both.
 - Running a single node, which never hands control on, so a resolved feeder's value is reused.
 """
 
@@ -434,3 +436,35 @@ def _record_executions(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[
 
     monkeypatch.setattr(node_executor, "execute", _record)
     return executed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feeder_first", [False, True])
+async def test_merge_waits_for_both_entry_points(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+    feeder_first: bool,  # noqa: FBT001
+) -> None:
+    """A node both entry points lead into waits for both, when one entry point feeds the other.
+
+    ``E1 -> M`` and ``E2 -> M``, then ``M -> N``, with ``E2`` feeding ``E1`` and ``M``. Seeding ``E1``
+    adopts ``E2`` into ``E1``'s graph, so a single graph holds both entry points. ``M`` must still
+    wait for ``E1``: run on ``E2`` alone, it is marked stale again when ``E1`` finishes after it.
+    Run twice, because the second run starts with every node RESOLVED.
+    """
+    flow = loose_sink_flow
+    names = ("E2", "E1", "M", "N") if feeder_first else ("E1", "E2", "M", "N")
+    for name in names:
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "M", "exec_in")
+    connect("E2", "exec_out", "M", "exec_in")
+    connect("M", "exec_out", "N", "exec_in")
+    connect("E2", "result", "E1", "text")
+    connect("E2", "result", "M", "text")
+
+    for run in (1, 2):
+        states = await _run(engine, flow)
+        assert states["M"] == NodeResolutionState.RESOLVED, f"run {run}: M ran before both entry points had finished"
+        assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), f"run {run}: a node ended unresolved"
