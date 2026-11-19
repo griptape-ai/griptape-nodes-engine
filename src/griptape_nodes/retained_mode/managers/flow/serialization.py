@@ -475,9 +475,6 @@ class FlowSerialization(EngineScoped):
                     create_flow_request = CreateFlowRequest(
                         flow_name=flow_name,
                         parent_flow_name=parent_name,
-                        # Ignored here, but saved files carry it: engines before the flow context moved
-                        # to `with` blocks would otherwise leave this flow current after creating it.
-                        set_as_new_context=False,
                         metadata=flow.metadata,
                     )
             else:

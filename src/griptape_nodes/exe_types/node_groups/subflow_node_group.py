@@ -169,7 +169,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         request = CreateFlowRequest(
             flow_name=subflow_name,
             parent_flow_name=self._get_subflow_parent_flow_name(),
-            set_as_new_context=False,
             metadata=subflow_metadata,
         )
         result = self._handle_request_in_workflow(request)

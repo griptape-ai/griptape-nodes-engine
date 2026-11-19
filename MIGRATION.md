@@ -40,8 +40,8 @@ with GriptapeNodes.ContextManager().flow(flow):
 `has_current_element` and `get_current_element` are gone. Nothing in the engine read the element
 context.
 
-**Saved workflow files.** No change needed. Files saved by earlier versions still open and run,
-and files saved by this version still run on earlier engines.
+**Saved workflow files.** No change needed. Files saved by earlier versions still open and run.
+Newly saved files no longer include the `_ensure_workflow_context` function.
 
 ## Execution events name their workflow in `open_workflow_id`
 

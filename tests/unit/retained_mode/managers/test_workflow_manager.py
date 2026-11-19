@@ -2882,26 +2882,13 @@ class TestWorkflowManager:
         assert ast.unparse(open_stmt) == "GriptapeNodes.ContextManager().push_workflow(file_path=__file__)"
         assert ast.unparse(build_stmt) == "await build_workflow()"
 
-    def test_generate_workflow_file_content_ensure_context_is_async(self, engine: Engine) -> None:
-        """_ensure_workflow_context is now async and must await ahandle_request."""
-        content = self._generate(engine, with_shape=True)
-        module = ast.parse(content)
-
-        ensure = next(
-            node
-            for node in module.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ensure_workflow_context"
-        )
-        body_src = "\n".join(ast.unparse(stmt) for stmt in ensure.body)
-        assert "await GriptapeNodes.ahandle_request" in body_src
-        # Sanity check: the old sync variant is gone.
-        assert "GriptapeNodes.handle_request(" not in body_src
-
-    def test_generated_file_still_runs_on_engines_with_a_shared_flow_stack(self, engine: Engine) -> None:
-        """Older engines need the file to make its top-level flow current after building it."""
+    def test_generated_file_leaves_the_current_flow_to_the_engine(self, engine: Engine) -> None:
+        """The engine treats the top-level flow as current, so the file neither pins it nor asks for it."""
         content = self._generate(engine, with_shape=True)
 
-        assert "async def _ensure_workflow_context" in content
+        assert "_ensure_workflow_context" not in content
+        assert "push_flow" not in content
+        assert "set_as_new_context" not in content
 
     def test_generate_workflow_file_content_is_valid_python(self, engine: Engine) -> None:
         """Generated content must parse cleanly (no smuggled-string comments left behind)."""
