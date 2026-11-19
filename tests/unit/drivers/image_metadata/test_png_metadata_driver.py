@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, BinaryIO
 
+import pytest
+
 from griptape_nodes.drivers.image_metadata.png_metadata_driver import PngMetadataDriver
 from griptape_nodes.image import GriptapeImage
 from griptape_nodes.image.png_text_chunks import MAX_COMPRESSED_TEXT_BYTES
@@ -53,32 +55,29 @@ class TestPngMetadataDriver:
                 "gtn_short": "x",
             }
 
-    def test_short_text_stays_uncompressed(self) -> None:
+    @pytest.mark.parametrize(
+        ("key", "text", "expected_chunk", "absent_chunk"),
+        [
+            pytest.param("gtn_short", "x", b"tEXt", b"zTXt", id="short"),
+            pytest.param(
+                "gtn_huge", "a" * (MAX_COMPRESSED_TEXT_BYTES + 1), b"tEXt", b"zTXt", id="above-decompress-limit"
+            ),
+            pytest.param(
+                "gtn_large", "a" * (MAX_COMPRESSED_TEXT_BYTES - 1), b"zTXt", b"tEXt", id="below-decompress-limit"
+            ),
+        ],
+    )
+    def test_bytes_text_compression_and_readback(
+        self, key: str, text: str, expected_chunk: bytes, absent_chunk: bytes
+    ) -> None:
         raw_png = encode(solid(4, 4, RED), "png")
 
-        png = PngMetadataDriver().inject_metadata(raw_png, {"gtn_short": "x"})
+        png = PngMetadataDriver().inject_metadata(raw_png, {key: text})
 
-        assert b"zTXt" not in _chunk_types(png)
-        assert b"tEXt" in _chunk_types(png)
-
-    def test_text_over_decompress_limit_stays_uncompressed_and_reads_back(self) -> None:
-        huge_text = "a" * (MAX_COMPRESSED_TEXT_BYTES + 1)
-        raw_png = encode(solid(4, 4, RED), "png")
-
-        png = PngMetadataDriver().inject_metadata(raw_png, {"gtn_huge": huge_text})
-
-        assert b"zTXt" not in _chunk_types(png)
-        assert b"tEXt" in _chunk_types(png)
-        assert PngMetadataDriver().extract_metadata(png) == {"gtn_huge": huge_text}
-
-    def test_text_under_decompress_limit_is_compressed(self) -> None:
-        large_text = "a" * (MAX_COMPRESSED_TEXT_BYTES - 1)
-        raw_png = encode(solid(4, 4, RED), "png")
-
-        png = PngMetadataDriver().inject_metadata(raw_png, {"gtn_large": large_text})
-
-        assert b"zTXt" in _chunk_types(png)
-        assert PngMetadataDriver().extract_metadata(png) == {"gtn_large": large_text}
+        chunk_types = _chunk_types(png)
+        assert expected_chunk in chunk_types
+        assert absent_chunk not in chunk_types
+        assert PngMetadataDriver().extract_metadata(png) == {key: text}
 
     def test_accepts_path_and_preserves_existing_text_chunks(self, tmp_path: Path) -> None:
         initial = PngMetadataDriver().inject_metadata(encode(solid(4, 4, RED), "png"), {"existing": "keep", "k": "old"})

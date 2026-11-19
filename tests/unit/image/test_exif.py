@@ -240,21 +240,19 @@ def _app1(payload: bytes) -> bytes:
 
 
 class TestUserComment:
-    def test_ascii_comment_reads_as_text(self) -> None:
-        comment = b"ASCII\x00\x00\x00hello"
+    @pytest.mark.parametrize(
+        ("byte_order", "comment", "expected"),
+        [
+            pytest.param("<", b"ASCII\x00\x00\x00hello", "hello", id="ascii-little-endian"),
+            pytest.param(">", b"UNICODE\x00" + "h\u00e9".encode("utf-16-be"), "h\u00e9", id="unicode-big-endian"),
+        ],
+    )
+    def test_comment_reads_in_the_blocks_byte_order(self, byte_order: str, comment: bytes, expected: str) -> None:
         exif = Exif.from_bytes(
-            _block("<", [], exif_ifd=[_entry(EXIF_USER_COMMENT_TAG, _UNDEFINED, len(comment), comment)])
+            _block(byte_order, [], exif_ifd=[_entry(EXIF_USER_COMMENT_TAG, _UNDEFINED, len(comment), comment)])
         )
 
-        assert exif[EXIF_USER_COMMENT_TAG] == "hello"
-
-    def test_unicode_comment_reads_in_the_blocks_byte_order(self) -> None:
-        comment = b"UNICODE\x00" + "hé".encode("utf-16-be")
-        exif = Exif.from_bytes(
-            _block(">", [], exif_ifd=[_entry(EXIF_USER_COMMENT_TAG, _UNDEFINED, len(comment), comment)])
-        )
-
-        assert exif[EXIF_USER_COMMENT_TAG] == "hé"
+        assert exif[EXIF_USER_COMMENT_TAG] == expected
 
     def test_written_comment_lands_in_the_exif_ifd(self) -> None:
         exif = Exif()

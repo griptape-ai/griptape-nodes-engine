@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.settings import (
+    FROM_ENV_CONTEXT,
     AppInitializationComplete,
     DistributedExecutionSettings,
     LibraryDependencyInstallBehavior,
@@ -252,9 +253,6 @@ class TestOpenImageIOSettings:
         expected_default: object,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        from griptape_nodes.retained_mode.managers import settings as settings_module
-
-        settings_module._reported_invalid_settings.discard((f"openimageio.{field_name}", repr(bad_value)))
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = Settings.model_validate({"openimageio": {field_name: bad_value}})
 
@@ -262,9 +260,6 @@ class TestOpenImageIOSettings:
         assert f"openimageio.{field_name}" in caplog.text
 
     def test_non_mapping_openimageio_falls_back_to_defaults(self, caplog: pytest.LogCaptureFixture) -> None:
-        from griptape_nodes.retained_mode.managers import settings as settings_module
-
-        settings_module._reported_invalid_settings.discard(("openimageio", repr("invalid")))
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             result = Settings.model_validate({"openimageio": "invalid"})
 
@@ -272,8 +267,6 @@ class TestOpenImageIOSettings:
         assert "openimageio" in caplog.text
 
     def test_environment_values_are_converted(self) -> None:
-        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
-
         result = Settings.model_validate(
             {
                 "openimageio": {
@@ -310,8 +303,6 @@ class TestOpenImageIOSettings:
         ],
     )
     def test_invalid_environment_value_raises_validation_error(self, field_name: str, bad_env_value: str) -> None:
-        from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT
-
         with pytest.raises(ValidationError, match=f"openimageio.{field_name}"):
             Settings.model_validate(
                 {"openimageio": {field_name: bad_env_value}},

@@ -30,7 +30,16 @@ from griptape_nodes.image.containers import (
 )
 from griptape_nodes.image.exif import EXIF_PIXEL_X_DIMENSION_TAG, EXIF_PIXEL_Y_DIMENSION_TAG, tiff_metadata
 from griptape_nodes.image.formats import sniff_image_format
-from griptape_nodes.image.pipeline import Flatten, Orient, RoundCorners, Thumbnail, ToRGB, _ExifTranspose, _plan_steps
+from griptape_nodes.image.pipeline import (
+    Flatten,
+    Orient,
+    PipelineStep,
+    RoundCorners,
+    Thumbnail,
+    ToRGB,
+    _ExifTranspose,
+    _plan_steps,
+)
 from griptape_nodes.image.png_text_chunks import (
     MAX_COMPRESSED_TEXT_BYTES,
     insert_text_chunks,
@@ -138,6 +147,9 @@ class TestImageFormat:
             ("tif", ImageFormat.TIFF),
             ("targa", ImageFormat.TGA),
             ("openexr", ImageFormat.EXR),
+            ("cineon", ImageFormat.CIN),
+            ("jpeg2000", ImageFormat.JP2),
+            ("pbm", ImageFormat.PBM),
             ("webp", ImageFormat.WEBP),
         ],
     )
@@ -372,23 +384,34 @@ class TestPixelDepth:
 
 
 class TestPlanSteps:
-    def test_moves_orientation_after_thumbnail_and_swaps_bounds(self) -> None:
-        planned = _plan_steps([_ExifTranspose(), ToRGB(), Thumbnail(100, 50)], _ROTATE_90_CLOCKWISE)
-
-        assert planned == [ToRGB(), Thumbnail(50, 100), Orient(_ROTATE_90_CLOCKWISE)]
-
-    def test_applies_only_the_first_exif_transpose(self) -> None:
-        planned = _plan_steps([_ExifTranspose(), ToRGB(), _ExifTranspose()], _ROTATE_90_CLOCKWISE)
-
-        assert planned == [ToRGB(), Orient(_ROTATE_90_CLOCKWISE)]
-
-    def test_keeps_orientation_before_steps_that_depend_on_it(self) -> None:
-        planned = _plan_steps([_ExifTranspose(), RoundCorners(0.1), Flatten((0, 0, 0))], 3)
-
-        assert planned == [Orient(3), RoundCorners(0.1), Flatten((0, 0, 0))]
-
-    def test_drops_an_upright_orientation(self) -> None:
-        assert _plan_steps([_ExifTranspose(), Thumbnail(10, 10)], 1) == [Thumbnail(10, 10)]
+    @pytest.mark.parametrize(
+        ("steps", "orientation", "expected"),
+        [
+            pytest.param(
+                [_ExifTranspose(), ToRGB(), Thumbnail(100, 50)],
+                _ROTATE_90_CLOCKWISE,
+                [ToRGB(), Thumbnail(50, 100), Orient(_ROTATE_90_CLOCKWISE)],
+                id="swap-thumbnail-bounds",
+            ),
+            pytest.param(
+                [_ExifTranspose(), ToRGB(), _ExifTranspose()],
+                _ROTATE_90_CLOCKWISE,
+                [ToRGB(), Orient(_ROTATE_90_CLOCKWISE)],
+                id="first-transpose-only",
+            ),
+            pytest.param(
+                [_ExifTranspose(), RoundCorners(0.1), Flatten((0, 0, 0))],
+                3,
+                [Orient(3), RoundCorners(0.1), Flatten((0, 0, 0))],
+                id="orientation-dependent-steps",
+            ),
+            pytest.param([_ExifTranspose(), Thumbnail(10, 10)], 1, [Thumbnail(10, 10)], id="upright-noop"),
+        ],
+    )
+    def test_plan_steps(
+        self, steps: list[PipelineStep | _ExifTranspose], orientation: int, expected: list[PipelineStep]
+    ) -> None:
+        assert _plan_steps(steps, orientation) == expected
 
 
 class TestPipeline:
@@ -461,19 +484,27 @@ class TestPipeline:
         ):
             assert (upright.width, upright.height) == (40, 20)
 
-    def test_thumbnail_fits_bounds_and_keeps_aspect_ratio(self) -> None:
+    @pytest.mark.parametrize(
+        ("extension", "source_size", "color", "bounds", "expected_size"),
+        [
+            pytest.param("png", (400, 200), WHITE, (100, 100), (100, 50), id="png-aspect-ratio"),
+            pytest.param("jpg", (1600, 1000), GREEN, (160, 160), (160, 100), id="large-jpeg"),
+            pytest.param("png", (40, 20), WHITE, (100, 100), (40, 20), id="never-enlarge"),
+        ],
+    )
+    def test_thumbnail_fits_bounds(
+        self,
+        extension: str,
+        source_size: tuple[int, int],
+        color: tuple[int, ...],
+        bounds: tuple[int, int],
+        expected_size: tuple[int, int],
+    ) -> None:
         with (
-            GriptapeImage.open(_png(400, 200)) as image,
-            GriptapeImagePipeline(image).thumbnail(100, 100).end() as small,
+            GriptapeImage.open(encode(solid(*source_size, color), extension)) as image,
+            GriptapeImagePipeline(image).thumbnail(*bounds).end() as small,
         ):
-            assert (small.width, small.height) == (100, 50)
-
-    def test_thumbnail_of_a_large_jpeg_matches_the_bounds(self) -> None:
-        with (
-            GriptapeImage.open(encode(solid(1600, 1000, GREEN), "jpg")) as image,
-            GriptapeImagePipeline(image).thumbnail(160, 160).end() as small,
-        ):
-            assert (small.width, small.height) == (160, 100)
+            assert (small.width, small.height) == expected_size
 
     def test_thumbnail_of_a_gray_jpeg_stays_gray(self) -> None:
         with (
@@ -484,13 +515,6 @@ class TestPipeline:
 
         red, green, blue = (int(value) for value in pixels[50, 80])
         assert abs(red - 128) <= 2 and red == green == blue  # noqa: PLR2004, PT018
-
-    def test_thumbnail_never_enlarges(self) -> None:
-        with (
-            GriptapeImage.open(_png(40, 20)) as image,
-            GriptapeImagePipeline(image).thumbnail(100, 100).end() as same,
-        ):
-            assert (same.width, same.height) == (40, 20)
 
     def test_thumbnail_defaults_to_the_preview_size(self) -> None:
         with (

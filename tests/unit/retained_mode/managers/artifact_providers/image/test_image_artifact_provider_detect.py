@@ -43,12 +43,22 @@ class TestImageDetectFormat:
         fill = 0.5 if dtype == np.float32 else 200
         pixels = np.full((32, 32, 3), fill, dtype=dtype)
         payload = encode(pixels, ext)
-        assert ImageArtifactProvider.detect_format(payload) == expected
+        detected = ImageArtifactProvider.detect_format(payload)
+        assert detected == expected
+        assert detected in ImageArtifactProvider.get_supported_formats()
 
-    def test_sniffs_psd_dds_and_cineon_headers(self) -> None:
-        assert ImageArtifactProvider.detect_format(b"8BPS\x00\x01" + b"\x00" * 16) == "psd"
-        assert ImageArtifactProvider.detect_format(b"DDS \x7c\x00\x00\x00" + b"\x00" * 16) == "dds"
-        assert ImageArtifactProvider.detect_format(b"\x80\x2a\x5f\xd7" + b"\x00" * 16) == "cin"
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            pytest.param(b"8BPS\x00\x01" + b"\x00" * 16, "psd", id="psd"),
+            pytest.param(b"DDS \x7c\x00\x00\x00" + b"\x00" * 16, "dds", id="dds"),
+            pytest.param(b"\x80\x2a\x5f\xd7" + b"\x00" * 16, "cin", id="cin"),
+        ],
+    )
+    def test_sniffs_psd_dds_and_cineon_headers(self, payload: bytes, expected: str) -> None:
+        detected = ImageArtifactProvider.detect_format(payload)
+        assert detected == expected
+        assert detected in ImageArtifactProvider.get_supported_formats()
 
     def test_ico_not_claimed(self) -> None:
         """ICO is not in get_supported_formats(), so it must not be sniffed (GH#5614)."""
@@ -75,34 +85,6 @@ class TestImageDetectFormat:
 
     def test_short_data_returns_none(self) -> None:
         assert ImageArtifactProvider.detect_format(b"\x89PNG") is None
-
-
-class TestDetectFormatContract:
-    """Every return value of detect_format() must be in get_supported_formats()."""
-
-    @pytest.mark.parametrize(
-        "byte_sample",
-        [
-            encode(solid(32, 32, WHITE), "png"),
-            encode(solid(32, 32, WHITE), "jpg"),
-            encode(solid(32, 32, WHITE), "gif"),
-            encode(solid(32, 32, WHITE), "webp"),
-            encode(solid(32, 32, WHITE), "bmp"),
-            encode(solid(32, 32, WHITE), "tif"),
-            encode(np.full((32, 32, 3), 0.5, dtype=np.float32), "exr"),
-            encode(np.full((32, 32, 3), 0.5, dtype=np.float32), "hdr"),
-            encode(solid(32, 32, WHITE), "dpx"),
-            encode(solid(32, 32, WHITE), "jp2"),
-            b"8BPS\x00\x01" + b"\x00" * 16,
-            b"DDS \x7c\x00\x00\x00" + b"\x00" * 16,
-            b"\x80\x2a\x5f\xd7" + b"\x00" * 16,
-        ],
-        ids=["png", "jpg", "gif", "webp", "bmp", "tif", "exr", "hdr", "dpx", "jp2", "psd", "dds", "cin"],
-    )
-    def test_detect_format_return_values_are_all_supported(self, byte_sample: bytes) -> None:
-        detected = ImageArtifactProvider.detect_format(byte_sample)
-        assert detected is not None
-        assert detected in ImageArtifactProvider.get_supported_formats()
 
 
 class TestGetArtifactMetadata:

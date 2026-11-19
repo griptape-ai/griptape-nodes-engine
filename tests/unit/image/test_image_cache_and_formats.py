@@ -129,12 +129,6 @@ class TestExpandedFormatSniffing:
                 preview_bytes = GriptapeImagePipeline(img).thumbnail(16, 16).end().encode(ImageFormat.WEBP)
                 assert sniff_image_extension(preview_bytes) == "webp"
 
-    def test_from_name_resolves_oiiio_format_aliases(self) -> None:
-        assert ImageFormat.from_name("openexr") == ImageFormat.EXR
-        assert ImageFormat.from_name("cineon") == ImageFormat.CIN
-        assert ImageFormat.from_name("jpeg2000") == ImageFormat.JP2
-        assert ImageFormat.from_name("pbm") == ImageFormat.PBM
-
     @pytest.mark.parametrize("target_format", [ImageFormat.WEBP, ImageFormat.PNG, ImageFormat.JPEG])
     def test_multichannel_exr_encodes_to_preview_formats(self, tmp_path: Path, target_format: ImageFormat) -> None:
         # Given a 6-channel float EXR (RGBA + depth + object id)
