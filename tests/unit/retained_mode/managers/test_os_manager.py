@@ -3,7 +3,7 @@ import platform
 import subprocess
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import anyio
 import pytest
@@ -289,19 +289,18 @@ class TestReadFileRequest:
 
 
 class TestReadFileRequestImagePreview:
-    """Test ReadFileRequest's image thumbnail generation: Pillow always runs first.
+    """Test ReadFileRequest's image thumbnail generation: OpenImageIO runs first.
 
-    Size only matters once Pillow has already failed to decode the file -- base64-encoding a
-    multi-hundred-MB file whole is what hung the engine on large/multi-part images it can't open
-    (EXR sequences, for one). A large file Pillow *can* decode must still get a thumbnail. See
-    os_manager.py's _generate_thumbnail_from_image_content.
+    Size only matters once OpenImageIO fails to decode the file -- base64-encoding a
+    multi-hundred-MB file whole is what hung the engine on large damaged payloads. A large file
+    OpenImageIO can decode (including EXR) still gets a thumbnail.
     """
 
     # Minimal valid 1x1 red PNG, built by hand so the test has no binary fixture dependency.
     _ONE_PIXEL_PNG = (
         b"\x89PNG\r\n\x1a\n"
         b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
-        b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\x18\xdd\x8d\xb0"
+        b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00\x03\x01\x01\x00\xc9\xfe\x92\xef"
         b"\x00\x00\x00\x00IEND\xaeB`\x82"
     )
 
@@ -313,8 +312,8 @@ class TestReadFileRequestImagePreview:
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_large_pillow_decodable_file_is_still_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
-        """A file over the size cap that Pillow can decode (e.g. a big JPEG) still gets a thumbnail."""
+    def test_large_decodable_file_is_still_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
+        """A file over the size cap that OpenImageIO can decode still gets a thumbnail."""
         file_path = tmp_path / "huge.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
@@ -327,9 +326,9 @@ class TestReadFileRequestImagePreview:
         assert result.content.startswith("data:image/webp;base64,")
 
     def test_oversized_undecodable_file_returns_no_preview(self, engine: Engine, tmp_path: Path) -> None:
-        """A file over the size cap that Pillow can't decode must never be base64-encoded whole."""
+        """A file over the size cap that OpenImageIO cannot decode must never be base64-encoded whole."""
         file_path = tmp_path / "huge.exr"
-        content = b"not a real exr, just needs to fail a Pillow decode"
+        content = b"not a real exr, just needs to fail an OpenImageIO decode"
         file_path.write_bytes(content)
 
         with (
@@ -347,20 +346,29 @@ class TestReadFileRequestImagePreview:
         assert isinstance(result, ReadFileResultSuccess)
         assert result.content == OSManager._NO_PREVIEW_DATA_URL
 
-    def test_pillow_decodable_format_is_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
-        """A format Pillow can decode (PNG) gets its 200px WEBP thumbnail."""
-        file_path = tmp_path / "test.png"
-        file_path.write_bytes(self._ONE_PIXEL_PNG)
+    def test_decodable_png_and_exr_formats_are_thumbnailed(self, engine: Engine, tmp_path: Path) -> None:
+        """Formats OpenImageIO can decode (including PNG and EXR) get a 200px WEBP thumbnail."""
+        import numpy as np
 
-        request = ReadFileRequest(file_path=str(file_path))
-        result = engine.handle_request(request)
+        from tests.unit.image.sample_images import encode
 
-        assert isinstance(result, ReadFileResultSuccess)
-        assert isinstance(result.content, str)
-        assert result.content.startswith("data:image/webp;base64,")
+        png_path = tmp_path / "test.png"
+        png_path.write_bytes(self._ONE_PIXEL_PNG)
+        png_result = engine.handle_request(ReadFileRequest(file_path=str(png_path)))
+        assert isinstance(png_result, ReadFileResultSuccess)
+        assert isinstance(png_result.content, str)
+        assert png_result.content.startswith("data:image/webp;base64,")
+
+        exr_path = tmp_path / "frame.exr"
+        exr_path.write_bytes(encode(np.full((16, 16, 3), 0.5, dtype=np.float32), "exr"))
+        with patch("mimetypes.guess_type", return_value=("image/aces", None)):
+            exr_result = engine.handle_request(ReadFileRequest(file_path=str(exr_path)))
+        assert isinstance(exr_result, ReadFileResultSuccess)
+        assert isinstance(exr_result.content, str)
+        assert exr_result.content.startswith("data:image/webp;base64,")
 
     def test_undecodable_file_under_cap_returns_original_bytes(self, engine: Engine, tmp_path: Path) -> None:
-        """A format Pillow can't open, under the size cap, returns the raw bytes, never a hang."""
+        """A corrupt image under the size cap returns the raw bytes rather than hanging."""
         file_path = tmp_path / "test.exr"
         content = b"not a real exr, just needs to never be decoded"
         file_path.write_bytes(content)
@@ -377,7 +385,7 @@ class TestReadFileRequestImagePreview:
     def test_should_transform_image_content_to_thumbnail_false_skips_decoding(
         self, engine: Engine, tmp_path: Path
     ) -> None:
-        """Opting out of thumbnailing returns the raw bytes without ever calling Pillow."""
+        """Opting out of thumbnailing returns the raw bytes without decoding."""
         file_path = tmp_path / "test.png"
         file_path.write_bytes(self._ONE_PIXEL_PNG)
 
@@ -472,7 +480,8 @@ class TestRenameFileRequest:
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_rename_file_success(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully renaming a file."""
         os_manager = engine.os_manager
         old_path = tmp_path / "old.txt"
@@ -480,26 +489,28 @@ class TestRenameFileRequest:
         old_path.write_text("Content")
 
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
-        result = os_manager.on_rename_file_request(request)
+        result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultSuccess)
         assert not old_path.exists()
         assert new_path.exists()
         assert new_path.read_text() == "Content"
 
-    def test_rename_file_source_not_found(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_source_not_found(self, engine: Engine, tmp_path: Path) -> None:
         """Test renaming non-existent file."""
         os_manager = engine.os_manager
         request = RenameFileRequest(
             old_path=str(tmp_path / "nonexistent.txt"), new_path=str(tmp_path / "new.txt"), workspace_only=False
         )
 
-        result = os_manager.on_rename_file_request(request)
+        result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_rename_file_destination_exists(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_destination_exists(self, engine: Engine, tmp_path: Path) -> None:
         """Test renaming when destination already exists."""
         os_manager = engine.os_manager
         old_path = tmp_path / "old.txt"
@@ -508,12 +519,13 @@ class TestRenameFileRequest:
         new_path.write_text("New content")
 
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
-        result = os_manager.on_rename_file_request(request)
+        result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_rename_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
         """Test permission denied when renaming."""
         os_manager = engine.os_manager
         old_path = tmp_path / "old.txt"
@@ -523,7 +535,7 @@ class TestRenameFileRequest:
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
 
         with patch.object(Path, "rename", side_effect=PermissionError("Permission denied")):
-            result = os_manager.on_rename_file_request(request)
+            result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
@@ -1525,7 +1537,7 @@ class TestDeleteFileRequest:
         file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
 
-        with patch.object(anyio.Path, "unlink", AsyncMock(side_effect=PermissionError("Access denied"))):
+        with patch.object(Path, "unlink", side_effect=PermissionError("Access denied")):
             request = DeleteFileRequest(
                 path=str(file_path),
                 workspace_only=False,

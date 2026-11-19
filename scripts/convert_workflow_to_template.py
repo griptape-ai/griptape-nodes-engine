@@ -14,9 +14,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import tomlkit
-from PIL import Image
 from rich.console import Console
 from rich.prompt import Confirm, Prompt
+
+from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline, ImageFormat, ImageMetadata
 
 console = Console()
 
@@ -153,51 +154,15 @@ def process_image(image_path: Path, output_path: Path) -> None:
         msg = f"Image file not found: {image_path}"
         raise ValueError(msg)
 
-    try:
-        # Check if it's a GIF - if so, copy as-is
-        if image_path.suffix.lower() == ".gif":
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(image_path, output_path)
-            return
-
-        # Load image
-        img = Image.open(image_path)
-
-        # Convert to RGB if needed (webp supports RGB/RGBA)
-        if img.mode not in ("RGB", "RGBA"):
-            img = img.convert("RGB")
-
-        # Resize to cover 512x512 while maintaining aspect ratio
-        # This is similar to CSS object-fit: cover
-        target_size = (512, 512)
-        img_width, img_height = img.size
-        target_width, target_height = target_size
-
-        # Calculate scaling factor to cover the target size
-        scale = max(target_width / img_width, target_height / img_height)
-
-        # Calculate new dimensions
-        new_width = int(img_width * scale)
-        new_height = int(img_height * scale)
-
-        # Resize image
-        img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-        # Crop from center to exact target size
-        left = (new_width - target_width) // 2
-        top = (new_height - target_height) // 2
-        right = left + target_width
-        bottom = top + target_height
-
-        img_cropped = img_resized.crop((left, top, right, bottom))
-
-        # Save as webp with quality=85
+    if image_path.suffix.lower() == ".gif":
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        img_cropped.save(output_path, format="WEBP", quality=85)
+        shutil.copy2(image_path, output_path)
+        return
 
-    except Exception as err:
-        msg = f"Failed to process image: {err}"
-        raise ValueError(msg) from err
+    with GriptapeImage.open(image_path) as image, GriptapeImagePipeline(image).cover(512, 512).end() as preview:
+        data = preview.encode(ImageFormat.WEBP, quality=85, metadata=ImageMetadata())
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(data)
 
 
 def generate_github_url(library_path: Path, thumbnail_filename: str) -> str:

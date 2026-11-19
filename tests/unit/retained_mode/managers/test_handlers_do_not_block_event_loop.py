@@ -15,29 +15,33 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
-from PIL import Image
 
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.image import GriptapeImage
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.os_events import (
+    CopyFileRequest,
+    CopyFileResultFailure,
+    CopyFileResultSuccess,
     ExistingFilePolicy,
     ReadFileRequest,
     ReadFileResultSuccess,
+    RenameFileRequest,
+    RenameFileResultFailure,
+    RenameFileResultSuccess,
     WriteFileRequest,
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_rounded_preview_generator import (
-    PILRoundedPreviewGenerator,
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
+    RoundedPreviewGenerator,
+    ThumbnailGenerator,
 )
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
-    PILThumbnailGenerator,
-)
+from tests.unit.image.sample_images import BLUE, RED, encode, solid
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -88,9 +92,7 @@ async def _assert_engine_answers_while_parked(engine: Engine, step: _SlowStep) -
 
 
 def _png_bytes() -> bytes:
-    buffer = BytesIO()
-    Image.new("RGB", (64, 64), "red").save(buffer, format="PNG")
-    return buffer.getvalue()
+    return encode(solid(64, 64, RED), "png")
 
 
 @pytest.fixture
@@ -103,6 +105,90 @@ def slow_metadata_injection(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> 
     provider.prepare_content_for_write.side_effect = lambda data, _name, _metadata: step.run(data)
     monkeypatch.setattr(engine.artifact_manager, "provider_for_write", lambda _name: provider)
     return step
+
+
+class TestRenameAndCopyRequests:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["rename", "copy"])
+    async def test_destination_created_before_worker_runs_is_preserved(
+        self,
+        engine: Engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+    ) -> None:
+        source = tmp_path / "source.txt"
+        target = tmp_path / "target.txt"
+        source.write_text("source")
+        original_to_thread = asyncio.to_thread
+
+        async def create_destination_before_mutation(function, *args, **kwargs):  # noqa: ANN001, ANN202
+            if getattr(function, "__name__", "") in {"_rename_path", "_copy_file", "_copy_requested_file"}:
+                target.write_text("keep")
+            return await original_to_thread(function, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", create_destination_before_mutation)
+        if operation == "rename":
+            result = await engine.ahandle_request(
+                RenameFileRequest(old_path=str(source), new_path=str(target), workspace_only=False)
+            )
+            assert isinstance(result, RenameFileResultFailure)
+        else:
+            result = await engine.ahandle_request(
+                CopyFileRequest(source_path=str(source), destination_path=str(target))
+            )
+            assert isinstance(result, CopyFileResultFailure)
+        assert target.read_text() == "keep"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["rename", "copy"])
+    async def test_engine_answers_while_mutation_is_parked(
+        self,
+        engine: Engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+    ) -> None:
+        # Given a slow filesystem mutation while engine state remains on the loop.
+        source = tmp_path / "source.txt"
+        target = tmp_path / "target.txt"
+        source.write_text("source")
+        step = _SlowStep()
+        if operation == "rename":
+            original = type(source).rename
+
+            def rename(path: Path, destination: Path) -> Path:
+                step.run(None)
+                return original(path, destination)
+
+            monkeypatch.setattr(type(source), "rename", rename)
+            request = RenameFileRequest(old_path=str(source), new_path=str(target), workspace_only=False)
+        else:
+            original_copy = engine.os_manager._copy_file
+
+            def copy(src: Path, dest: Path) -> int:
+                step.run(None)
+                return original_copy(src, dest)
+
+            monkeypatch.setattr(engine.os_manager, "_copy_file", copy)
+            request = CopyFileRequest(source_path=str(source), destination_path=str(target))
+
+        # When the mutation starts, an unrelated request must still be answered.
+        mutation = asyncio.create_task(engine.ahandle_request(request))
+        try:
+            await _assert_engine_answers_while_parked(engine, step)
+        finally:
+            step.release.set()
+            result = await asyncio.wait_for(mutation, timeout=_START_TIMEOUT_SECONDS)
+
+        # Then filesystem work ran outside the event loop and completed successfully.
+        assert not step.gave_up
+        assert step.thread_id != threading.get_ident()
+        if operation == "rename":
+            assert isinstance(result, RenameFileResultSuccess)
+        else:
+            assert isinstance(result, CopyFileResultSuccess)
+        assert target.read_text() == "source"
 
 
 class TestWriteFileRequest:
@@ -228,7 +314,7 @@ class TestReadFileThumbnail:
         source = tmp_path / "source.png"
         source.write_bytes(_png_bytes())
         step = _SlowStep()
-        # Pillow runs before any registry lookup, so this exercises the off-loop encode directly.
+        # Image decoding runs before any registry lookup, so this exercises the off-loop encode directly.
         monkeypatch.setattr(engine.os_manager, "_image_bytes_to_preview_data_url", lambda _data: step.run("data:thumb"))
 
         read = asyncio.create_task(engine.ahandle_request(ReadFileRequest(file_path=str(source), workspace_only=False)))
@@ -373,8 +459,8 @@ class TestPreviewGenerators:
     @pytest.mark.parametrize(
         ("generator_type", "render_method"),
         [
-            (PILThumbnailGenerator, "_render_thumbnail"),
-            (PILRoundedPreviewGenerator, "_render_rounded_preview"),
+            (ThumbnailGenerator, "_render_thumbnail"),
+            (RoundedPreviewGenerator, "_render_rounded_preview"),
         ],
         ids=["thumbnail", "rounded"],
     )
@@ -405,25 +491,25 @@ class TestPreviewGenerators:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "generator_type", [PILThumbnailGenerator, PILRoundedPreviewGenerator], ids=["thumbnail", "rounded"]
+        "generator_type", [ThumbnailGenerator, RoundedPreviewGenerator], ids=["thumbnail", "rounded"]
     )
-    @pytest.mark.parametrize("mode", ["RGB", "RGBA"])
+    @pytest.mark.parametrize("color", [BLUE, (*BLUE, 255)], ids=["RGB", "RGBA"])
     async def test_preview_is_still_rendered_from_the_source_image(
-        self, engine: Engine, tmp_path: Path, generator_type: type, mode: str
+        self, engine: Engine, tmp_path: Path, generator_type: type, color: tuple[int, ...]
     ) -> None:
         source = tmp_path / "source.png"
-        Image.new(mode, (200, 100), "blue").save(source)
+        source.write_bytes(encode(solid(200, 100, color), "png"))
         generator = _make_generator(generator_type, engine, source, tmp_path / "previews")
 
         file_name = await generator.attempt_generate_preview()
 
-        with Image.open(tmp_path / "previews" / file_name) as preview:
+        with GriptapeImage.open(tmp_path / "previews" / file_name) as preview:
             assert preview.width == 32  # noqa: PLR2004
             assert preview.height <= 32  # noqa: PLR2004
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "generator_type", [PILThumbnailGenerator, PILRoundedPreviewGenerator], ids=["thumbnail", "rounded"]
+        "generator_type", [ThumbnailGenerator, RoundedPreviewGenerator], ids=["thumbnail", "rounded"]
     )
     async def test_preview_write_failure_raises(
         self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator_type: type

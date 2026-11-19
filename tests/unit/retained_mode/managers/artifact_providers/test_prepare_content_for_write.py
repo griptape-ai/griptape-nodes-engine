@@ -17,7 +17,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry 
 
 _MODULE = "griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider"
 COLLECT_PATH = f"{_MODULE}.collect_workflow_metadata"
-IMAGE_OPEN_PATH = f"{_MODULE}.Image.open"
+IMAGE_OPEN_PATH = f"{_MODULE}.GriptapeImage.open"
 DRIVER_REGISTRY_PATH = f"{_MODULE}.ImageMetadataDriverRegistry.get_driver_for_format"
 
 
@@ -87,6 +87,7 @@ class TestImageArtifactProviderPrepareContentForWrite:
         metadata = {"gtn_saved_at": "2024-01-01T00:00:00+00:00"}
 
         mock_image = MagicMock()
+        mock_image.__enter__.return_value = mock_image
         mock_image.format = "PNG"
         mock_driver = MagicMock()
         mock_driver.inject_metadata.return_value = injected_bytes

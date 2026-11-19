@@ -52,6 +52,10 @@ from griptape_nodes.files.path_utils import (
     sanitize_path_string,
     strip_surrounding_quotes,
 )
+from griptape_nodes.image.cache import (
+    image_path_mutation,
+    image_rename_mutation,
+)
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
@@ -1322,12 +1326,11 @@ class OSManager(EngineScoped):
         """Handle image content by creating previews or returning static URLs.
 
         The workspace check reads engine state, so it runs on the loop; only the image encode
-        runs on a worker thread. Pillow is tried first regardless of file size, since decoding a
-        large-but-valid image (a big JPEG or TIFF, say) is cheap and still worth a thumbnail. Only
-        when Pillow can't decode the file does size matter: under ``_MAX_PREVIEWABLE_IMAGE_BYTES``
-        the original bytes are returned undecoded; over it, a no-preview sentinel is returned
-        instead, since base64-encoding a multi-hundred-MB file whole is what has hung the engine
-        on large or multi-part images Pillow can't open (EXR sequences, for one).
+        runs on a worker thread. OpenImageIO is tried first regardless of file size, since decoding
+        a large valid image is worth a thumbnail. Size matters when OpenImageIO cannot decode the
+        file: under ``_MAX_PREVIEWABLE_IMAGE_BYTES`` the original bytes are returned undecoded;
+        over it, a no-preview sentinel is returned instead of base64-encoding a large undecodable
+        payload whole.
 
         Args:
             content: Image bytes
@@ -1369,25 +1372,18 @@ class OSManager(EngineScoped):
 
         path_obj = Path(file_path) if isinstance(file_path, str) else file_path
 
-        pillow_preview = await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes)
-        if pillow_preview is not None:
-            return pillow_preview
+        rendered_preview = await to_thread(self._image_bytes_to_preview_data_url, original_image_bytes)
+        if rendered_preview is not None:
+            return rendered_preview
 
         if len(original_image_bytes) > self._MAX_PREVIEWABLE_IMAGE_BYTES:
-            # Pillow couldn't decode this file, and it's large enough that base64-encoding it
-            # whole is the actual cost that has hung the engine on large/multi-part images it
-            # can't open (EXR sequences, for one). A 200+ MB EXR sequence frame reaches this
-            # unconditionally via the sequence-frame loader, which bypasses the File Browser
-            # dialog's own 10MB client-side preview cutoff. Skip encoding it entirely.
             logger.debug(
-                "%s exceeds the %d byte preview cap and Pillow could not decode it; skipping preview.",
+                "%s exceeds the %d byte preview cap and OpenImageIO could not decode it; skipping preview.",
                 path_obj,
                 self._MAX_PREVIEWABLE_IMAGE_BYTES,
             )
             return self._NO_PREVIEW_DATA_URL
 
-        # Pillow couldn't decode this file, but it's small enough that returning it undecoded
-        # costs nothing worth guarding against.
         logger.debug("No preview could be generated for %s; returning the original bytes.", path_obj)
         return f"data:{mime_type};base64,{base64.b64encode(original_image_bytes).decode('utf-8')}"
 
@@ -1396,7 +1392,7 @@ class OSManager(EngineScoped):
         """Encode a small WEBP preview of the image as a data URL. CPU-bound and touches no engine state.
 
         Returns:
-            The preview data URL, or None if Pillow could not decode the image (the caller then
+            The preview data URL, or None if OpenImageIO could not decode the image (the caller then
             returns the original bytes under the size cap, or a no-preview sentinel over it).
         """
         preview_data_url = create_image_preview_from_bytes(
@@ -1557,19 +1553,20 @@ class OSManager(EngineScoped):
         # Instead, copy contents explicitly and then best-effort the metadata,
         # ignoring an EPERM raised by the flags step so metadata that can't be
         # replicated on the destination filesystem doesn't fail the copy.
-        shutil.copyfile(src_normalized, dest_normalized)
-        try:
-            shutil.copystat(src_normalized, dest_normalized)
-        except PermissionError:
-            # chflags() couldn't replicate BSD file flags on the destination
-            # (e.g. SF_ARCHIVED on an SMB mount). Contents and the permission
-            # bits that matter are already in place; the copy has effectively
-            # succeeded, so warn rather than fail.
-            logger.warning(
-                "Could not replicate all file metadata from %s to %s (EPERM); file contents copied successfully.",
-                src_normalized,
-                dest_normalized,
-            )
+        with image_path_mutation(dest_normalized, is_directory=False):
+            shutil.copyfile(src_normalized, dest_normalized)
+            try:
+                shutil.copystat(src_normalized, dest_normalized)
+            except PermissionError:
+                # chflags() couldn't replicate BSD file flags on the destination
+                # (e.g. SF_ARCHIVED on an SMB mount). Contents and the permission
+                # bits that matter are already in place; the copy has effectively
+                # succeeded, so warn rather than fail.
+                logger.warning(
+                    "Could not replicate all file metadata from %s to %s (EPERM); file contents copied successfully.",
+                    src_normalized,
+                    dest_normalized,
+                )
 
         # Return size of copied file
         return Path(src_normalized).stat().st_size
@@ -1912,7 +1909,7 @@ class OSManager(EngineScoped):
         )
 
     @handles(RenameFileRequest)
-    def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
+    async def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to rename a file or directory."""
         # Resolve and validate paths
         try:
@@ -1955,18 +1952,9 @@ class OSManager(EngineScoped):
             msg = f"I/O error creating parent directory for {new_path}: {e}"
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
-        # Perform the rename operation
-        try:
-            old_path.rename(new_path)
-        except PermissionError as e:
-            msg = f"Permission denied renaming {old_path} to {new_path}: {e}"
-            return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
-        except OSError as e:
-            msg = f"I/O error renaming {old_path} to {new_path}: {e}"
-            return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
-        except Exception as e:
-            msg = f"Unexpected error renaming {old_path} to {new_path}: {type(e).__name__}: {e}"
-            return RenameFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
+        failure = await asyncio.to_thread(self._rename_path, old_path, new_path)
+        if failure is not None:
+            return failure
 
         # SUCCESS PATH
         details = f"Renamed: {old_path} -> {new_path}"
@@ -1976,8 +1964,30 @@ class OSManager(EngineScoped):
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 
+    def _rename_path(self, old_path: Path, new_path: Path) -> RenameFileResultFailure | None:
+        """Acquire image locks and rename together outside the event loop."""
+        with image_rename_mutation(old_path, new_path, is_directory=old_path.is_dir()):
+            if new_path.exists():
+                msg = (
+                    f"Attempted to rename '{old_path}' to '{new_path}'. Failed because the destination already exists."
+                )
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+            try:
+                old_path.rename(new_path)
+            except PermissionError as e:
+                msg = f"Permission denied renaming {old_path} to {new_path}: {e}"
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
+            except OSError as e:
+                msg = f"I/O error renaming {old_path} to {new_path}: {e}"
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
+            except Exception as e:
+                msg = f"Unexpected error renaming {old_path} to {new_path}: {type(e).__name__}: {e}"
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
+
+        return None
+
     @handles(CopyFileRequest)
-    def on_copy_file_request(self, request: CopyFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
+    async def on_copy_file_request(self, request: CopyFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
         """Handle a request to copy a single file."""
         # Resolve source path
         try:
@@ -1988,12 +1998,12 @@ class OSManager(EngineScoped):
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if source exists
-        if not Path(source_normalized).exists():
+        if not await anyio.Path(source_normalized).exists():
             msg = f"Source file does not exist: {source_path}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if source is a file (not a directory)
-        if not Path(source_normalized).is_file():
+        if not await anyio.Path(source_normalized).is_file():
             msg = f"Source path is not a file: {source_path}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
@@ -2006,7 +2016,7 @@ class OSManager(EngineScoped):
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if destination already exists (unless overwrite is True)
-        if Path(dest_normalized).exists() and not request.overwrite:
+        if await anyio.Path(dest_normalized).exists() and not request.overwrite:
             msg = f"Destination file already exists: {destination_path}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
@@ -2024,7 +2034,9 @@ class OSManager(EngineScoped):
 
         # Copy the file
         try:
-            bytes_copied = self._copy_file(source_path, destination_path)
+            bytes_copied = await asyncio.to_thread(
+                self._copy_requested_file, source_path, destination_path, request.overwrite
+            )
         except PermissionError as e:
             msg = f"Permission denied copying {source_path} to {destination_path}: {e}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
@@ -2046,6 +2058,19 @@ class OSManager(EngineScoped):
             bytes_copied=bytes_copied,
             result_details=f"File copied successfully: {source_path} -> {destination_path}",
         )
+
+    def _copy_requested_file(self, source: Path, destination: Path, overwrite: bool) -> int:  # noqa: FBT001
+        """Reserve a new destination before copying when overwrite is disabled."""
+        if overwrite:
+            return self._copy_file(source, destination)
+        with image_path_mutation(destination, is_directory=False):
+            with destination.open("xb"):
+                pass
+            try:
+                return self._copy_file(source, destination)
+            except OSError:
+                destination.unlink(missing_ok=True)
+                raise
 
     @staticmethod
     def remove_readonly(func, path, excinfo) -> None:  # noqa: ANN001, ARG004
@@ -2107,14 +2132,22 @@ class OSManager(EngineScoped):
         else:
             deleted_paths = [str(resolved_path)]
 
+        def delete_permanently() -> None:
+            with image_path_mutation(resolved_path, is_directory=is_directory):
+                if is_directory:
+                    shutil.rmtree(resolved_path, onexc=OSManager.remove_readonly)
+                else:
+                    resolved_path.unlink()
+
+        def recycle() -> None:
+            with image_path_mutation(resolved_path, is_directory=is_directory):
+                send2trash.send2trash(str(resolved_path))
+
         # Helper function for permanent deletion
         async def attempt_permanent_delete() -> DeleteFileResultFailure | None:
             """Permanently delete the file/directory. Returns failure result or None on success."""
             try:
-                if is_directory:
-                    await asyncio.to_thread(shutil.rmtree, resolved_path, onexc=OSManager.remove_readonly)
-                else:
-                    await anyio.Path(resolved_path).unlink()
+                await asyncio.to_thread(delete_permanently)
             except PermissionError as e:
                 msg = f"Attempted to delete {'directory' if is_directory else 'file'} at path {path_to_delete}. Failed due to permission denied: {e}"
                 return DeleteFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
@@ -2130,7 +2163,7 @@ class OSManager(EngineScoped):
         async def attempt_recycle_bin_delete() -> DeleteFileResultFailure | None:
             """Send to recycle bin. Returns failure result or None on success."""
             try:
-                await asyncio.to_thread(send2trash.send2trash, str(resolved_path))
+                await asyncio.to_thread(recycle)
             except send2trash.TrashPermissionError as e:
                 msg = f"Attempted to send {'directory' if is_directory else 'file'} at path {path_to_delete} to the recycle bin. Failed due to recycle bin unavailable: {e}"
                 return DeleteFileResultFailure(

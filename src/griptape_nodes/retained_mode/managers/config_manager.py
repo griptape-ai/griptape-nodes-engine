@@ -69,7 +69,6 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoRequest,
     GetFileInfoResultFailure,
     RenameFileRequest,
-    RenameFileResultFailure,
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
@@ -2204,7 +2203,12 @@ class ConfigManager(EngineScoped):
             current_config = json.loads(file_content)
         except json.JSONDecodeError as e:
             # Config file is corrupted - back it up and start fresh
-            backup_path_str = str(USER_CONFIG_PATH.with_suffix(".bak"))
+            backup_path = USER_CONFIG_PATH.with_suffix(".bak")
+            backup_index = 1
+            while backup_path.exists() or backup_path.is_symlink():
+                backup_path = USER_CONFIG_PATH.with_suffix(f".{backup_index}.bak")
+                backup_index += 1
+            backup_path_str = str(backup_path)
 
             logger.warning(
                 "User config file at '%s' contained invalid JSON. Attempting to back up to '%s'. Parse error: %s",
@@ -2219,19 +2223,18 @@ class ConfigManager(EngineScoped):
                 new_path=backup_path_str,
                 workspace_only=False,
             )
-            rename_result = os_manager.on_rename_file_request(rename_request)
+            rename_result = self.engine.handle_request(rename_request)
 
-            if isinstance(rename_result, RenameFileResultFailure):
+            if rename_result.failed():
                 logger.error(
-                    "Failed to back up corrupted config from '%s' to '%s': %s. Using empty config.",
+                    "Failed to back up corrupted config from '%s' to '%s': %s. Leaving the original config unchanged.",
                     config_path_str,
                     backup_path_str,
                     rename_result.result_details,
                 )
-            else:
-                logger.info("Successfully backed up corrupted config to '%s'", backup_path_str)
+                return False
+            logger.info("Successfully backed up corrupted config to '%s'", backup_path_str)
 
-            # Use empty config regardless of backup success
             current_config = {}
 
         # Step 5: Merge delta with current config

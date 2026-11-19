@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -10,11 +11,11 @@ import anyio
 import pytest
 import static_ffmpeg._add_paths
 import static_ffmpeg.run
-from PIL import Image
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.image import GriptapeImage
 from griptape_nodes.retained_mode.engine import Engine, current_engine
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -45,11 +46,12 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
 )
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils import ffmpeg_cache
+from tests.unit.image.sample_images import RED, encode, solid
 from tests.workflow_context import unsaved_workflow_open
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
-        PILThumbnailParameters,
+    from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
+        ThumbnailParameters,
     )
 
 # ==================================================================================
@@ -771,11 +773,7 @@ class TestGeneratePreview:
             Path to a 100x100 JPEG test image with known properties
         """
         image_path = temp_dir / "test_source.jpg"
-
-        # Create a simple test image (100x100 red square)
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
-
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
         return image_path
 
     @pytest.fixture
@@ -818,7 +816,7 @@ class TestGeneratePreview:
         assert preview_path.exists()
 
         # Verify preview dimensions
-        with Image.open(str(preview_path)) as preview_img:
+        with GriptapeImage.open(preview_path) as preview_img:
             assert preview_img.width <= 50  # noqa: PLR2004
             assert preview_img.height <= 50  # noqa: PLR2004
 
@@ -939,7 +937,7 @@ class TestGeneratePreview:
         preview_dir = test_image_path.parent / ".griptape-nodes-previews"
         preview_path = preview_dir / f"{test_image_path.name}.webp"
 
-        with Image.open(str(preview_path)) as preview_img:
+        with GriptapeImage.open(preview_path) as preview_img:
             assert preview_img.width <= 30  # noqa: PLR2004
             assert preview_img.height <= 40  # noqa: PLR2004
             # Verify aspect ratio preserved (source is 100x100, so should be square)
@@ -1125,6 +1123,49 @@ class TestGeneratePreview:
         assert metadata["source_file_size"] == source_stat.st_size
 
     @pytest.mark.asyncio
+    async def test_retry_invalidation_runs_outside_event_loop(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+    ) -> None:
+        # Given a source that changes after its first preview and an invalidator recording threads.
+        generation_calls = 0
+        loop_thread = threading.get_ident()
+        invalidation_threads: list[int] = []
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_change(provider: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider, **kwargs)  # type: ignore[arg-type]
+            if generation_calls == 1:
+                with test_image_path.open("ab") as handle:
+                    handle.write(b"changed")
+            return result
+
+        def record_invalidation(_path: str) -> None:
+            invalidation_threads.append(threading.get_ident())
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=False,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        # When the changed source triggers invalidation before a retry.
+        with (
+            patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_change),
+            patch("griptape_nodes.retained_mode.managers.artifact_manager.invalidate_image_cache", record_invalidation),
+        ):
+            result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
+
+        # Then the retry succeeds and invalidation does not acquire source locks on the loop thread.
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert invalidation_threads
+        assert loop_thread not in invalidation_threads
+
+    @pytest.mark.asyncio
     async def test_same_size_rewrite_mid_generation_retries(
         self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, test_image_path: Path
     ) -> None:
@@ -1259,8 +1300,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
     def test_image_path(self, temp_dir: Path) -> Path:
         """Create a real test image file."""
         image_path = temp_dir / "test_source.jpg"
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
         return image_path
 
     @pytest.fixture
@@ -1385,11 +1425,7 @@ class TestGetPreviewForArtifact:
     def test_image_path(self, temp_dir: Path) -> Path:
         """Create a real test image file."""
         image_path = temp_dir / "test_source.jpg"
-
-        # Create a simple test image (100x100 red square)
-        img = Image.new("RGB", (100, 100), color="red")
-        img.save(str(image_path), format="JPEG")
-
+        image_path.write_bytes(encode(solid(100, 100, RED), "jpg"))
         return image_path
 
     @pytest.fixture
@@ -1809,24 +1845,24 @@ class TestGeneratorValidation:
     """Test generator parameter validation logic."""
 
     def test_pil_thumbnail_validate_parameters_valid(self) -> None:
-        """Test PILThumbnailGenerator validates correct parameters."""
+        """Test ThumbnailGenerator validates correct parameters."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         params = {"max_width": 1024, "max_height": 768}
-        params_model_class = PILThumbnailGenerator.get_parameters()
+        params_model_class = ThumbnailGenerator.get_parameters()
         # Should not raise ValidationError
         params_model_class.model_validate(params)
 
     def test_pil_thumbnail_validate_parameters_invalid_type(self) -> None:
-        """Test PILThumbnailGenerator rejects invalid types."""
+        """Test ThumbnailGenerator rejects invalid types."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         params = {"max_width": "not_a_number", "max_height": 768}
-        params_model_class = PILThumbnailGenerator.get_parameters()
+        params_model_class = ThumbnailGenerator.get_parameters()
 
         with pytest.raises(ValidationError) as exc_info:
             params_model_class.model_validate(params)
@@ -1836,13 +1872,13 @@ class TestGeneratorValidation:
         assert any(e["loc"][0] == "max_width" for e in errors)
 
     def test_pil_thumbnail_validate_parameters_invalid_value(self) -> None:
-        """Test PILThumbnailGenerator rejects negative values."""
+        """Test ThumbnailGenerator rejects negative values."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         params = {"max_width": -100, "max_height": 768}
-        params_model_class = PILThumbnailGenerator.get_parameters()
+        params_model_class = ThumbnailGenerator.get_parameters()
 
         with pytest.raises(ValidationError) as exc_info:
             params_model_class.model_validate(params)
@@ -1852,33 +1888,33 @@ class TestGeneratorValidation:
         assert any(e["loc"][0] == "max_width" and "greater_than" in e["type"] for e in errors)
 
     def test_pil_thumbnail_validate_parameters_missing_key(self) -> None:
-        """Test PILThumbnailGenerator uses defaults for missing parameters."""
+        """Test ThumbnailGenerator uses defaults for missing parameters."""
         from typing import cast
 
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         params = {"max_width": 1024}
-        params_model_class = PILThumbnailGenerator.get_parameters()
+        params_model_class = ThumbnailGenerator.get_parameters()
 
         # With Pydantic, fields with defaults are optional - should use default value
-        validated_params = cast("PILThumbnailParameters", params_model_class.model_validate(params))
+        validated_params = cast("ThumbnailParameters", params_model_class.model_validate(params))
         assert validated_params.max_width == 1024  # noqa: PLR2004
         assert validated_params.max_height == 1024  # Uses default value  # noqa: PLR2004
 
     def test_pil_thumbnail_validate_parameters_extra_key(self) -> None:
-        """Test PILThumbnailGenerator ignores unknown parameters (backward compatibility)."""
+        """Test ThumbnailGenerator ignores unknown parameters (backward compatibility)."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         params = {"max_width": 1024, "max_height": 768, "unknown_param": 42}
-        params_model_class = PILThumbnailGenerator.get_parameters()
+        params_model_class = ThumbnailGenerator.get_parameters()
 
         # Extra fields are ignored (for backward compatibility with old configs)
         # See https://github.com/griptape-ai/griptape-nodes-engine/issues/3980
-        validated_params = cast("PILThumbnailParameters", params_model_class.model_validate(params))
+        validated_params = cast("ThumbnailParameters", params_model_class.model_validate(params))
 
         # Only known fields are included in the model
         assert validated_params.max_width == 1024  # noqa: PLR2004
@@ -1886,24 +1922,24 @@ class TestGeneratorValidation:
         assert not hasattr(validated_params, "unknown_param")
 
     def test_pil_rounded_validate_parameters_valid(self) -> None:
-        """Test PILRoundedPreviewGenerator validates correct parameters."""
+        """Test RoundedPreviewGenerator validates correct parameters."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILRoundedPreviewGenerator,
+            RoundedPreviewGenerator,
         )
 
         params = {"max_width": 1024, "max_height": 768, "corner_radius_percent": 2.0}
-        params_model_class = PILRoundedPreviewGenerator.get_parameters()
+        params_model_class = RoundedPreviewGenerator.get_parameters()
         # Should not raise ValidationError
         params_model_class.model_validate(params)
 
     def test_pil_rounded_validate_parameters_invalid_corner_radius_percent(self) -> None:
-        """Test PILRoundedPreviewGenerator rejects negative corner_radius_percent."""
+        """Test RoundedPreviewGenerator rejects negative corner_radius_percent."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILRoundedPreviewGenerator,
+            RoundedPreviewGenerator,
         )
 
         params = {"max_width": 1024, "max_height": 768, "corner_radius_percent": -1.0}
-        params_model_class = PILRoundedPreviewGenerator.get_parameters()
+        params_model_class = RoundedPreviewGenerator.get_parameters()
 
         with pytest.raises(ValidationError) as exc_info:
             params_model_class.model_validate(params)
@@ -1915,7 +1951,7 @@ class TestGeneratorValidation:
     def test_generator_constructor_uses_validation(self) -> None:
         """Test generator constructors use Pydantic validation and raise ValidationError on invalid params."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         invalid_params = {"max_width": "not_a_number", "max_height": 768}
@@ -1925,7 +1961,7 @@ class TestGeneratorValidation:
             dest_dir = Path(tmpdir) / "preview"
 
             with pytest.raises(ValidationError):
-                PILThumbnailGenerator(
+                ThumbnailGenerator(
                     source_file_location=str(source_path),
                     preview_format="webp",
                     destination_preview_directory=str(dest_dir),
@@ -2013,7 +2049,7 @@ class TestProviderRegistrationConfigLogLevels:
             GetConfigCategoryRequest,
         )
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         manager = ArtifactManager(engine=Mock())
@@ -2024,7 +2060,7 @@ class TestProviderRegistrationConfigLogLevels:
             return engine.handle_request(request)
 
         manager.engine.handle_request = capture_requests
-        manager._read_generator_config(ImageArtifactProvider, PILThumbnailGenerator)
+        manager._read_generator_config(ImageArtifactProvider, ThumbnailGenerator)
 
         category_requests = [r for r in captured_requests if isinstance(r, GetConfigCategoryRequest)]
         assert len(category_requests) == 1

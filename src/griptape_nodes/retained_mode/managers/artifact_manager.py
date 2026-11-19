@@ -16,8 +16,10 @@ from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.files.path_utils import canonicalize_for_identity, decompose_source_path
+from griptape_nodes.image.cache import invalidate_image_cache
+from griptape_nodes.image.oiio_config import apply_openimageio_settings
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
-from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
     CheckArtifactReadPermissionRequest,
     CheckArtifactReadPermissionResultFailure,
@@ -219,6 +221,10 @@ class ArtifactManager(EngineScoped):
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
+            )
+            event_manager.add_listener_to_app_event(
+                ConfigChanged,
+                self._on_config_changed,
             )
 
     @contextmanager
@@ -442,6 +448,7 @@ class ArtifactManager(EngineScoped):
         # AppInitializationComplete before executing them. Process-wide and installed once;
         # later broadcasts (and later engines) no-op. See utils/ffmpeg_cache.py.
         install_ffmpeg_resolution(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
+        apply_openimageio_settings(self.engine.config_manager)
 
         # Register default providers (order matters: Image, Video, Audio)
         # Generator settings are now registered automatically via _register_provider_settings()
@@ -460,6 +467,11 @@ class ArtifactManager(EngineScoped):
                 f"Failed due to: {failure_details}"
             )
             raise RuntimeError(error_message)
+
+    def _on_config_changed(self, payload: ConfigChanged) -> None:
+        if payload.key not in {"", "openimageio"} and not payload.key.startswith("openimageio."):
+            return
+        apply_openimageio_settings(self.engine.config_manager)
 
     @handles(GeneratePreviewRequest)
     async def on_handle_generate_preview_request(  # noqa: PLR0911, C901, PLR0912, PLR0915
@@ -627,6 +639,7 @@ class ArtifactManager(EngineScoped):
             )
             # The post-generation stat becomes the retry's pre-generation stat.
             source_file_entry = post_generation_info_result.file_entry
+            await to_thread(invalidate_image_cache, source_path)
             generation_attempt += 1
 
         # OPTIONAL: Generate metadata if requested

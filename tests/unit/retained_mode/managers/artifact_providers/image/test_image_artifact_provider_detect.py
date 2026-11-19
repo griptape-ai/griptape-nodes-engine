@@ -1,71 +1,83 @@
-"""Tests for ImageArtifactProvider.detect_format magic-byte sniffing."""
+"""Tests for ImageArtifactProvider format detection and header metadata extraction."""
 
-from io import BytesIO
+from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+import numpy as np
+import OpenImageIO as oiio  # noqa: N813
 import pytest
-from PIL import Image
 
+from griptape_nodes.image import EXIF_ORIENTATION_TAG, Exif
+from griptape_nodes.image.containers import replace_jpeg_exif
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
+from tests.unit.image.sample_images import WHITE, encode, solid
 
-
-def _pil_bytes(fmt: str, mode: str = "RGB") -> bytes:
-    buf = BytesIO()
-    Image.new(mode, (1, 1), color=0 if mode == "P" else "white").save(buf, format=fmt)
-    return buf.getvalue()
-
-
-def _png_bytes() -> bytes:
-    return _pil_bytes("PNG")
-
-
-def _jpeg_bytes() -> bytes:
-    return _pil_bytes("JPEG")
-
-
-def _gif_bytes() -> bytes:
-    return _pil_bytes("GIF", mode="P")
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestImageDetectFormat:
-    def test_png(self) -> None:
-        assert ImageArtifactProvider.detect_format(_png_bytes()) == "png"
+    @pytest.mark.parametrize(
+        ("ext", "expected"),
+        [
+            ("png", "png"),
+            ("jpg", "jpg"),
+            ("gif", "gif"),
+            ("webp", "webp"),
+            ("bmp", "bmp"),
+            ("tif", "tiff"),
+            ("exr", "exr"),
+            ("hdr", "hdr"),
+            ("dpx", "dpx"),
+            ("jp2", "jp2"),
+            ("pfm", "pfm"),
+            ("ppm", "ppm"),
+            ("sgi", "sgi"),
+        ],
+    )
+    def test_sniffs_supported_formats(self, ext: str, expected: str) -> None:
+        dtype = np.float32 if ext in ("exr", "hdr", "pfm") else np.uint8
+        fill = 0.5 if dtype == np.float32 else 200
+        pixels = np.full((32, 32, 3), fill, dtype=dtype)
+        payload = encode(pixels, ext)
+        detected = ImageArtifactProvider.detect_format(payload)
+        assert detected == expected
+        assert detected in ImageArtifactProvider.get_supported_formats()
 
-    def test_jpeg(self) -> None:
-        assert ImageArtifactProvider.detect_format(_jpeg_bytes()) == "jpg"
-
-    def test_gif(self) -> None:
-        assert ImageArtifactProvider.detect_format(_gif_bytes()) == "gif"
-
-    def test_webp(self) -> None:
-        assert ImageArtifactProvider.detect_format(_pil_bytes("WEBP")) == "webp"
-
-    def test_bmp(self) -> None:
-        assert ImageArtifactProvider.detect_format(_pil_bytes("BMP")) == "bmp"
-
-    def test_tiff(self) -> None:
-        assert ImageArtifactProvider.detect_format(_pil_bytes("TIFF")) == "tiff"
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            pytest.param(b"8BPS\x00\x01" + b"\x00" * 16, "psd", id="psd"),
+            pytest.param(b"DDS \x7c\x00\x00\x00" + b"\x00" * 16, "dds", id="dds"),
+            pytest.param(b"\x80\x2a\x5f\xd7" + b"\x00" * 16, "cin", id="cin"),
+        ],
+    )
+    def test_sniffs_psd_dds_and_cineon_headers(self, payload: bytes, expected: str) -> None:
+        detected = ImageArtifactProvider.detect_format(payload)
+        assert detected == expected
+        assert detected in ImageArtifactProvider.get_supported_formats()
 
     def test_ico_not_claimed(self) -> None:
-        """ICO is not in get_supported_formats(), so it must not be sniffed either (GH#5614)."""
-        buf = BytesIO()
-        Image.new("RGBA", (16, 16)).save(buf, format="ICO")
-        assert ImageArtifactProvider.detect_format(buf.getvalue()) is None
+        """ICO is not in get_supported_formats(), so it must not be sniffed (GH#5614)."""
+        ico_header = b"\x00\x00\x01\x00\x01\x00\x10\x10\x00\x00\x01\x00\x20\x00"
+        assert ImageArtifactProvider.detect_format(ico_header) is None
 
     def test_heic_via_iso_bmff_brand_not_claimed(self) -> None:
-        """HEIC is not in get_supported_formats(), so it must not be sniffed either (GH#5614)."""
+        """HEIC is not in get_supported_formats(), so it must not be sniffed (GH#5614)."""
         assert ImageArtifactProvider.detect_format(b"\x00\x00\x00\x18ftypheic" + b"\x00" * 16) is None
 
     def test_heif_mif1_brand_not_claimed(self) -> None:
         assert ImageArtifactProvider.detect_format(b"\x00\x00\x00\x18ftypmif1" + b"\x00" * 16) is None
 
     def test_avif_via_iso_bmff_brand_not_claimed(self) -> None:
-        """AVIF is not in get_supported_formats(), so it must not be sniffed either (GH#5614)."""
+        """AVIF is not in get_supported_formats(), so it must not be sniffed (GH#5614)."""
         assert ImageArtifactProvider.detect_format(b"\x00\x00\x00\x18ftypavif" + b"\x00" * 16) is None
 
     def test_riff_without_webp_marker_returns_none(self) -> None:
-        """A RIFF header alone (e.g. WAV / AVI) must not be claimed as WebP."""
+        """A RIFF header alone (WAV / AVI) must not be claimed as WebP."""
         assert ImageArtifactProvider.detect_format(b"RIFF\x00\x00\x00\x00WAVE" + b"\x00" * 16) is None
 
     def test_unidentifiable_returns_none(self) -> None:
@@ -75,27 +87,28 @@ class TestImageDetectFormat:
         assert ImageArtifactProvider.detect_format(b"\x89PNG") is None
 
 
-class TestDetectFormatContract:
-    """Every *sampled* return value of detect_format() must be a declared format.
+class TestGetArtifactMetadata:
+    def test_extracts_exr_float_header_metadata(self, tmp_path: Path) -> None:
+        exr_path = tmp_path / "plate.exr"
+        pixels = np.full((24, 48, 4), 0.25, dtype=np.float16)
+        written = oiio.ImageBuf(np.ascontiguousarray(pixels)).write(str(exr_path))
+        assert written
 
-    This does not catch a new sniffing branch that returns an undeclared format
-    with no sample here to exercise it - that shape of drift (GH#5614's heic /
-    avif / ico sniffing) is guarded by the *_not_claimed tests above instead.
-    """
+        meta = ImageArtifactProvider.get_artifact_metadata(str(exr_path))
+        assert meta is not None
+        assert meta.width == 48  # noqa: PLR2004
+        assert meta.height == 24  # noqa: PLR2004
+        assert meta.channels == 4  # noqa: PLR2004
+        assert meta.color_space == "RGBA"
+        assert meta.format == "EXR"
 
-    @pytest.mark.parametrize(
-        "byte_sample",
-        [
-            _png_bytes(),
-            _jpeg_bytes(),
-            _gif_bytes(),
-            _pil_bytes("WEBP"),
-            _pil_bytes("BMP"),
-            _pil_bytes("TIFF"),
-        ],
-        ids=["png", "jpeg", "gif", "webp", "bmp", "tiff"],
-    )
-    def test_detect_format_return_values_are_all_supported(self, byte_sample: bytes) -> None:
-        detected = ImageArtifactProvider.detect_format(byte_sample)
-        assert detected is not None
-        assert detected in ImageArtifactProvider.get_supported_formats()
+    def test_swaps_dimensions_for_exif_rotated_jpeg(self, tmp_path: Path) -> None:
+        exif = Exif()
+        exif[EXIF_ORIENTATION_TAG] = 6
+        jpeg_bytes = replace_jpeg_exif(encode(solid(40, 20, WHITE), "jpg"), exif.to_bytes())
+        jpg_path = tmp_path / "rotated.jpg"
+        jpg_path.write_bytes(jpeg_bytes)
+
+        meta = ImageArtifactProvider.get_artifact_metadata(str(jpg_path))
+        assert meta is not None
+        assert (meta.width, meta.height) == (20, 40)

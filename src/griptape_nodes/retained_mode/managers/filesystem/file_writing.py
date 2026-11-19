@@ -31,6 +31,7 @@ from griptape_nodes.files.path_utils import (
     normalize_path_for_platform,
     sanitize_path_string,
 )
+from griptape_nodes.image.cache import image_source_access, invalidate_image_cache
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
@@ -1126,7 +1127,12 @@ class FileWriter(EngineScoped):
                 )
 
         try:
-            atomic_write_bytes(normalized_path, data)
+            with image_source_access(normalized_path):
+                invalidate_image_cache(normalized_path)
+                try:
+                    atomic_write_bytes(normalized_path, data)
+                finally:
+                    invalidate_image_cache(normalized_path)
         except IsADirectoryError as e:
             msg = f"Attempted to write to file '{file_path_display}'. Failed due to path is a directory: {e}"
             return FileWriteAttemptResult(
@@ -1213,12 +1219,19 @@ class FileWriter(EngineScoped):
             - Failure: failure_reason and error_message are set, bytes_written is None
         """
         try:
-            bytes_written = self._write_with_portalocker(
-                str(normalized_path),
-                content,
-                encoding,
-                mode=mode,
-            )
+            with image_source_access(normalized_path):
+                if mode != "x":
+                    invalidate_image_cache(normalized_path)
+                try:
+                    bytes_written = self._write_with_portalocker(
+                        str(normalized_path),
+                        content,
+                        encoding,
+                        mode=mode,
+                    )
+                finally:
+                    if mode != "x":
+                        invalidate_image_cache(normalized_path)
             # Success!
             return FileWriteAttemptResult(
                 bytes_written=bytes_written,

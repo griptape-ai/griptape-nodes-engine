@@ -16,6 +16,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  image-minimal-install:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12", "3.15"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout actions
+        uses: actions/checkout@v7
+      - name: Init environment
+        uses: ./.github/actions/init-environment
+      - name: Check isolated engine image dependencies
+        run: uv run --python ${{ matrix.python-version }} --isolated --no-project --with . python scripts/smoke_image_dependencies.py
+
   unit-test-ubuntu:
     runs-on: ubuntu-latest
     strategy:
