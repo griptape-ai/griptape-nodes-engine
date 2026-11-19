@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -264,6 +265,35 @@ class TestRuns:
         assert engine.open_workflow_info(workflow).state == OpenWorkflowState(run_state=WorkflowRunState.RUNNING)
         next_may_end.set()
         await asyncio.wait_for(following.ended, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_a_paused_run_whose_node_fails_while_stepping_reports_why(self, engine: Engine) -> None:
+        workflow = _open(engine, "runs")
+        flows = workflow.flows
+        flow_manager = engine.flow_manager
+        flow_running = {"value": False}
+
+        async def pauses() -> Any:
+            flow_running["value"] = True
+            return StartFlowResultSuccess(result_details="paused at a breakpoint")
+
+        machine = MagicMock(is_advancing=False)
+        machine.resolution_machine.is_advancing = False
+        machine.resolution_machine.is_errored.return_value = True
+        machine.resolution_machine.get_error_message.return_value = "Node 'Text One' failed."
+        with patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]):
+            with engine.bind_workflow(workflow):
+                run = flow_manager.submit_run(_Spec("flow", pauses))
+            await asyncio.wait_for(run.outcome, timeout=1.0)
+
+            flows.global_control_flow_machine = machine
+            flow_running["value"] = False
+            flow_manager._finish_run_if_over(flows)
+            await asyncio.wait_for(run.ended, timeout=1.0)
+
+        assert engine.open_workflow_info(workflow).state.last_run_error == (
+            "Attempted to run flow 'flow'. Failed due to: Node 'Text One' failed."
+        )
 
     @pytest.mark.asyncio
     async def test_a_run_that_raises_reports_the_error(self, engine: Engine) -> None:

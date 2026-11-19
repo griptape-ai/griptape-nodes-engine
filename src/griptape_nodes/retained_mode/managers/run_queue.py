@@ -74,6 +74,8 @@ class Run:
     position: int = 0
     # The id the client gave the request that submitted it, so the client can tell its own run apart.
     request_id: str | None = None
+    # Why it failed, set when its state becomes FAILED.
+    failure: str | None = None
 
 
 class RunQueue:
