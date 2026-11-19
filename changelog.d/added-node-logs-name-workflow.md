@@ -1,4 +1,3 @@
-- A node's `LogHandlerEvent` now names the workflow the node runs in, in the `open_workflow_id` of
-  the `AppEvent` that carries it, so a client with several workflows open shows the line only on
-  that workflow's node.
+- A node's log lines now name the workflow it ran in, so with several workflows open they show only
+  on that workflow.
   [#6379](https://github.com/griptape-ai/griptape-nodes-engine/issues/6379)
