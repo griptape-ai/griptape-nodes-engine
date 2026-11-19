@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import MetadataImageInput, opening_metadata_image
+from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import opening_metadata_image
 from griptape_nodes.image import Exif
 from griptape_nodes.image.exif import EXIF_USER_COMMENT_TAG
 from griptape_nodes.image.png_text_chunks import insert_text_chunks, png_chunk, should_compress_text
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from io import BytesIO
     from pathlib import Path
 
+    from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import MetadataImageInput
     from griptape_nodes.retained_mode.engine import Engine
 
 

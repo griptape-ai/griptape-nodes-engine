@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 
 import OpenImageIO as oiio  # noqa: N813
 
-from griptape_nodes.image.cache import invalidate_image_cache  # noqa: F401 - retained public import path
+from griptape_nodes.image.cache import invalidate_image_cache
 from griptape_nodes.retained_mode.managers.settings import OPENIMAGEIO_KEY, OpenImageIOSettings, Settings
+
+__all__ = ["apply_openimageio_settings", "invalidate_image_cache"]
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager

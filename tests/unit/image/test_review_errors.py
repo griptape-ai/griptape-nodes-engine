@@ -1,7 +1,7 @@
 """Exercise metadata limits and codec failures through stable public behavior."""
 
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, patch
 
 import OpenImageIO as oiio  # noqa: N813
@@ -12,10 +12,13 @@ from griptape_nodes.image import GriptapeImage
 from griptape_nodes.image.cache import refresh_image_cache
 from griptape_nodes.image.image_io import write_file
 from griptape_nodes.image.metadata_reader import FileMetadataSource
-from griptape_nodes.image.pipeline import Orient, PipelineStep
+from griptape_nodes.image.pipeline import Orient
 from griptape_nodes.image.png_text_chunks import insert_text_chunks, read_text_chunks
 from griptape_nodes.retained_mode.managers.settings import FROM_ENV_CONTEXT, OpenImageIOSettings, Settings
 from tests.unit.image.sample_images import RED, encode, solid
+
+if TYPE_CHECKING:
+    from griptape_nodes.image.pipeline import PipelineStep
 
 
 class TestReviewErrors:
@@ -54,7 +57,6 @@ class TestReviewErrors:
         path = tmp_path / "metadata"
         path.write_bytes(b"abc")
         with path.open("rb") as handle:
-            source = FileMetadataSource(handle)
             with patch("griptape_nodes.image.metadata_reader.MAX_METADATA_READ_BYTES", 1):
                 source = FileMetadataSource(handle)
             with pytest.raises(ValueError, match="size limit"):

@@ -93,14 +93,14 @@ class BaseImageMetadataDriver(ABC):
     @abstractmethod
     def get_supported_formats(self) -> list[str]:
         """Return list of uppercase format strings this driver supports."""
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def inject_metadata(self, image: MetadataImageInput, metadata: dict[str, str]) -> bytes:
         """Inject metadata into ``image`` and return modified image bytes."""
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def extract_metadata(self, image: MetadataImageInput) -> dict[str, str]:
         """Extract all available metadata from ``image`` as string key-value pairs."""
-        ...
+        raise NotImplementedError
