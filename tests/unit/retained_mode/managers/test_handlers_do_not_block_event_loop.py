@@ -24,9 +24,15 @@ from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.image import GriptapeImage
 from griptape_nodes.retained_mode.events.config_events import GetConfigValueRequest, GetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.os_events import (
+    CopyFileRequest,
+    CopyFileResultFailure,
+    CopyFileResultSuccess,
     ExistingFilePolicy,
     ReadFileRequest,
     ReadFileResultSuccess,
+    RenameFileRequest,
+    RenameFileResultFailure,
+    RenameFileResultSuccess,
     WriteFileRequest,
     WriteFileResultSuccess,
 )
@@ -99,6 +105,90 @@ def slow_metadata_injection(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> 
     provider.prepare_content_for_write.side_effect = lambda data, _name, _metadata: step.run(data)
     monkeypatch.setattr(engine.artifact_manager, "provider_for_write", lambda _name: provider)
     return step
+
+
+class TestRenameAndCopyRequests:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["rename", "copy"])
+    async def test_destination_created_before_worker_runs_is_preserved(
+        self,
+        engine: Engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+    ) -> None:
+        source = tmp_path / "source.txt"
+        target = tmp_path / "target.txt"
+        source.write_text("source")
+        original_to_thread = asyncio.to_thread
+
+        async def create_destination_before_mutation(function, *args, **kwargs):  # noqa: ANN001, ANN202
+            if getattr(function, "__name__", "") in {"_rename_path", "_copy_file", "_copy_requested_file"}:
+                target.write_text("keep")
+            return await original_to_thread(function, *args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", create_destination_before_mutation)
+        if operation == "rename":
+            result = await engine.ahandle_request(
+                RenameFileRequest(old_path=str(source), new_path=str(target), workspace_only=False)
+            )
+            assert isinstance(result, RenameFileResultFailure)
+        else:
+            result = await engine.ahandle_request(
+                CopyFileRequest(source_path=str(source), destination_path=str(target))
+            )
+            assert isinstance(result, CopyFileResultFailure)
+        assert target.read_text() == "keep"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["rename", "copy"])
+    async def test_engine_answers_while_mutation_is_parked(
+        self,
+        engine: Engine,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+    ) -> None:
+        # Given a slow filesystem mutation while engine state remains on the loop.
+        source = tmp_path / "source.txt"
+        target = tmp_path / "target.txt"
+        source.write_text("source")
+        step = _SlowStep()
+        if operation == "rename":
+            original = type(source).rename
+
+            def rename(path: Path, destination: Path) -> Path:
+                step.run(None)
+                return original(path, destination)
+
+            monkeypatch.setattr(type(source), "rename", rename)
+            request = RenameFileRequest(old_path=str(source), new_path=str(target), workspace_only=False)
+        else:
+            original_copy = engine.os_manager._copy_file
+
+            def copy(src: Path, dest: Path) -> int:
+                step.run(None)
+                return original_copy(src, dest)
+
+            monkeypatch.setattr(engine.os_manager, "_copy_file", copy)
+            request = CopyFileRequest(source_path=str(source), destination_path=str(target))
+
+        # When the mutation starts, an unrelated request must still be answered.
+        mutation = asyncio.create_task(engine.ahandle_request(request))
+        try:
+            await _assert_engine_answers_while_parked(engine, step)
+        finally:
+            step.release.set()
+            result = await asyncio.wait_for(mutation, timeout=_START_TIMEOUT_SECONDS)
+
+        # Then filesystem work ran outside the event loop and completed successfully.
+        assert not step.gave_up
+        assert step.thread_id != threading.get_ident()
+        if operation == "rename":
+            assert isinstance(result, RenameFileResultSuccess)
+        else:
+            assert isinstance(result, CopyFileResultSuccess)
+        assert target.read_text() == "source"
 
 
 class TestWriteFileRequest:

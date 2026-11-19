@@ -54,6 +54,7 @@ from griptape_nodes.files.path_utils import (
 )
 from griptape_nodes.image.cache import (
     image_path_mutation,
+    image_rename_mutation,
 )
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
@@ -1908,7 +1909,7 @@ class OSManager(EngineScoped):
         )
 
     @handles(RenameFileRequest)
-    def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
+    async def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to rename a file or directory."""
         # Resolve and validate paths
         try:
@@ -1951,7 +1952,26 @@ class OSManager(EngineScoped):
             msg = f"I/O error creating parent directory for {new_path}: {e}"
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
-        with image_path_mutation(old_path, is_directory=old_path.is_dir()):
+        failure = await asyncio.to_thread(self._rename_path, old_path, new_path)
+        if failure is not None:
+            return failure
+
+        # SUCCESS PATH
+        details = f"Renamed: {old_path} -> {new_path}"
+        return RenameFileResultSuccess(
+            old_path=str(old_path),
+            new_path=str(new_path),
+            result_details=ResultDetails(message=details, level=logging.INFO),
+        )
+
+    def _rename_path(self, old_path: Path, new_path: Path) -> RenameFileResultFailure | None:
+        """Acquire image locks and rename together outside the event loop."""
+        with image_rename_mutation(old_path, new_path, is_directory=old_path.is_dir()):
+            if new_path.exists():
+                msg = (
+                    f"Attempted to rename '{old_path}' to '{new_path}'. Failed because the destination already exists."
+                )
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
             try:
                 old_path.rename(new_path)
             except PermissionError as e:
@@ -1964,16 +1984,10 @@ class OSManager(EngineScoped):
                 msg = f"Unexpected error renaming {old_path} to {new_path}: {type(e).__name__}: {e}"
                 return RenameFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
-        # SUCCESS PATH
-        details = f"Renamed: {old_path} -> {new_path}"
-        return RenameFileResultSuccess(
-            old_path=str(old_path),
-            new_path=str(new_path),
-            result_details=ResultDetails(message=details, level=logging.INFO),
-        )
+        return None
 
     @handles(CopyFileRequest)
-    def on_copy_file_request(self, request: CopyFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
+    async def on_copy_file_request(self, request: CopyFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
         """Handle a request to copy a single file."""
         # Resolve source path
         try:
@@ -1984,12 +1998,12 @@ class OSManager(EngineScoped):
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if source exists
-        if not Path(source_normalized).exists():
+        if not await anyio.Path(source_normalized).exists():
             msg = f"Source file does not exist: {source_path}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if source is a file (not a directory)
-        if not Path(source_normalized).is_file():
+        if not await anyio.Path(source_normalized).is_file():
             msg = f"Source path is not a file: {source_path}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
@@ -2002,7 +2016,7 @@ class OSManager(EngineScoped):
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check if destination already exists (unless overwrite is True)
-        if Path(dest_normalized).exists() and not request.overwrite:
+        if await anyio.Path(dest_normalized).exists() and not request.overwrite:
             msg = f"Destination file already exists: {destination_path}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
@@ -2020,7 +2034,9 @@ class OSManager(EngineScoped):
 
         # Copy the file
         try:
-            bytes_copied = self._copy_file(source_path, destination_path)
+            bytes_copied = await asyncio.to_thread(
+                self._copy_requested_file, source_path, destination_path, request.overwrite
+            )
         except PermissionError as e:
             msg = f"Permission denied copying {source_path} to {destination_path}: {e}"
             return CopyFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
@@ -2042,6 +2058,19 @@ class OSManager(EngineScoped):
             bytes_copied=bytes_copied,
             result_details=f"File copied successfully: {source_path} -> {destination_path}",
         )
+
+    def _copy_requested_file(self, source: Path, destination: Path, overwrite: bool) -> int:  # noqa: FBT001
+        """Reserve a new destination before copying when overwrite is disabled."""
+        if overwrite:
+            return self._copy_file(source, destination)
+        with image_path_mutation(destination, is_directory=False):
+            with destination.open("xb"):
+                pass
+            try:
+                return self._copy_file(source, destination)
+            except OSError:
+                destination.unlink(missing_ok=True)
+                raise
 
     @staticmethod
     def remove_readonly(func, path, excinfo) -> None:  # noqa: ANN001, ARG004

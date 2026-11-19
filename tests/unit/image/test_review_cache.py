@@ -59,12 +59,13 @@ class TestCacheReview:
         expected_invalidations = 2
         assert invalidate.call_count == expected_invalidations
 
-    def test_directory_rename_clears_descendant_cache(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_directory_rename_clears_descendant_cache(self, engine: Engine, tmp_path: Path) -> None:
         source = tmp_path / "folder"
         source.mkdir()
         (source / "image.png").write_bytes(encode(solid(64, 64, RED), "png"))
         with patch("griptape_nodes.image.cache.invalidate_all_image_cache") as clear:
-            result = engine.os_manager.on_rename_file_request(
+            result = await engine.os_manager.on_rename_file_request(
                 RenameFileRequest(old_path=str(source), new_path=str(tmp_path / "renamed"), workspace_only=False)
             )
         assert isinstance(result, RenameFileResultSuccess)

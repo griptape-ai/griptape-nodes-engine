@@ -480,7 +480,8 @@ class TestRenameFileRequest:
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_rename_file_success(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully renaming a file."""
         os_manager = engine.os_manager
         old_path = tmp_path / "old.txt"
@@ -488,26 +489,28 @@ class TestRenameFileRequest:
         old_path.write_text("Content")
 
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
-        result = os_manager.on_rename_file_request(request)
+        result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultSuccess)
         assert not old_path.exists()
         assert new_path.exists()
         assert new_path.read_text() == "Content"
 
-    def test_rename_file_source_not_found(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_source_not_found(self, engine: Engine, tmp_path: Path) -> None:
         """Test renaming non-existent file."""
         os_manager = engine.os_manager
         request = RenameFileRequest(
             old_path=str(tmp_path / "nonexistent.txt"), new_path=str(tmp_path / "new.txt"), workspace_only=False
         )
 
-        result = os_manager.on_rename_file_request(request)
+        result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
-    def test_rename_file_destination_exists(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_destination_exists(self, engine: Engine, tmp_path: Path) -> None:
         """Test renaming when destination already exists."""
         os_manager = engine.os_manager
         old_path = tmp_path / "old.txt"
@@ -516,12 +519,13 @@ class TestRenameFileRequest:
         new_path.write_text("New content")
 
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
-        result = os_manager.on_rename_file_request(request)
+        result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
-    def test_rename_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_rename_file_permission_denied(self, engine: Engine, tmp_path: Path) -> None:
         """Test permission denied when renaming."""
         os_manager = engine.os_manager
         old_path = tmp_path / "old.txt"
@@ -531,7 +535,7 @@ class TestRenameFileRequest:
         request = RenameFileRequest(old_path=str(old_path), new_path=str(new_path), workspace_only=False)
 
         with patch.object(Path, "rename", side_effect=PermissionError("Permission denied")):
-            result = os_manager.on_rename_file_request(request)
+            result = await os_manager.on_rename_file_request(request)
 
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
