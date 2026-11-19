@@ -10,6 +10,7 @@ import numpy as np
 import OpenImageIO as oiio  # noqa: N813
 import pytest
 
+from griptape_nodes.files.path_utils import normalize_path_for_platform
 from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline, ImageFormat
 from griptape_nodes.image.cache import image_directory_mutation, image_source_access
 from griptape_nodes.image.oiio_config import invalidate_image_cache
@@ -26,11 +27,18 @@ class TestCacheReview:
     def test_external_same_second_rewrite_refreshes_pixels(self, tmp_path: Path) -> None:
         path = tmp_path / "source.png"
         path.write_bytes(encode(solid(64, 64, RED), "png"))
-        timestamp = path.stat().st_mtime_ns
+        # NTFS timestamps have 100 ns resolution; keep both observed times in one second.
+        nanoseconds_per_second = 1_000_000_000
+        timestamp = path.stat().st_mtime_ns // nanoseconds_per_second * nanoseconds_per_second
+        os.utime(path, ns=(timestamp, timestamp))
+        observed_before = path.stat().st_mtime_ns
         with GriptapeImage.open(path) as image:
             image._decoded().get_pixels(oiio.UINT8)
         path.write_bytes(encode(solid(64, 64, BLUE), "png"))
-        os.utime(path, ns=(timestamp, timestamp + 1))
+        os.utime(path, ns=(timestamp, timestamp + 100_000_000))
+        observed_after = path.stat().st_mtime_ns
+        assert observed_after != observed_before
+        assert observed_after // nanoseconds_per_second == observed_before // nanoseconds_per_second
         with GriptapeImage.open(path) as image:
             pixels = image._decoded().get_pixels(oiio.UINT8)
             assert isinstance(pixels, np.ndarray)
@@ -133,7 +141,8 @@ class TestCacheReview:
         target.write_bytes(encode(solid(64, 64, RED), "png"))
         with patch("griptape_nodes.image.cache.invalidate_image_cache") as invalidate:
             engine.os_manager._copy_file(source, target)
-        assert invalidate.call_args_list == [((str(target),),), ((str(target),),)]
+        expected_path = normalize_path_for_platform(target)
+        assert invalidate.call_args_list == [((expected_path,),), ((expected_path,),)]
 
     def test_open_wrapper_refreshes_between_public_operations(self, tmp_path: Path) -> None:
         path = tmp_path / "source.png"

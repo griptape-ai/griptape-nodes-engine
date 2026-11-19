@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 import OpenImageIO as oiio  # noqa: N813
 
-from griptape_nodes.files.path_utils import canonicalize_for_identity
+from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io
 
 _WINDOWS_LONG_PATH_PREFIX = "\\\\?\\"
 
@@ -163,7 +163,9 @@ def invalidate_image_cache(path: str | Path) -> None:
     candidates = {raw}
     if raw.startswith(_WINDOWS_LONG_PATH_PREFIX):
         candidates.add(raw.removeprefix(_WINDOWS_LONG_PATH_PREFIX))
-    candidates.add(str(canonicalize_for_identity(path)))
+    canonical = canonicalize_for_identity(path)
+    candidates.add(str(canonical))
+    candidates.add(str(canonicalize_for_io(canonical)))
 
     with image_source_access(path):
         for candidate in candidates:
