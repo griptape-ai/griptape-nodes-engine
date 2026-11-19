@@ -115,6 +115,8 @@ Results then arrive as messages whose `type` is `success_result` or `failure_res
 
 While a flow runs, the engine also sends execution events: which node is running, parameter values as they change, and the run's end. Each names its workflow in `open_workflow_id`, or `null` when it belongs to none; publishing progress names the workflow being published.
 
+Log lines arrive as `LogHandlerEvent` app events. A line a node logged while running names the node in `node_name` and its workflow in the app event's `open_workflow_id`. The engine's other log lines name no workflow.
+
 The engine tells every connection on the session when any client opens or closes a workflow:
 
 - `WorkflowOpenedEvent` carries it in `open_workflow`, as `ListOpenWorkflowsRequest` lists it. A loaded workflow is announced once built; until then only `ListOpenWorkflowsRequest` and the heartbeat list it, and a failed build closes it without a `WorkflowClosedEvent`.

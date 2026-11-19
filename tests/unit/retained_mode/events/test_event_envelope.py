@@ -197,6 +197,12 @@ def test_serialized_key_order_puts_payload_last() -> None:
         "payload_type",
         "payload",
     ]
+    assert list(converters.engine.unstructure(_events()["AppEvent"])) == [
+        "open_workflow_id",
+        "event_type",
+        "payload_type",
+        "payload",
+    ]
 
 
 @pytest.mark.parametrize("name", list(_events()))

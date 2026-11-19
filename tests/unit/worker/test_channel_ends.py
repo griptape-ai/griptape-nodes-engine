@@ -59,6 +59,8 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import WorkerRequestGateDecision, read_forwarded_result
 from griptape_nodes.retained_mode.managers.read_through_secrets_manager import ReadThroughSecretsManager
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
+from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.worker import runtime as runtime_module
 from griptape_nodes.worker.channel import (
     AsyncChannel,
@@ -66,7 +68,7 @@ from griptape_nodes.worker.channel import (
     WorkerLink,
     listen_for_worker,
 )
-from griptape_nodes.worker.parent import ParentEnd
+from griptape_nodes.worker.parent import ParentEnd, QueuedWorkerEvent, read_worker_notification
 from griptape_nodes.worker.runtime import WorkerSide, WorkerStartupError, prepare_worker_engine
 from griptape_nodes.worker.wire import APP_EVENT, EVENT_RESULT, EXECUTION_EVENT, event_body, event_request_envelope
 
@@ -472,6 +474,35 @@ class TestAppEvents:
         assert payload["payload_type"] == "CurrentProjectChanged"
         [log_event] = queued
         assert isinstance(log_event.payload, LogHandlerEvent)
+
+    def test_a_node_log_line_keeps_the_workflow_it_names_across_the_channel(self, parent_engine: Engine) -> None:
+        """The worker names the workflow its node runs in, and the engine queues the line still naming it."""
+        queue: asyncio.Queue = asyncio.Queue()
+        parent_engine.event_manager.initialize_queue(queue)
+        log_line = AppEvent(
+            payload=LogHandlerEvent(message="m", levelname="INFO", created=1.0, node_name="Text One"),
+            open_workflow_id="wf-1",
+        )
+
+        notification = read_worker_notification(event_body(APP_EVENT, log_line))
+        assert isinstance(notification, QueuedWorkerEvent)
+        with parent_engine.bind_workflow(NO_WORKFLOW):
+            parent_engine.event_manager.put_event(notification.event)
+
+        assert queue.get_nowait().open_workflow_id == "wf-1"
+
+    def test_a_log_line_a_worker_named_no_workflow_keeps_naming_none(self, parent_engine: Engine) -> None:
+        queue: asyncio.Queue = asyncio.Queue()
+        parent_engine.event_manager.initialize_queue(queue)
+        # Named no workflow in the worker, where no node of an open workflow ran it.
+        log_line = AppEvent(payload=LogHandlerEvent(message="m", levelname="INFO", created=1.0, node_name="Text One"))
+
+        notification = read_worker_notification(event_body(APP_EVENT, log_line))
+        assert isinstance(notification, QueuedWorkerEvent)
+        with parent_engine.bind_workflow(WorkflowRuntime("parent-bound", MagicMock())):
+            parent_engine.event_manager.put_event(notification.event)
+
+        assert queue.get_nowait().open_workflow_id is None
 
 
 async def _until(predicate: Any) -> None:
