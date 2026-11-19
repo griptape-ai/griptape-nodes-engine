@@ -5,8 +5,44 @@ from io import StringIO
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.error import MarkedYAMLError, YAMLError
 
 from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
+
+_MAPPING_VALUES_PROBLEM = "mapping values are not allowed here"
+
+
+def _colon_in_value_hint(line: str) -> str:
+    block_hint = "write key: | and put the text on the next line, indented"
+    # Text that already holds a double quote can't be wrapped in one, and prose often holds apostrophes.
+    if '"' in line:
+        fix = f"To keep a colon in the text, {block_hint}."
+    else:
+        fix = f'To keep a colon in the text, wrap the value in quotes, like key: "text: more text", or {block_hint}.'
+    return f"{fix} If this line is meant to be its own key, check its indentation."
+
+
+def _describe_yaml_error(value: str, error: Exception) -> str:
+    """Describe a YAML parse error in terms an artist can act on: where it is, and how to fix it."""
+    if not isinstance(error, MarkedYAMLError) or error.problem_mark is None:
+        return f"the text is not valid YAML: {error}"
+
+    line_index = error.problem_mark.line
+    column = error.problem_mark.column
+    lines = value.splitlines()
+    line = lines[line_index] if line_index < len(lines) else ""
+    location = f"line {line_index + 1}, column {column + 1}"
+    quoted_line = f"\nLine {line_index + 1}: {line.strip()}" if line.strip() else ""
+
+    # Several words before the colon read as prose; a lone word is more likely a misplaced key.
+    if error.problem == _MAPPING_VALUES_PROBLEM and " " in line[:column].strip():
+        return (
+            f"the text is not valid YAML at {location}: a value contains a colon followed by a space, "
+            f"which YAML reads as the start of another key.{quoted_line}\n{_colon_in_value_hint(line)}"
+        )
+
+    problem = error.problem or "invalid syntax"
+    return f"the text is not valid YAML at {location}: {problem}.{quoted_line}"
 
 
 class ParameterYaml(Parameter):
@@ -147,9 +183,8 @@ class ParameterYaml(Parameter):
             yaml.preserve_quotes = True
             try:
                 yaml.load(value)
-            except Exception as e:
-                msg = f"ParameterYaml: Failed to validate YAML string: {e}. Input: {value[:200]!r}"
-                raise ValueError(msg) from e
+            except (YAMLError, ValueError, RecursionError) as e:
+                raise ValueError(_describe_yaml_error(value, e)) from e
             return value
 
         if isinstance(value, (dict, list)):
