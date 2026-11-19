@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from griptape_nodes.common.isolated_execution_scope import (
+    IsolatedExecutionScope,
+    current_isolated_execution_scope,
+    isolated_execution_scope,
+)
+from griptape_nodes.common.loop_body_scope import LoopBodyScope, current_loop_body_scope, entered_loop_body_scope
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import EndNode, StartNode
 from griptape_nodes.exe_types.workflow_node import (
@@ -23,7 +30,14 @@ from griptape_nodes.exe_types.workflow_node import (
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowShape
 from griptape_nodes.retained_mode.engine import current_engine
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartLocalSubflowRequest,
+    StartLocalSubflowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 CONTROL_TYPE = "parametercontroltype"
 
@@ -540,3 +554,96 @@ class TestWorkspaceRelativeWorkflowPath:
         result = _workspace_relative_workflow_path(linked_parent / "ws", elsewhere / "lib" / "wf.py")
 
         assert result == str(Path("libs/mylib/wf.py"))
+
+
+class TestAprocess:
+    @pytest.fixture
+    def workflow_node(self, monkeypatch: pytest.MonkeyPatch) -> WorkflowNode:
+        shape = WorkflowShape(
+            inputs={"Start Flow": {"text": _param("text")}},
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+        node_class = build_workflow_node_class(
+            node_type="ShoutWorkflow",
+            workflow_file_path=Path("/library/shout_workflow.py"),
+            workflow_metadata=_metadata(shape),
+        )
+        node = node_class(name="Shout It")
+        monkeypatch.setattr(node, "_load_subflow", AsyncMock(spec=WorkflowNode._load_subflow, return_value="Subflow"))
+        monkeypatch.setattr(node, "_resolve_live_routes", Mock(spec=WorkflowNode._resolve_live_routes))
+        monkeypatch.setattr(node, "_apply_inputs", Mock(spec=WorkflowNode._apply_inputs))
+        monkeypatch.setattr(node, "_collect_outputs", Mock(spec=WorkflowNode._collect_outputs))
+        return node
+
+    @pytest.fixture
+    def enclosing_scope(self) -> LoopBodyScope:
+        return LoopBodyScope(canvas_node_names={"Shout It_1": "Shout It"}, engine_node_names=frozenset())
+
+    @pytest.fixture
+    def scope_seen_by_subflow(self) -> list[LoopBodyScope | None]:
+        return []
+
+    @pytest.fixture
+    def run_subflow(
+        self,
+        workflow_node: WorkflowNode,
+        monkeypatch: pytest.MonkeyPatch,
+        scope_seen_by_subflow: list[LoopBodyScope | None],
+    ) -> AsyncMock:
+        async def record_scope(request: StartLocalSubflowRequest) -> ResultPayload:
+            assert request.flow_name == "Subflow"
+            scope_seen_by_subflow.append(current_loop_body_scope.get())
+            return StartLocalSubflowResultSuccess(result_details="done")
+
+        run = AsyncMock(spec=WorkflowNode._ahandle_request_in_workflow, side_effect=record_scope)
+        monkeypatch.setattr(workflow_node, "_ahandle_request_in_workflow", run)
+        return run
+
+    @pytest.mark.asyncio
+    async def test_subflow_runs_without_the_enclosing_loop_scope(
+        self,
+        workflow_node: WorkflowNode,
+        run_subflow: AsyncMock,
+        enclosing_scope: LoopBodyScope,
+        scope_seen_by_subflow: list[LoopBodyScope | None],
+    ) -> None:
+        with entered_loop_body_scope(enclosing_scope):
+            await workflow_node.aprocess()
+
+        run_subflow.assert_awaited_once()
+        assert scope_seen_by_subflow == [None]
+
+    @pytest.mark.asyncio
+    async def test_enclosing_loop_scope_is_restored_afterwards(
+        self, workflow_node: WorkflowNode, run_subflow: AsyncMock, enclosing_scope: LoopBodyScope
+    ) -> None:
+        with entered_loop_body_scope(enclosing_scope):
+            await workflow_node.aprocess()
+
+            assert current_loop_body_scope.get() is enclosing_scope
+
+        run_subflow.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_subflow_keeps_the_enclosing_isolated_execution_scope(
+        self, workflow_node: WorkflowNode, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scopes_seen_by_subflow: list[IsolatedExecutionScope | None] = []
+
+        async def record_scope(request: StartLocalSubflowRequest) -> ResultPayload:
+            assert request.flow_name == "Subflow"
+            scopes_seen_by_subflow.append(current_isolated_execution_scope.get())
+            return StartLocalSubflowResultSuccess(result_details="done")
+
+        run = AsyncMock(spec=WorkflowNode._ahandle_request_in_workflow, side_effect=record_scope)
+        monkeypatch.setattr(workflow_node, "_ahandle_request_in_workflow", run)
+
+        with isolated_execution_scope("My Group"):
+            outer_scope = current_isolated_execution_scope.get()
+
+            await workflow_node.aprocess()
+
+            assert current_isolated_execution_scope.get() is outer_scope
+
+        run.assert_awaited_once()
+        assert scopes_seen_by_subflow == [IsolatedExecutionScope(owner_name="My Group")]

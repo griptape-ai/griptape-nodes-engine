@@ -17,6 +17,7 @@ import logging
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
+from griptape_nodes.common.nested_workflow_scope import entered_nested_workflow
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import ControlNode, EndNode, StartNode
@@ -345,7 +346,8 @@ class WorkflowNode(ControlNode):
 
         self._apply_inputs(subflow_name, live_routes)
 
-        result = await self._ahandle_request_in_workflow(StartLocalSubflowRequest(flow_name=subflow_name))
+        with entered_nested_workflow():
+            result = await self._ahandle_request_in_workflow(StartLocalSubflowRequest(flow_name=subflow_name))
         if not isinstance(result, StartLocalSubflowResultSuccess):
             msg = (
                 f"Attempted to run the workflow behind node '{self.name}'. "
