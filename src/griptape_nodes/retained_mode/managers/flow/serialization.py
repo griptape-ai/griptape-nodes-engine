@@ -470,14 +470,11 @@ class FlowSerialization(EngineScoped):
                         imported_flow_metadata=flow.metadata,
                     )
                 else:
-                    # Always set set_as_new_context=False during serialization - let the workflow manager
-                    # that loads this serialized flow decide whether to push it to context or not
                     # Get parent flow name from the flow manager's tracking
                     parent_name = self.engine.flow_manager.get_parent_flow_in(workflow, flow_name)
                     create_flow_request = CreateFlowRequest(
                         flow_name=flow_name,
                         parent_flow_name=parent_name,
-                        set_as_new_context=False,
                         metadata=flow.metadata,
                     )
             else:
@@ -712,7 +709,7 @@ class FlowSerialization(EngineScoped):
         return result
 
     @handles(DeserializeFlowFromCommandsRequest)
-    def on_deserialize_flow_from_commands(  # noqa: C901, PLR0911, PLR0912 (I am big and complicated and have a lot of negative edge-cases)
+    def on_deserialize_flow_from_commands(  # noqa: PLR0911 (I am big and complicated and have a lot of negative edge-cases)
         self, request: DeserializeFlowFromCommandsRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         # Do we want to create a NEW Flow to deserialize into, or use the one in the Current Context?
@@ -720,7 +717,6 @@ class FlowSerialization(EngineScoped):
             if workflow.context.has_current_flow():
                 flow = workflow.context.get_current_flow()
                 flow_name = flow.name
-                pushed_flow_context = False
                 created_new_flow = False
             else:
                 details = "Attempted to deserialize a set of Flow Creation commands into the Current Context. Failed because the Current Context was empty."
@@ -746,14 +742,11 @@ class FlowSerialization(EngineScoped):
                     details = f"Attempted to deserialize Flow Creation commands with unknown command type: {type(flow_initialization_command).__name__}."
                     return DeserializeFlowFromCommandsResultFailure(result_details=details)
 
-            # Adopt the newly-created flow as our current context.
             flow = workflow.objects.get_as_type(flow_name, ControlFlow)
             if flow is None:
                 details = f"Attempted to deserialize a serialized set of Flow Creation commands. Failed to find created flow '{flow_name}'."
                 return DeserializeFlowFromCommandsResultFailure(result_details=details)
-            workflow.context.push_flow(flow)
-            pushed_flow_context = True  # Mark that we pushed this flow
-            created_new_flow = True  # Mark that we created this flow
+            created_new_flow = True
 
         # Deserializing a flow goes in a specific order: every node in this Flow AND its subflows
         # first, then connections, then values. Connections are serialized against a Flow's whole
@@ -762,49 +755,44 @@ class FlowSerialization(EngineScoped):
         # subtree exists, subflows included, because any earlier and such an edge fails with "node
         # did not exist within the flow" and fails the whole load.
         try:
-            deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
-                workflow, serialized_flow_commands=request.serialized_flow_commands
-            )
+            with workflow.context.flow(flow):
+                deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
+                    workflow, serialized_flow_commands=request.serialized_flow_commands
+                )
 
-            # Now apply the connections, for this Flow and every Flow beneath it.
-            # We didn't know the exact name that would be used for the nodes, but we knew the node's
-            # creation UUID. Tie the UUID back to the node names.
-            #
-            # The outermost Flow claims every edge, deliberately, and the recursion below it finds
-            # nothing left to do: this Flow's serialized_connections is the fully aggregated list, and
-            # each edge is created the first time it is seen. Codegen resolves the same duplication
-            # the other way round -- it recurses first, so the innermost Flow wins -- because there
-            # the edge has to be written where its endpoints are already in scope as variables. Here
-            # every node in the subtree exists before any edge is made, so there is no such
-            # constraint and claiming at the top is the simpler of the two.
-            self._deserialize_connections_for_flow_and_subflows(
-                workflow,
-                serialized_flow_commands=request.serialized_flow_commands,
-                deserialized_nodes=deserialized_nodes,
-                created_connection_keys=set(),
-            )
+                # Now apply the connections, for this Flow and every Flow beneath it.
+                # We didn't know the exact name that would be used for the nodes, but we knew the node's
+                # creation UUID. Tie the UUID back to the node names.
+                #
+                # The outermost Flow claims every edge, deliberately, and the recursion below it finds
+                # nothing left to do: this Flow's serialized_connections is the fully aggregated list, and
+                # each edge is created the first time it is seen. Codegen resolves the same duplication
+                # the other way round -- it recurses first, so the innermost Flow wins -- because there
+                # the edge has to be written where its endpoints are already in scope as variables. Here
+                # every node in the subtree exists before any edge is made, so there is no such
+                # constraint and claiming at the top is the simpler of the two.
+                self._deserialize_connections_for_flow_and_subflows(
+                    workflow,
+                    serialized_flow_commands=request.serialized_flow_commands,
+                    deserialized_nodes=deserialized_nodes,
+                    created_connection_keys=set(),
+                )
 
-            # Now assign the values, again across the whole subtree.
-            # This is the same issue that we handle for Connections:
-            # we don't know the exact node name that would be used, but we do know the UUIDs.
-            self._deserialize_values_for_flow_and_subflows(
-                workflow,
-                serialized_flow_commands=request.serialized_flow_commands,
-                deserialized_nodes=deserialized_nodes,
-            )
+                # Now assign the values, again across the whole subtree.
+                # This is the same issue that we handle for Connections:
+                # we don't know the exact node name that would be used, but we do know the UUIDs.
+                self._deserialize_values_for_flow_and_subflows(
+                    workflow,
+                    serialized_flow_commands=request.serialized_flow_commands,
+                    deserialized_nodes=deserialized_nodes,
+                )
         except FlowDeserializationError as err:
             details = f"Attempted to deserialize a Flow '{flow_name}'. {err}"
             if created_new_flow:
-                self.engine.flow_manager._cleanup_flow_on_failed_deserialization(
-                    workflow, flow_name, pushed_flow_context=pushed_flow_context
-                )
+                self.engine.flow_manager._cleanup_flow_on_failed_deserialization(workflow, flow_name)
             return DeserializeFlowFromCommandsResultFailure(result_details=details)
 
         node_name_mappings = deserialized_nodes.original_name_to_node_name
-
-        # Pop flow context if requested and we pushed it
-        if request.pop_flow_context_after and pushed_flow_context:
-            workflow.context.pop_flow()
 
         details = f"Successfully deserialized Flow '{flow_name}'."
         return DeserializeFlowFromCommandsResultSuccess(

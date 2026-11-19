@@ -120,11 +120,10 @@ class TestRuntimeLifecycle:
         assert engine.workflow_registry.find_by_name("inner") is None
         assert engine.workflow_registry.find_by_path(str(unregistered_file)) is None
 
-    def test_popping_the_workflow_closes_it_with_its_context(self, engine: Engine) -> None:
+    def test_popping_the_workflow_closes_it_with_its_flows(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
-        flow = MagicMock(name="flow")
-        engine.context_manager.push_flow(flow)
-        assert engine.current_workflow().context.get_current_flow() is flow
+        engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        assert engine.context_manager.has_current_flow()
 
         name = engine.context_manager.pop_workflow()
         engine.context_manager.push_workflow(workflow_name=name)

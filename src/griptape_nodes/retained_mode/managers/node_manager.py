@@ -919,9 +919,12 @@ class NodeManager(EngineScoped):
         with self._loading(node.name, request.specific_library_name) as state_scope:
             node.state = NodeResolutionState(state)
 
-        # See if we want to push this into the context of the current flow.
         if request.set_as_new_context:
-            workflow.context.push_node(node)
+            logger.warning(
+                "CreateNodeRequest for Node '%s' set set_as_new_context, which is deprecated and ignored. "
+                "Name the node on later requests, or send them inside a ContextManager().node() block.",
+                final_node_name,
+            )
 
         # Success message based on whether we used Current Context or explicit flow
         if request.override_parent_flow_name is None:
@@ -1501,8 +1504,6 @@ class NodeManager(EngineScoped):
             details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
             return DeleteNodeResultFailure(result_details=details)
 
-        # Awaited outside the node context: the context stack is shared, so holding the node on it
-        # across an await lets another task see it as current and pair its pops with another delete's.
         cancel_outcome = await self.cancel_conditionally(workflow, parent_flow, parent_flow_name, node)
         if cancel_outcome.failure is not None:
             return cancel_outcome.failure
@@ -1571,10 +1572,6 @@ class NodeManager(EngineScoped):
 
         # Now remove the record keeping
         self._forget_node(workflow, node, parent_flow)
-
-        # If we were part of the Current Context, pop it.
-        if request.node_name is None:
-            workflow.context.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
         # Stopping a run the artist started is not something to do silently. Say it happened, and say
@@ -3761,7 +3758,7 @@ class NodeManager(EngineScoped):
         """Make a flow for one execution's copy, under the worker's own top-level flow. Returns its name."""
         if workflow.objects.get_as_type(_WORKER_COPIES_FLOW_NAME, ControlFlow) is None:
             top_result = workflow.handle_request(
-                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME, set_as_new_context=False)
+                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME)
             )
             if not isinstance(top_result, CreateFlowResultSuccess):
                 details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {top_result.result_details}"
@@ -3770,7 +3767,6 @@ class NodeManager(EngineScoped):
             CreateFlowRequest(
                 parent_flow_name=_WORKER_COPIES_FLOW_NAME,
                 flow_name=f"{_WORKER_COPIES_FLOW_NAME}_{uuid4().hex}",
-                set_as_new_context=False,
             )
         )
         if not isinstance(flow_result, CreateFlowResultSuccess):

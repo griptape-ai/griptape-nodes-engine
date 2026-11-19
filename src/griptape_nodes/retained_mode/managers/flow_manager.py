@@ -282,22 +282,8 @@ class FlowManager(EngineScoped):
         if creation_record is not None:
             creation_record.append(flow_name)
 
-    def _cleanup_flow_on_failed_deserialization(
-        self, workflow: WorkflowRuntime, flow_name: str, *, pushed_flow_context: bool
-    ) -> None:
-        """Clean up a flow that failed during deserialization.
-
-        This method deletes the flow (which cascades to delete all nodes and connections)
-        and pops the flow context if it was pushed.
-
-        Args:
-            workflow: The workflow the flow was deserialized into
-            flow_name: The name of the flow to delete
-            pushed_flow_context: Whether we pushed this flow to the context
-        """
-        if pushed_flow_context:
-            workflow.context.pop_flow()
-
+    def _cleanup_flow_on_failed_deserialization(self, workflow: WorkflowRuntime, flow_name: str) -> None:
+        """Delete a flow that failed during deserialization, with its nodes and connections."""
         delete_flow_request = DeleteFlowRequest(flow_name=flow_name)
         delete_result = workflow.handle_request(delete_flow_request)
         if delete_result.failed():
@@ -468,11 +454,11 @@ class FlowManager(EngineScoped):
         WORKFLOW-scoped so a saved workflow file run as a script, which asks with no workflow named,
         gets the one it opened.
         """
-        for flow_name, parent in workflow.flows.name_to_parent_name.items():
-            if parent is None:
-                return GetTopLevelFlowResultSuccess(
-                    flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
-                )
+        flow = workflow.top_level_flow()
+        if flow is not None:
+            return GetTopLevelFlowResultSuccess(
+                flow_name=flow.name, result_details=f"Successfully found top level flow: '{flow.name}'"
+            )
         msg = "Attempted to get top level flow, but no such flow exists"
         logger.debug(msg)
         return GetTopLevelFlowResultSuccess(flow_name=None, result_details=msg)
@@ -625,9 +611,12 @@ class FlowManager(EngineScoped):
             referenced_workflow_name = workflow_manager.get_current_referenced_workflow()
             workflow.flows.flow_to_referenced_workflow_name[flow] = referenced_workflow_name
 
-        # See if we need to push it as the current context.
         if request.set_as_new_context:
-            workflow.context.push_flow(flow)
+            logger.warning(
+                "CreateFlowRequest for Flow '%s' set set_as_new_context, which is deprecated and ignored. "
+                "Name the flow on later requests, or send them inside a ContextManager().flow() block.",
+                final_flow_name,
+            )
 
         # Success
         details = f"Successfully created Flow '{final_flow_name}'."
@@ -647,15 +636,13 @@ class FlowManager(EngineScoped):
         flow_name = request.flow_name
         flow = None
         if flow_name is None:
-            # We want to delete whatever is at the top of the Current Context.
             if not workflow.context.has_current_flow():
                 details = (
                     "Attempted to delete a Flow from the Current Context. Failed because the Current Context was empty."
                 )
                 result = DeleteFlowResultFailure(result_details=details)
                 return result
-            # We pop it off here, but we'll re-add it using context in a moment.
-            flow = workflow.context.pop_flow()
+            flow = workflow.context.get_current_flow()
 
         # Does this Flow even exist?
         if flow is None and flow_name is not None:
@@ -740,14 +727,6 @@ class FlowManager(EngineScoped):
                 workflow.flows.global_control_flow_machine = None
                 workflow.flows.global_dag_builder.clear()
                 self._finish_run_if_over(flows)
-
-        # A flow deleted by name can still be the Current Context. Leave it, as deleting without a name does.
-        if (
-            flow_name is not None
-            and workflow.context.has_current_flow()
-            and workflow.context.get_current_flow() is flow
-        ):
-            workflow.context.pop_flow()
 
         details = f"Successfully deleted Flow '{flow_name}'."
         result = DeleteFlowResultSuccess(result_details=details)

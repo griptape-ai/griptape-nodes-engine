@@ -1,5 +1,48 @@
 # Unreleased
 
+## Flow and node context belongs to the caller
+
+A request that names no flow acts on the workflow's top-level flow. It no longer acts on a flow an
+earlier request made current, because requests can't make a flow or node current anymore.
+
+**Request API clients.** `set_as_new_context` on `CreateFlowRequest` and `CreateNodeRequest` is
+ignored. Name the flow or node on the requests that follow:
+
+```python
+# Before
+handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="inner", set_as_new_context=True))
+handle_request(CreateNodeRequest(node_type="Agent"))
+
+# After
+handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="inner"))
+handle_request(CreateNodeRequest(node_type="Agent", override_parent_flow_name="inner"))
+```
+
+`DeserializeFlowFromCommandsRequest` no longer takes `pop_flow_context_after`. Drop the argument;
+the request leaves the current flow as it found it.
+
+**Library authors and scripts.** `ContextManager` keeps its `with` blocks and drops the calls that
+push and pop by hand. A block applies to the code inside it and to tasks started there, not to other
+requests running at the same time:
+
+```python
+# Before
+context_manager.push_flow(flow)
+GriptapeNodes.handle_request(CreateNodeRequest(node_type="Agent"))
+context_manager.pop_flow()
+
+# After
+with GriptapeNodes.ContextManager().flow(flow):
+    GriptapeNodes.handle_request(CreateNodeRequest(node_type="Agent"))
+```
+
+`push_flow`, `pop_flow`, `push_node`, `pop_node`, `push_element`, `pop_element`, `element()`,
+`has_current_element` and `get_current_element` are gone. Nothing in the engine read the element
+context.
+
+**Saved workflow files.** No change needed. Files saved by earlier versions still open and run.
+Newly saved files no longer include the `_ensure_workflow_context` function.
+
 ## Execution events name their workflow in `open_workflow_id`
 
 **Request API clients.** `ExecutionEvent` and streamed `ProgressEvent` carried the open workflow
