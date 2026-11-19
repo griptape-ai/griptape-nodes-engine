@@ -24,11 +24,14 @@ from griptape_nodes.retained_mode.engine import EngineScoped, engine_scope
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import ReportsOpenWorkflow
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     AppPayload,
     BaseEvent,
+    BelongsToBoundWorkflow,
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
+    ExecutionEvent,
     ExecutionGriptapeNodeEvent,
     ExecutionPayload,
     GraphAccessMixin,
@@ -206,20 +209,33 @@ def _suppression_candidates(event: Any) -> list[Any]:
 
 
 def _name_bound_workflow(event: Any) -> None:
-    """Name the bound workflow on an execution event built without `open_workflow_id`.
+    """Name the bound workflow on an event built without `open_workflow_id` that belongs to it.
 
     Node libraries build events without it, and an event that names no workflow reaches every
     client on the session. One built with `open_workflow_id=None` belongs to no workflow and keeps it.
     """
-    if not isinstance(event, ExecutionGriptapeNodeEvent):
+    envelope = _envelope_naming_workflow(event)
+    if envelope is None:
         return
-    execution_event = event.wrapped_event
-    if "open_workflow_id" in execution_event.model_fields_set:
+    if "open_workflow_id" in envelope.model_fields_set:
         return
     workflow = bound_workflow.get()
     if workflow is None or workflow is NO_WORKFLOW:
         return
-    execution_event.open_workflow_id = workflow.workflow_id
+    envelope.open_workflow_id = workflow.workflow_id
+
+
+def _envelope_naming_workflow(event: Any) -> ExecutionEvent | AppEvent | None:
+    """The envelope of `event` that names the workflow it belongs to, or None for an event that belongs to none."""
+    if isinstance(event, ExecutionGriptapeNodeEvent):
+        return event.wrapped_event
+    if (
+        isinstance(event, AppEvent)
+        and isinstance(event.payload, BelongsToBoundWorkflow)
+        and event.payload.belongs_to_bound_workflow()
+    ):
+        return event
+    return None
 
 
 def _is_async_callable(callback: Any) -> bool:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, NoReturn, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -283,6 +283,19 @@ class AppPayload(Payload):
     pass
 
 
+@runtime_checkable
+class BelongsToBoundWorkflow(Protocol):
+    """An app payload that can belong to the workflow bound when it is queued, such as a node's log line.
+
+    `EventManager` names that workflow on the payload's `AppEvent` when `belongs_to_bound_workflow`
+    says so. Other app payloads belong to no workflow.
+    """
+
+    def belongs_to_bound_workflow(self) -> bool:
+        """Whether this payload belongs to the workflow bound when it is queued."""
+        ...
+
+
 # Type variables for our generic payloads
 P = TypeVar("P", bound=RequestPayload)
 R = TypeVar("R", bound=ResultPayload)
@@ -500,7 +513,10 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
 
 # Events sent as part of the lifecycle of the Griptape Nodes application.
 class AppEvent[A: AppPayload](BaseEvent):
+    """An event about the application. `open_workflow_id` names the open workflow it belongs to, or None."""
+
     payload: A
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an AppEvent, inferring the generic type if needed."""
