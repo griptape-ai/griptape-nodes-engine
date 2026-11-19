@@ -502,14 +502,17 @@ class ModelAccessComponent:
     def _repair_stale_dropdown(self) -> bool:
         """Rebuild the ``Options`` trait and rows if a replayed workflow left retired models in them.
 
-        Returns whether it rebuilt them. A dropdown is stale when a saved row is named by a
-        ``deprecated_values`` key: those keys are accepted but never offered, so a row that names
-        one can only have been saved before that model was retired.
+        Returns whether it rebuilt them. A dropdown is stale when its saved rows name at least one
+        ``deprecated_values`` key (a key is accepted but never offered, so such a row can only
+        predate that model's retirement) and name nothing outside this node's own vocabulary of
+        current choices plus deprecated keys.
 
         Deliberately not "the saved list differs from ``model_choices``". A node may repopulate
         this parameter on purpose -- an Agent pointing the same dropdown at a third-party
         provider's models, then assigning one of them -- and this runs on every assignment, so a
-        difference test would revert that on the spot. Such a list never contains a retired key.
+        difference test would revert that on the spot. The vocabulary condition keeps a provider's
+        list safe even when it happens to include an id this node has retired, because the list
+        also names models this node has never offered.
 
         A parameter with no ``Options`` trait is left alone. A node strips it
         deliberately while a driver is connected and puts it back through
@@ -518,10 +521,12 @@ class ModelAccessComponent:
         parameter = self._parameter
         if not parameter.find_elements_by_type(Options):
             return False
-        retired = [
-            name for name in self._row_names(parameter.ui_options.get("data")) if name in self._deprecated_values
-        ]
+        row_names = self._row_names(parameter.ui_options.get("data"))
+        retired = [name for name in row_names if name in self._deprecated_values]
         if not retired:
+            return False
+        vocabulary = {*self._model_choices, *self._deprecated_values}
+        if any(name not in vocabulary for name in row_names):
             return False
 
         self.reinstall_options()

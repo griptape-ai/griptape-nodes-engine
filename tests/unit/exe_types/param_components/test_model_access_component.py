@@ -1306,6 +1306,25 @@ class TestRuntimeRepopulationIsNotRepaired:
         assert node.get_parameter_value(param.name) == "llama3"
         assert [record for record in caplog.records if record.levelname == "WARNING"] == []
 
+    def test_a_provider_list_that_includes_a_retired_id_survives(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A provider can legitimately offer an id this node has retired, alongside models it never offered."""
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        provider_models = ["retired", "llama3", "mistral"]
+        param.update_ui_options_key("data", [{"name": name} for name in provider_models])
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node._update_option_choices(param.name, provider_models, "llama3")
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert options_trait.choices == provider_models
+        assert [row["name"] for row in param.ui_options["data"]] == provider_models
+        assert node.get_parameter_value(param.name) == "llama3"
+        assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
     def test_switching_back_to_the_component_choices_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
         """The Griptape Cloud branch passes model_choices without the deprecated keys."""
         node, helper, param = _build_probe_node_with_component(
