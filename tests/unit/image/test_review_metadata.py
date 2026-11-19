@@ -10,8 +10,9 @@ import pytest
 from griptape_nodes.drivers.image_metadata.exif_metadata_driver import ExifMetadataDriver
 from griptape_nodes.drivers.image_metadata.png_metadata_driver import PngMetadataDriver
 from griptape_nodes.image import Exif, GriptapeImage, GriptapeImagePipeline, ImageFormat, ImageMetadata
+from griptape_nodes.image.path_metadata import read_path_extra_metadata_kinds
 from griptape_nodes.image.png_text_chunks import PNG_SIGNATURE, png_chunk
-from tests.unit.image.sample_images import RED, encode, solid
+from tests.unit.image.sample_images import RED, encode, gray_tiff, solid
 
 
 class TestMetadataReview:
@@ -93,6 +94,11 @@ class TestMetadataReview:
         with GriptapeImage.open(path) as image, GriptapeImagePipeline(image).thumbnail(32, 32).end() as preview:
             preview.encode(ImageFormat.WEBP)
         assert any("XMP" in record.getMessage() for record in caplog.records)
+
+    def test_tiff_path_reports_custom_metadata_kinds(self, tmp_path: Path) -> None:
+        path = tmp_path / "extra.tif"
+        path.write_bytes(gray_tiff({0x02BC: (7, b"<custom/>"), 0x83BB: (7, b"iptc")}))
+        assert read_path_extra_metadata_kinds(path, ImageFormat.TIFF) == ["XMP", "IPTC"]
 
     @staticmethod
     def _pixel_chunk(source: bytes) -> bytes:
