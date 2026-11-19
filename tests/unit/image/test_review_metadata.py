@@ -108,6 +108,17 @@ class TestMetadataReview:
         path.write_bytes(data)
         assert read_path_extra_metadata_kinds(path, ImageFormat.TIFF) == []
 
+    def test_relative_open_keeps_its_original_source(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        path = tmp_path / "source.png"
+        path.write_bytes(encode(solid(64, 64, RED), "png"))
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.chdir(tmp_path)
+        with GriptapeImage.open(Path("source.png")) as image:
+            monkeypatch.chdir(other)
+            assert image.metadata.text == {}
+            assert image.width == 64  # noqa: PLR2004
+
     @staticmethod
     def _pixel_chunk(source: bytes) -> bytes:
         position = 12

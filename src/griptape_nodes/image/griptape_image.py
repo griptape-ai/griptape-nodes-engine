@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import replace
-from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Self
 
+from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io
 from griptape_nodes.image.cache import image_source_access
 from griptape_nodes.image.containers import (
     is_complete,
@@ -63,6 +63,7 @@ from griptape_nodes.image.png_text_chunks import read_text_chunks
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
     from types import TracebackType
 
     import OpenImageIO as oiio  # noqa: N813
@@ -511,10 +512,12 @@ class GriptapeImage:
         if isinstance(source, bytes):
             image = cls(source=source, source_path=None, buf=None, image_format=sniff_image_format(source))
         else:
-            path = Path(source) if isinstance(source, str) else source
-            with path.open("rb") as handle:
-                head = handle.read(SNIFF_MIN_HEADER_BYTES)
-            image = cls(source=None, source_path=path, buf=None, image_format=sniff_image_format(head))
+            path = canonicalize_for_identity(source)
+            with image_source_access(path):
+                with canonicalize_for_io(path).open("rb") as handle:
+                    head = handle.read(SNIFF_MIN_HEADER_BYTES)
+                image = cls(source=None, source_path=path, buf=None, image_format=sniff_image_format(head))
+                image._read_header()
         header = image._read_header()
         if image.format is None:
             image._format = ImageFormat.from_name(header.file_format_name)

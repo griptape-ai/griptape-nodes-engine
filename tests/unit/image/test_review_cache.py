@@ -126,6 +126,15 @@ class TestCacheReview:
         with image_source_access(tmp_path / "source.png"):
             pass
 
+    def test_copy_overwrite_invalidates_destination(self, engine: Engine, tmp_path: Path) -> None:
+        source = tmp_path / "source.png"
+        target = tmp_path / "target.png"
+        source.write_bytes(encode(solid(64, 64, BLUE), "png"))
+        target.write_bytes(encode(solid(64, 64, RED), "png"))
+        with patch("griptape_nodes.image.cache.invalidate_image_cache") as invalidate:
+            engine.os_manager._copy_file(source, target)
+        assert invalidate.call_args_list == [((str(target),),), ((str(target),),)]
+
     def test_cached_missing_source_fails(self, tmp_path: Path) -> None:
         path = tmp_path / "source.png"
         path.write_bytes(encode(solid(64, 64, RED), "png"))
