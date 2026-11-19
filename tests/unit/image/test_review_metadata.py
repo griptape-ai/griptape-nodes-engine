@@ -9,7 +9,7 @@ import pytest
 
 from griptape_nodes.drivers.image_metadata.exif_metadata_driver import ExifMetadataDriver
 from griptape_nodes.drivers.image_metadata.png_metadata_driver import PngMetadataDriver
-from griptape_nodes.image import Exif, GriptapeImage, GriptapeImagePipeline, ImageMetadata
+from griptape_nodes.image import Exif, GriptapeImage, GriptapeImagePipeline, ImageFormat, ImageMetadata
 from griptape_nodes.image.png_text_chunks import PNG_SIGNATURE, png_chunk
 from tests.unit.image.sample_images import RED, encode, solid
 
@@ -69,6 +69,30 @@ class TestMetadataReview:
         path.write_bytes(data)
         with GriptapeImage.open(path) as file_image, GriptapeImage.open(data) as byte_image:
             assert file_image.metadata == byte_image.metadata
+
+    def test_tiff_metadata_limit_is_explicit(self, tmp_path: Path) -> None:
+        exif = Exif()
+        exif[0x927C] = b"large maker note" * 16
+        with GriptapeImage.open(encode(solid(64, 64), "tif")) as image:
+            data = image.encode(ImageFormat.TIFF, metadata=ImageMetadata(exif=exif))
+        path = tmp_path / "limited.tif"
+        path.write_bytes(data)
+        with (
+            patch("griptape_nodes.image.exif.MAX_METADATA_READ_BYTES", 100),
+            GriptapeImage.open(path) as image,
+            pytest.raises(ValueError, match="size limit"),
+        ):
+            _ = image.metadata
+
+    def test_path_reencoding_reports_xmp_loss(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        source = encode(solid(64, 64), "jpg")
+        xmp = b"http://ns.adobe.com/xap/1.0/\x00" + b"<custom/>"
+        segment = b"\xff\xe1" + struct.pack(">H", len(xmp) + 2) + xmp
+        path = tmp_path / "xmp.jpg"
+        path.write_bytes(source[:2] + segment + source[2:])
+        with GriptapeImage.open(path) as image, GriptapeImagePipeline(image).thumbnail(32, 32).end() as preview:
+            preview.encode(ImageFormat.WEBP)
+        assert any("XMP" in record.getMessage() for record in caplog.records)
 
     @staticmethod
     def _pixel_chunk(source: bytes) -> bytes:

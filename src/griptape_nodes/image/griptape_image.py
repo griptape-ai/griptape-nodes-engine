@@ -56,7 +56,7 @@ from griptape_nodes.image.operations import (
     to_rgb,
     to_rgba,
 )
-from griptape_nodes.image.path_metadata import read_path_metadata
+from griptape_nodes.image.path_metadata import read_path_extra_metadata_kinds, read_path_metadata
 from griptape_nodes.image.pipeline import Cover, Flatten, Orient, PipelineStep, RoundCorners, Thumbnail, ToRGB, ToRGBA
 from griptape_nodes.image.pixel_type import PixelType
 from griptape_nodes.image.png_text_chunks import read_text_chunks
@@ -352,6 +352,11 @@ class GriptapeImage:
 
     def _extra_metadata_kinds(self) -> list[str]:
         if self._extra_kinds is None:
+            if self._source_path is not None and self._format in self._CONTAINER_METADATA_FORMATS:
+                assert self._format is not None  # noqa: S101
+                with image_source_access(self._source_path):
+                    self._extra_kinds = read_path_extra_metadata_kinds(self._source_path, self._format)
+                return list(self._extra_kinds)
             source = self._source
             if source is None:
                 return []

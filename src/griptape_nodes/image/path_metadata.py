@@ -6,7 +6,7 @@ import struct
 from typing import TYPE_CHECKING
 
 from griptape_nodes.files.path_utils import canonicalize_for_io
-from griptape_nodes.image.containers import read_exif, read_icc_profile
+from griptape_nodes.image.containers import read_exif, read_extra_metadata_kinds, read_icc_profile
 from griptape_nodes.image.exif import Exif, tiff_metadata_from_source
 from griptape_nodes.image.formats import ImageFormat
 from griptape_nodes.image.metadata import ImageMetadata
@@ -43,11 +43,50 @@ def read_path_metadata(path: Path, image_format: ImageFormat) -> ImageMetadata:
     return ImageMetadata(text=text, exif=exif, icc_profile=read_icc_profile(data, image_format))
 
 
+def read_path_extra_metadata_kinds(path: Path, image_format: ImageFormat) -> list[str]:
+    """Identify metadata lost during pixel encoding using bounded container reads."""
+    with canonicalize_for_io(path).open("rb", buffering=0) as handle:
+        source = FileMetadataSource(handle)
+        if image_format == ImageFormat.TIFF:
+            return _tiff_extra_kinds(source)
+        if image_format == ImageFormat.WEBP:
+            data = _chunk_metadata(source, image_format)
+        elif image_format in {ImageFormat.JPEG, ImageFormat.MPO}:
+            data = _jpeg_metadata(source)
+        else:
+            return []
+    return read_extra_metadata_kinds(data, image_format)
+
+
+def _tiff_extra_kinds(source: FileMetadataSource) -> list[str]:
+    head = source.read_at(0, min(8, source.size))
+    if len(head) < 8 or head[:2] not in {b"II", b"MM"}:  # noqa: PLR2004
+        return []
+    order = "<"
+    if head[:2] == b"MM":
+        order = ">"
+    magic, offset = struct.unpack(f"{order}HI", head[2:])
+    if magic != 42 or offset + 2 > source.size:  # noqa: PLR2004
+        return []
+    count = struct.unpack(f"{order}H", source.read_at(offset, 2))[0]
+    kinds = []
+    tags = {0x02BC: "XMP", 0x83BB: "IPTC", 0x8649: "Photoshop data", 0x935C: "Photoshop data"}
+    for index in range(count):
+        position = offset + 2 + index * 12
+        if position + 12 > source.size:
+            break
+        tag = struct.unpack(f"{order}H", source.read_at(position, 2))[0]
+        kind = tags.get(tag)
+        if kind is not None and kind not in kinds:
+            kinds.append(kind)
+    return kinds
+
+
 def _chunk_metadata(source: FileMetadataSource, image_format: ImageFormat) -> bytes:
     is_png = image_format == ImageFormat.PNG
     position = 12
     prefix = b"RIFF\x00\x00\x00\x00WEBP"
-    selected = {b"EXIF", b"ICCP"}
+    selected = {b"EXIF", b"ICCP", b"XMP "}
     if is_png:
         position = len(PNG_SIGNATURE)
         prefix = PNG_SIGNATURE
@@ -100,7 +139,7 @@ def _jpeg_metadata(source: FileMetadataSource) -> bytes:
         if size < _JPEG_LENGTH_BYTES or position + 2 + size > source.size:
             msg = "Attempted to read JPEG metadata. Failed because an image segment is incomplete."
             raise ValueError(msg)
-        if marker[1] in {0xE1, 0xE2}:
+        if marker[1] in {0xE1, 0xE2, 0xED}:
             result += marker + length_bytes + source.read_at(position + 4, size - 2)
         position += size + 2
     else:

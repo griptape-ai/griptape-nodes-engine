@@ -591,6 +591,9 @@ class _BlockReader:
                 continue
             size = unit_bytes * value_count
             if size > self._remaining_value_bytes:
+                if self._tiff_file:
+                    msg = "Attempted to read TIFF metadata. Failed because the metadata exceeds the size limit."
+                    raise ValueError(msg)
                 continue
             if size <= _INLINE_BYTES:
                 raw = data.read_at(position + 8, size)
