@@ -211,8 +211,9 @@ class VariableResolver:
         rather than asking per value.
         """
         if workflow is None:
-            return engine.workflow_manager.variable_substitution.is_enabled()
-        return workflow.variables.substitution_enabled
+            # A node with no workflow of its own has nothing to name, so the open workflow decides.
+            workflow = engine.current_workflow_or_none()
+        return engine.workflow_manager.variable_substitution.is_enabled(workflow)
 
     @staticmethod
     def get_variables_if_enabled(

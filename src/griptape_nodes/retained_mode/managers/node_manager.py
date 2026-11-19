@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
-    from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
@@ -512,16 +511,6 @@ class NodeManager(EngineScoped):
     def handle_flow_rename(self, workflow: WorkflowRuntime, old_name: str, new_name: str) -> None:
         # Find all instances where a node had the old parent and update it to the new one.
         workflow.nodes.rename_flow(old_name, new_name)
-
-    def _current_nodes_or_none(self) -> WorkflowNodes | None:
-        """The current workflow's node bookkeeping, or None for lookups that find nothing without a workflow.
-
-        Only edge methods read through here.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return None
-        return workflow.nodes
 
     def _cleanup_node_on_failed_deserialization(self, workflow: WorkflowRuntime, node_name: str) -> None:
         """Clean up a node that failed during deserialization.
@@ -3498,16 +3487,17 @@ class NodeManager(EngineScoped):
     def get_node_parent_flow_by_name(self, node_name: str) -> str:
         """The name of the flow the open workflow's node belongs to.
 
-        Edge method for code not handed a workflow; engine code reads `workflow.nodes.parent_flow_name`.
+        Edge method for `VariableResolver`, which node code calls with no workflow to pass; engine code
+        reads `workflow.nodes.parent_flow_name`.
 
         Raises:
             KeyError: No node of that name is in the open workflow, or no workflow is open.
         """
-        nodes = self._current_nodes_or_none()
-        if nodes is None:
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
             msg = f"Node '{node_name}' could not be found."
             raise KeyError(msg)
-        return nodes.parent_flow_name(node_name)
+        return workflow.nodes.parent_flow_name(node_name)
 
     @handles(ResolveNodeRequest)
     async def on_resolve_from_node_request(  # noqa: PLR0911
@@ -3547,8 +3537,8 @@ class NodeManager(EngineScoped):
         spec = ResolveNodeSpec(request=request, workflow=workflow, flow_name=flow.name, node_name=node.name)
         # A node run while another node's run is in progress joins that run, so the two run side by side.
         if flow_mgr.check_for_existing_running_flow_in(workflow) and workflow.flows.global_single_node_resolution:
-            return await flow_mgr.join_run_in_progress(spec)
-        return await flow_mgr.start_run(spec)
+            return await flow_mgr.join_run_in_progress(workflow, spec)
+        return await flow_mgr.start_run(workflow, spec)
 
     async def execute_resolve_node(  # noqa: C901, PLR0911
         self, workflow: WorkflowRuntime, node: BaseNode, flow: ControlFlow, *, debug_mode: bool
@@ -3977,7 +3967,7 @@ class NodeManager(EngineScoped):
                     # that never answered the start would never answer the lease either. One refused for
                     # a reason that may pass, such as capacity, is leased and started again.
                     if wm.may_start_worker(library_name):
-                        lease = await wm.acquire_lease(library_name, request.node_name)
+                        lease = await wm.acquire_lease(workflow, library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
                 worker_engine_id = (
                     library_manager.workers.get_worker_for_library(library_name) if library_name else None

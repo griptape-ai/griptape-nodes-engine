@@ -355,7 +355,7 @@ class TestSubstitutionFlagOnTheRuntime:
         result = engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
 
         assert isinstance(result, WorkflowNotNamedResultFailure)
-        assert engine.workflow_manager.variable_substitution.is_enabled() is True
+        assert engine.workflow_manager.variable_substitution.is_enabled(None) is True
 
     def test_the_flag_is_held_by_the_open_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -363,7 +363,7 @@ class TestSubstitutionFlagOnTheRuntime:
         engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
 
         assert engine.current_workflow().variables.substitution_enabled is False
-        assert engine.workflow_manager.variable_substitution.is_enabled() is False
+        assert engine.workflow_manager.variable_substitution.is_enabled(engine.current_workflow()) is False
 
     def test_the_flag_does_not_survive_clearing_and_reopening_the_same_workflow(self, engine: Engine) -> None:
         name = engine.context_manager.push_workflow(workflow_name="outer")
@@ -372,7 +372,7 @@ class TestSubstitutionFlagOnTheRuntime:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         engine.context_manager.push_workflow(workflow_name=name)
 
-        assert engine.workflow_manager.variable_substitution.is_enabled() is True
+        assert engine.workflow_manager.variable_substitution.is_enabled(engine.current_workflow()) is True
 
 
 class TestNodesAndFlowsOnTheRuntime:
@@ -381,13 +381,13 @@ class TestNodesAndFlowsOnTheRuntime:
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
         runtime = engine.current_workflow()
         runtime.nodes.name_to_parent_flow_name["node"] = "canvas"
-        engine.flow_manager._global_single_node_resolution = True
+        runtime.flows.global_single_node_resolution = True
 
         assert engine.node_manager.get_node_parent_flow_by_name("node") == "canvas"
         assert runtime.flows.name_to_parent_name == {"canvas": None}
         assert runtime.flows.global_single_node_resolution is True
         assert engine.flow_manager.get_connections() is runtime.flows.connections
-        assert engine.flow_manager.global_dag_builder.connections is runtime.flows.connections
+        assert runtime.flows.global_dag_builder.connections is runtime.flows.connections
 
         engine.context_manager.pop_workflow()
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -395,14 +395,12 @@ class TestNodesAndFlowsOnTheRuntime:
         reopened = engine.current_workflow()
         assert reopened.nodes.name_to_parent_flow_name == {}
         assert reopened.flows.name_to_parent_name == {}
-        assert not engine.flow_manager.global_single_node_resolution
+        assert not reopened.flows.global_single_node_resolution
         assert not engine.flow_manager.does_canvas_exist(reopened)
 
-    def test_lookups_find_no_node_or_run_with_no_workflow_open(self, engine: Engine) -> None:
+    def test_lookups_find_no_node_with_no_workflow_open(self, engine: Engine) -> None:
         with pytest.raises(KeyError, match="could not be found"):
             engine.node_manager.get_node_parent_flow_by_name("node")
-        assert not engine.flow_manager.check_for_existing_running_flow()
-        assert not engine.flow_manager.execution_is_advancing()
 
     def test_listing_the_canvas_flows_with_no_workflow_open_finds_none(self, engine: Engine) -> None:
         result = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=None))
@@ -470,9 +468,9 @@ class TestNodesAndFlowsOnTheRuntime:
         async def second_body() -> ResultPayload:
             return StartFlowResultSuccess(result_details="second ran")
 
-        running = asyncio.ensure_future(engine.flow_manager.start_run(_RunSpec("flow", first_body)))
+        running = asyncio.ensure_future(engine.flow_manager.start_run(first, _RunSpec("flow", first_body)))
         await asyncio.sleep(0)
-        waiting = engine.flow_manager.submit_run(_RunSpec("flow", second_body))
+        waiting = engine.flow_manager.submit_run(_RunSpec("flow", second_body), flows=first.flows)
 
         assert first.flows.run_in_progress is not None
         assert first.flows.run_queue.snapshot() == [waiting]
@@ -526,11 +524,11 @@ class TestNodesAndFlowsOnTheRuntime:
 
         async def read_run_state() -> dict[str, object]:
             await release.wait()
-            flow_manager = engine.flow_manager
+            flows = engine.current_workflow().flows
             return {
-                "dag_builder": flow_manager.global_dag_builder,
-                "flow_queue": flow_manager.global_flow_queue,
-                "single_node_resolution": flow_manager.global_single_node_resolution,
+                "dag_builder": flows.global_dag_builder,
+                "flow_queue": flows.global_flow_queue,
+                "single_node_resolution": flows.global_single_node_resolution,
             }
 
         async def start_run(_request: _StartRunRequest) -> ResultPayloadSuccess:

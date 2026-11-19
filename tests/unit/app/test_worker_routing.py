@@ -446,10 +446,8 @@ class TestDropAllLocalObjectsHandler:
         closed = engine.context_manager.adopt_orchestrator_workflow(_CLOSED_WORKFLOW_ID, None, None, None)
         still_open = engine.context_manager.adopt_orchestrator_workflow(_OPEN_WORKFLOW_ID, None, None, None)
         manager = engine.resource_manager
-        with engine.run_in_worker_workflow(closed):
-            closed_key = manager.put_local_object(object(), owner="Lib A", source="N", key="closed")
-        with engine.run_in_worker_workflow(still_open):
-            open_key = manager.put_local_object(object(), owner="Lib A", source="N", key="open")
+        closed_key = manager.put_local_object(object(), owner="Lib A", source="N", key="closed", workflow=closed)
+        open_key = manager.put_local_object(object(), owner="Lib A", source="N", key="open", workflow=still_open)
 
         result = await _handle_drop_all_local_objects(
             DropAllLocalObjectsRequest(workflow_id=_CLOSED_WORKFLOW_ID), event_manager=engine.event_manager

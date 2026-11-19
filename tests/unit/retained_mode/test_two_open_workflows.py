@@ -982,15 +982,13 @@ class TestHeldObjects:
         a, b = two_open
         released: list[str] = []
         resources = engine.resource_manager
-        # Held while each workflow's node runs, which is bound to it.
-        with engine.bind_workflow(a):
-            key_a = resources.put_local_object(
-                "model for A", owner="Lib", source="node_in_A", key="a", on_drop=lambda _v: released.append("A")
-            )
-        with engine.bind_workflow(b):
-            resources.put_local_object(
-                "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B")
-            )
+        # Held for the workflow each node belongs to.
+        key_a = resources.put_local_object(
+            "model for A", owner="Lib", source="node_in_A", key="a", on_drop=lambda _v: released.append("A"), workflow=a
+        )
+        resources.put_local_object(
+            "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B"), workflow=b
+        )
 
         engine.close_workflow(b)
 
@@ -1018,14 +1016,12 @@ class TestHeldObjects:
         engine.close_workflow(a)
         released: list[str] = []
         resources = engine.resource_manager
-        with engine.bind_workflow(NO_WORKFLOW):
-            resources.put_local_object(
-                "shared model", owner="Lib", source="host", key="h", on_drop=lambda _v: released.append("host")
-            )
-        with engine.bind_workflow(b):
-            resources.put_local_object(
-                "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B")
-            )
+        resources.put_local_object(
+            "shared model", owner="Lib", source="host", key="h", on_drop=lambda _v: released.append("host")
+        )
+        resources.put_local_object(
+            "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B"), workflow=b
+        )
 
         with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all:
             result = _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), None)
@@ -1042,9 +1038,10 @@ class TestHeldObjects:
         a, b = two_open
         released: list[str] = []
         resources = engine.resource_manager
-        for workflow, label in ((a, "A"), (b, "B"), (NO_WORKFLOW, "host")):
-            with engine.bind_workflow(workflow):
-                resources.put_local_object(label, owner="Lib", source=label, key=label, on_drop=released.append)
+        for workflow, label in ((a, "A"), (b, "B"), (None, "host")):
+            resources.put_local_object(
+                label, owner="Lib", source=label, key=label, on_drop=released.append, workflow=workflow
+            )
 
         with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all:
             result = _send(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True), None)
@@ -1147,11 +1144,9 @@ class TestWorkerForTwoOrchestratorWorkflows:
         assert runtime_a is not None
         assert runtime_b is not None
         resources = worker_engine.resource_manager
-        # Held while each workflow's node runs, which is bound to its runtime.
-        with worker_engine.run_in_worker_workflow(runtime_a):
-            key_a = resources.put_local_object("A's model", owner="Lib", source="pa", key="a")
-        with worker_engine.run_in_worker_workflow(runtime_b):
-            key_b = resources.put_local_object("B's model", owner="Lib", source="pb", key="b")
+        # Held for the runtime each workflow's node belongs to.
+        key_a = resources.put_local_object("A's model", owner="Lib", source="pa", key="a", workflow=runtime_a)
+        key_b = resources.put_local_object("B's model", owner="Lib", source="pb", key="b", workflow=runtime_b)
 
         # The orchestrator closes A and tells its workers which workflow closed.
         await _handle_drop_all_local_objects(

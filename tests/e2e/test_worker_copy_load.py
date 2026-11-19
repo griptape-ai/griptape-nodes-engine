@@ -198,7 +198,7 @@ def _what_the_worker_still_holds(worker: SimulatedWorker) -> dict[str, list[str]
             ]
             held["node parents"] += list(workflow.nodes.name_to_parent_flow_name)
             held["flow parents"] += [
-                name for name in engine.flow_manager._name_to_parent_name if name != _WORKER_COPIES_FLOW_NAME
+                name for name in workflow.flows.name_to_parent_name if name != _WORKER_COPIES_FLOW_NAME
             ]
     return {kind: sorted(names) for kind, names in held.items()}
 

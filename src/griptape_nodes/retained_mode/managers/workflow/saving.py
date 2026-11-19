@@ -429,6 +429,7 @@ class WorkflowSaver(EngineScoped):
             is_template=existing.is_template,
             branched_from=branched_from,
             workflow_shape=workflow_shape,
+            workflow=workflow,
         )
         # _save_workflow_file_inline returns a SaveWorkflowFileFromSerializedFlowResult*
         # (its native result family). on_save_workflow_request's public contract
@@ -617,9 +618,19 @@ class WorkflowSaver(EngineScoped):
 
     @handles(SaveWorkflowFileFromSerializedFlowRequest)
     async def on_save_workflow_file_from_serialized_flow_request(
-        self, request: SaveWorkflowFileFromSerializedFlowRequest
+        self, request: SaveWorkflowFileFromSerializedFlowRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
-        """Save a workflow file from serialized flow commands without registry overhead."""
+        """Save a workflow file from serialized flow commands without registry overhead.
+
+        The file keeps the settings of the workflow the request runs in, such as disabled variable
+        substitution. With no workflow it gets the defaults.
+        """
+        return self._save_serialized_flow_file(request, workflow=workflow)
+
+    def _save_serialized_flow_file(
+        self, request: SaveWorkflowFileFromSerializedFlowRequest, *, workflow: WorkflowRuntime | None
+    ) -> ResultPayload:
+        """Write the file `request` describes, generating its code against `workflow` (None when it names none)."""
         # Determine write destination
         if request.file_path:
             # Callers that pre-resolved a file path (rename, failed-workflow saver,
@@ -645,6 +656,7 @@ class WorkflowSaver(EngineScoped):
             is_template=request.is_template,
             branched_from=request.branched_from,
             workflow_shape=request.workflow_shape,
+            workflow=workflow,
         )
 
     @handles(SaveSubflowToWorkflowRequest)
@@ -724,7 +736,7 @@ class WorkflowSaver(EngineScoped):
             is_template=existing.is_template,
             workflow_shape=workflow_shape,
         )
-        save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
+        save_file_result = self._save_serialized_flow_file(save_file_request, workflow=workflow)
         if not isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             details = (
                 f"Attempted to save subflow '{request.flow_name}' to '{file_path}'. "
@@ -1195,6 +1207,7 @@ class WorkflowSaver(EngineScoped):
         is_template: bool | None,
         branched_from: str | None,
         workflow_shape: WorkflowShape | None,
+        workflow: WorkflowRuntime | None,
     ) -> ResultPayload:
         """Generate the workflow file content and write it to ``destination``.
 
@@ -1202,6 +1215,8 @@ class WorkflowSaver(EngineScoped):
         ``on_save_workflow_file_from_serialized_flow_request``. Callers with a
         pre-resolved Path wrap it as ``ProjectFileDestination(str(path), ...)``
         before calling this helper.
+
+        ``workflow`` is the open workflow being saved, or None when the request names none.
         """
         if creation_date is None:
             creation_date = datetime.now(tz=UTC)
@@ -1226,6 +1241,7 @@ class WorkflowSaver(EngineScoped):
             final_code_output = self.engine.workflow_manager.codegen.generate_workflow_file_content(
                 serialized_flow_commands=serialized_flow_commands,
                 workflow_metadata=workflow_metadata,
+                workflow=workflow,
             )
         except Exception as err:
             details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during content generation: {err}"

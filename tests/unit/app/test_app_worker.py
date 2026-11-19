@@ -111,7 +111,7 @@ def worker_manager() -> WorkerManager:
     # No transport to other engines until a test attaches one.
     gtn.can_reach_other_engines = False
     # Outside any run until a test puts the code in one.
-    gtn.flow_manager.current_run.return_value = None
+    gtn.flow_manager.current_run_in.return_value = None
     wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
         send_message=AsyncMock(),
@@ -1486,6 +1486,8 @@ class TestWorkerExecutionPath:
 
 _HOST_ENGINE = "gpu-01-engine-id"
 _LIBRARY = "Heavy Library"
+# The workflow whose node asks for a lease; the engine here is a mock, so any object stands for it.
+_WORKFLOW = MagicMock()
 _LICENSE = "artist-license"
 _ARTIST_ENGINE = "artist-engine-id"
 _ARTIST_SESSION = "artist-sess"
@@ -3175,7 +3177,7 @@ def _in_run(worker_manager: WorkerManager, run_id: str = "run-1") -> MagicMock:
     run = MagicMock()
     run.run_id = run_id
     run.ended = asyncio.get_running_loop().create_future()
-    worker_manager.engine.flow_manager.current_run.return_value = run  # type: ignore[attr-defined]
+    worker_manager.engine.flow_manager.current_run_in.return_value = run  # type: ignore[attr-defined]
     return run
 
 
@@ -3208,7 +3210,7 @@ class TestReleasingALeaseOnAnotherEngine:
 
         worker_manager.engine.request = lost_once  # type: ignore[method-assign]
         with patch("griptape_nodes.retained_mode.managers.worker_manager._REPORT_RETRY_PAUSE_S", new=0):
-            lease = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+            lease = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale")
             worker_manager.release_after_node(lease)
             await asyncio.gather(*worker_manager._engine_notices)
 
@@ -3316,9 +3318,9 @@ class TestAskingAnotherEngineForALease:
         run = _in_run(worker_manager)
         _offer_session_to(worker_manager, _HOST_ENGINE)
 
-        first = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        first = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale")
         worker_manager.release_after_node(first)
-        second = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+        second = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Denoise")
         worker_manager.release_after_node(second)
         await _settle()
         assert links.sent_types() == ["AcquireLeaseRequest"], "a run's later nodes ask for nothing more"
@@ -3345,12 +3347,12 @@ class TestAskingAnotherEngineForALease:
         links = _host_engine(worker_manager)
         _in_run(worker_manager)
         _offer_session_to(worker_manager, _HOST_ENGINE)
-        before = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        before = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale")
         worker_manager.release_after_node(before)
 
         await worker_manager.on_engine_lost(_HOST_ENGINE)
         _offer_session_to(worker_manager, _HOST_ENGINE)
-        after = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+        after = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Denoise")
 
         assert before is not None
         assert after is not None
@@ -3366,12 +3368,12 @@ class TestAskingAnotherEngineForALease:
         links = _host_engine(worker_manager)
         _in_run(worker_manager)
         _offer_session_to(worker_manager, _HOST_ENGINE)
-        before = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        before = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale")
         worker_manager.release_after_node(before)
 
         worker_manager._withdraw_session_offers()
         _offer_session_to(worker_manager, _HOST_ENGINE)
-        after = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+        after = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Denoise")
 
         assert before is not None
         assert after is not None
@@ -3385,9 +3387,9 @@ class TestAskingAnotherEngineForALease:
         links = _host_engine(worker_manager)
         _offer_session_to(worker_manager, _HOST_ENGINE)
 
-        first = await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+        first = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale")
         worker_manager.release_after_node(first)
-        second = await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+        second = await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Denoise")
         worker_manager.release_after_node(second)
         await asyncio.gather(*worker_manager._engine_notices)
 
@@ -3411,7 +3413,7 @@ class TestAskingAnotherEngineForALease:
         links.blocked["AcquireLeaseRequest"] = asyncio.Event()
         report = worker_manager.engine.flow_manager.report_run_waiting_for_engine
         _in_run(worker_manager)
-        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale"))
         await _settle()
         (acquire,) = links.sent_of(worker_events.AcquireLeaseRequest)
         lease_id = cast("worker_events.AcquireLeaseRequest", acquire).lease_id
@@ -3433,7 +3435,7 @@ class TestAskingAnotherEngineForALease:
     async def test_a_library_that_runs_here_needs_no_lease(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
 
-        assert await worker_manager.acquire_lease("Local Library", "Upscale") is None
+        assert await worker_manager.acquire_lease(_WORKFLOW, "Local Library", "Upscale") is None
         assert links.sent == []
 
     @pytest.mark.asyncio
@@ -3446,10 +3448,10 @@ class TestAskingAnotherEngineForALease:
         _in_run(worker_manager)
 
         with pytest.raises(RuntimeError, match="never registered"):
-            await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+            await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale")
         assert worker_manager._leases == {}
         with pytest.raises(RuntimeError, match="never registered"):
-            await worker_manager.acquire_lease(_LIBRARY, "Denoise")
+            await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Denoise")
 
         assert links.sent_types().count("AcquireLeaseRequest") == 2  # noqa: PLR2004
 
@@ -3461,7 +3463,7 @@ class TestAskingAnotherEngineForALease:
         links.not_found = "gpu-01 did not answer."
 
         with pytest.raises(RuntimeError, match="gpu-01 did not answer"):
-            await worker_manager.acquire_lease(_LIBRARY, "Upscale")
+            await worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale")
 
         assert worker_manager._leases == {}
 
@@ -3473,8 +3475,8 @@ class TestAskingAnotherEngineForALease:
         links.blocked["AcquireLeaseRequest"] = asyncio.Event()
         run = _in_run(worker_manager)
         _offer_session_to(worker_manager, _HOST_ENGINE)
-        cancelled = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
-        waiting = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Denoise"))
+        cancelled = asyncio.create_task(worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale"))
+        waiting = asyncio.create_task(worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Denoise"))
         await _settle()
 
         cancelled.cancel()
@@ -3497,7 +3499,7 @@ class TestAskingAnotherEngineForALease:
         links = _host_engine(worker_manager)
         links.blocked["AcquireLeaseRequest"] = asyncio.Event()
         _offer_session_to(worker_manager, _HOST_ENGINE)
-        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale"))
         await _settle()
 
         acquiring.cancel()
@@ -3514,7 +3516,7 @@ class TestAskingAnotherEngineForALease:
         links = _host_engine(worker_manager)
         links.blocked["AcquireLeaseRequest"] = asyncio.Event()
         _in_run(worker_manager)
-        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale"))
         await _settle()
         (acquire,) = links.sent_of(worker_events.AcquireLeaseRequest)
         lease_id = cast("worker_events.AcquireLeaseRequest", acquire).lease_id
@@ -3534,7 +3536,7 @@ class TestAskingAnotherEngineForALease:
     async def test_only_the_engine_it_waits_on_may_report_its_place(self, worker_manager: WorkerManager) -> None:
         links = _host_engine(worker_manager)
         links.blocked["AcquireLeaseRequest"] = asyncio.Event()
-        acquiring = asyncio.create_task(worker_manager.acquire_lease(_LIBRARY, "Upscale"))
+        acquiring = asyncio.create_task(worker_manager.acquire_lease(_WORKFLOW, _LIBRARY, "Upscale"))
         await _settle()
         (acquire,) = links.sent_of(worker_events.AcquireLeaseRequest)
         lease_id = cast("worker_events.AcquireLeaseRequest", acquire).lease_id

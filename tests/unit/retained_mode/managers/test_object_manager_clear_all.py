@@ -2,7 +2,7 @@
 
 `reset_global_execution_state()` drops the run's task bookkeeping and nulls its
 machine state, which makes the flow look idle. Anything that cancels on the
-strength of `check_for_existing_running_flow()` afterwards -- including
+strength of `check_for_existing_running_flow_in()` afterwards -- including
 `Engine.clear_current_workflow_data`, whose whole job here is to "cancel any
 running flow so the delete path doesn't race with execution" -- is then a no-op,
 and the previous run's node tasks carry on: still billing API calls, and still
