@@ -6,7 +6,7 @@ import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from static_ffmpeg import run as static_ffmpeg_run
 
@@ -405,43 +405,23 @@ class VideoArtifactProvider(BaseArtifactProvider):
             logger.warning("Attempted to find video stream in '%s'. No video stream found.", source_path)
             return None
 
+        # A field ffprobe reports in an unexpected form falls back to its "unknown" value (0), so the rest still count.
         codec = video_stream.get("codec_name", "unknown")
+        width = cls._probe_int(video_stream.get("width", 0), "width", source_path)
+        height = cls._probe_int(video_stream.get("height", 0), "height", source_path)
+        frame_rate = cls._probe_frame_rate(video_stream.get("r_frame_rate", "0/1"), source_path)
 
-        # ffprobe fields are strings or numbers we don't control; a value that won't convert means no metadata.
-        try:
-            width = int(video_stream.get("width", 0))
-            height = int(video_stream.get("height", 0))
+        # Duration from stream or format level
+        duration_seconds = cls._probe_float(video_stream.get("duration", 0.0), "duration", source_path)
+        if duration_seconds == 0.0:
+            format_info = probe_data.get("format", {})
+            duration_seconds = cls._probe_float(format_info.get("duration", 0.0), "duration", source_path)
 
-            # Parse frame rate from r_frame_rate (e.g., "30/1" or "24000/1001")
-            frame_rate = 0.0
-            r_frame_rate = video_stream.get("r_frame_rate", "0/1")
-            if "/" in r_frame_rate:
-                num, den = r_frame_rate.split("/")
-                if int(den) != 0:
-                    frame_rate = int(num) / int(den)
-
-            # Duration from stream or format level
-            duration_seconds = float(video_stream.get("duration", 0.0))
-            if duration_seconds == 0.0:
-                format_info = probe_data.get("format", {})
-                duration_seconds = float(format_info.get("duration", 0.0))
-        except (ValueError, TypeError) as exc:
-            logger.warning(
-                "Attempted to read video properties from '%s'. Failed due to unexpected ffprobe output: %s",
-                source_path,
-                exc,
-            )
-            return None
-
+        file_size = 0
         try:
             file_size = Path(source_path).stat().st_size
         except OSError as exc:
-            logger.warning(
-                "Attempted to read the file size of '%s'. Failed due to: %s",
-                source_path,
-                exc,
-            )
-            return None
+            logger.warning("Attempted to read the file size of '%s'. Failed due to: %s", source_path, exc)
 
         return VideoArtifactMetadata(
             width=width,
@@ -451,3 +431,45 @@ class VideoArtifactProvider(BaseArtifactProvider):
             frame_rate=round(frame_rate, 3),
             file_size=file_size,
         )
+
+    @staticmethod
+    def _probe_int(value: Any, field_name: str, source_path: str) -> int:
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Attempted to read the video %s of '%s'. Failed due to an unexpected ffprobe value: %r",
+                field_name,
+                source_path,
+                value,
+            )
+            return 0
+
+    @staticmethod
+    def _probe_float(value: Any, field_name: str, source_path: str) -> float:
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            logger.warning(
+                "Attempted to read the video %s of '%s'. Failed due to an unexpected ffprobe value: %r",
+                field_name,
+                source_path,
+                value,
+            )
+            return 0.0
+
+    @staticmethod
+    def _probe_frame_rate(r_frame_rate: Any, source_path: str) -> float:
+        """Parse ffprobe's r_frame_rate fraction (e.g., "30/1" or "24000/1001")."""
+        try:
+            numerator, denominator = (int(part) for part in r_frame_rate.split("/"))
+        except (AttributeError, ValueError, TypeError):
+            logger.warning(
+                "Attempted to read the video frame rate of '%s'. Failed due to an unexpected ffprobe value: %r",
+                source_path,
+                r_frame_rate,
+            )
+            return 0.0
+        if denominator == 0:
+            return 0.0
+        return numerator / denominator
