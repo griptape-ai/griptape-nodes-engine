@@ -12,6 +12,15 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.111.1] - 2026-11-18
+
+### Fixed
+
+- A node in a library that runs in its own process now names itself when Griptape Cloud refuses its
+  `BudgetAccessRequest` and it raises the refusal: the run stops with "Budget stopped this run.
+  'Node' was blocked by ...", as for a node in the engine, instead of "The next call was blocked by".
+  [#5869](https://github.com/griptape-ai/griptape-nodes-engine/issues/5869)
+
 ## [0.111.0] - 2026-11-16
 
 ### Changed
@@ -1291,7 +1300,8 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.111.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.111.1...HEAD
+[0.111.1]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.111.0...v0.111.1
 [0.111.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.110.0...v0.111.0
 [0.110.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.109.0...v0.110.0
 [0.109.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.108.0...v0.109.0
