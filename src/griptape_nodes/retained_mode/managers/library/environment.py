@@ -167,7 +167,9 @@ class LibraryEnvironment(EngineScoped):
             logger.info("Creating virtual environment at %s with Python %s", library_venv_path, python_version)
             is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
             await subprocess_run(
-                [uv_path, "venv", str(library_venv_path), "--python", python_version],
+                # The running interpreter, not its version string: uv may not discover this interpreter
+                # by version and would download a matching Python instead.
+                [uv_path, "venv", str(library_venv_path), "--python", sys.executable],
                 check=True,
                 capture_output=not is_debug,
                 text=True,

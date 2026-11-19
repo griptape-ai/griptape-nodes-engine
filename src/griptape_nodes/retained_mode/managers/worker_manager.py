@@ -84,6 +84,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.worker_events import LibraryLoadReport
     from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
     from griptape_nodes.retained_mode.managers.run_queue import Run
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
     from griptape_nodes.worker.channel import AsyncChannel, PendingWorker
     from griptape_nodes.worker.wire import WorkerHello
 
@@ -1040,8 +1041,8 @@ class WorkerManager(EngineScoped):
         msg = f"{host_engine_id}, the computer running this library's nodes, did not run it: {result.result_details}"
         raise worker_events.WorkerGoneError(msg)
 
-    async def acquire_lease(self, library_name: str, node_name: str) -> EngineLease | None:
-        """Wait until the engine that runs `library_name`'s worker holds a lease for the node, or None if it runs here.
+    async def acquire_lease(self, workflow: WorkflowRuntime, library_name: str, node_name: str) -> EngineLease | None:
+        """Wait until the engine that runs `library_name`'s worker holds a lease for the node of `workflow`, or None if it runs here.
 
         A run asks each engine once: its later nodes there wait on the same lease, and its end releases
         it. A node outside any run has a lease of its own, which `release_after_node` releases.
@@ -1055,7 +1056,7 @@ class WorkerManager(EngineScoped):
         host_engine_id = self._engine_for_library(library_name)
         if host_engine_id is None:
             return None
-        lease = self._lease_for(host_engine_id)
+        lease = self._lease_for(workflow, host_engine_id)
         request_task = cast("asyncio.Task[ResultPayload]", lease.request_task)
         try:
             # Shielded, since the run's other nodes may wait on the same lease.
@@ -1083,9 +1084,9 @@ class WorkerManager(EngineScoped):
             return
         self._end_lease(lease)
 
-    def _lease_for(self, host_engine_id: str) -> EngineLease:
-        """The lease the code executing now uses on `host_engine_id`, acquired there if it has none."""
-        run = self.engine.flow_manager.current_run()
+    def _lease_for(self, workflow: WorkflowRuntime, host_engine_id: str) -> EngineLease:
+        """The lease the code executing now in `workflow` uses on `host_engine_id`, acquired there if it has none."""
+        run = self.engine.flow_manager.current_run_in(workflow)
         if run is not None:
             lease = self._run_leases.get((run.run_id, host_engine_id))
             if lease is not None:

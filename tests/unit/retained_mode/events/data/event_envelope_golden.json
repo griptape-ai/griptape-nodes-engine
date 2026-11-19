@@ -120,6 +120,7 @@
     }
   },
   "AppEvent": {
+    "open_workflow_id": null,
     "event_type": "AppEvent",
     "payload_type": "AppInitializationComplete",
     "payload": {

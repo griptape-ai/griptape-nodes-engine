@@ -46,6 +46,7 @@ from griptape_nodes.exe_types.node_types import (
     StartNode,
 )
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
@@ -371,7 +372,7 @@ class NodeExecutor(EngineScoped):
                 workflow, self._node_finish_process_event(start_event, outcome=outcome, failure=failure)
             )
 
-    async def _run_node(self, workflow: WorkflowRuntime, node: BaseNode) -> None:
+    async def _run_node(self, workflow: WorkflowRuntime, node: BaseNode) -> None:  # noqa: C901, PLR0911
         """Run the given node by the path its type and execution environment call for.
 
         Args:
@@ -414,6 +415,10 @@ class NodeExecutor(EngineScoped):
             # Handle iterative loop nodes - check if we need to package and execute the loop
             if isinstance(node, BaseIterativeEndNode):
                 await self.handle_loop_execution(node)
+                return
+
+            if isinstance(node, WorkflowNode):
+                await self._run_workflow_node(node)
                 return
 
             # Resolved here because only this process has workflow context to resolve it FROM;
@@ -463,6 +468,20 @@ class NodeExecutor(EngineScoped):
             # A connection torn down while this node was running left its input value in place so the
             # node could finish on it. Now that it has, drop it.
             node.reset_deferred_input_values()
+
+    async def _run_workflow_node(self, node: WorkflowNode) -> None:
+        """Run a Workflow node in this process and outside any node's run, as a local group runs.
+
+        It loads a workflow file and runs it as a subflow, which is graph work rather than node code:
+        inside a node's run, strict mode and the other running-node checks would treat the loaded
+        workflow as the node's own code. Failures are built as ExecuteNodeRequest builds them, so
+        budget-halt failures read the same.
+        """
+        try:
+            await node.aprocess()
+        except Exception as exc:
+            failure = self.engine.node_manager.execution_failure(exc, node.name)
+            raise self._execute_node_failed_error(node.name, failure, failure.exception) from failure.exception
 
     def _node_start_process_event(
         self, workflow: WorkflowRuntime, node: BaseNode, loop_body_scope: LoopBodyScope | None
@@ -1460,7 +1479,7 @@ class NodeExecutor(EngineScoped):
 
         return tuple(source_that_reached_end) == source
 
-    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
+    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
@@ -1491,7 +1510,6 @@ class NodeExecutor(EngineScoped):
         # where a raise after creation but before execution would leak the flow. deserialized_flows
         # is populated the instant the flow is created. (The flow is also tagged transient at
         # packaging time, so a mid-run save cannot bake it into the workflow regardless.)
-        workflow_context = workflow.context
         event_manager = self.engine.event_manager
         deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
         self._silence_packaged_node_creation_broadcasts(package_result)
@@ -1510,10 +1528,6 @@ class NodeExecutor(EngineScoped):
                 # Track for cleanup as soon as the flow exists (iteration index 0 is a placeholder;
                 # the single flow is reused across all iterations).
                 deserialized_flows.append((0, flow_name, node_name_mappings))
-
-                # Pop the deserialized flow from context stack
-                if workflow_context.has_current_flow() and workflow_context.get_current_flow().name == flow_name:
-                    workflow_context.pop_flow()
 
             logger.debug("Successfully deserialized flow for sequential execution: %s", flow_name)
             # Get node mappings
@@ -2105,7 +2119,6 @@ class NodeExecutor(EngineScoped):
         Returns:
             Tuple of (flow_name, node_name_mappings, packaged_start_node_name)
         """
-        workflow_context = workflow.context
         event_manager = self.engine.event_manager
         self._silence_packaged_node_creation_broadcasts(package_result)
         with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
@@ -2119,9 +2132,6 @@ class NodeExecutor(EngineScoped):
 
             flow_name = deserialize_result.flow_name
             node_name_mappings = deserialize_result.node_name_mappings
-
-            if workflow_context.has_current_flow() and workflow_context.get_current_flow().name == flow_name:
-                workflow_context.pop_flow()
 
         packaged_start_node_name = node_name_mappings.get(start_node_name)
         if packaged_start_node_name is None:
@@ -3532,8 +3542,6 @@ class NodeExecutor(EngineScoped):
         # flows are also tagged transient at packaging time, so a mid-run save can never bake them
         # into the workflow even in the window before cleanup runs.)
         deserialized_flows = []
-        workflow_context = workflow.context
-        saved_context_flow = workflow_context.get_current_flow() if workflow_context.has_current_flow() else None
         self._silence_packaged_node_creation_broadcasts(package_result)
 
         # Everything about the iteration flows stays off the wire, from the first deserialize to the last
@@ -3546,16 +3554,6 @@ class NodeExecutor(EngineScoped):
         ):
             try:
                 for iteration_index in range(total_iterations):
-                    # Restore context before each deserialization to ensure all iteration flows
-                    # are created at the same level (not as children of each other)
-                    if saved_context_flow is not None:
-                        # Pop any flows that were pushed during previous iteration
-                        while (
-                            workflow_context.has_current_flow()
-                            and workflow_context.get_current_flow() != saved_context_flow
-                        ):
-                            workflow_context.pop_flow()
-
                     deserialize_request = DeserializeFlowFromCommandsRequest(
                         serialized_flow_commands=package_result.serialized_flow_commands
                     )
@@ -3567,15 +3565,6 @@ class NodeExecutor(EngineScoped):
                     deserialized_flows.append(
                         (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
                     )
-
-                    # Pop the deserialized flow from the context stack to prevent it from staying there
-                    # Deserialization pushes the flow onto the stack, but we don't want iteration flows
-                    # to remain on the stack after deserialization
-                    if (
-                        workflow_context.has_current_flow()
-                        and workflow_context.get_current_flow().name == deserialize_result.flow_name
-                    ):
-                        workflow_context.pop_flow()
                 logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
                 # Step 2: Define the per-iteration coroutine
                 packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
@@ -4348,7 +4337,7 @@ class NodeExecutor(EngineScoped):
                 if target_node.should_preserve_stored_template(target_param_name, param_value):
                     self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
                 else:
-                    self.engine.node_manager.on_set_parameter_value_request_in_workflow(
+                    self.engine.node_manager.on_set_parameter_value_request(
                         SetParameterValueRequest(
                             node_name=target_node_name,
                             parameter_name=target_param_name,

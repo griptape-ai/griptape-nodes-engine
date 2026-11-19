@@ -231,8 +231,8 @@ class TestRuns:
             return StartFlowResultSuccess(result_details="second ran")
 
         with engine.bind_workflow(workflow):
-            first_run = engine.flow_manager.submit_run(_Spec("flow", first))
-            second_run = engine.flow_manager.submit_run(_Spec("flow", second))
+            first_run = engine.flow_manager.submit_run(_Spec("flow", first), flows=workflow.flows)
+            second_run = engine.flow_manager.submit_run(_Spec("flow", second), flows=workflow.flows)
         first_may_end.set()
         await asyncio.wait_for(asyncio.gather(first_run.ended, second_run.ended), timeout=1.0)
 
@@ -256,12 +256,12 @@ class TestRuns:
             return StartFlowResultSuccess(result_details="ran")
 
         with engine.bind_workflow(workflow):
-            failed = engine.flow_manager.submit_run(_Spec("flow", fails))
+            failed = engine.flow_manager.submit_run(_Spec("flow", fails), flows=workflow.flows)
         await asyncio.wait_for(failed.ended, timeout=1.0)
         assert engine.open_workflow_info(workflow).state == OpenWorkflowState(last_run_error="Node 'Text One' failed.")
 
         with engine.bind_workflow(workflow):
-            following = engine.flow_manager.submit_run(_Spec("flow", holds))
+            following = engine.flow_manager.submit_run(_Spec("flow", holds), flows=workflow.flows)
         assert engine.open_workflow_info(workflow).state == OpenWorkflowState(run_state=WorkflowRunState.RUNNING)
         next_may_end.set()
         await asyncio.wait_for(following.ended, timeout=1.0)
@@ -283,7 +283,7 @@ class TestRuns:
         machine.resolution_machine.get_error_message.return_value = "Node 'Text One' failed."
         with patch.object(flow_manager, "_flow_is_running", side_effect=lambda _flows: flow_running["value"]):
             with engine.bind_workflow(workflow):
-                run = flow_manager.submit_run(_Spec("flow", pauses))
+                run = flow_manager.submit_run(_Spec("flow", pauses), flows=workflow.flows)
             await asyncio.wait_for(run.outcome, timeout=1.0)
 
             flows.global_control_flow_machine = machine
@@ -304,7 +304,7 @@ class TestRuns:
             raise RuntimeError(msg)
 
         with engine.bind_workflow(workflow):
-            run = engine.flow_manager.submit_run(_Spec("flow", raises))
+            run = engine.flow_manager.submit_run(_Spec("flow", raises), flows=workflow.flows)
         await asyncio.wait_for(run.ended, timeout=1.0)
 
         assert engine.open_workflow_info(workflow).state.last_run_error == (
@@ -321,8 +321,8 @@ class TestRuns:
             return StartFlowResultSuccess(result_details="ran")
 
         with engine.bind_workflow(workflow):
-            first = engine.flow_manager.submit_run(_Spec("flow", holds))
-            waiting = engine.flow_manager.submit_run(_Spec("flow", holds))
+            first = engine.flow_manager.submit_run(_Spec("flow", holds), flows=workflow.flows)
+            waiting = engine.flow_manager.submit_run(_Spec("flow", holds), flows=workflow.flows)
         _state_events(queue)
 
         assert await engine.flow_manager.cancel_run_in(workflow, waiting.run_id)

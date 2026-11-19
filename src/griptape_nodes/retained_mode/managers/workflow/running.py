@@ -659,34 +659,6 @@ class WorkflowRunner(EngineScoped):
             return
         entry.opened_by_clean_slate_run = True
 
-    async def _ensure_workflow_context_established(self, workflow: WorkflowRuntime) -> None:
-        """Ensure `workflow`, which a file just built into, has a current flow."""
-        if not workflow.context.has_current_flow():
-            # Use the proper request to get the top-level flow
-            from griptape_nodes.retained_mode.events.flow_events import (
-                GetTopLevelFlowRequest,
-                GetTopLevelFlowResultSuccess,
-            )
-
-            top_level_flow_request = GetTopLevelFlowRequest()
-            top_level_flow_result = await workflow.ahandle_request(top_level_flow_request)
-
-            if (
-                isinstance(top_level_flow_result, GetTopLevelFlowResultSuccess)
-                and top_level_flow_result.flow_name is not None
-            ):
-                # Push the flow to the context stack permanently using FlowManager
-                flow_manager = self.engine.flow_manager
-                flow_obj = flow_manager.get_flow_by_name_in(workflow, top_level_flow_result.flow_name)
-                workflow.context.push_flow(flow_obj)
-                details = f"Workflow execution completed. Set '{top_level_flow_result.flow_name}' as current context."
-                logger.debug(details)
-
-            # If we still don't have a flow, that's a critical error
-            if not workflow.context.has_current_flow():
-                error_message = "Workflow execution completed but no current flow context could be established"
-                raise RuntimeError(error_message)
-
     async def _run_workflow_in_frame(
         self,
         *,
@@ -733,15 +705,18 @@ class WorkflowRunner(EngineScoped):
                 if workflow_builder is not None and iscoroutinefunction(workflow_builder):
                     await workflow_builder()
 
-                # After workflow execution, ensure there's always a current context by pushing
-                # the top-level flow if the context is empty. This fixes regressions where
-                # with Workflow Schema version 0.6.0+ workflows expect context to be established.
-                await self._ensure_workflow_context_established(workflow)
-
         except Exception as e:
             return WorkflowExecutionResult(
                 execution_successful=False,
                 execution_details=f"Failed to run workflow on path '{complete_file_path}'. Exception: {e}",
+                status=WorkflowStatus.UNUSABLE,
+                problems=tuple(frame.problems),
+                workflow_id=workflow.workflow_id,
+            )
+        if workflow.top_level_flow() is None:
+            return WorkflowExecutionResult(
+                execution_successful=False,
+                execution_details=f"Failed to run workflow on path '{complete_file_path}'. It built no top-level flow.",
                 status=WorkflowStatus.UNUSABLE,
                 problems=tuple(frame.problems),
                 workflow_id=workflow.workflow_id,

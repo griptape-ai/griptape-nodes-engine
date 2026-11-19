@@ -28,7 +28,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
-    from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
@@ -65,7 +64,6 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
-from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.files.directory import DirectoryDestinationProvider
 from griptape_nodes.files.file import FileDestinationProvider
 from griptape_nodes.files.file_sequence import FileSequenceDestinationProvider
@@ -513,16 +511,6 @@ class NodeManager(EngineScoped):
         # Find all instances where a node had the old parent and update it to the new one.
         workflow.nodes.rename_flow(old_name, new_name)
 
-    def _current_nodes_or_none(self) -> WorkflowNodes | None:
-        """The current workflow's node bookkeeping, or None for lookups that find nothing without a workflow.
-
-        Only edge methods read through here.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return None
-        return workflow.nodes
-
     def _cleanup_node_on_failed_deserialization(self, workflow: WorkflowRuntime, node_name: str) -> None:
         """Clean up a node that failed during deserialization.
 
@@ -930,9 +918,12 @@ class NodeManager(EngineScoped):
         with self._loading(node.name, request.specific_library_name) as state_scope:
             node.state = NodeResolutionState(state)
 
-        # See if we want to push this into the context of the current flow.
         if request.set_as_new_context:
-            workflow.context.push_node(node)
+            logger.warning(
+                "CreateNodeRequest for Node '%s' set set_as_new_context, which is deprecated and ignored. "
+                "Name the node on later requests, or send them inside a ContextManager().node() block.",
+                final_node_name,
+            )
 
         # Success message based on whether we used Current Context or explicit flow
         if request.override_parent_flow_name is None:
@@ -1512,8 +1503,6 @@ class NodeManager(EngineScoped):
             details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
             return DeleteNodeResultFailure(result_details=details)
 
-        # Awaited outside the node context: the context stack is shared, so holding the node on it
-        # across an await lets another task see it as current and pair its pops with another delete's.
         cancel_outcome = await self.cancel_conditionally(workflow, parent_flow, parent_flow_name, node)
         if cancel_outcome.failure is not None:
             return cancel_outcome.failure
@@ -1582,10 +1571,6 @@ class NodeManager(EngineScoped):
 
         # Now remove the record keeping
         self._forget_node(workflow, node, parent_flow)
-
-        # If we were part of the Current Context, pop it.
-        if request.node_name is None:
-            workflow.context.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
         # Stopping a run the artist started is not something to do silently. Say it happened, and say
@@ -2362,20 +2347,8 @@ class NodeManager(EngineScoped):
             group_name=new_group.name, node_name=node_name, result_details=details
         )
 
-    def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
-        """Remove a parameter from a node of the open workflow, outside dispatch.
-
-        Edge method for code that calls the handler directly and is not handed a workflow (node
-        library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{request.node_name}'. Failed because no workflow is open."
-            return RemoveParameterFromNodeResultFailure(result_details=details)
-        return self.on_remove_parameter_from_node_request_in_workflow(request, workflow)
-
     @handles(RemoveParameterFromNodeRequest)
-    def on_remove_parameter_from_node_request_in_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_remove_parameter_from_node_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: RemoveParameterFromNodeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         node_name = request.node_name
@@ -2711,7 +2684,7 @@ class NodeManager(EngineScoped):
                 source_node = self.get_node_by_name_in(workflow, conn.source_node_name)
                 source_param = source_node.get_parameter_by_name(conn.source_parameter_name)
                 if source_param and not parameter.is_incoming_type_allowed(source_param.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=conn.source_node_name,
                             source_parameter_name=conn.source_parameter_name,
@@ -2730,7 +2703,7 @@ class NodeManager(EngineScoped):
                 target_node = self.get_node_by_name_in(workflow, conn.target_node_name)
                 target_param = target_node.get_parameter_by_name(conn.target_parameter_name)
                 if target_param and not target_param.is_incoming_type_allowed(parameter.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=node_name,
                             source_parameter_name=request.parameter_name,
@@ -2877,22 +2850,9 @@ class NodeManager(EngineScoped):
         details = f"Successfully altered details for ParameterGroup '{request.group_name}' from Node '{node_name}'."
         return AlterParameterGroupDetailsResultSuccess(result_details=details)
 
-    def on_get_parameter_value_request(self, request: GetParameterValueRequest) -> ResultPayload:
-        """Answer `request` for the open workflow, outside dispatch.
-
-        Kept for node libraries that call it directly. Engine code sends the request instead.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = (
-                f"Attempted to get value for Parameter '{request.parameter_name}'. Failed because no workflow is open."
-            )
-            return GetParameterValueResultFailure(result_details=details)
-        return self.on_get_parameter_value_request_in_workflow(request, workflow)
-
     # For C901 (too complex): Need to give customers explicit reasons for failure on each case.
     @handles(GetParameterValueRequest)
-    def on_get_parameter_value_request_in_workflow(
+    def on_get_parameter_value_request(
         self, request: GetParameterValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         node_name = request.node_name
@@ -2950,21 +2910,9 @@ class NodeManager(EngineScoped):
         value: Any
         modified: bool
 
-    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
-        """Set a parameter value on a node of the open workflow, outside dispatch.
-
-        Edge method for code that calls the handler directly and is not handed a workflow (node
-        library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = f"Attempted to set parameter value for '{request.node_name}.{request.parameter_name}'. Failed because no workflow is open."
-            return SetParameterValueResultFailure(result_details=details)
-        return self.on_set_parameter_value_request_in_workflow(request, workflow)
-
     # added ignoring C901 since this method is overly long because of granular error checking, not actual complexity.
     @handles(SetParameterValueRequest)
-    def on_set_parameter_value_request_in_workflow(
+    def on_set_parameter_value_request(
         self, request: SetParameterValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         if not request.initial_setup:
@@ -3414,7 +3362,7 @@ class NodeManager(EngineScoped):
 
         # Iterate through all nodes in this Flow (yes, this restriction still sucks)
         list_nodes_in_flow_request = ListNodesInFlowRequest(flow_name=flow_name)
-        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request_in_workflow(
+        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request(
             list_nodes_in_flow_request, workflow
         )
         if not list_nodes_in_flow_result.succeeded():
@@ -3506,12 +3454,12 @@ class NodeManager(EngineScoped):
         return sorted(owned)
 
     def get_node_by_name(self, name: str) -> BaseNode:
-        """The open workflow's node named `name`.
+        """The node named `name` in the workflow the caller is bound to.
 
         Edge method for code not handed a workflow; engine code calls `get_node_by_name_in`.
 
         Raises:
-            ValueError: No node of that name is in the open workflow, or no workflow is open.
+            ValueError: No node of that name is in the bound workflow, or the caller is bound to none.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -3533,18 +3481,19 @@ class NodeManager(EngineScoped):
         return node
 
     def get_node_parent_flow_by_name(self, node_name: str) -> str:
-        """The name of the flow the open workflow's node belongs to.
+        """The name of the flow the bound workflow's node belongs to.
 
-        Edge method for code not handed a workflow; engine code reads `workflow.nodes.parent_flow_name`.
+        Edge method for `VariableResolver`, which node code calls with no workflow to pass; engine code
+        reads `workflow.nodes.parent_flow_name`.
 
         Raises:
-            KeyError: No node of that name is in the open workflow, or no workflow is open.
+            KeyError: No node of that name is in the bound workflow, or the caller is bound to none.
         """
-        nodes = self._current_nodes_or_none()
-        if nodes is None:
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
             msg = f"Node '{node_name}' could not be found."
             raise KeyError(msg)
-        return nodes.parent_flow_name(node_name)
+        return workflow.nodes.parent_flow_name(node_name)
 
     @handles(ResolveNodeRequest)
     async def on_resolve_from_node_request(  # noqa: PLR0911
@@ -3584,8 +3533,8 @@ class NodeManager(EngineScoped):
         spec = ResolveNodeSpec(request=request, workflow=workflow, flow_name=flow.name, node_name=node.name)
         # A node run while another node's run is in progress joins that run, so the two run side by side.
         if flow_mgr.check_for_existing_running_flow_in(workflow) and workflow.flows.global_single_node_resolution:
-            return await flow_mgr.join_run_in_progress(spec)
-        return await flow_mgr.start_run(spec)
+            return await flow_mgr.join_run_in_progress(workflow, spec)
+        return await flow_mgr.start_run(workflow, spec)
 
     async def execute_resolve_node(  # noqa: C901, PLR0911
         self, workflow: WorkflowRuntime, node: BaseNode, flow: ControlFlow, *, debug_mode: bool
@@ -3664,12 +3613,6 @@ class NodeManager(EngineScoped):
 
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
-
-        Like node groups and loops, a Workflow node is the exception and stays in this
-        process: it imports, starts and reads its subflow from this process's flows. The
-        nodes inside its subflow are still routed to their own workers. The check sits here
-        rather than in `NodeExecutor._run_node` beside the group and loop checks, so the
-        node keeps the request path's hydration and failure reporting.
         """
         library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
@@ -3689,9 +3632,7 @@ class NodeManager(EngineScoped):
         # scope, not ours. Decide forwarding first; only open a local scope when
         # this process is actually going to execute the node. The orchestrator found
         # its node in `workflow` above.
-        #
-        # Workflow nodes stay in this process; see the docstring.
-        if node is not None and workflow is not None and not isinstance(node, WorkflowNode):
+        if node is not None and workflow is not None:
             # "This library cannot run right now" is expected and recoverable -- an evicted worker,
             # or one that never started -- and get_worker_for_library reports it by raising. Caught
             # here so it reads as the node failure it is, rather than an unhandled engine error that
@@ -3808,7 +3749,7 @@ class NodeManager(EngineScoped):
         """Make a flow for one execution's copy, under the worker's own top-level flow. Returns its name."""
         if workflow.objects.get_as_type(_WORKER_COPIES_FLOW_NAME, ControlFlow) is None:
             top_result = workflow.handle_request(
-                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME, set_as_new_context=False)
+                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME)
             )
             if not isinstance(top_result, CreateFlowResultSuccess):
                 details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {top_result.result_details}"
@@ -3817,7 +3758,6 @@ class NodeManager(EngineScoped):
             CreateFlowRequest(
                 parent_flow_name=_WORKER_COPIES_FLOW_NAME,
                 flow_name=f"{_WORKER_COPIES_FLOW_NAME}_{uuid4().hex}",
-                set_as_new_context=False,
             )
         )
         if not isinstance(flow_result, CreateFlowResultSuccess):
@@ -4014,7 +3954,7 @@ class NodeManager(EngineScoped):
                     # that never answered the start would never answer the lease either. One refused for
                     # a reason that may pass, such as capacity, is leased and started again.
                     if wm.may_start_worker(library_name):
-                        lease = await wm.acquire_lease(library_name, request.node_name)
+                        lease = await wm.acquire_lease(workflow, library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
                 worker_engine_id = (
                     library_manager.workers.get_worker_for_library(library_name) if library_name else None
@@ -4288,7 +4228,7 @@ class NodeManager(EngineScoped):
                 with aprocess_scope(request.variables, node):
                     await node.aprocess()
             except Exception as e:
-                return self._execution_failure(e, node_name)
+                return self.execution_failure(e, node_name)
             finally:
                 # The scratch marker only means anything while the run is in flight. A parameter
                 # the node still holds here was never torn down, so serialization must treat it
@@ -4322,7 +4262,7 @@ class NodeManager(EngineScoped):
             result_details=f"Node '{node.name}' executed successfully.",
         )
 
-    def _execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
+    def execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
         """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
         budget_halt = self._budget_halt_for(exc, node_name)
         if budget_halt is not None:
@@ -6632,9 +6572,7 @@ class NodeManager(EngineScoped):
                 target_node_name=new_node_name,
                 target_parameter_name=incoming_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
-                connection_request, workflow
-            )
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request, workflow)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_incoming.append(incoming_connection)
 
@@ -6645,9 +6583,7 @@ class NodeManager(EngineScoped):
                 target_node_name=outgoing_connection.target_node_name,
                 target_parameter_name=outgoing_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
-                connection_request, workflow
-            )
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request, workflow)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_outgoing.append(outgoing_connection)
 

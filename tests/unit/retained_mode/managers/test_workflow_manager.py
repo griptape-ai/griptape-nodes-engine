@@ -127,8 +127,14 @@ from griptape_nodes.retained_mode.managers.workflow.shape import (
 from griptape_nodes.retained_mode.managers.workflow_manager import (
     WorkflowManager,
 )
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
-from tests.workflow_context import empty_workflow_registry
+from tests.workflow_context import (
+    empty_workflow_registry,
+    send_in_the_open_workflow,
+    send_in_the_open_workflow_async,
+    the_open_workflow,
+)
 
 
 def _file_path(context_manager: "ContextManager") -> str | None:
@@ -1556,6 +1562,7 @@ class TestWorkflowManager:
             context_manager.push_workflow(workflow_name=workflow_key)
 
             # Create a top-level flow under the active workflow so there's state to tear down.
+            workflow = engine.current_workflow()
             create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None))
             assert isinstance(create_result, CreateFlowResultSuccess)
             flow_name = create_result.flow_name
@@ -1569,15 +1576,18 @@ class TestWorkflowManager:
                 )
 
                 assert isinstance(result, DeleteWorkflowResultSuccess)
-                # Context stack is fully torn down.
-                assert not context_manager.has_current_workflow()
-                # Child flow was deleted too; no orphans left in the ObjectManager.
-                assert not object_manager.has_object_with_name(flow_name)
-                assert not object_manager.get_filtered_subset(type=ControlFlow)
+                # Nothing is left open: the push bound this test to the workflow, so it now holds a
+                # binding to a closed one, and its reads are refused rather than finding another.
+                assert engine.open_workflows.all_open() == []
+                with pytest.raises(WorkflowNotOpenError):
+                    context_manager.has_current_workflow()
+                # Child flow was deleted too; no orphans left in the workflow's objects.
+                assert not workflow.objects.has(flow_name)
+                assert workflow.objects.get_filtered_subset(type=ControlFlow) == {}
                 # Registry entry is gone.
                 assert engine.workflow_registry.find_by_name(workflow_key) is None
             finally:
-                if context_manager.has_current_workflow():
+                if engine.open_workflows.all_open():
                     context_manager.pop_workflow()
 
     def test_delete_non_active_workflow_leaves_context_untouched(self, engine: Engine) -> None:
@@ -2872,20 +2882,13 @@ class TestWorkflowManager:
         assert ast.unparse(open_stmt) == "GriptapeNodes.ContextManager().push_workflow(file_path=__file__)"
         assert ast.unparse(build_stmt) == "await build_workflow()"
 
-    def test_generate_workflow_file_content_ensure_context_is_async(self, engine: Engine) -> None:
-        """_ensure_workflow_context is now async and must await ahandle_request."""
+    def test_generated_file_leaves_the_current_flow_to_the_engine(self, engine: Engine) -> None:
+        """The engine treats the top-level flow as current, so the file neither pins it nor asks for it."""
         content = self._generate(engine, with_shape=True)
-        module = ast.parse(content)
 
-        ensure = next(
-            node
-            for node in module.body
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ensure_workflow_context"
-        )
-        body_src = "\n".join(ast.unparse(stmt) for stmt in ensure.body)
-        assert "await GriptapeNodes.ahandle_request" in body_src
-        # Sanity check: the old sync variant is gone.
-        assert "GriptapeNodes.handle_request(" not in body_src
+        assert "_ensure_workflow_context" not in content
+        assert "push_flow" not in content
+        assert "set_as_new_context" not in content
 
     def test_generate_workflow_file_content_is_valid_python(self, engine: Engine) -> None:
         """Generated content must parse cleanly (no smuggled-string comments left behind)."""
@@ -3670,11 +3673,10 @@ class TestRunWorkflowWithCurrentStateRequest:
     ) -> None:
         open_flow = Mock(spec=ControlFlow)
         open_flow.name = self._OPEN_FLOW_NAME
-        open_workflow.context.push_flow(open_flow)
-
-        result = await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
-            RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
-        )
+        with open_workflow.context.flow(open_flow):
+            result = await engine.workflow_manager.runner.on_run_workflow_with_current_state_request(
+                RunWorkflowWithCurrentStateRequest(file_path=self._WORKFLOW_FILE), open_workflow
+            )
 
         assert isinstance(result, RunWorkflowWithCurrentStateResultFailure), result
         # The guard is a precondition on engine state, so the file never gets exec'd.
@@ -3892,6 +3894,7 @@ class TestWorkflowSaveSituationMacro:
         destination, _relative = workflow_manager.saver._build_workflow_save_path(f"{file_name}.py")
 
         result = workflow_manager.saver._save_workflow_file_inline(
+            workflow=None,
             destination=destination,
             serialized_flow_commands=self._empty_commands(),
             file_name=file_name,
@@ -3911,6 +3914,34 @@ class TestWorkflowSaveSituationMacro:
             f"Expected success, got {result.result_details}"
         )
         return result.file_path
+
+    def test_a_save_from_serialized_flow_keeps_its_workflows_disabled_substitution(
+        self, engine: Engine, temp_dir: Path
+    ) -> None:
+        """Packaging and the failed-run saver send this request bound to their workflow; its setting must survive."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowFileFromSerializedFlowRequest,
+            SaveWorkflowFileFromSerializedFlowResultSuccess,
+            SetVariableSubstitutionEnabledRequest,
+        )
+
+        entry = engine.workflow_registry.register_unsaved("substitution_off", listed=False)
+        workflow = engine.open_workflow(entry.workflow_id)
+        workflow.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
+
+        result = asyncio.run(
+            workflow.ahandle_request(
+                SaveWorkflowFileFromSerializedFlowRequest(
+                    serialized_flow_commands=self._empty_commands(),
+                    file_name="substitution_off",
+                    file_path=str(temp_dir / "substitution_off.py"),
+                )
+            )
+        )
+
+        assert isinstance(result, SaveWorkflowFileFromSerializedFlowResultSuccess), result.result_details
+        content = Path(result.file_path).read_text(encoding="utf-8")
+        assert "SetVariableSubstitutionEnabledRequest(enabled=False" in content
 
     def test_first_save_writes_v001(self, engine: Engine, temp_dir: Path) -> None:
         """Bug #4941: the first save with `{_index:03}` must produce v001 (not fail with MISSING_REQUIRED)."""
@@ -3935,6 +3966,7 @@ class TestWorkflowSaveSituationMacro:
         assert relative == str(Path("episode") / "my_workflow.py")
 
         result = workflow_manager.saver._save_workflow_file_inline(
+            workflow=None,
             destination=destination,
             serialized_flow_commands=self._empty_commands(),
             file_name="my_workflow",
@@ -4085,7 +4117,7 @@ class TestWorkflowCreationHonorsSaveSituation:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
         return save_result.workflow_name
 
@@ -4144,7 +4176,9 @@ class TestWorkflowCreationHonorsSaveSituation:
             engine.ahandle_request(OpenWorkflowRequest(workflow_name=created.workflow_name, create_flow=True))
         )
         assert isinstance(opened, OpenWorkflowResultSuccess), opened.result_details
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=created.workflow_name)))
+        saved = asyncio.run(
+            send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=created.workflow_name))
+        )
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert Path(saved.file_path) == Path(created.file_path)
@@ -4416,7 +4450,7 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
         engine.workflow_registry.get_workflow_by_name(save_result.workflow_name).metadata.is_template = True
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
@@ -4449,7 +4483,7 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
         metadata = engine.workflow_registry.get_workflow_by_name(save_result.workflow_name).metadata
         metadata.is_griptape_provided = True
@@ -4500,7 +4534,7 @@ class TestWorkflowCreationOnTheDefaultProject:
         library_content = library_file.read_text(encoding="utf-8")
         copy_id = self._open_library_workflow_copy(engine, library_key)
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert saved.workflow_id == copy_id
@@ -4508,7 +4542,9 @@ class TestWorkflowCreationOnTheDefaultProject:
         assert Path(saved.file_path).exists()
         assert library_file.read_text(encoding="utf-8") == library_content
 
-        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=saved.workflow_name)))
+        saved_again = asyncio.run(
+            send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=saved.workflow_name))
+        )
 
         assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
         assert Path(saved_again.file_path) == Path(saved.file_path)
@@ -4527,14 +4563,16 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         library_key = self._make_library_workflow(engine, "library_workflow")
         self._open_library_workflow_copy(engine, library_key)
-        engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
+        send_in_the_open_workflow(engine, SetVariableSubstitutionEnabledRequest(enabled=False))
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
-        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=saved.workflow_name)))
+        saved_again = asyncio.run(
+            send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=saved.workflow_name))
+        )
         assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
 
-        assert engine.workflow_manager.variable_substitution.is_enabled() is False
+        assert engine.workflow_manager.variable_substitution.is_enabled(the_open_workflow(engine)) is False
         assert "SetVariableSubstitutionEnabledRequest" in Path(saved_again.file_path).read_text(encoding="utf-8")
 
     def test_saving_the_users_own_workflow_still_overwrites_it(self, engine: Engine, temp_dir: Path) -> None:
@@ -4547,7 +4585,7 @@ class TestWorkflowCreationOnTheDefaultProject:
         own_key = self._make_library_workflow(engine, "own_workflow")
         engine.workflow_registry.get_workflow_by_name(own_key).metadata.is_griptape_provided = False
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=own_key)))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=own_key)))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert Path(saved.file_path) == temp_dir / "own_workflow.py"
@@ -4565,7 +4603,7 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="shot_lighting"))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
 
         branched = engine.handle_request(BranchWorkflowRequest(workflow_name=save_result.workflow_name))
@@ -5946,8 +5984,6 @@ class TestConcurrentWorkflowImports:
             task_name = asyncio.current_task().get_name()  # type: ignore[union-attr]
             arrived[task_name].set()
             await asyncio.wait_for(asyncio.gather(arrived["A"].wait(), arrived["B"].wait()), timeout=5.0)
-            # Both imports are inside their flow context; neither push may reach the shared stack.
-            assert self.shared_stack_names(engine) == []
             if task_name == "B":
                 await asyncio.wait_for(a_created.wait(), timeout=5.0)
             result = engine.handle_request(
@@ -5986,11 +6022,6 @@ class TestConcurrentWorkflowImports:
         assert result_b.created_flow_name == "ConcImportedB"
         assert engine.flow_manager.get_parent_flow_in(workflow, "ConcImportedA") == target_a
         assert engine.flow_manager.get_parent_flow_in(workflow, "ConcImportedB") == target_b
-        assert self.shared_stack_names(engine) == []
-
-    def shared_stack_names(self, engine: Engine) -> list[str]:
-        workflow_stack = engine.current_workflow().context
-        return [flow_state._flow.name for flow_state in workflow_stack._flow_stack]
 
 
 class TestReferencedWorkflowTagging:
@@ -6626,19 +6657,19 @@ class TestRepairPathShapedDisplayName:
 class TestNodeLibraryDelegates:
     """Node libraries call these on `GriptapeNodes.WorkflowManager()`; they must reach the parts."""
 
-    def test_run_workflow_opens_the_file_when_no_workflow_is_open(self, engine: Engine) -> None:
+    def test_run_workflow_opens_the_file_when_it_is_given_no_workflow(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
-            assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
+            assert asyncio.run(workflow_manager.run_workflow("flow.py", None)) is result
         run_mock.assert_awaited_once_with("flow.py", None)
 
-    def test_run_workflow_builds_into_the_open_workflow(self, engine: Engine) -> None:
+    def test_run_workflow_builds_into_the_workflow_it_is_given(self, engine: Engine) -> None:
         workflow_manager = engine.workflow_manager
         opened = engine.context_manager.open_workflow(workflow_name="open")
         result = WorkflowExecutionResult(execution_successful=True, execution_details="ok")
         with patch.object(workflow_manager.runner, "run_workflow", AsyncMock(return_value=result)) as run_mock:
-            assert asyncio.run(workflow_manager.run_workflow("flow.py")) is result
+            assert asyncio.run(workflow_manager.run_workflow("flow.py", opened)) is result
         run_mock.assert_awaited_once_with("flow.py", opened)
 
     def test_walk_object_tree_delegates_to_codegen(self, engine: Engine) -> None:

@@ -123,15 +123,14 @@ class ReferencedWorkflowImport(EngineScoped):
             details = f"Attempted to import unsaved workflow '{imported.name}' as a referenced sub flow."
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
-        # Execute the workflow within the target flow context, on this task's own copy
-        # of the flow stack so concurrent imports cannot push onto each other's. Only
+        # Execute the workflow within the target flow context. Only
         # the flows this import creates are recorded, so flows created by other tasks
         # are never mistaken for ours. A nested import records into its own list; its
         # flows sit inside ours, so deleting ours removes them.
         flow_manager = self.engine.flow_manager
         with flow_manager.task_local_flow_creation_record() as created_flows:
             try:
-                workflow_result = await self._run_workflow_file_on_task_local_flow_stack(
+                workflow_result = await self._run_workflow_file_in_flow(
                     workflow, request, imported, workflow_file_path, flow_name
                 )
             except BaseException:
@@ -179,7 +178,7 @@ class ReferencedWorkflowImport(EngineScoped):
             result_details=self._import_result_details(workflow_result, details, level=logging.DEBUG),
         )
 
-    async def _run_workflow_file_on_task_local_flow_stack(
+    async def _run_workflow_file_in_flow(
         self,
         workflow: WorkflowRuntime,
         request: ImportWorkflowAsReferencedSubFlowRequest,
@@ -187,7 +186,7 @@ class ReferencedWorkflowImport(EngineScoped):
         workflow_file_path: str,
         flow_name: str,
     ) -> WorkflowExecutionResult:
-        """Run the workflow file on its own task-local flow stack, inside `flow_name`.
+        """Run the workflow file inside a block for `flow_name`, so the flows it creates land in it.
 
         When track_as_referenced is True, wrap in `referenced_workflow` so the flow
         serializes as an import command. When False, the flow serializes as inline
@@ -195,11 +194,7 @@ class ReferencedWorkflowImport(EngineScoped):
         """
         workflow_manager = self.engine.workflow_manager
         target_flow = self.engine.flow_manager.get_flow_by_name_in(workflow, flow_name)
-        with (
-            workflow.context.task_local_flow_stack(),
-            # Entered after the task-local stack so its push lands on the task-local stack.
-            workflow.context.flow(target_flow),
-        ):
+        with workflow.context.flow(target_flow):
             if request.track_as_referenced:
                 with workflow_manager.referenced_workflow(imported.name):
                     return await workflow_manager.runner.run_workflow(workflow_file_path, workflow)

@@ -30,6 +30,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.slider import Slider
+from tests.workflow_context import bind, the_open_workflow
 
 _LIBRARY_NAME = "trait-state-serialization-test-library"
 
@@ -137,6 +138,7 @@ def _ensure_workflow(engine: Engine) -> None:
         return
     context = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="trait_state_test"))
     assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
+    bind(the_open_workflow(engine))
 
 
 def _add_node(engine: Engine, name: str) -> _ModelPicker:
