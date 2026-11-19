@@ -313,8 +313,10 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class EnsureWorkflowAndFlowResultSuccess(ResultPayloadSuccess):
     """The workflow and its top-level flow are ready for CreateNode calls that name the workflow.
+
+    Reports `altered_workflow_state` when it created the flow of a workflow already open.
 
     Args:
         workflow_name: Name of the workflow the request used or opened.

@@ -46,6 +46,11 @@ class WorkflowFlows:
         # True while cancel_all_runs_in awaits the run in progress, so a run submitted meanwhile waits to be turned away.
         self.cancelling_all = False
 
+    @property
+    def workflow(self) -> WorkflowRuntime | None:
+        """The workflow these flows belong to, or None for a line of runs that belongs to no workflow."""
+        return self._workflow
+
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
         """An execution event about a run here, naming the workflow it belongs to, or none."""
         workflow_id = None

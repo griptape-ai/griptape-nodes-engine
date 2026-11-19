@@ -2285,6 +2285,7 @@ class FlowManager(EngineScoped):
         flows.run_queue.enqueue(run)
         self._start_next_run_if_idle(flows)
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
         return run
 
     async def cancel_run_in(self, workflow: WorkflowRuntime, run_id: str) -> bool:
@@ -2361,6 +2362,7 @@ class FlowManager(EngineScoped):
             self._leave_line(run)
             self._on_run_loop(run, self._end_without_executing, run, f"The run did not start: {reason}")
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
 
     def _end_without_executing(self, run: Run, details: str) -> None:
         """End a run that left the line without executing; its request returns `details`."""
@@ -2405,6 +2407,8 @@ class FlowManager(EngineScoped):
         run.state = RunState.RUNNING
         flows.run_in_progress = run
         flows.driving = True
+        if flows.workflow is not None:
+            flows.workflow.last_run_error = None
         # The run that just ended may have ended on a short-lived loop, such as a synchronous request's.
         self._on_run_loop(run, self._create_driver, run)
 
@@ -2432,6 +2436,7 @@ class FlowManager(EngineScoped):
             # The request awaiting the outcome reports the error, so the driver does not raise it again.
             run.outcome.set_exception(e)
             run.state = RunState.FAILED
+            run.failure = f"Attempted to run flow '{run.flow_name}'. Failed due to: {e}"
             flows.driving = False
             self._finish_run(run)
             return
@@ -2445,6 +2450,7 @@ class FlowManager(EngineScoped):
                 run.state = RunState.FINISHED
             else:
                 run.state = RunState.FAILED
+                run.failure = str(result.result_details)
         self._finish_run(run)
 
     def _finish_run_if_over(self, flows: WorkflowFlows) -> None:
@@ -2460,8 +2466,23 @@ class FlowManager(EngineScoped):
         if run is None or flows.driving or self._run_is_advancing(flows) or self._flow_is_running(flows):
             return
         if run.state is RunState.PAUSED:
-            run.state = RunState.FINISHED
+            # A node that failed while the user stepped or continued the run ends it as a failure.
+            failure = self._flow_failure(flows, run)
+            if failure is None:
+                run.state = RunState.FINISHED
+            else:
+                run.state = RunState.FAILED
+                run.failure = failure
         self._finish_run(run)
+
+    @staticmethod
+    def _flow_failure(flows: WorkflowFlows, run: Run) -> str | None:
+        """Why the flow of `run` failed, or None when it did not."""
+        machine = flows.global_control_flow_machine
+        if machine is None or not machine.resolution_machine.is_errored():
+            return None
+        error_message = machine.resolution_machine.get_error_message() or "A node failed."
+        return f"Attempted to run flow '{run.flow_name}'. Failed due to: {error_message}"
 
     def _finish_run(self, run: Run) -> None:
         """End `run`, the run in progress in its workflow, and start that workflow's next. The only place a run ends."""
@@ -2469,9 +2490,17 @@ class FlowManager(EngineScoped):
         if flows.run_in_progress is not run:
             return
         flows.run_in_progress = None
+        if flows.workflow is not None and run.state is RunState.FAILED:
+            flows.workflow.last_run_error = run.failure or f"The run of flow '{run.flow_name}' failed."
         self._on_run_loop(run, run.ended.set_result, None)
         self._start_next_run_if_idle(flows)
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
+
+    def _report_workflow_state(self, flows: WorkflowFlows) -> None:
+        """Tell clients of the runs of the workflow `flows` belongs to, if it belongs to one."""
+        if flows.workflow is not None:
+            self.engine.report_workflow_state(flows.workflow)
 
     @staticmethod
     def _on_run_loop(run: Run, callback: Callable[..., object], *args: object) -> None:
