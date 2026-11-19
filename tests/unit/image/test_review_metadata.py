@@ -97,7 +97,9 @@ class TestMetadataReview:
 
     def test_tiff_path_reports_custom_metadata_kinds(self, tmp_path: Path) -> None:
         path = tmp_path / "extra.tif"
-        path.write_bytes(gray_tiff({0x02BC: (7, b"<custom/>"), 0x83BB: (7, b"iptc")}))
+        path.write_bytes(
+            gray_tiff({0x02BC: (7, b'<dc:title xmlns:dc="custom">Title</dc:title>'), 0x83BB: (7, b"iptc")})
+        )
         assert read_path_extra_metadata_kinds(path, ImageFormat.TIFF) == ["XMP", "IPTC"]
 
     @pytest.mark.parametrize(

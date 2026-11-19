@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Self
 
 from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io
-from griptape_nodes.image.cache import SourceFingerprint, image_source_access, refresh_image_cache
+from griptape_nodes.image.cache import (
+    SourceFingerprint,
+    image_source_access,
+    invalidate_image_cache,
+    refresh_image_cache,
+)
 from griptape_nodes.image.containers import (
     is_complete,
     read_exif,
@@ -48,6 +54,7 @@ from griptape_nodes.image.operations import (
     GRAYSCALE_ALPHA_CHANNELS,
     GRAYSCALE_CHANNELS,
     RGBA_CHANNELS,
+    checked,
     cover,
     flattened,
     oriented,
@@ -62,7 +69,7 @@ from griptape_nodes.image.pixel_type import PixelType
 from griptape_nodes.image.png_text_chunks import read_text_chunks
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
     from types import TracebackType
 
@@ -126,6 +133,7 @@ class GriptapeImage:
         extra_metadata_kinds: list[str] | None = None,
         display_encoded: bool | None = None,
     ) -> None:
+        self._metadata_override = metadata is not None
         self._source_fingerprint: SourceFingerprint | None = None
         self._source = source
         self._source_path = source_path
@@ -231,15 +239,18 @@ class GriptapeImage:
         exif = None
         if metadata.exif is not None:
             exif = metadata.exif.copy()
-        return type(self)(
-            source=self._source,
-            source_path=self._source_path,
-            buf=self._buf,
-            image_format=self._format,
-            metadata=replace(metadata, text=dict(metadata.text), exif=exif),
-            extra_metadata_kinds=self._extra_kinds,
-            display_encoded=self._display_encoded,
-        )
+        with self.processing_source():
+            attached = type(self)(
+                source=self._source,
+                source_path=self._source_path,
+                buf=self._buf,
+                image_format=self._format,
+                metadata=replace(metadata, text=dict(metadata.text), exif=exif),
+                extra_metadata_kinds=self._extra_kinds,
+                display_encoded=self._display_encoded,
+            )
+            attached._source_fingerprint = self._source_fingerprint
+            return attached
 
     def close(self) -> None:
         """Release the source and decoded pixels."""
@@ -259,7 +270,18 @@ class GriptapeImage:
         optimize: bool = False,
         metadata: ImageMetadata | None = None,
     ) -> bytes:
-        """Encode the image to ``image_format`` bytes."""
+        """Encode the image to ``image_format`` bytes using its current source and metadata."""
+        with self.processing_source():
+            return self._encode(image_format, quality=quality, optimize=optimize, metadata=metadata)
+
+    def _encode(
+        self,
+        image_format: ImageFormat,
+        *,
+        quality: int | None,
+        optimize: bool,
+        metadata: ImageMetadata | None,
+    ) -> bytes:
         if image_format not in ENCODE_EXTENSIONS:
             msg = f"Attempted to save an image as {image_format}. Failed because that format cannot be written."
             raise ValueError(msg)
@@ -278,7 +300,7 @@ class GriptapeImage:
             and self._can_splice(source, image_format, quality, requested, optimize=optimize)
         ):
             encoded = source
-            if not own_metadata:
+            if not own_metadata or self._metadata_override:
                 encoded = spliced(source, image_format, requested, dropped)
         else:
             if self._source_path is not None:
@@ -344,7 +366,7 @@ class GriptapeImage:
             return False
         if quality is not None or optimize:
             return False
-        if requested.icc_profile != self.metadata.icc_profile:
+        if requested.icc_profile != self._read_metadata(source).icc_profile:
             return False
         return is_complete(source, image_format)
 
@@ -391,13 +413,25 @@ class GriptapeImage:
             exif[EXIF_ORIENTATION_TAG] = orientation
         return ImageMetadata(text=text, exif=exif, icc_profile=spec_icc_profile(spec))
 
+    @contextmanager
+    def processing_source(self) -> Iterator[None]:
+        """Refresh and protect a source while planning and consuming its pixels."""
+        if self._source_path is None:
+            yield
+            return
+        with image_source_access(self._source_path):
+            self._refresh_source()
+            try:
+                yield
+            except ValueError:
+                invalidate_image_cache(self._source_path)
+                self._buf = None
+                raise
+
     def run_pipeline(self, steps: Sequence[PipelineStep]) -> GriptapeImage:
         """Apply validated image steps while coordinating cached source consumption."""
-        if self._source_path is not None:
-            with image_source_access(self._source_path):
-                self._refresh_source()
-                return self._run_pipeline(steps)
-        return self._run_pipeline(steps)
+        with self.processing_source():
+            return self._run_pipeline(steps)
 
     def _refresh_source(self) -> None:
         if self._source_path is None:
@@ -406,9 +440,11 @@ class GriptapeImage:
         if fingerprint == self._source_fingerprint:
             return
         self._source_fingerprint = fingerprint
+        self._source = None
         self._buf = None
         self._header = None
-        self._metadata = None
+        if not self._metadata_override:
+            self._metadata = None
         self._extra_kinds = None
 
     def _run_pipeline(self, steps: Sequence[PipelineStep]) -> GriptapeImage:
@@ -430,7 +466,8 @@ class GriptapeImage:
 
     def _apply_step(self, step: PipelineStep | None) -> GriptapeImage:  # noqa: PLR0911
         if step is None:
-            return self._derive(self._decoded().copy(), step)
+            source = self._decoded()
+            return self._derive(checked(source.copy(), source), step)
         if isinstance(step, Flatten):
             return self._derive(flattened(self._decoded(), step), step)
         if isinstance(step, Cover):

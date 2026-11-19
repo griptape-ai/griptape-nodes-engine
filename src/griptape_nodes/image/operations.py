@@ -40,7 +40,7 @@ def checked(buf: oiio.ImageBuf, *sources: oiio.ImageBuf) -> oiio.ImageBuf:
 def alpha_channel(buf: oiio.ImageBuf) -> int | None:
     """Return the index of ``buf``'s alpha channel, or None if it has none."""
     alpha = buf.spec().alpha_channel
-    if alpha < 0:
+    if alpha < 0 or alpha >= buf.nchannels:
         return None
     return alpha
 

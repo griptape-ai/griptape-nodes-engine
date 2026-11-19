@@ -92,7 +92,7 @@ class TestReviewCoverage:
     @pytest.mark.parametrize(
         ("image_format", "data"),
         [
-            (ImageFormat.PNG, b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\x00JUNK" + bytes(4)),
+            (ImageFormat.PNG, b"\x89PNG\r\n\x1a\n" + (b"\x00\x00\x00\x00JUNK" + bytes(4)) * 2),
             (ImageFormat.JPEG, b"\xff\xd8\xff\xe0\x00\x02"),
         ],
     )

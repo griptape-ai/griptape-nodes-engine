@@ -25,7 +25,7 @@ class PngMetadataDriver(BaseImageMetadataDriver):
 
     def inject_metadata(self, image: MetadataImageInput, metadata: dict[str, str]) -> bytes:
         """Inject metadata into PNG text chunks, overwriting matching keys and keeping the rest."""
-        with opening_metadata_image(image) as gt_image:
+        with opening_metadata_image(image, fallback_format=ImageFormat.PNG) as gt_image:
             text_metadata = {key: value for key, value in gt_image.metadata.text.items() if key not in metadata}
             for key, value in metadata.items():
                 text_metadata[key] = str(value)
@@ -33,5 +33,5 @@ class PngMetadataDriver(BaseImageMetadataDriver):
 
     def extract_metadata(self, image: MetadataImageInput) -> dict[str, str]:
         """Extract all text chunks from a PNG image."""
-        with opening_metadata_image(image) as gt_image:
+        with opening_metadata_image(image, fallback_format=ImageFormat.PNG) as gt_image:
             return dict(gt_image.metadata.text)

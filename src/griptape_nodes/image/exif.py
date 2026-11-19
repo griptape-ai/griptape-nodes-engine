@@ -654,6 +654,13 @@ def _is_xmp_stamp(data: bytes, header: _TiffHeader, location: _EntryLocation) ->
     else:
         (value_offset,) = struct.unpack(f"{header.byte_order}I", data[location.position + 8 : location.position + 12])
         packet = data[value_offset : value_offset + location.count]
+    return is_oiio_xmp_stamp(packet)
+
+
+def is_oiio_xmp_stamp(packet: bytes) -> bool:
+    """Whether a small XMP packet contains only OpenImageIO's generated properties."""
+    if len(packet) > _XMP_STAMP_MAX_BYTES:
+        return False
     properties = {
         match.group(0)
         for match in _XMP_QUALIFIED_NAME.finditer(_XMP_QUOTED.sub(b"", packet))

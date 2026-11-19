@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.files.path_utils import canonicalize_for_io
 from griptape_nodes.image.containers import read_exif, read_extra_metadata_kinds, read_icc_profile
-from griptape_nodes.image.exif import Exif, tiff_metadata_from_source
+from griptape_nodes.image.exif import Exif, is_oiio_xmp_stamp, tiff_metadata_from_source
 from griptape_nodes.image.formats import ImageFormat
 from griptape_nodes.image.metadata import ImageMetadata
 from griptape_nodes.image.metadata_reader import FileMetadataSource
@@ -28,7 +28,10 @@ def read_path_metadata(path: Path, image_format: ImageFormat) -> ImageMetadata:
         source = FileMetadataSource(handle)
         if image_format == ImageFormat.TIFF:
             parsed = tiff_metadata_from_source(source)
-            return ImageMetadata(exif=parsed.exif, icc_profile=parsed.icc_profile)
+            exif = None
+            if parsed.exif:
+                exif = parsed.exif
+            return ImageMetadata(exif=exif, icc_profile=parsed.icc_profile)
         if image_format in {ImageFormat.PNG, ImageFormat.WEBP}:
             data = _chunk_metadata(source, image_format)
         else:
@@ -75,11 +78,25 @@ def _tiff_extra_kinds(source: FileMetadataSource) -> list[str]:
         position = offset + 2 + index * 12
         if position + 12 > source.size:
             break
-        tag = struct.unpack(f"{order}H", source.read_at(position, 2))[0]
+        entry = source.read_at(position, 12)
+        tag, field_type, value_count = struct.unpack(f"{order}HHI", entry[:8])
+        if tag == 0x02BC and _path_xmp_stamp(source, entry, order, field_type, value_count):  # noqa: PLR2004
+            continue
         kind = tags.get(tag)
         if kind is not None and kind not in kinds:
             kinds.append(kind)
     return kinds
+
+
+def _path_xmp_stamp(source: FileMetadataSource, entry: bytes, order: str, field_type: int, count: int) -> bool:
+    if field_type not in {1, 7} or count > 4096:  # noqa: PLR2004
+        return False
+    if count <= 4:  # noqa: PLR2004
+        return is_oiio_xmp_stamp(entry[8 : 8 + count])
+    offset = struct.unpack(f"{order}I", entry[8:])[0]
+    if offset + count > source.size:
+        return False
+    return is_oiio_xmp_stamp(source.read_at(offset, count))
 
 
 def _chunk_metadata(source: FileMetadataSource, image_format: ImageFormat) -> bytes:
@@ -92,9 +109,8 @@ def _chunk_metadata(source: FileMetadataSource, image_format: ImageFormat) -> by
         prefix = PNG_SIGNATURE
         selected = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"iCCP"}
     result = bytearray(prefix)
-    for _ in range(_MAX_METADATA_CHUNKS):
-        if position + 8 > source.size:
-            break
+    metadata_chunks = 0
+    while position + 8 <= source.size:
         header = source.read_at(position, 8)
         if is_png:
             size = int.from_bytes(header[:4], "big")
@@ -108,14 +124,17 @@ def _chunk_metadata(source: FileMetadataSource, image_format: ImageFormat) -> by
         if end > source.size:
             msg = "Attempted to read image metadata. Failed because an image chunk is incomplete."
             raise ValueError(msg)
+        pixel_chunk = kind in {b"IDAT", b"VP8 ", b"VP8L", b"ANMF"}
+        if not pixel_chunk:
+            metadata_chunks += 1
+            if metadata_chunks > _MAX_METADATA_CHUNKS:
+                msg = "Attempted to read image metadata. Failed because the image has too many metadata chunks."
+                raise ValueError(msg)
         if kind in selected:
             result += header + source.read_at(position + 8, size + padding)
         position = end
         if kind == b"IEND":
             break
-    else:
-        msg = "Attempted to read image metadata. Failed because the image has too many metadata chunks."
-        raise ValueError(msg)
     return bytes(result)
 
 

@@ -148,9 +148,10 @@ class GriptapeImagePipeline:
         open, ``end`` and encode together in one ``griptape_nodes.utils.async_utils.to_thread`` call,
         as the preview generators do.
         """
-        steps = _plan_steps(self._steps, self._orientation())
-        self._steps.clear()
-        return self._image.run_pipeline(steps)
+        with self._image.processing_source():
+            steps = _plan_steps(self._steps, self._orientation())
+            self._steps.clear()
+            return self._image.run_pipeline(steps)
 
     def _orientation(self) -> int:
         if not any(isinstance(step, _ExifTranspose) for step in self._steps):

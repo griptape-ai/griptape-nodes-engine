@@ -89,11 +89,12 @@ def replace_text_chunks(png: bytes, texts: Mapping[str, str]) -> bytes:
         if end > len(png):
             msg = "Attempted to update PNG metadata. Failed because an image chunk is incomplete."
             raise ValueError(msg)
-        payload = png[position + _CHUNK_HEADER_BYTES : end - _CHUNK_CRC_BYTES]
         retain = kind not in _TEXT_CHUNK_TYPES
-        if kind in _TEXT_CHUNK_TYPES and _decode_text_chunk(kind, payload) is None:
-            key = payload.partition(b"\x00")[0].decode("latin-1")
-            retain = key not in texts
+        if kind in _TEXT_CHUNK_TYPES:
+            payload = png[position + _CHUNK_HEADER_BYTES : end - _CHUNK_CRC_BYTES]
+            if _decode_text_chunk(kind, payload) is None:
+                key = payload.partition(b"\x00")[0].decode("latin-1")
+                retain = key not in texts
         if retain:
             kept += png[position:end]
         position = end

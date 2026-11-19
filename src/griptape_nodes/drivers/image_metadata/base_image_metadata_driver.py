@@ -30,7 +30,9 @@ MetadataImageInput = GriptapeImage | bytes | Path | str | LegacyMetadataImage
 
 
 @contextmanager
-def opening_metadata_image(image: MetadataImageInput) -> Iterator[GriptapeImage]:
+def opening_metadata_image(
+    image: MetadataImageInput, *, fallback_format: ImageFormat | None = None
+) -> Iterator[GriptapeImage]:
     """Yield a ``GriptapeImage`` for ``image``, closing any temporary wrapper on exit.
 
     Accepts ``GriptapeImage``, ``bytes``, ``Path``, ``str``, or a legacy duck-typed image object
@@ -51,6 +53,8 @@ def opening_metadata_image(image: MetadataImageInput) -> Iterator[GriptapeImage]
 
     save_fn = getattr(image, "save", None)
     fmt = getattr(image, "format", None)
+    if fmt is None and fallback_format is not None:
+        fmt = str(fallback_format)
     if not callable(save_fn) or not isinstance(fmt, str) or not fmt:
         msg = f"Unsupported image input for metadata driver: {type(image).__name__}"
         raise TypeError(msg)

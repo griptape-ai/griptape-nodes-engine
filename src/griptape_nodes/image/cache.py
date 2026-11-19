@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from threading import Condition, RLock, local
 from typing import TYPE_CHECKING
@@ -88,6 +88,20 @@ def image_path_mutation(path: str | Path, *, is_directory: bool) -> Iterator[Non
             yield
         finally:
             invalidate_image_cache(path)
+
+
+@contextmanager
+def image_rename_mutation(source: str | Path, destination: str | Path, *, is_directory: bool) -> Iterator[None]:
+    """Coordinate both rename identities without acquiring source locks in opposite orders."""
+    if is_directory:
+        with image_directory_mutation():
+            yield
+        return
+    paths = sorted({str(canonicalize_for_identity(source)), str(canonicalize_for_identity(destination))})
+    with ExitStack() as stack:
+        for path in paths:
+            stack.enter_context(image_path_mutation(path, is_directory=False))
+        yield
 
 
 @contextmanager

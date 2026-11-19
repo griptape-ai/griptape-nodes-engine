@@ -107,6 +107,8 @@ def read_ephemeral_file(path: Path) -> Decoded:
 
 
 def _normalized_decoded(buf: oiio.ImageBuf, file_format_name: str) -> Decoded:
+    if buf.spec().alpha_channel >= buf.nchannels:
+        buf.specmod().alpha_channel = buf.nchannels - 1
     if buf.nchannels == GRAYSCALE_ALPHA_CHANNELS:
         buf.make_writable(keep_cache_type=True)
         buf.specmod().channelnames = ("Y", "A")

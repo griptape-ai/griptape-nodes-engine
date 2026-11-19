@@ -1374,7 +1374,7 @@ class FlowSerialization(EngineScoped):
         with image:
             try:
                 return dict(image.metadata.text)
-            except ValueError as e:
+            except (ValueError, OSError) as e:
                 return ExtractFlowCommandsFromImageMetadataResultFailure(
                     result_details=f"Failed to read image metadata: {e}",
                     file_path=file_url_or_path,
