@@ -18,6 +18,8 @@ class LogHandlerEvent(AppPayload):
         message: The log message content
         levelname: Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
         created: Timestamp when the log entry was created
+        node_name: The node that logged it while running, or None for the engine's own logs. A node's
+            line names its workflow on the `AppEvent` that carries it.
     """
 
     message: str

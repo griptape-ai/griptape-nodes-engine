@@ -24,11 +24,13 @@ from griptape_nodes.retained_mode.engine import EngineScoped, engine_scope
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.app_events import ReportsOpenWorkflow
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     AppPayload,
     BaseEvent,
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
+    ExecutionEvent,
     ExecutionGriptapeNodeEvent,
     ExecutionPayload,
     GraphAccessMixin,
@@ -45,6 +47,7 @@ from griptape_nodes.retained_mode.events.generic_events import (
     WorkflowNotNamedResultFailure,
     WorkflowNotOpenResultFailure,
 )
+from griptape_nodes.retained_mode.events.logger_events import LogHandlerEvent
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
@@ -206,20 +209,30 @@ def _suppression_candidates(event: Any) -> list[Any]:
 
 
 def _name_bound_workflow(event: Any) -> None:
-    """Name the bound workflow on an execution event built without `open_workflow_id`.
+    """Name the bound workflow on an execution event or node log line built without `open_workflow_id`.
 
     Node libraries build events without it, and an event that names no workflow reaches every
     client on the session. One built with `open_workflow_id=None` belongs to no workflow and keeps it.
     """
-    if not isinstance(event, ExecutionGriptapeNodeEvent):
+    envelope = _envelope_naming_workflow(event)
+    if envelope is None:
         return
-    execution_event = event.wrapped_event
-    if "open_workflow_id" in execution_event.model_fields_set:
+    if "open_workflow_id" in envelope.model_fields_set:
         return
     workflow = bound_workflow.get()
     if workflow is None or workflow is NO_WORKFLOW:
         return
-    execution_event.open_workflow_id = workflow.workflow_id
+    envelope.open_workflow_id = workflow.workflow_id
+
+
+def _envelope_naming_workflow(event: Any) -> ExecutionEvent | AppEvent | None:
+    """The envelope of `event` that names the workflow it belongs to, or None for an event that belongs to none."""
+    if isinstance(event, ExecutionGriptapeNodeEvent):
+        return event.wrapped_event
+    # A node's log line belongs to the workflow the node runs in. The engine's other logs belong to none.
+    if isinstance(event, AppEvent) and isinstance(event.payload, LogHandlerEvent) and event.payload.node_name:
+        return event
+    return None
 
 
 def _is_async_callable(callback: Any) -> bool:

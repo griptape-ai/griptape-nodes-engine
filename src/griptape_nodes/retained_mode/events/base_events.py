@@ -499,7 +499,14 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
 
 # Events sent as part of the lifecycle of the Griptape Nodes application.
 class AppEvent[A: AppPayload](BaseEvent):
+    """An event about the application. `open_workflow_id` names the open workflow it belongs to, None for most.
+
+    Only a node's log line names one: `EventManager` fills it in with the bound workflow when the
+    event is queued, as it does for an `ExecutionEvent`.
+    """
+
     payload: A
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an AppEvent, inferring the generic type if needed."""
