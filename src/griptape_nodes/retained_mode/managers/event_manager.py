@@ -80,6 +80,9 @@ if TYPE_CHECKING:
     # its return value is ignored because nothing awaits the notification.
     PostDispatchHook = Callable[[Any, ResultPayload], None] | Callable[[Any, ResultPayload], Awaitable[None]]
 
+    # A result observer sees every result as dispatch produces it, with the workflow its handler took.
+    ResultObserver = Callable[[ResultPayload, WorkflowRuntime | None], None]
+
 
 class WorkerRequestGateDecision(NamedTuple):
     """What a worker request gate decides about one request a library's worker process sent this engine.
@@ -466,6 +469,9 @@ class EventManager(EngineScoped):
         # __hash__ set to None and would raise on set.add.
         self._post_dispatch_hooks: dict[type[RequestPayload], list[PostDispatchHook]] = {}
         self._post_dispatch_hooks_lock = threading.Lock()
+        # Result observers, run inline on every result before its event is built.
+        self._result_observers: list[ResultObserver] = []
+        self._result_observers_lock = threading.Lock()
         # Strong references to in-flight hook tasks; asyncio only holds weak ones, so a
         # task that is not retained here can be garbage collected mid-run (also RUF006).
         self._inflight_post_dispatch_hook_tasks: set[asyncio.Task] = set()
@@ -771,6 +777,23 @@ class EventManager(EngineScoped):
             return None
         finally:
             self._hook_evaluation.active = False
+
+    def add_result_observer(self, observer: ResultObserver) -> None:
+        """Register `observer` to see every request's result, with the workflow its handler took.
+
+        Observers run inline, in registration order, before the result event is built and before
+        post-dispatch hooks, so a change an observer makes to the result reaches every client, and
+        what it records is in place before the caller hears back. Keep them cheap. Registering the
+        same observer twice is a no-op.
+        """
+        with self._result_observers_lock:
+            if observer not in self._result_observers:
+                self._result_observers.append(observer)
+
+    def remove_result_observer(self, observer: ResultObserver) -> None:
+        with self._result_observers_lock:
+            if observer in self._result_observers:
+                self._result_observers.remove(observer)
 
     def add_post_dispatch_hook(self, request_type: type[RP], callback: PostDispatchHook) -> None:
         """Register a callback to run after `request_type`'s handler has produced a result.
@@ -1611,15 +1634,9 @@ class EventManager(EngineScoped):
         refused before dispatch decided.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
-        workflow_mgr = self.engine.workflow_manager
 
         with operation_depth_mgr as depth_manager:
-            # Now see if the WorkflowManager was asking us to squelch altered_workflow_state commands
-            # This prevents situations like loading a workflow (which naturally alters the workflow state)
-            # from coming in and immediately being flagged as being dirty.
-            if workflow_mgr.should_squelch_workflow_altered():
-                callback_result.altered_workflow_state = False
-            self._record_workflow_altered(callback_result, request_workflow)
+            self._notify_result_observers(callback_result, request_workflow)
 
             # Override failure log level if requested, except for a crash: `failure_log_level`
             # silences failures its caller EXPECTS, so honoring it for an exception a handler or
@@ -1671,13 +1688,14 @@ class EventManager(EngineScoped):
 
         return result_event
 
-    def _record_workflow_altered(self, result: ResultPayload, request_workflow: _RequestWorkflow | None) -> None:
-        """Mark the workflow a request acted on as having unsaved changes when its result says it changed it."""
-        if not result.altered_workflow_state or request_workflow is None or request_workflow.workflow is None:
-            return
-        workflow = request_workflow.workflow
-        workflow.has_unsaved_changes = True
-        self.engine.report_workflow_state(workflow)
+    def _notify_result_observers(self, result: ResultPayload, request_workflow: _RequestWorkflow | None) -> None:
+        workflow = None
+        if request_workflow is not None:
+            workflow = request_workflow.workflow
+        with self._result_observers_lock:
+            observers = list(self._result_observers)
+        for observer in observers:
+            observer(result, workflow)
 
     def _result_for_handler_exception(
         self, request: RP, exception: Exception, *, context: ResultContext, request_workflow: _RequestWorkflow

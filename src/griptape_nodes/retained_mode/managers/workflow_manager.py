@@ -226,6 +226,7 @@ class WorkflowManager(EngineScoped):
         self.publishing = WorkflowPublishing(event_manager, engine=engine)
         self.referenced_import = ReferencedWorkflowImport(event_manager, engine=engine)
         event_manager.register_request_handlers(self)
+        event_manager.add_result_observer(self._on_request_result)
 
     def has_current_referenced_workflow(self) -> bool:
         """Check if there is currently a referenced workflow context active."""
@@ -465,6 +466,19 @@ class WorkflowManager(EngineScoped):
 
     def should_squelch_workflow_altered(self) -> bool:
         return _squelch_workflow_altered_depth.get() > 0
+
+    def _on_request_result(self, result: ResultPayload, workflow: WorkflowRuntime | None) -> None:
+        """Mark `workflow` as having unsaved changes when `result` says its handler changed it.
+
+        Inside a squelch, such as a load building the workflow it opens, the result is told it changed
+        nothing first, so clients don't read the load as an edit either.
+        """
+        if self.should_squelch_workflow_altered():
+            result.altered_workflow_state = False
+        if not result.altered_workflow_state or workflow is None:
+            return
+        workflow.has_unsaved_changes = True
+        self.engine.report_workflow_state(workflow)
 
     def persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
