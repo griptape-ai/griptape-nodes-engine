@@ -502,29 +502,28 @@ class ModelAccessComponent:
     def _repair_stale_dropdown(self) -> bool:
         """Rebuild the ``Options`` trait and rows if a replayed workflow left retired models in them.
 
-        Returns whether it rebuilt them. Compares model names only: a row's icon,
-        subtitle and label change with the artist's license and are rebuilt by
-        ``refresh``, so a difference there is not staleness.
+        Returns whether it rebuilt them. A dropdown is stale when a saved row is named by a
+        ``deprecated_values`` key: those keys are accepted but never offered, so a row that names
+        one can only have been saved before that model was retired.
+
+        Deliberately not "the saved list differs from ``model_choices``". A node may repopulate
+        this parameter on purpose -- an Agent pointing the same dropdown at a third-party
+        provider's models, then assigning one of them -- and this runs on every assignment, so a
+        difference test would revert that on the spot. Such a list never contains a retired key.
 
         A parameter with no ``Options`` trait is left alone. A node strips it
         deliberately while a driver is connected and puts it back through
         ``reinstall_options``.
         """
         parameter = self._parameter
-        options_traits = parameter.find_elements_by_type(Options)
-        if not options_traits:
+        if not parameter.find_elements_by_type(Options):
             return False
-        saved_choices = [choice for options in options_traits for choice in options.choices]
-        saved_row_names = self._row_names(parameter.ui_options.get("data"))
-        if (
-            len(options_traits) == 1
-            and options_traits[0].choices == self._dropdown_choices()
-            and saved_row_names == self._model_choices
-        ):
+        retired = [
+            name for name in self._row_names(parameter.ui_options.get("data")) if name in self._deprecated_values
+        ]
+        if not retired:
             return False
 
-        saved_models = [*saved_choices, *saved_row_names]
-        retired = [model for model in dict.fromkeys(saved_models) if model not in self._dropdown_choices()]
         self.reinstall_options()
         logger.warning(
             "Attempted to open the model list for parameter '%s' on node '%s'. The saved workflow listed %s, "
@@ -532,7 +531,7 @@ class ModelAccessComponent:
             "Save the workflow to keep the update.",
             parameter.name,
             self._node.name,
-            ", ".join(repr(model) for model in retired) if retired else "a different list of models",
+            ", ".join(repr(model) for model in dict.fromkeys(retired)),
         )
         return True
 
