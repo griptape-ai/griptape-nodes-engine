@@ -7,7 +7,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Self
 
 from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io
-from griptape_nodes.image.cache import image_source_access
+from griptape_nodes.image.cache import SourceFingerprint, image_source_access, refresh_image_cache
 from griptape_nodes.image.containers import (
     is_complete,
     read_exif,
@@ -126,6 +126,7 @@ class GriptapeImage:
         extra_metadata_kinds: list[str] | None = None,
         display_encoded: bool | None = None,
     ) -> None:
+        self._source_fingerprint: SourceFingerprint | None = None
         self._source = source
         self._source_path = source_path
         self._buf = buf
@@ -282,6 +283,7 @@ class GriptapeImage:
         else:
             if self._source_path is not None:
                 with image_source_access(self._source_path):
+                    self._refresh_source()
                     encoded = reencoded(
                         self._decoded(),
                         image_format,
@@ -393,8 +395,21 @@ class GriptapeImage:
         """Apply validated image steps while coordinating cached source consumption."""
         if self._source_path is not None:
             with image_source_access(self._source_path):
+                self._refresh_source()
                 return self._run_pipeline(steps)
         return self._run_pipeline(steps)
+
+    def _refresh_source(self) -> None:
+        if self._source_path is None:
+            return
+        fingerprint = refresh_image_cache(self._source_path)
+        if fingerprint == self._source_fingerprint:
+            return
+        self._source_fingerprint = fingerprint
+        self._buf = None
+        self._header = None
+        self._metadata = None
+        self._extra_kinds = None
 
     def _run_pipeline(self, steps: Sequence[PipelineStep]) -> GriptapeImage:
         """Apply image steps and release intermediate images."""

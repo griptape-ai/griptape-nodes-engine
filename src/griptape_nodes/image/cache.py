@@ -122,7 +122,7 @@ def _end_directory_mutation() -> None:
         _gate.notify_all()
 
 
-def refresh_image_cache(path: str | Path) -> None:
+def refresh_image_cache(path: str | Path) -> SourceFingerprint:
     """Evict a changed source before opening its cache-backed pixels."""
     canonical = canonicalize_for_identity(path)
     key = str(canonical)
@@ -142,6 +142,7 @@ def refresh_image_cache(path: str | Path) -> None:
             _fingerprints.move_to_end(key)
             while len(_fingerprints) > _MAX_FINGERPRINTS:
                 _fingerprints.popitem(last=False)
+        return fingerprint
 
 
 def invalidate_all_image_cache() -> None:

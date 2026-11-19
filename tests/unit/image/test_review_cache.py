@@ -10,7 +10,7 @@ import numpy as np
 import OpenImageIO as oiio  # noqa: N813
 import pytest
 
-from griptape_nodes.image import GriptapeImage
+from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline, ImageFormat
 from griptape_nodes.image.cache import image_directory_mutation, image_source_access
 from griptape_nodes.image.oiio_config import invalidate_image_cache
 from griptape_nodes.retained_mode.engine import Engine
@@ -134,6 +134,18 @@ class TestCacheReview:
         with patch("griptape_nodes.image.cache.invalidate_image_cache") as invalidate:
             engine.os_manager._copy_file(source, target)
         assert invalidate.call_args_list == [((str(target),),), ((str(target),),)]
+
+    def test_open_wrapper_refreshes_between_public_operations(self, tmp_path: Path) -> None:
+        path = tmp_path / "source.png"
+        path.write_bytes(encode(solid(64, 64, RED), "png"))
+        with GriptapeImage.open(path) as source:
+            with GriptapeImagePipeline(source).thumbnail(32, 32).end() as first:
+                first.encode(ImageFormat.PNG)
+            path.write_bytes(encode(solid(64, 64, BLUE), "png"))
+            with GriptapeImagePipeline(source).thumbnail(32, 32).end() as second:
+                pixels = second._decoded().get_pixels(oiio.UINT8)
+                assert isinstance(pixels, np.ndarray)
+                np.testing.assert_array_equal(pixels[0, 0], BLUE)
 
     def test_cached_missing_source_fails(self, tmp_path: Path) -> None:
         path = tmp_path / "source.png"
