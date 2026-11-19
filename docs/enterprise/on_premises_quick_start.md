@@ -19,7 +19,7 @@ You need:
 
 The Admin Server needs a **Griptape Cloud API key** to start. This is not the same thing as the **license keys** you issue to users in step 5: the API key authenticates the Admin Server itself to Griptape Cloud, is created once, and belongs to you rather than to a seat.
 
-The key comes from the **Admin Dashboard**, so nothing needs to be installed yet — sign in to the web editor from any internet-connected browser. The desktop application works identically if you already run it; both use the same interface.
+The key comes from the **Admin Dashboard**, so nothing needs to be installed yet — sign in to the web editor at [nodes.griptape.ai](https://nodes.griptape.ai) from any internet-connected browser. The desktop application works identically if you already run it; both use the same interface.
 
 1. Sign in with **Login or Sign-Up**. You must own the organization you are deploying for.
 1. Open the **Admin Dashboard**:
