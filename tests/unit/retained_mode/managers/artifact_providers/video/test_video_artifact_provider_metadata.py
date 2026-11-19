@@ -91,6 +91,18 @@ class TestParseProbeData:
         assert metadata == video_artifact_provider.VideoArtifactMetadata(**expected)
         assert str(video_file) in caplog.text
 
+    def test_zero_denominator_frame_rate_is_unknown_without_warning(
+        self, video_file: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # ffprobe reports "0/0" for streams with no frame rate; that's expected output, not a parse failure.
+        metadata = video_artifact_provider.VideoArtifactProvider._parse_probe_data(
+            _probe_data(r_frame_rate="0/0"), str(video_file)
+        )
+
+        assert metadata is not None
+        assert metadata.frame_rate == 0.0
+        assert caplog.text == ""
+
     def test_unexpected_stream_duration_falls_back_to_format_duration(self, video_file: Path) -> None:
         probe_data = _probe_data(duration="not-a-duration")
         probe_data["format"] = {"duration": "4.25"}
