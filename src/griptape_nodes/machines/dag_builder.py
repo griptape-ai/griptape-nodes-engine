@@ -200,7 +200,7 @@ class DagBuilder:
 
         return added_nodes
 
-    def _upstream_dependency(
+    def _upstream_dependency(  # noqa: PLR0911
         self, node: BaseNode, param: Parameter, nodes_to_exclude: set[str], connections: Connections
     ) -> BaseNode | None:
         """Return the node feeding `param` by data that this DAG must run first, if any.
