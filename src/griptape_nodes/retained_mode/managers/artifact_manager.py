@@ -639,7 +639,7 @@ class ArtifactManager(EngineScoped):
             )
             # The post-generation stat becomes the retry's pre-generation stat.
             source_file_entry = post_generation_info_result.file_entry
-            invalidate_image_cache(source_path)
+            await to_thread(invalidate_image_cache, source_path)
             generation_attempt += 1
 
         # OPTIONAL: Generate metadata if requested

@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -1120,6 +1121,49 @@ class TestGeneratePreview:
         # The retry's pre-generation stat matches the final on-disk file: fresh.
         source_stat = await anyio.Path(test_image_path).stat()
         assert metadata["source_file_size"] == source_stat.st_size
+
+    @pytest.mark.asyncio
+    async def test_retry_invalidation_runs_outside_event_loop(
+        self,
+        artifact_manager: ArtifactManager,
+        test_macro_path: MacroPath,
+        test_image_path: Path,
+    ) -> None:
+        # Given a source that changes after its first preview and an invalidator recording threads.
+        generation_calls = 0
+        loop_thread = threading.get_ident()
+        invalidation_threads: list[int] = []
+        original = ImageArtifactProvider.attempt_generate_preview
+
+        async def generate_then_change(provider: ImageArtifactProvider, **kwargs: object) -> object:
+            nonlocal generation_calls
+            generation_calls += 1
+            result = await original(provider, **kwargs)  # type: ignore[arg-type]
+            if generation_calls == 1:
+                with test_image_path.open("ab") as handle:
+                    handle.write(b"changed")
+            return result
+
+        def record_invalidation(_path: str) -> None:
+            invalidation_threads.append(threading.get_ident())
+
+        request = GeneratePreviewRequest(
+            macro_path=test_macro_path,
+            artifact_provider_name="Image",
+            generate_preview_metadata_json=False,
+            preview_generator_parameters={"max_width": 50, "max_height": 50},
+        )
+        # When the changed source triggers invalidation before a retry.
+        with (
+            patch.object(ImageArtifactProvider, "attempt_generate_preview", generate_then_change),
+            patch("griptape_nodes.retained_mode.managers.artifact_manager.invalidate_image_cache", record_invalidation),
+        ):
+            result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
+
+        # Then the retry succeeds and invalidation does not acquire source locks on the loop thread.
+        assert isinstance(result, GeneratePreviewResultSuccess)
+        assert invalidation_threads
+        assert loop_thread not in invalidation_threads
 
     @pytest.mark.asyncio
     async def test_same_size_rewrite_mid_generation_retries(
