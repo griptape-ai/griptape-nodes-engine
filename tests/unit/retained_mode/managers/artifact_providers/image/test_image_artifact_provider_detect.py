@@ -109,7 +109,8 @@ class TestGetArtifactMetadata:
     def test_extracts_exr_float_header_metadata(self, tmp_path: Path) -> None:
         exr_path = tmp_path / "plate.exr"
         pixels = np.full((24, 48, 4), 0.25, dtype=np.float16)
-        assert oiio.ImageBuf(np.ascontiguousarray(pixels)).write(str(exr_path))
+        written = oiio.ImageBuf(np.ascontiguousarray(pixels)).write(str(exr_path))
+        assert written
 
         meta = ImageArtifactProvider.get_artifact_metadata(str(exr_path))
         assert meta is not None

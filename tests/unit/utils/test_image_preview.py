@@ -44,7 +44,8 @@ class TestImagePreviewUtilities:
 
     def test_create_image_preview_from_bytes_handles_exr_and_rejects_svg(self, tmp_path: Path) -> None:
         exr_path = tmp_path / "hdr.exr"
-        assert oiio.ImageBuf(np.full((32, 64, 3), 0.75, dtype=np.float32)).write(str(exr_path))
+        written = oiio.ImageBuf(np.full((32, 64, 3), 0.75, dtype=np.float32)).write(str(exr_path))
+        assert written
 
         data_url = create_image_preview_from_bytes(exr_path.read_bytes(), max_width=16, max_height=16)
 

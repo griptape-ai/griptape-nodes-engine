@@ -1,4 +1,4 @@
-"""Tests for ThumbnailGenerator, RoundedPreviewGenerator, and backward-compatible PIL aliases."""
+"""Tests for ThumbnailGenerator and RoundedPreviewGenerator."""
 
 from __future__ import annotations
 
@@ -15,14 +15,8 @@ from pydantic import ValidationError
 from griptape_nodes.image import GriptapeImage, ImageFormat
 from griptape_nodes.image.oiio_config import apply_openimageio_settings
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-    PILRoundedParameters,
-    PILRoundedPreviewGenerator,
-    PILThumbnailGenerator,
-    PILThumbnailParameters,
-    RoundedParameters,
     RoundedPreviewGenerator,
     ThumbnailGenerator,
-    ThumbnailParameters,
 )
 from tests.unit.image.sample_images import BLUE, RED, encode, solid
 
@@ -63,12 +57,10 @@ def temp_output_dir() -> Generator[str, None, None]:
         yield tmpdir
 
 
-class TestBackwardCompatibleAliases:
-    def test_pil_prefixed_aliases_point_to_new_classes(self) -> None:
-        assert PILThumbnailGenerator is ThumbnailGenerator
-        assert PILThumbnailParameters is ThumbnailParameters
-        assert PILRoundedPreviewGenerator is RoundedPreviewGenerator
-        assert PILRoundedParameters is RoundedParameters
+class TestGeneratorFriendlyNames:
+    def test_persisted_friendly_names_are_unchanged(self) -> None:
+        assert ThumbnailGenerator.get_friendly_name() == "Standard Thumbnail Generation"
+        assert RoundedPreviewGenerator.get_friendly_name() == "Rounded Image Preview Generation"
 
 
 class TestRoundedPreviewGeneratorParameters:
@@ -197,7 +189,8 @@ class TestPreviewGeneratorGeneration:
         cache = oiio.ImageCache(shared=True)
         exr_path = tmp_path / "shot.exr"
         pixels = np.full((64, 32, 4), 0.5, dtype=np.float32)
-        assert oiio.ImageBuf(np.ascontiguousarray(pixels)).write(str(exr_path))
+        written = oiio.ImageBuf(np.ascontiguousarray(pixels)).write(str(exr_path))
+        assert written
         cache.invalidate_all(True)
         unique_before = cache.getattribute("stat:unique_files", oiio.INT)
 

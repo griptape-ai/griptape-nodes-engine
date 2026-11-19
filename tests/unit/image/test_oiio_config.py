@@ -16,6 +16,7 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileRequest,
     WriteFileResultSuccess,
 )
+from tests.unit.image.sample_images import encode, solid
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -115,17 +116,20 @@ class TestImageCacheInvalidation:
         cache = oiio.ImageCache(shared=True)
         cache.invalidate_all(True)
 
-        image_path = tmp_path / "cached.png"
-        _write_solid_png(image_path, (255, 0, 0))
+        image_path = tmp_path / "cached.tif"
+        # TIFF retains an ImageInput handle; the PNG reader may close after its first tile.
+        image_path.write_bytes(encode(solid(64, 64, (255, 0, 0)), "tif"))
         buf = oiio.ImageBuf(str(image_path))
         assert buf.getpixel(0, 0) == pytest.approx((1.0, 0.0, 0.0))
-        assert "1 current" in cache.getstats(1)
+        opened_handles = cache.getattribute("stat:open_files_current", oiio.INT)
+        assert isinstance(opened_handles, int)
+        assert opened_handles >= 1
 
         # When the path is invalidated
         invalidate_image_cache(image_path)
 
         # Then the open ImageInput handle is closed
-        assert "0 current" in cache.getstats(1)
+        assert cache.getattribute("stat:open_files_current", oiio.INT) == opened_handles - 1
 
     @pytest.mark.asyncio
     async def test_write_file_request_invalidates_cached_tiles_on_overwrite(

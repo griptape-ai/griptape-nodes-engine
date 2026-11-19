@@ -77,7 +77,8 @@ def _oiio_file_bytes(tmp_path: Path, suffix: str, *, is_float: bool = False, gra
         pixels = np.full((32, 32, channels), 128, dtype=np.uint8)
     target = tmp_path / f"sample{suffix}"
     buf = oiio.ImageBuf(np.ascontiguousarray(pixels))
-    assert buf.write(str(target)), buf.geterror()
+    written = buf.write(str(target))
+    assert written, buf.geterror()
     return target.read_bytes()
 
 
@@ -140,7 +141,8 @@ class TestExpandedFormatSniffing:
         pixels = np.full((16, 16, 6), 0.5, dtype=np.float32)
         exr_path = tmp_path / "beauty_with_aovs.exr"
         buf = oiio.ImageBuf(np.ascontiguousarray(pixels))
-        assert buf.write(str(exr_path)), buf.geterror()
+        written = buf.write(str(exr_path))
+        assert written, buf.geterror()
 
         # When thumbnailing and encoding to an 8-bit preview format
         with GriptapeImage.open(exr_path) as img:
