@@ -331,3 +331,36 @@ async def test_rerun_waits_for_mid_chain_feeder(
     assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), (
         "the reader ran before its mid-chain feeder on the second run"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feeder_first", [False, True])
+async def test_merge_waits_for_both_entry_points(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+    feeder_first: bool,  # noqa: FBT001
+) -> None:
+    """A node both entry points lead into waits for both, when one entry point feeds the other.
+
+    ``E1 -> M`` and ``E2 -> M``, then ``M -> N``, with ``E2`` feeding ``E1`` and ``M``. Seeding ``E1``
+    adopts ``E2`` into ``E1``'s graph, so a single graph holds both entry points. ``M`` must still
+    wait for ``E1``: run on ``E2`` alone, it is marked stale again when ``E1`` finishes after it.
+    Run twice, because the second run starts with every node RESOLVED.
+    """
+    flow = loose_sink_flow
+    names = ("E2", "E1", "M", "N") if feeder_first else ("E1", "E2", "M", "N")
+    for name in names:
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "M", "exec_in")
+    connect("E2", "exec_out", "M", "exec_in")
+    connect("M", "exec_out", "N", "exec_in")
+    connect("E2", "result", "E1", "text")
+    connect("E2", "result", "M", "text")
+
+    for run in (1, 2):
+        states = await _run(engine, flow)
+        assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), (
+            f"run {run}: the merge node ran before both entry points had finished"
+        )
