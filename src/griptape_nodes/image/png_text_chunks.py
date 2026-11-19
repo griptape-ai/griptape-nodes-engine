@@ -66,6 +66,10 @@ def read_text_chunks(png: bytes) -> dict[str, str]:
             continue
         chunk = _decode_text_chunk(chunk_type, png[data_start : data_start + length])
         if chunk is None:
+            key = png[data_start : data_start + length].partition(b"\x00")[0]
+            if key == b"gtn_flow_commands":
+                msg = "Attempted to read the workflow saved in a PNG. Failed because its workflow metadata is damaged or exceeds the size limit."
+                raise ValueError(msg)
             continue
         total_bytes += len(chunk.text)
         if total_bytes > MAX_TOTAL_TEXT_BYTES:

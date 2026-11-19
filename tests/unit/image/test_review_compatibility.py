@@ -10,11 +10,12 @@ import pytest
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import MetadataImageInput, opening_metadata_image
 from griptape_nodes.image import Exif
 from griptape_nodes.image.exif import EXIF_USER_COMMENT_TAG
-from griptape_nodes.image.png_text_chunks import insert_text_chunks, should_compress_text
+from griptape_nodes.image.png_text_chunks import insert_text_chunks, png_chunk, should_compress_text
 from griptape_nodes.retained_mode.events.flow_events import (
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
 )
+from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from tests.unit.image.sample_images import encode, solid
 from tests.unit.image.test_exif import _block, _entry
 
@@ -57,6 +58,16 @@ class TestReviewCompatibility:
     def test_comment_prefixes(self, raw: bytes) -> None:
         parsed = Exif.from_bytes(_block("<", [], exif_ifd=[_entry(EXIF_USER_COMMENT_TAG, 7, len(raw), raw)]))
         assert parsed[EXIF_USER_COMMENT_TAG]
+
+    def test_unreadable_workflow_text_reports_failure(self, engine: Engine, tmp_path: Path) -> None:
+        source = encode(solid(64, 64), "png")
+        chunk = png_chunk(b"zTXt", FLOW_COMMANDS_KEY.encode("latin-1") + b"\x00\x00invalid zlib")
+        path = tmp_path / "unreadable.png"
+        path.write_bytes(source[:-12] + chunk + source[-12:])
+        result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
+            ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(path), deserialize=False)
+        )
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
 
     def test_long_unicode_text_uses_bounded_compression(self) -> None:
         assert should_compress_text("\u2603" * 2048)
