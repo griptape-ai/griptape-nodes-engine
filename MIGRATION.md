@@ -1,5 +1,28 @@
 # Unreleased
 
+## Image processing uses OpenImageIO
+
+The engine uses OpenImageIO for previews and image metadata. It no longer installs Pillow.
+Libraries importing `PIL` must declare `pillow` in their project dependencies and in
+`metadata.dependencies.pip_dependencies` in their library manifest. Existing standard, OpenEXR
+and OpenColorIO library checkouts already declare it. Check the version of your own library
+before upgrading.
+
+`PngMetadataDriver` and `ExifMetadataDriver` accept encoded bytes, filesystem paths,
+`GriptapeImage` instances and legacy image objects exposing `format` and `save`. Existing
+Pillow-object callers can continue using those drivers when their library installs Pillow.
+JPEG metadata exceeding the format's size limit raises an error; use PNG for large embedded
+workflows.
+
+Preview generator imports use `ThumbnailGenerator`, `ThumbnailParameters`,
+`RoundedPreviewGenerator` and `RoundedParameters` from
+`griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators`.
+Replace imports of the removed `pil_thumbnail_generator` and `pil_rounded_preview_generator`
+modules and their `PIL*` names. Saved generator settings keep their existing friendly names.
+
+The engine can preview additional VFX formats. Each node library still defines the formats its
+own Load, Save and processing nodes accept.
+
 ## Flow and node context belongs to the caller
 
 A request that names no flow acts on the workflow's top-level flow. It no longer acts on a flow an
