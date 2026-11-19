@@ -18,6 +18,7 @@ These tests cover small, near-pure helpers that decide loop control flow:
   from the loop's start node into the end node's ``new_item_to_add``.
 * ``_extract_iteration_results_from_subprocess`` - a failed isolated or publisher iteration
   keeps its place in the results as None.
+* The loop drivers record each iteration flow as owned by the flow that holds its loop.
 """
 
 import logging
@@ -34,7 +35,10 @@ from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
-from griptape_nodes.retained_mode.events.execution_events import StartLocalSubflowResultFailure
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartLocalSubflowResultFailure,
+    StartLocalSubflowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.failure_tree import FailureKind, FailureLeaf, WorkflowNodeFailure
 from griptape_nodes.retained_mode.events.flow_events import (
     DeserializeFlowFromCommandsResultSuccess,
@@ -793,10 +797,15 @@ def _leaf(node_name: str, message: str = "boom") -> FailureLeaf:
     return FailureLeaf(node_name=node_name, kind=FailureKind.RAISED, details=details)
 
 
+class _StopAfterDeserializingError(RuntimeError):
+    """Raised by a test to end a run once the iteration flows have been created."""
+
+
 def _holding_workflow() -> Mock:
-    """A workflow for the loop helpers to run against."""
+    """A workflow whose loop nodes all sit in the flow `Holding_flow`."""
     workflow = Mock(spec=WorkflowRuntime)
     workflow.nodes = Mock(spec=WorkflowNodes)
+    workflow.nodes.parent_flow_name.return_value = "Holding_flow"
     workflow.context = Mock(spec=WorkflowContextStack)
     workflow.context.has_current_flow.return_value = False
     workflow.ahandle_request = AsyncMock(spec=WorkflowRuntime.ahandle_request)
@@ -877,6 +886,60 @@ class LoopIterationFixtures:
         return package_result
 
 
+class TestIterationFlowOwner(LoopIterationFixtures):
+    """Each iteration flow is recorded as owned by the flow that holds the loop, at every site that makes one."""
+
+    PARALLEL_ITERATIONS = 2
+
+    @pytest.fixture(autouse=True)
+    def unlimited_parallelism(self, engine: Mock) -> None:
+        engine.config_manager.get_config_value.return_value = 0
+
+    def test_while_group_flow_is_owned_by_the_flow_holding_the_group(
+        self, executor: NodeExecutor, engine: Mock, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.handle_request.return_value = DeserializeFlowFromCommandsResultSuccess(
+            result_details="ok", flow_name="While_subflow_1", node_name_mappings={"Start": "Start_1"}
+        )
+
+        executor._deserialize_while_flow(workflow, package_result, "Start", "While")
+
+        workflow.nodes.parent_flow_name.assert_called_once_with("While")
+        engine.flow_manager.record_iteration_flow_owner.assert_called_once_with(
+            workflow, "While_subflow_1", "Holding_flow"
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_iteration_flows_are_owned_by_the_flow_holding_the_loop(
+        self,
+        executor: NodeExecutor,
+        engine: Mock,
+        workflow: Mock,
+        package_result: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            executor,
+            "get_node_parameter_mappings",
+            Mock(spec=NodeExecutor.get_node_parameter_mappings, side_effect=_StopAfterDeserializingError),
+        )
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+
+        with pytest.raises(_StopAfterDeserializingError):
+            await executor._execute_loop_iterations_locally(
+                package_result=package_result,
+                total_iterations=self.PARALLEL_ITERATIONS,
+                parameter_values_per_iteration={},
+                end_loop_node=end_node,
+            )
+
+        workflow.nodes.parent_flow_name.assert_called_with("Loop")
+        engine.flow_manager.record_iteration_flow_owner.assert_called_with(workflow, "Iteration_flow", "Holding_flow")
+        assert engine.flow_manager.record_iteration_flow_owner.call_count == self.PARALLEL_ITERATIONS
+
+
 class TestExecuteLoopIterationsSequentially(LoopIterationFixtures):
     """A sequential loop reuses one iteration flow, names failures as the artist sees them, and carries on."""
 
@@ -940,6 +1003,22 @@ class TestExecuteLoopIterationsSequentially(LoopIterationFixtures):
         assert workflow.ahandle_request.await_count == self.SEQUENTIAL_ITERATIONS
         assert successful_iterations == []
         assert [failure.iteration_index for failure in failures] == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_the_reused_flow_is_owned_by_the_flow_holding_the_loop(
+        self, executor: NodeExecutor, engine: Mock, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultSuccess(result_details="ok")
+
+        _results, successful_iterations, _last, _skipped, _broke, failures = await self._run(
+            executor, workflow, package_result
+        )
+
+        engine.flow_manager.record_iteration_flow_owner.assert_called_once_with(
+            workflow, "Iteration_flow", "Holding_flow"
+        )
+        assert successful_iterations == [0, 1, 2]
+        assert failures == []
 
 
 class TestExecuteLoopIterationsLocally(LoopIterationFixtures):

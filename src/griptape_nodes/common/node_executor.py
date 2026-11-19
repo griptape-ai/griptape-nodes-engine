@@ -1351,6 +1351,7 @@ class NodeExecutor(EngineScoped):
                 # Track for cleanup as soon as the flow exists (iteration index 0 is a placeholder;
                 # the single flow is reused across all iterations).
                 deserialized_flows.append((0, flow_name, node_name_mappings))
+                self._record_iteration_flow_owner(workflow, flow_name, end_loop_node.name)
 
             logger.debug("Successfully deserialized flow for sequential execution: %s", flow_name)
             # Get node mappings
@@ -1863,7 +1864,7 @@ class NodeExecutor(EngineScoped):
 
         # Deserialize the flow once for sequential re-execution
         flow_name, node_name_mappings, packaged_start_node_name = self._deserialize_while_flow(
-            workflow, package_result, start_node_mapping.node_name
+            workflow, package_result, start_node_mapping.node_name, node.name
         )
 
         # Build reverse mapping for event translation
@@ -1935,6 +1936,7 @@ class NodeExecutor(EngineScoped):
         workflow: WorkflowRuntime,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         start_node_name: str,
+        loop_node_name: str,
     ) -> tuple[str, dict[str, str], str]:
         """Deserialize a packaged while-loop flow and return execution context.
 
@@ -1942,6 +1944,7 @@ class NodeExecutor(EngineScoped):
             workflow: The workflow the nodes are in.
             package_result: The packaged flow result
             start_node_name: Original name of the start node
+            loop_node_name: Name of the while group node that runs the flow
 
         Returns:
             Tuple of (flow_name, node_name_mappings, packaged_start_node_name)
@@ -1959,6 +1962,7 @@ class NodeExecutor(EngineScoped):
 
             flow_name = deserialize_result.flow_name
             node_name_mappings = deserialize_result.node_name_mappings
+            self._record_iteration_flow_owner(workflow, flow_name, loop_node_name)
 
         packaged_start_node_name = node_name_mappings.get(start_node_name)
         if packaged_start_node_name is None:
@@ -1966,6 +1970,13 @@ class NodeExecutor(EngineScoped):
             raise TypeError(msg)
 
         return flow_name, node_name_mappings, packaged_start_node_name
+
+    def _record_iteration_flow_owner(
+        self, workflow: WorkflowRuntime, iteration_flow_name: str, loop_node_name: str
+    ) -> None:
+        """Note which flow holds the loop that runs an iteration flow, for the recursion-depth count."""
+        owner_flow_name = workflow.nodes.parent_flow_name(loop_node_name)
+        self.engine.flow_manager.record_iteration_flow_owner(workflow, iteration_flow_name, owner_flow_name)
 
     async def _run_while_loop_iterations(  # noqa: PLR0913
         self,
@@ -3361,6 +3372,8 @@ class NodeExecutor(EngineScoped):
                     deserialized_flows.append(
                         (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
                     )
+                    self._record_iteration_flow_owner(workflow, deserialize_result.flow_name, end_loop_node.name)
+
                 logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
                 # Step 2: Define the per-iteration coroutine
                 packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name

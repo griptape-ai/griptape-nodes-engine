@@ -20,6 +20,8 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 if TYPE_CHECKING:
@@ -33,6 +35,7 @@ class TestExecuteLoopIterationsLocally:
         engine.event_manager = Mock()
         engine.config_manager = Mock()
         engine.config_manager.get_config_value.return_value = 0
+        engine.flow_manager = Mock(spec=FlowManager)
         executor = NodeExecutor(engine=engine)
         start_or_end_mapping = Mock()
         start_or_end_mapping.node_name = "Start"
@@ -54,6 +57,8 @@ class TestExecuteLoopIterationsLocally:
     @pytest.fixture
     def workflow(self, inner_failure: FailureTree) -> Mock:
         workflow = Mock(spec=WorkflowRuntime)
+        workflow.nodes = Mock(spec=WorkflowNodes)
+        workflow.nodes.parent_flow_name.return_value = "Holding_flow"
         workflow.context = Mock()
         workflow.context.has_current_flow.return_value = False
         workflow.handle_request.return_value = DeserializeFlowFromCommandsResultSuccess(
