@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import numpy as np
+import OpenImageIO as oiio  # noqa: N813
 import pytest
 
 from griptape_nodes.image import GriptapeImage, ImageFormat
@@ -34,6 +36,17 @@ class TestConvertWorkflowTemplateProcessImage:
         with GriptapeImage.open(output) as img:
             assert img.format == ImageFormat.WEBP
             assert (img.width, img.height) == (512, 512)
+
+    def test_partial_alpha_keeps_color(self, tmp_path: Path) -> None:
+        process_image = _load_process_image()
+        source = tmp_path / "transparent.png"
+        source.write_bytes(encode(solid(600, 600, (255, 0, 0, 128)), "png"))
+        output = tmp_path / "transparent.webp"
+        process_image(source, output)
+        with GriptapeImage.open(output) as image:
+            pixels = image._decoded().get_pixels(oiio.UINT8)
+            assert isinstance(pixels, np.ndarray)
+            np.testing.assert_allclose(pixels[256, 256], (255, 0, 0, 128), atol=3)
 
     def test_copies_gif_unchanged(self, tmp_path: Path) -> None:
         process_image = _load_process_image()

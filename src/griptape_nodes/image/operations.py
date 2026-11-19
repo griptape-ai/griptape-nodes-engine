@@ -11,7 +11,7 @@ import numpy as np
 import OpenImageIO as oiio  # noqa: N813
 
 if TYPE_CHECKING:
-    from griptape_nodes.image.pipeline import Flatten, RoundCorners, Thumbnail
+    from griptape_nodes.image.pipeline import Cover, Flatten, RoundCorners, Thumbnail
 
 GRAYSCALE_CHANNELS = 1
 GRAYSCALE_ALPHA_CHANNELS = 2
@@ -80,6 +80,34 @@ def thumbnail(buf: oiio.ImageBuf, step: Thumbnail) -> oiio.ImageBuf:
     if has_alpha:
         resized = checked(oiio.ImageBufAlgo.unpremult(resized))
     return resized
+
+
+def cover(buf: oiio.ImageBuf, step: Cover) -> oiio.ImageBuf:
+    """Resize with associated-alpha filtering, then center-crop to exact bounds."""
+    spec = buf.spec()
+    scale = max(step.width / spec.width, step.height / spec.height)
+    width = max(step.width, round(spec.width * scale))
+    height = max(step.height, round(spec.height * scale))
+    source = buf
+    has_alpha = alpha_channel(buf) is not None
+    if has_alpha:
+        source = checked(oiio.ImageBufAlgo.premult(buf), buf)
+    resized = checked(
+        oiio.ImageBufAlgo.resize(source, "lanczos3", roi=oiio.ROI(0, width, 0, height, 0, 1, 0, buf.nchannels)),
+        source,
+        buf,
+    )
+    left = (width - step.width) // 2
+    top = (height - step.height) // 2
+    cropped = checked(
+        oiio.ImageBufAlgo.cut(
+            resized, oiio.ROI(left, left + step.width, top, top + step.height, 0, 1, 0, buf.nchannels)
+        ),
+        resized,
+    )
+    if has_alpha:
+        return checked(oiio.ImageBufAlgo.unpremult(cropped), cropped)
+    return cropped
 
 
 def to_rgb(buf: oiio.ImageBuf) -> oiio.ImageBuf:

@@ -32,6 +32,14 @@ class Thumbnail:
 
 
 @dataclass(frozen=True)
+class Cover:
+    """Resize and center-crop to exact dimensions, enlarging small sources."""
+
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
 class ToRGB:
     """Convert to three-channel color, discarding any alpha."""
 
@@ -62,7 +70,7 @@ class Flatten:
     background: tuple[int, int, int]
 
 
-PipelineStep = Orient | Thumbnail | ToRGB | ToRGBA | RoundCorners | Flatten
+PipelineStep = Orient | Thumbnail | Cover | ToRGB | ToRGBA | RoundCorners | Flatten
 
 # Steps an orientation can be moved past: they don't depend on which way the pixels face
 _ORIENTATION_INDEPENDENT = (ToRGB, ToRGBA)
@@ -103,6 +111,14 @@ class GriptapeImagePipeline:
     def thumbnail(self, max_width: int = DEFAULT_THUMBNAIL_SIZE, max_height: int = DEFAULT_THUMBNAIL_SIZE) -> Self:
         """Shrink to fit within the bounds, keeping the aspect ratio. Never enlarges."""
         self._steps.append(Thumbnail(max_width, max_height))
+        return self
+
+    def cover(self, width: int, height: int) -> Self:
+        """Resize and center-crop to the requested dimensions."""
+        if width <= 0 or height <= 0:
+            msg = "Attempted to resize an image. Failed because both output dimensions must be positive."
+            raise ValueError(msg)
+        self._steps.append(Cover(width, height))
         return self
 
     def to_rgb(self) -> Self:

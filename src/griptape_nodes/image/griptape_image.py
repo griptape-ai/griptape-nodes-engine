@@ -48,6 +48,7 @@ from griptape_nodes.image.operations import (
     GRAYSCALE_ALPHA_CHANNELS,
     GRAYSCALE_CHANNELS,
     RGBA_CHANNELS,
+    cover,
     flattened,
     oriented,
     rounded,
@@ -56,7 +57,7 @@ from griptape_nodes.image.operations import (
     to_rgba,
 )
 from griptape_nodes.image.path_metadata import read_path_metadata
-from griptape_nodes.image.pipeline import Flatten, Orient, PipelineStep, RoundCorners, Thumbnail, ToRGB, ToRGBA
+from griptape_nodes.image.pipeline import Cover, Flatten, Orient, PipelineStep, RoundCorners, Thumbnail, ToRGB, ToRGBA
 from griptape_nodes.image.pixel_type import PixelType
 from griptape_nodes.image.png_text_chunks import read_text_chunks
 
@@ -419,6 +420,8 @@ class GriptapeImage:
             return self._derive(self._decoded().copy(), step)
         if isinstance(step, Flatten):
             return self._derive(flattened(self._decoded(), step), step)
+        if isinstance(step, Cover):
+            return self._derive(cover(self._decoded(), step), step)
         if isinstance(step, Thumbnail):
             return self._derive(thumbnail(self._decoded(), step), step)
         if isinstance(step, Orient):
