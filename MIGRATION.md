@@ -59,6 +59,35 @@ They have no effect. While a library still asks for a worker and declares no
 - The fitness problems reporting that request handlers and post-dispatch hooks are unsupported in an
     isolated library. Both now work in every library.
 
+## Managers no longer have ambient-workflow request methods
+
+**Library authors.** `NodeManager.on_get_parameter_value_request`, `on_set_parameter_value_request`
+and `on_remove_parameter_from_node_request`, and `FlowManager.on_get_top_level_flow_request`,
+`on_list_nodes_in_flow_request`, `on_create_connection_request`, `on_delete_connection_request` and
+`on_start_local_subflow_request`, used to take only a request and act on the open workflow. Those
+names now belong to the handlers the engine dispatches requests to, which require the workflow as a
+second argument. Don't call them, even with a workflow: calling a handler directly skips dispatch,
+including its hooks and result broadcast. Send the request instead:
+
+```python
+# Before
+result = GriptapeNodes.NodeManager().on_get_parameter_value_request(request)
+
+# After
+result = GriptapeNodes.handle_request(request)
+```
+
+From a node's `process()` or `aprocess()`, or a thread they start, send it through the node's
+workflow with `self.workflow.handle_request(request)`, or `await self.workflow.ahandle_request(request)`
+in async code. `self.workflow` is `None` until the node is added to a workflow, so don't send
+requests from a node's `__init__`.
+
+The two-argument `on_<name>_request_in_workflow` names are gone, renamed to the bare
+`on_<name>_request` names with the same arguments. For example,
+`on_set_parameter_value_request_in_workflow(request, workflow)` is now
+`on_set_parameter_value_request(request, workflow)`. They are dispatch handlers too, so send the
+request rather than call them.
+
 ## Parameter values keep their type
 
 **Library authors.** A field of your own request, result, or event payload that holds parameter

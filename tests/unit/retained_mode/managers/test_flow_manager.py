@@ -487,7 +487,7 @@ class TestListNodesInFlowRequest:
             "get_as_type",
             side_effect=lambda _name, typ: flow if typ is ControlFlow else None,
         ):
-            return flow_manager.on_list_nodes_in_flow_request_in_workflow(request, workflow)  # type: ignore[arg-type]
+            return flow_manager.on_list_nodes_in_flow_request(request, workflow)  # type: ignore[arg-type]
 
     def test_no_filter_returns_all_nodes(self, engine: Engine) -> None:
         from griptape_nodes.retained_mode.events.flow_events import ListNodesInFlowRequest, ListNodesInFlowResultSuccess
