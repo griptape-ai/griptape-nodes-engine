@@ -100,6 +100,14 @@ class TestMetadataReview:
         path.write_bytes(gray_tiff({0x02BC: (7, b"<custom/>"), 0x83BB: (7, b"iptc")}))
         assert read_path_extra_metadata_kinds(path, ImageFormat.TIFF) == ["XMP", "IPTC"]
 
+    @pytest.mark.parametrize(
+        "data", [b"bad", b"MM\x00\x2b" + bytes(4), b"II\x2a\x00" + struct.pack("<I", 8) + b"\x01\x00"]
+    )
+    def test_extra_tiff_metadata_handles_invalid_directories(self, tmp_path: Path, data: bytes) -> None:
+        path = tmp_path / "invalid.tif"
+        path.write_bytes(data)
+        assert read_path_extra_metadata_kinds(path, ImageFormat.TIFF) == []
+
     @staticmethod
     def _pixel_chunk(source: bytes) -> bytes:
         position = 12
