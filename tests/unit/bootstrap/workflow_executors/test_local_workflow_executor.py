@@ -33,8 +33,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     SetCurrentProjectResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
+    RunWorkflowFromScratchResultSuccess,
     SaveWorkflowFileFromSerializedFlowRequest,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
+    WorkflowStatus,
 )
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.serialization.values import encode_value
@@ -44,6 +46,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 # A Windows path that exceeds the legacy MAX_PATH (260 chars).
 # Total length is ~300 characters including the drive letter.
@@ -483,13 +486,68 @@ class TestSetInputForFlow:
         assert values == {"pair": (1, 2), "text": "plain"}
 
 
-class TestSaveFailedWorkflow:
-    """The executor runs unbound, as a standalone run does, with its one workflow open."""
+class TestLoadWorkflowFromPathBindsTheWorkflow:
+    """The executor works in the workflow it opens for the rest of its run, as a saved file that pushes itself does."""
 
     @staticmethod
-    def _executor(target: Path) -> LocalWorkflowExecutor:
+    def _load_result(workflow: WorkflowRuntime) -> RunWorkflowFromScratchResultSuccess:
+        return RunWorkflowFromScratchResultSuccess(
+            status=WorkflowStatus.GOOD,
+            workflow_id=workflow.workflow_id,
+            open_workflow=MagicMock(),
+            result_details="loaded",
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_opened_workflow_is_bound_after_the_load(self, engine: Engine) -> None:
+        workflow = engine.open_workflow(engine.workflow_registry.register_unsaved("loaded", listed=False).workflow_id)
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._workflow = None
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", AsyncMock(return_value=self._load_result(workflow))):
+            await executor._load_workflow_from_path("loaded.py")
+
+        assert bound_workflow.get() is workflow
+        assert executor._workflow is workflow
+
+    @pytest.mark.asyncio
+    async def test_leaving_the_executor_ends_the_binding(self, engine: Engine) -> None:
+        workflow = engine.open_workflow(engine.workflow_registry.register_unsaved("loaded", listed=False).workflow_id)
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._workflow = None
+        executor._save_on_failure_path = None
+        with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", AsyncMock(return_value=self._load_result(workflow))):
+            await executor._load_workflow_from_path("loaded.py")
+
+        await executor.__aexit__(None, None, None)
+
+        assert bound_workflow.get() is None
+        assert executor._workflow is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_load_binds_nothing(self, engine: Engine) -> None:  # noqa: ARG002
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._workflow = None
+        failure = MagicMock()
+        failure.failed.return_value = True
+
+        with (
+            patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", AsyncMock(return_value=failure)),
+            pytest.raises(LocalExecutorError),
+        ):
+            await executor._load_workflow_from_path("broken.py")
+
+        assert bound_workflow.get() is None
+
+
+class TestSaveFailedWorkflow:
+    """The failed run's workflow is the one the executor opened, else the one its caller bound."""
+
+    @staticmethod
+    def _executor(target: Path, workflow: WorkflowRuntime | None = None) -> LocalWorkflowExecutor:
         executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
         executor._save_on_failure_path = str(target)
+        executor._workflow = workflow
         return executor
 
     @pytest.mark.asyncio
@@ -523,7 +581,28 @@ class TestSaveFailedWorkflow:
         assert "boom" in (save.description or "")
 
     @pytest.mark.asyncio
-    async def test_skips_the_save_with_no_workflow_open(self, tmp_path: Path) -> None:
+    async def test_saves_the_workflow_the_executor_opened_even_when_its_caller_is_unbound(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        workflow = engine.open_workflow(engine.workflow_registry.register_unsaved("opened", listed=False).workflow_id)
+        sent: list[tuple[RequestPayload, object]] = []
+
+        async def record(request: RequestPayload) -> ResultPayload:
+            sent.append((request, bound_workflow.get()))
+            return await engine.ahandle_request(request)
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request", side_effect=record):
+            await self._executor(tmp_path / "failed.py", workflow)._save_failed_workflow("boom")
+
+        assert [type(request) for request, _ in sent] == [GetTopLevelFlowRequest]
+        assert all(binding is workflow for _, binding in sent)
+
+    @pytest.mark.asyncio
+    async def test_skips_the_save_with_no_workflow_bound_even_with_one_open(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        engine.open_workflow(engine.workflow_registry.register_unsaved("open", listed=False).workflow_id)
+
         with patch(f"{MODULE_PATH}.GriptapeNodes.ahandle_request") as ahandle_request:
             await self._executor(tmp_path / "failed.py")._save_failed_workflow("boom")
 

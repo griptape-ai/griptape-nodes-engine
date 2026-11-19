@@ -51,6 +51,7 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult, WorkflowRunner
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW
 from griptape_nodes.servers.mcp import SUPPORTED_REQUEST_EVENTS
+from tests.workflow_context import the_open_workflow
 
 ORIGINAL_RUN_WORKFLOW = WorkflowRunner.run_workflow
 
@@ -113,7 +114,7 @@ def saved_workflow_name(engine: Engine, tmp_path: Path) -> Iterator[str]:
     _use_default_project(engine, workspace)
     opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="saved"))
     assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
-    saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+    saved = asyncio.run(the_open_workflow(engine).ahandle_request(SaveWorkflowRequest()))
     assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     yield saved.workflow_name

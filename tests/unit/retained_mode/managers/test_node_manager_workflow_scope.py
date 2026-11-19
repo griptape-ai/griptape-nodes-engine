@@ -51,6 +51,7 @@ from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from tests.workflow_context import unbind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -388,8 +389,9 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
     @pytest.mark.asyncio
     async def test_an_unbound_request_finds_no_node_while_one_is_open(self, engine: Engine) -> None:
         """As an MCP client that names no workflow sends it: no envelope id and no binding."""
-        _open_workflow(engine)
+        workflow = _open_workflow(engine)
         node_name = _create_node(engine, _create_canvas(engine), "node")
+        unbind(workflow)
         process = MagicMock()
 
         with patch.object(_ValueNode, "process", process):

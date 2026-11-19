@@ -254,12 +254,12 @@ class FlowManager(EngineScoped):
         return self._node_executor
 
     def get_connections(self) -> Connections:
-        """Get the current workflow's connections.
+        """Get the connections of the workflow the caller is bound to.
 
-        Facade surface: node libraries call it with no workflow to pass, so it reads the current workflow.
+        Facade surface: node libraries call it with no workflow to pass, so it reads the bound workflow.
 
         Raises:
-            NoOpenWorkflowError: No workflow is current.
+            NoOpenWorkflowError: The caller is bound to no workflow.
         """
         return self.engine.current_workflow().flows.connections
 
@@ -854,12 +854,12 @@ class FlowManager(EngineScoped):
         return result
 
     def get_flow_by_name(self, flow_name: str) -> ControlFlow:
-        """The open workflow's flow named `flow_name`.
+        """The flow named `flow_name` in the workflow the caller is bound to.
 
         Edge method for code not handed a workflow; engine code calls `get_flow_by_name_in`.
 
         Raises:
-            KeyError: No flow of that name is in the open workflow, or no workflow is open.
+            KeyError: No flow of that name is in the bound workflow, or the caller is bound to none.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -2648,14 +2648,6 @@ class FlowManager(EngineScoped):
             engine=self.engine,
         )
 
-    def reset_global_execution_state(self) -> None:
-        """Edge method for `Engine` teardown, which calls it with no workflow; engine code calls `reset_global_execution_state_in`.
-
-        Raises:
-            NoOpenWorkflowError: No workflow is current.
-        """
-        self.reset_global_execution_state_in(self.engine.current_workflow())
-
     def reset_global_execution_state_in(self, workflow: WorkflowRuntime) -> None:
         """Reset all of `workflow`'s execution state - useful when clearing the workflow."""
         flows = workflow.flows
@@ -3273,7 +3265,7 @@ class FlowManager(EngineScoped):
         return boundary_nodes
 
     def get_node_dependencies(self, flow: ControlFlow, node: BaseNode) -> list[BaseNode]:  # noqa: ARG002
-        """The node and its upstream nodes, only the node when no workflow is open.
+        """The node and its upstream nodes, only the node when the caller is bound to no workflow.
 
         Edge method for code not handed a workflow; engine code calls `get_node_dependencies_in`.
         """

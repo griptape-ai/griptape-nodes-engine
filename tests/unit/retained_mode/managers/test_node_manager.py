@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.events.node_events import (
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
 from griptape_nodes.serialization.values import UndecodedValue
+from tests.workflow_context import bind, the_open_workflow
 
 # Workflow ids in the form the registry mints.
 _ORCHESTRATOR_WORKFLOW_ID = "0577bcf13a9809c5fcc5b68d391658f0"
@@ -285,6 +286,7 @@ class TestSerializeNodeWithoutLibraryMetadata:
 
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="proxy_workflow", flow_name="proxy_flow"))
+        bind(the_open_workflow(engine))
 
         node = ErrorProxyNode(
             name="Execute Python",
@@ -814,6 +816,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         self._register()
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="denied_workflow", flow_name="denied_flow"))
+        bind(the_open_workflow(engine))
         engine.event_manager.add_authorization_hook(
             lambda _checkpoint: CheckpointDenial(
                 failures=(

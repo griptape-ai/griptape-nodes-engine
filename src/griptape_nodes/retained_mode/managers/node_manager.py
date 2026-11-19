@@ -3458,12 +3458,12 @@ class NodeManager(EngineScoped):
         return sorted(owned)
 
     def get_node_by_name(self, name: str) -> BaseNode:
-        """The open workflow's node named `name`.
+        """The node named `name` in the workflow the caller is bound to.
 
         Edge method for code not handed a workflow; engine code calls `get_node_by_name_in`.
 
         Raises:
-            ValueError: No node of that name is in the open workflow, or no workflow is open.
+            ValueError: No node of that name is in the bound workflow, or the caller is bound to none.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -3485,13 +3485,13 @@ class NodeManager(EngineScoped):
         return node
 
     def get_node_parent_flow_by_name(self, node_name: str) -> str:
-        """The name of the flow the open workflow's node belongs to.
+        """The name of the flow the bound workflow's node belongs to.
 
         Edge method for `VariableResolver`, which node code calls with no workflow to pass; engine code
         reads `workflow.nodes.parent_flow_name`.
 
         Raises:
-            KeyError: No node of that name is in the open workflow, or no workflow is open.
+            KeyError: No node of that name is in the bound workflow, or the caller is bound to none.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:

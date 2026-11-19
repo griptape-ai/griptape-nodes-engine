@@ -127,8 +127,14 @@ from griptape_nodes.retained_mode.managers.workflow.shape import (
 from griptape_nodes.retained_mode.managers.workflow_manager import (
     WorkflowManager,
 )
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
-from tests.workflow_context import empty_workflow_registry
+from tests.workflow_context import (
+    empty_workflow_registry,
+    send_in_the_open_workflow,
+    send_in_the_open_workflow_async,
+    the_open_workflow,
+)
 
 
 def _file_path(context_manager: "ContextManager") -> str | None:
@@ -1556,6 +1562,7 @@ class TestWorkflowManager:
             context_manager.push_workflow(workflow_name=workflow_key)
 
             # Create a top-level flow under the active workflow so there's state to tear down.
+            workflow = engine.current_workflow()
             create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None))
             assert isinstance(create_result, CreateFlowResultSuccess)
             flow_name = create_result.flow_name
@@ -1569,15 +1576,18 @@ class TestWorkflowManager:
                 )
 
                 assert isinstance(result, DeleteWorkflowResultSuccess)
-                # Context stack is fully torn down.
-                assert not context_manager.has_current_workflow()
-                # Child flow was deleted too; no orphans left in the ObjectManager.
-                assert not object_manager.has_object_with_name(flow_name)
-                assert not object_manager.get_filtered_subset(type=ControlFlow)
+                # Nothing is left open: the push bound this test to the workflow, so it now holds a
+                # binding to a closed one, and its reads are refused rather than finding another.
+                assert engine.open_workflows.all_open() == []
+                with pytest.raises(WorkflowNotOpenError):
+                    context_manager.has_current_workflow()
+                # Child flow was deleted too; no orphans left in the workflow's objects.
+                assert not workflow.objects.has(flow_name)
+                assert workflow.objects.get_filtered_subset(type=ControlFlow) == {}
                 # Registry entry is gone.
                 assert engine.workflow_registry.find_by_name(workflow_key) is None
             finally:
-                if context_manager.has_current_workflow():
+                if engine.open_workflows.all_open():
                     context_manager.pop_workflow()
 
     def test_delete_non_active_workflow_leaves_context_untouched(self, engine: Engine) -> None:
@@ -4115,7 +4125,7 @@ class TestWorkflowCreationHonorsSaveSituation:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
         return save_result.workflow_name
 
@@ -4174,7 +4184,9 @@ class TestWorkflowCreationHonorsSaveSituation:
             engine.ahandle_request(OpenWorkflowRequest(workflow_name=created.workflow_name, create_flow=True))
         )
         assert isinstance(opened, OpenWorkflowResultSuccess), opened.result_details
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=created.workflow_name)))
+        saved = asyncio.run(
+            send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=created.workflow_name))
+        )
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert Path(saved.file_path) == Path(created.file_path)
@@ -4446,7 +4458,7 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
         engine.workflow_registry.get_workflow_by_name(save_result.workflow_name).metadata.is_template = True
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
@@ -4479,7 +4491,7 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
         metadata = engine.workflow_registry.get_workflow_by_name(save_result.workflow_name).metadata
         metadata.is_griptape_provided = True
@@ -4530,7 +4542,7 @@ class TestWorkflowCreationOnTheDefaultProject:
         library_content = library_file.read_text(encoding="utf-8")
         copy_id = self._open_library_workflow_copy(engine, library_key)
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert saved.workflow_id == copy_id
@@ -4538,7 +4550,9 @@ class TestWorkflowCreationOnTheDefaultProject:
         assert Path(saved.file_path).exists()
         assert library_file.read_text(encoding="utf-8") == library_content
 
-        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=saved.workflow_name)))
+        saved_again = asyncio.run(
+            send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=saved.workflow_name))
+        )
 
         assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
         assert Path(saved_again.file_path) == Path(saved.file_path)
@@ -4557,14 +4571,16 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         library_key = self._make_library_workflow(engine, "library_workflow")
         self._open_library_workflow_copy(engine, library_key)
-        engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
+        send_in_the_open_workflow(engine, SetVariableSubstitutionEnabledRequest(enabled=False))
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
-        saved_again = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=saved.workflow_name)))
+        saved_again = asyncio.run(
+            send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=saved.workflow_name))
+        )
         assert isinstance(saved_again, SaveWorkflowResultSuccess), saved_again.result_details
 
-        assert engine.workflow_manager.variable_substitution.is_enabled(engine.current_workflow()) is False
+        assert engine.workflow_manager.variable_substitution.is_enabled(the_open_workflow(engine)) is False
         assert "SetVariableSubstitutionEnabledRequest" in Path(saved_again.file_path).read_text(encoding="utf-8")
 
     def test_saving_the_users_own_workflow_still_overwrites_it(self, engine: Engine, temp_dir: Path) -> None:
@@ -4577,7 +4593,7 @@ class TestWorkflowCreationOnTheDefaultProject:
         own_key = self._make_library_workflow(engine, "own_workflow")
         engine.workflow_registry.get_workflow_by_name(own_key).metadata.is_griptape_provided = False
 
-        saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest(file_name=own_key)))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name=own_key)))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert Path(saved.file_path) == temp_dir / "own_workflow.py"
@@ -4595,7 +4611,7 @@ class TestWorkflowCreationOnTheDefaultProject:
 
         ensure_result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="shot_lighting"))
         assert isinstance(ensure_result, EnsureWorkflowAndFlowResultSuccess)
-        save_result = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+        save_result = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest()))
         assert isinstance(save_result, SaveWorkflowResultSuccess), save_result.result_details
 
         branched = engine.handle_request(BranchWorkflowRequest(workflow_name=save_result.workflow_name))

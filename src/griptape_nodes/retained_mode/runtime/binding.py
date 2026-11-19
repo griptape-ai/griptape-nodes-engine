@@ -27,15 +27,16 @@ class NoWorkflow(Enum):
 
 NO_WORKFLOW: Final = NoWorkflow.NO_WORKFLOW
 
-# None means nothing was bound, which is different from binding NO_WORKFLOW: unbound work acts on
-# the only open workflow (see `Engine.current_workflow`), and NO_WORKFLOW work acts on none.
+# None means nothing was bound. NO_WORKFLOW means bound to none on purpose, such as engine work that
+# outlives the request that started it (`create_task_bound_to_no_workflow`). Either way the work acts
+# on no workflow. An edge that opens a workflow binds it (`ContextManager.push_workflow`).
 bound_workflow: ContextVar[WorkflowRuntime | NoWorkflow | None] = ContextVar(
     "griptape_nodes_bound_workflow", default=None
 )
 
 
 class WorkflowNotNamedError(Exception):
-    """Work that needs a workflow named none, and several are open, so none can be chosen for it."""
+    """Never raised. Kept so node libraries that catch it, such as released Nuke builds, still import."""
 
 
 class WorkflowNotOpenError(Exception):

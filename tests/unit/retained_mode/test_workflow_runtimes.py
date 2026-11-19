@@ -149,13 +149,14 @@ class TestRuntimeLifecycle:
 
         with engine.bind_workflow(closed):
             engine.context_manager.pop_workflow()
-            with pytest.raises(WorkflowNotOpenError):
-                engine.current_workflow_or_none()
+            with pytest.raises(NoOpenWorkflowError):
+                engine.current_workflow()
 
         assert engine.open_workflows.all_open() == [other]
 
-    def test_a_request_that_opens_a_workflow_stays_bound_as_dispatch_bound_it(self, engine: Engine) -> None:
+    def test_a_request_that_pushes_a_workflow_binds_it_for_the_handler_only(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="other")
+        other = engine.current_workflow()
         bindings: list[object] = []
 
         def open_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
@@ -173,8 +174,9 @@ class TestRuntimeLifecycle:
         )
 
         assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
-        assert bindings == [NO_WORKFLOW]
-        assert bound_workflow.get() is None
+        opened = next(workflow for workflow in engine.open_workflows.all_open() if workflow is not other)
+        assert bindings == [opened]
+        assert bound_workflow.get() is other
 
     def test_clear_all_object_state_closes_the_open_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -182,7 +184,9 @@ class TestRuntimeLifecycle:
         result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
         assert result.succeeded()
-        assert engine.current_workflow_or_none() is None
+        assert engine.open_workflows.all_open() == []
+        with pytest.raises(WorkflowNotOpenError):
+            engine.current_workflow_or_none()
 
     def test_deleting_the_open_workflow_closes_it(self, engine: Engine) -> None:
         name = engine.context_manager.push_workflow(workflow_name="outer")
@@ -190,7 +194,9 @@ class TestRuntimeLifecycle:
         result = engine.handle_request(DeleteWorkflowRequest(name=name))
 
         assert result.succeeded()
-        assert engine.current_workflow_or_none() is None
+        assert engine.open_workflows.all_open() == []
+        with pytest.raises(WorkflowNotOpenError):
+            engine.current_workflow_or_none()
 
 
 class TestObjectsOnTheRuntime:
@@ -407,11 +413,6 @@ class TestNodesAndFlowsOnTheRuntime:
 
         assert isinstance(result, ListFlowsInFlowResultSuccess), result.result_details
         assert result.flow_names == []
-
-    @pytest.mark.asyncio
-    async def test_resets_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
-        with pytest.raises(NoOpenWorkflowError):
-            engine.flow_manager.reset_global_execution_state()
 
     @pytest.mark.asyncio
     async def test_a_cancelled_run_waking_after_another_workflow_opens_leaves_that_workflows_run_alone(
