@@ -52,7 +52,10 @@ from griptape_nodes.files.path_utils import (
     sanitize_path_string,
     strip_surrounding_quotes,
 )
-from griptape_nodes.image.oiio_config import invalidate_image_cache
+from griptape_nodes.image.cache import (
+    async_image_directory_mutation,
+    image_path_mutation,
+)
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
@@ -1948,19 +1951,18 @@ class OSManager(EngineScoped):
             msg = f"I/O error creating parent directory for {new_path}: {e}"
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
-        # Perform the rename operation
-        invalidate_image_cache(old_path)
-        try:
-            old_path.rename(new_path)
-        except PermissionError as e:
-            msg = f"Permission denied renaming {old_path} to {new_path}: {e}"
-            return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
-        except OSError as e:
-            msg = f"I/O error renaming {old_path} to {new_path}: {e}"
-            return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
-        except Exception as e:
-            msg = f"Unexpected error renaming {old_path} to {new_path}: {type(e).__name__}: {e}"
-            return RenameFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
+        with image_path_mutation(old_path, is_directory=old_path.is_dir()):
+            try:
+                old_path.rename(new_path)
+            except PermissionError as e:
+                msg = f"Permission denied renaming {old_path} to {new_path}: {e}"
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
+            except OSError as e:
+                msg = f"I/O error renaming {old_path} to {new_path}: {e}"
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
+            except Exception as e:
+                msg = f"Unexpected error renaming {old_path} to {new_path}: {type(e).__name__}: {e}"
+                return RenameFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
         # SUCCESS PATH
         details = f"Renamed: {old_path} -> {new_path}"
@@ -2138,46 +2140,44 @@ class OSManager(EngineScoped):
                 return DeleteFileResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
             return None
 
-        if not is_directory:
-            invalidate_image_cache(resolved_path)
-
-        # Perform deletion based on requested behavior
-        match request.deletion_behavior:
-            case DeletionBehavior.PERMANENTLY_DELETE:
-                failure = await attempt_permanent_delete()
-                if failure:
-                    return failure
-                outcome = DeletionOutcome.PERMANENTLY_DELETED
-                result_details = (
-                    f"Successfully deleted {'directory' if is_directory else 'file'} at path {path_to_delete}"
-                )
-
-            case DeletionBehavior.RECYCLE_BIN_ONLY:
-                failure = await attempt_recycle_bin_delete()
-                if failure:
-                    return failure
-                outcome = DeletionOutcome.SENT_TO_RECYCLE_BIN
-                result_details = f"Successfully sent {'directory' if is_directory else 'file'} at path {path_to_delete} to the recycle bin"
-
-            case DeletionBehavior.PREFER_RECYCLE_BIN:
-                failure = await attempt_recycle_bin_delete()
-                if failure:
-                    # Fall back to permanent deletion
+        async with async_image_directory_mutation():
+            # Perform deletion based on requested behavior
+            match request.deletion_behavior:
+                case DeletionBehavior.PERMANENTLY_DELETE:
                     failure = await attempt_permanent_delete()
                     if failure:
                         return failure
                     outcome = DeletionOutcome.PERMANENTLY_DELETED
-                    result_details = ResultDetails(
-                        message=f"Attempted to send {'directory' if is_directory else 'file'} at path {path_to_delete} to the recycle bin, but this failed; fell back to permanent deletion, which succeeded.",
-                        level=logging.WARNING,
+                    result_details = (
+                        f"Successfully deleted {'directory' if is_directory else 'file'} at path {path_to_delete}"
                     )
-                else:
+
+                case DeletionBehavior.RECYCLE_BIN_ONLY:
+                    failure = await attempt_recycle_bin_delete()
+                    if failure:
+                        return failure
                     outcome = DeletionOutcome.SENT_TO_RECYCLE_BIN
                     result_details = f"Successfully sent {'directory' if is_directory else 'file'} at path {path_to_delete} to the recycle bin"
 
-            case _:
-                msg = f"Unknown/unsupported deletion behavior: {request.deletion_behavior}"
-                raise ValueError(msg)
+                case DeletionBehavior.PREFER_RECYCLE_BIN:
+                    failure = await attempt_recycle_bin_delete()
+                    if failure:
+                        # Fall back to permanent deletion
+                        failure = await attempt_permanent_delete()
+                        if failure:
+                            return failure
+                        outcome = DeletionOutcome.PERMANENTLY_DELETED
+                        result_details = ResultDetails(
+                            message=f"Attempted to send {'directory' if is_directory else 'file'} at path {path_to_delete} to the recycle bin, but this failed; fell back to permanent deletion, which succeeded.",
+                            level=logging.WARNING,
+                        )
+                    else:
+                        outcome = DeletionOutcome.SENT_TO_RECYCLE_BIN
+                        result_details = f"Successfully sent {'directory' if is_directory else 'file'} at path {path_to_delete} to the recycle bin"
+
+                case _:
+                    msg = f"Unknown/unsupported deletion behavior: {request.deletion_behavior}"
+                    raise ValueError(msg)
 
         # SUCCESS PATH AT END
         return DeleteFileResultSuccess(

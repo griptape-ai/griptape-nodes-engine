@@ -103,7 +103,10 @@ class ThumbnailGenerator(BaseArtifactPreviewGenerator):
 
     async def _resolve_source(self) -> bytes | Path:
         if not is_url(self.source_file_location) and not self.source_file_location.startswith("data:"):
-            source_path = Path(self.source_file_location)
+            source_path = self.engine.os_manager.resolve_file_path(
+                self.source_file_location,
+                workspace_only=False,
+            )
             if not await anyio.Path(source_path).is_file():
                 msg = f"Failed to read source image: {self.source_file_location}"
                 raise FileNotFoundError(msg)

@@ -16,6 +16,7 @@ from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.files.path_utils import canonicalize_for_identity, decompose_source_path
+from griptape_nodes.image.cache import invalidate_image_cache
 from griptape_nodes.image.oiio_config import apply_openimageio_settings
 from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
@@ -638,6 +639,7 @@ class ArtifactManager(EngineScoped):
             )
             # The post-generation stat becomes the retry's pre-generation stat.
             source_file_entry = post_generation_info_result.file_entry
+            invalidate_image_cache(source_path)
             generation_attempt += 1
 
         # OPTIONAL: Generate metadata if requested
