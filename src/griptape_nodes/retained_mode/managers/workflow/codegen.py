@@ -1002,7 +1002,13 @@ class WorkflowCodeGenerator(EngineScoped):
         self,
         import_recorder: ImportRecorder,
     ) -> ast.AsyncFunctionDef:
-        """Generates the async _ensure_workflow_context function for the serialized workflow file."""
+        """Generates the async _ensure_workflow_context function for the serialized workflow file.
+
+        Only engines with a shared flow stack reach its `push_flow` call; this engine has no such
+        method. Here `has_current_flow()` is False only when the workflow has no top-level flow, so
+        `GetTopLevelFlowRequest` finds none and the call is skipped. Keep it that way, or every saved
+        file fails on this engine.
+        """
         import_recorder.add_from_import("griptape_nodes.retained_mode.events.flow_events", "GetTopLevelFlowRequest")
         import_recorder.add_from_import(
             "griptape_nodes.retained_mode.events.flow_events", "GetTopLevelFlowResultSuccess"
