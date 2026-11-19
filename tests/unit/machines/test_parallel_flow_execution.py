@@ -406,6 +406,7 @@ class TestCollectValuesFromUpstreamNodes:
         target_node.name = "target_node"
         target_node.lock = False
         target_node.parameters = [target_parameter]
+        target_node.incoming_value_overrun_reason.return_value = None
 
         node_reference = MagicMock()
         node_reference.node_reference = target_node
@@ -431,6 +432,60 @@ class TestCollectValuesFromUpstreamNodes:
         assert request.node_name == "target_node"
         assert request.parameter_name == "prompt"
         assert request.value == "hello"
+
+    @pytest.mark.asyncio
+    async def test_a_list_over_its_limit_fails_the_run_with_one_readable_sentence(self) -> None:
+        """A list is only known to be over its limit once the node above it has run, so it is caught here.
+
+        The counting itself is covered in the `ListRows` and `FlowManager` tests. What matters here is
+        that the run stops before the value is set, and that the message names the list rather than the
+        row's uuid and carries no nested "Failed because Exception:" layers.
+        """
+        upstream_node = MagicMock(spec=BaseNode)
+        upstream_node.name = "Create Image List"
+        upstream_node.parameter_output_values = {"output": ["first image", "second image"]}
+
+        upstream_parameter = MagicMock()
+        upstream_parameter.name = "output"
+        upstream_parameter.output_type = "list[ImageUrlArtifact]"
+
+        target_parameter = MagicMock()
+        target_parameter.name = "input_images_ParameterListUniqueParamID_deadbeef"
+        target_parameter.connection_label = "input_images"
+
+        target_node = MagicMock(spec=BaseNode)
+        target_node.name = "Nano Banana"
+        target_node.lock = False
+        target_node.parameters = [target_parameter]
+        target_node.incoming_value_overrun_reason.return_value = (
+            "the list 'Nano Banana.input_images' would hold 15 items, counting the items of a connected "
+            "list and of any list in a row, and it holds at most 14 items."
+        )
+
+        node_reference = MagicMock()
+        node_reference.node_reference = target_node
+
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = (upstream_node, upstream_parameter)
+        engine = MagicMock()
+        ahandle_request = AsyncMock(return_value=MagicMock())
+        engine.ahandle_request = ahandle_request
+        workflow = WorkflowRuntime("wf", engine)
+        workflow.flows.connections = mock_connections
+        context = MagicMock(engine=engine, workflow=workflow)
+
+        with pytest.raises(RuntimeError) as caught:
+            await ExecuteDagState.collect_values_from_upstream_nodes(context, node_reference)
+
+        message = str(caught.value)
+        assert message == (
+            'Attempted to pass "Create Image List.output" into "Nano Banana.input_images". Failed because '
+            "the list 'Nano Banana.input_images' would hold 15 items, counting the items of a connected "
+            "list and of any list in a row, and it holds at most 14 items."
+        )
+        assert "ParameterListUniqueParamID" not in message
+        assert "Failed because Exception" not in message
+        ahandle_request.assert_not_awaited()
 
 
 class TestParallelResolutionNodeDoneWhenTaskCompletes:

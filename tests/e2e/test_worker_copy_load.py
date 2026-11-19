@@ -526,31 +526,40 @@ class TestListsReachTheNodeAsTheOrchestratorHoldsThem:
 
         assert result.parameter_output_values["echo"] == ["a", "b", "c"]
 
-    @pytest.mark.parametrize(
-        ("node_type", "description"),
-        [("ReadsAnInputListNode", "within its rows"), ("ReadsABoundedListNode", "past its max_items")],
-    )
     @pytest.mark.asyncio
-    async def test_a_list_fed_by_a_connection(self, worker: SimulatedWorker, node_type: str, description: str) -> None:
+    async def test_a_list_fed_by_a_connection(self, worker: SimulatedWorker) -> None:
         """The flow runs both nodes in the worker; the list arrives whole, as its connection delivered it."""
         _create("ListSourceNode", "Source")
-        node = _create(node_type, "Fed")
+        node = _create("ReadsAnInputListNode", "Fed")
         _connect("Source", "items", "Fed", "items")
 
         result = await current_engine().ahandle_request(StartFlowRequest(flow_name=_CANVAS_FLOW_NAME))
 
         assert result.succeeded(), result
         assert [request.node_name for request in worker.received] == ["Source", "Fed"]
-        assert node.parameter_output_values["echo"] == ["first", "second", "third"], description
+        assert node.parameter_output_values["echo"] == ["first", "second", "third"]
 
-    @pytest.mark.parametrize("node_type", ["ReadsAnInputListNode", "ReadsABoundedListNode"])
+    @pytest.mark.asyncio
+    async def test_a_connected_list_past_max_items_stops_the_run(self, worker: SimulatedWorker) -> None:
+        """The source's three items do not fit a list that holds two, so the flow fails before the node runs."""
+        _create("ListSourceNode", "Source")
+        node = _create("ReadsABoundedListNode", "Fed")
+        _connect("Source", "items", "Fed", "items")
+
+        result = await current_engine().ahandle_request(StartFlowRequest(flow_name=_CANVAS_FLOW_NAME))
+
+        assert result.failed(), result
+        assert "would hold 3 items" in str(result)
+        assert "Fed" not in [request.node_name for request in worker.received]
+        assert "echo" not in node.parameter_output_values
+
     @pytest.mark.asyncio
     async def test_pasting_a_connected_list_with_its_upstream_keeps_its_whole_value(
-        self, worker: SimulatedWorker, node_type: str
+        self, worker: SimulatedWorker
     ) -> None:
         """A paste sets the values before it makes the connections, so the load must not ask whether the list is connected."""
         _create("ListSourceNode", "Source")
-        node = _create(node_type, "Fed")
+        node = _create("ReadsAnInputListNode", "Fed")
         _connect("Source", "items", "Fed", "items")
         run = await current_engine().ahandle_request(StartFlowRequest(flow_name=_CANVAS_FLOW_NAME))
         assert run.succeeded(), run

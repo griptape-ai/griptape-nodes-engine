@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from queue import Queue
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
 from griptape_nodes.common.node_executor import NodeExecutor
@@ -229,6 +229,13 @@ class QueueItem(NamedTuple):
 
     node: BaseNode
     dag_execution_type: DagExecutionType
+
+
+class SourceValue(NamedTuple):
+    """The value a new connection hands its target, and whether the source had one to give."""
+
+    value: Any
+    found: bool
 
 
 class FlowManager(EngineScoped):
@@ -1017,6 +1024,16 @@ class FlowManager(EngineScoped):
             )
             return CreateConnectionResultFailure(result_details=details)
 
+        # A list that cannot hold what this connection delivers is refused up front, so nothing is
+        # connected and then undone. Only a value the source already holds can be counted.
+        if self._should_pass_value_on_connection(request, source_param, target_node):
+            overrun_reason = target_node.incoming_value_overrun_reason(
+                target_param, self._value_on_connection(source_node, source_param).value
+            )
+            if overrun_reason is not None:
+                details = f'Attempted to connect "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{target_param.connection_label}". Failed because {overrun_reason}'
+                return CreateConnectionResultFailure(result_details=details)
+
         # Based on user feedback, if a connection already exists in a scenario where only ONE such connection can exist
         # (e.g., connecting to a data input that already has a connection, or from a control output that is already wired up),
         # delete the old connection and replace it with this one.
@@ -1184,19 +1201,9 @@ class FlowManager(EngineScoped):
         details = f'Connected "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}".{replaced_details}'
 
         # Now update the parameter values if it exists.
-        # check if it's been resolved/has a value in parameter_output_values
-        if source_param.name in source_node.parameter_output_values:
-            value = source_node.parameter_output_values[source_param.name]
-        # if it doesn't let's use the one in parameter_values! that's the most updated.
-        elif source_param.name in source_node.parameter_values:
-            value = source_node._get_raw_parameter_value(source_param.name)
-        # if not even that.. then does it have a default value?
-        elif source_param.default_value:
-            value = source_param.default_value
-        else:
-            value = None
-            if isinstance(target_param, ParameterContainer):
-                target_node.kill_parameter_children(target_param)
+        source_value = self._value_on_connection(source_node, source_param)
+        if not source_value.found and isinstance(target_param, ParameterContainer):
+            target_node.kill_parameter_children(target_param)
         # Set the parameter value (including None/empty values) unless we're in initial setup
         # Skip propagation for:
         # 1. Control Parameters as they should not receive values
@@ -1205,21 +1212,28 @@ class FlowManager(EngineScoped):
         is_control_parameter = (
             ParameterType.attempt_get_builtin(source_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
         )
-        is_dest_node_locked = target_node.lock
-        if (not is_control_parameter) and (not is_dest_node_locked) and (not request.initial_setup):
+        if self._should_pass_value_on_connection(request, source_param, target_node):
             # When creating a connection, pass the initial value from source to target parameter
             # Set incoming_connection_source fields to identify this as legitimate connection value passing
             # (not manual property setting) so it bypasses the INPUT+PROPERTY connection blocking logic
-            workflow.handle_request(
+            set_value_result = workflow.handle_request(
                 SetParameterValueRequest(
                     parameter_name=target_param.name,
                     node_name=target_node.name,
-                    value=value,
+                    value=source_value.value,
                     data_type=source_param.type,
                     incoming_connection_source_node_name=source_node.name,
                     incoming_connection_source_parameter_name=source_param.name,
                 )
             )
+            # A list or list entry that cannot take the value (for example, the list is full) would stay
+            # connected but empty, so the connection is undone and reported as failed.
+            if set_value_result.failed() and (
+                isinstance(target_param, ParameterList) or target_param.parent_container_name is not None
+            ):
+                return self._undo_connection_after_value_refused(
+                    request, workflow, replaced_connection, str(set_value_result.result_details)
+                )
 
         # Mark all downstream nodes as dirty when connection is created
         # This ensures dependency graph changes propagate even if values don't change
@@ -1242,6 +1256,39 @@ class FlowManager(EngineScoped):
         result = CreateConnectionResultSuccess(result_details=details, replaced_connection=replaced_connection)
 
         return result
+
+    def _undo_connection_after_value_refused(
+        self,
+        request: CreateConnectionRequest,
+        workflow: WorkflowRuntime,
+        replaced_connection: ReplacedConnection | None,
+        refusal_details: str,
+    ) -> CreateConnectionResultFailure:
+        """Remove the connection just made, and put back any it replaced, after its value was refused."""
+        details = f'Attempted to connect "{request.source_node_name}.{request.source_parameter_name}" to "{request.target_node_name}.{request.target_parameter_name}". Failed because the value could not be set on the target: {refusal_details}'
+        delete_result = workflow.handle_request(
+            DeleteConnectionRequest(
+                source_node_name=request.source_node_name,
+                source_parameter_name=request.source_parameter_name,
+                target_node_name=request.target_node_name,
+                target_parameter_name=request.target_parameter_name,
+            )
+        )
+        if delete_result.failed():
+            details = f"{details} The new connection could not be removed afterwards."
+        if replaced_connection is not None:
+            restore_result = workflow.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=replaced_connection.source_node_name,
+                    source_parameter_name=replaced_connection.source_parameter_name,
+                    target_node_name=replaced_connection.target_node_name,
+                    target_parameter_name=replaced_connection.target_parameter_name,
+                    initial_setup=request.initial_setup,
+                )
+            )
+            if restore_result.failed():
+                details = f"{details} The previous connection could not be restored."
+        return CreateConnectionResultFailure(result_details=details)
 
     @handles(DeleteConnectionRequest)
     def on_delete_connection_request(  # noqa: C901, PLR0911, PLR0912, PLR0915 (complex logic, multiple edge cases)
@@ -2380,6 +2427,31 @@ class FlowManager(EngineScoped):
         run = flows.run_in_progress
         if run is not None and run.state is RunState.CANCELLED:
             raise RuntimeError(_CANCELLED_BEFORE_STARTING)
+
+    @staticmethod
+    def _should_pass_value_on_connection(
+        request: CreateConnectionRequest, source_param: Parameter, target_node: BaseNode
+    ) -> bool:
+        is_control_parameter = (
+            ParameterType.attempt_get_builtin(source_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
+        )
+        return not is_control_parameter and not target_node.lock and not request.initial_setup
+
+    @staticmethod
+    def _value_on_connection(source_node: BaseNode, source_param: Parameter) -> SourceValue:
+        """The value a new connection hands to its target: the resolved output, else the set value, else the default.
+
+        `found` is False when the source has none of those, where the target's rows are cleared instead.
+        """
+        # Check if it's been resolved/has a value in parameter_output_values.
+        if source_param.name in source_node.parameter_output_values:
+            return SourceValue(value=source_node.parameter_output_values[source_param.name], found=True)
+        # If it doesn't, the one in parameter_values is the most updated.
+        if source_param.name in source_node.parameter_values:
+            return SourceValue(value=source_node._get_raw_parameter_value(source_param.name), found=True)
+        if source_param.default_value:
+            return SourceValue(value=source_param.default_value, found=True)
+        return SourceValue(value=None, found=False)
 
     @staticmethod
     def _parameter_list_is_full(parameter_list: ParameterList) -> bool:

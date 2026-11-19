@@ -153,18 +153,61 @@ class ListRows:
     def check_row_within_max_items(self, row: Parameter, value: Any, *, initial_setup: bool) -> None:
         if initial_setup:
             return
-        node = self._node
+        reason = self._row_overrun_reason(row, value)
+        if reason is not None:
+            self._raise_overrun(reason)
+
+    def check_connected_list_within_max_items(self, parameter: Parameter, value: Any, *, initial_setup: bool) -> None:
+        """Refuse a list a connection delivers when it and the rows' items together exceed `max_items`."""
+        if initial_setup or self.holds_no_value(parameter):
+            return
+        reason = self._list_overrun_reason(parameter, value)
+        if reason is not None:
+            self._raise_overrun(reason)
+
+    def incoming_overrun_reason(self, target: Parameter, value: Any) -> str | None:
+        """Why a connection to `target` delivering `value` would overrun `max_items`, or None if it fits.
+
+        For a connection not made yet, so a list `target` counts `value` in place of any list it holds now.
+        """
+        if isinstance(target, ParameterList):
+            return self._list_overrun_reason(target, value)
+        return self._row_overrun_reason(target, value)
+
+    def _row_overrun_reason(self, row: Parameter, value: Any) -> str | None:
         container = self._container_of(row)
         if not isinstance(container, ParameterList) or container.max_items is None:
-            return
-        held_count = 0
+            return None
+        held_count = self._connected_item_count(container)
         for child in container.get_child_parameters():
-            child_value = value if child.name == row.name else node._get_raw_parameter_value(child.name)
-            held_count += len(_items_of_row(container, child_value))
-        if held_count <= container.max_items:
-            return
+            child_value = value if child.name == row.name else self._node._get_raw_parameter_value(child.name)
+            held_count += _counted_items_of_row(container, child_value)
+        return self._overrun_reason(container, held_count)
+
+    def _list_overrun_reason(self, parameter: Parameter, value: Any) -> str | None:
+        if not isinstance(parameter, ParameterList) or parameter.max_items is None:
+            return None
+        held_count = len(value) if isinstance(value, list) else 0
+        for child in parameter.get_child_parameters():
+            held_count += _counted_items_of_row(parameter, self._node._get_raw_parameter_value(child.name))
+        return self._overrun_reason(parameter, held_count)
+
+    def _connected_item_count(self, parameter_list: ParameterList) -> int:
+        if self.holds_no_value(parameter_list):
+            return 0
+        connected = self._node.parameter_values.get(parameter_list.name)
+        if not isinstance(connected, list):
+            return 0
+        return len(connected)
+
+    def _overrun_reason(self, container: ParameterList, held_count: int) -> str | None:
+        if container.max_items is None or held_count <= container.max_items:
+            return None
+        return f"the list '{self._node.name}.{container.name}' would hold {held_count} items, counting the items of a connected list and of any list in a row, and it holds at most {container.max_items} items."
+
+    def _raise_overrun(self, reason: str) -> None:
         # Workers rebuild one row per item, so values over `max_items` cannot be restored.
-        msg = f"Attempted to set an item of list '{node.name}.{container.name}'. Failed because the list would hold {held_count} items, counting the items of any list in a row, and holds at most {container.max_items} items."
+        msg = f"Attempted to set an item of a list. Failed because {reason}"
         raise ValueError(msg)
 
     def row_removed(self, parameter_list: ParameterList, row: BaseNodeElement) -> None:
@@ -324,7 +367,16 @@ def handle_container_parameter(current_node: BaseNode, parameter: ParameterConta
 
 def _item_count(parameter_list: ParameterList, entries: list[Any]) -> int:
     """How many items the list holds with one row per entry."""
-    return sum(len(_items_of_row(parameter_list, entry)) for entry in entries)
+    return sum(_counted_items_of_row(parameter_list, entry) for entry in entries)
+
+
+def _counted_items_of_row(container: ParameterContainer, value: Any) -> int:
+    """How many items a row's `value` uses up of `max_items`."""
+    if value is None:
+        return 0
+    if isinstance(container, ParameterList) and container.row_value_counts_as_items(value):
+        return len([item for item in value if item is not None])
+    return 1
 
 
 def _items_of_row(container: ParameterContainer, value: Any) -> list[Any]:
