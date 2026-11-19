@@ -271,9 +271,13 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         ),
         # Deliberately visible (no dot prefix): provenance records are canonical
         # work product users commit and ship, unlike the regenerable caches above.
+        # Anchored at the workspace root, deliberately NOT the workflow folder: one store
+        # keeps a file's history whole across Save As, lets lineage resolve parents
+        # produced by other workflows, and gives the by-hash index one namespace so a
+        # copied file still matches. Queries stay workflow-independent as a result.
         "griptape-nodes-provenance": DirectoryDefinition(
             name="griptape-nodes-provenance",
-            path_macro="{workflow_dir?:/}griptape-nodes-provenance",
+            path_macro="{workspace_dir}/griptape-nodes-provenance",
             description="Immutable per-save provenance records; canonical records under by-path/, content-hash pointers under by-hash/.",
         ),
         "griptape-nodes-thumbnails": DirectoryDefinition(

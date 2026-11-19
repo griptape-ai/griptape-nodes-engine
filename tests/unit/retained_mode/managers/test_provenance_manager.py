@@ -987,6 +987,39 @@ class TestRecordWorkflowAttribution:
         assert record.workflow.name != focused_name
 
 
+class TestStoreLocation:
+    """The store is anchored at the workspace root, never a workflow's own folder.
+
+    One store keeps a file's history whole across Save As, lets lineage find parents
+    other workflows produced, and keeps the by-hash index in one namespace. The
+    by-path mirror keys on the workspace-relative path, so the workflow folder shows
+    up IN the key rather than as a separate store root.
+    """
+
+    def test_workflow_with_own_folder_records_at_the_workspace_store(self, engine: Engine, temp_dir: Path) -> None:
+        workflow_dir = temp_dir / "questwf"
+        workflow_dir.mkdir()
+        entry = engine.workflow_registry.register_unsaved("questwf", str(workflow_dir), listed=False)
+        try:
+            engine.open_workflow(entry.workflow_id)
+            result = engine.handle_request(
+                WriteFileRequest(
+                    file_path=str(workflow_dir / "render.txt"), content="pixels", provenance=_sample_provenance()
+                )
+            )
+        finally:
+            engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert result.provenance is not None
+        record_path = Path(result.provenance.record_path)
+        # Store root is the workspace, not the workflow folder...
+        assert record_path.is_relative_to(temp_dir / PROVENANCE_STORE_DIR)
+        assert not record_path.is_relative_to(workflow_dir)
+        # ...and the workflow folder appears in the by-path key instead.
+        assert record_path.parent == temp_dir / PROVENANCE_STORE_DIR / "by-path" / "questwf" / "render.txt"
+
+
 class TestScratchPathEdges:
     def test_non_temp_absolute_path_is_not_scratch(self, engine: Engine) -> None:
         assert engine.provenance_manager._is_engine_scratch_path(Path("/definitely/not/temp/out.png")) is False

@@ -112,6 +112,7 @@ from griptape_nodes.retained_mode.file_metadata.workflow_metadata import (
     _collect_workflow_info,
     _parameter_values_of,
 )
+from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.serialization.commands import encode_commands
 from griptape_nodes.serialization.values import ValueEncodeError
 from griptape_nodes.utils.version_utils import get_current_version
@@ -210,21 +211,7 @@ class ProvenanceManager(EngineScoped):
         super().__init__(engine=engine)
         self._event_manager = event_manager
         if event_manager is not None:
-            event_manager.assign_manager_to_request_type(
-                GetProvenanceForArtifactRequest, self.on_get_provenance_for_artifact_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListProvenanceRecordsForArtifactRequest, self.on_list_provenance_records_for_artifact_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListProvenanceRecordsForHashRequest, self.on_list_provenance_records_for_hash_request
-            )
-            event_manager.assign_manager_to_request_type(
-                ListProvenancedArtifactsRequest, self.on_list_provenanced_artifacts_request
-            )
-            event_manager.assign_manager_to_request_type(
-                GetProvenancePayloadRequest, self.on_get_provenance_payload_request
-            )
+            event_manager.register_request_handlers(self)
         # One-time flag so legacy projects (templates without the provenance
         # situation) log a single info line instead of one per save.
         self._warned_no_situation = False
@@ -342,7 +329,11 @@ class ProvenanceManager(EngineScoped):
         return None
 
     # -- query handlers (the external interface) -----------------------------
+    # HOST-scoped on purpose: the store lives at the workspace root, so a query is
+    # about a file, not about any open workflow -- it must answer with zero, one,
+    # or many workflows open, including for files whose workflow is closed or gone.
 
+    @handles(GetProvenanceForArtifactRequest)
     def on_get_provenance_for_artifact_request(self, request: GetProvenanceForArtifactRequest) -> ResultPayload:
         """Get the latest (or a specific) record for an artifact, by any path spelling."""
         artifact_path = self._resolve_artifact_path(request.macro_path)
@@ -387,6 +378,7 @@ class ProvenanceManager(EngineScoped):
             result_details=f"Found provenance record '{record.record_id}' for '{request.macro_path}'.",
         )
 
+    @handles(GetProvenancePayloadRequest)
     def on_get_provenance_payload_request(self, request: GetProvenancePayloadRequest) -> ResultPayload:
         """Fetch one record's full payload: the explicit opt-in to the weight."""
         artifact_path = self._resolve_artifact_path(request.macro_path)
@@ -420,6 +412,7 @@ class ProvenanceManager(EngineScoped):
             result_details=f"Fetched the full payload of record '{record.record_id}'.",
         )
 
+    @handles(ListProvenanceRecordsForArtifactRequest)
     def on_list_provenance_records_for_artifact_request(
         self, request: ListProvenanceRecordsForArtifactRequest
     ) -> ResultPayload:
@@ -437,6 +430,7 @@ class ProvenanceManager(EngineScoped):
             result_details=f"Found {len(resolved.records)} provenance record(s) for '{request.macro_path}'.",
         )
 
+    @handles(ListProvenanceRecordsForHashRequest)
     def on_list_provenance_records_for_hash_request(
         self, request: ListProvenanceRecordsForHashRequest
     ) -> ResultPayload:
@@ -459,6 +453,7 @@ class ProvenanceManager(EngineScoped):
             result_details=f"Found {len(records)} provenance record(s) for the content hash.",
         )
 
+    @handles(ListProvenancedArtifactsRequest)
     def on_list_provenanced_artifacts_request(self, request: ListProvenancedArtifactsRequest) -> ResultPayload:  # noqa: ARG002
         """Inventory every artifact with provenance, sorted by artifact type then path."""
         store_root = self._store_root_or_none()
