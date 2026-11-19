@@ -855,27 +855,22 @@ class TestDroppedMetadataWarning:
 
         assert caplog.records == []
 
-    def test_drops_exif_too_large_for_a_jpeg(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_rejects_exif_too_large_for_a_jpeg(self) -> None:
         exif = _camera_exif()
         exif[_EXIF_MAKER_NOTE_TAG] = bytes(_OVERSIZE_BYTES)
 
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes.image"):
-            jpeg = _from_pixels(solid(4, 4), ImageMetadata(exif=exif)).encode(ImageFormat.JPEG)
+        with pytest.raises(ValueError, match="metadata is too large"):
+            _from_pixels(solid(4, 4), ImageMetadata(exif=exif)).encode(ImageFormat.JPEG)
 
-        assert read_exif(jpeg, ImageFormat.JPEG) is None
-        assert [record.getMessage() for record in caplog.records] == ["Saved an image as JPEG without its EXIF."]
-
-    def test_drops_exif_too_large_to_splice_into_a_jpeg(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_rejects_exif_too_large_to_splice_into_a_jpeg(self) -> None:
         exif = _camera_exif()
         exif[_EXIF_MAKER_NOTE_TAG] = bytes(_OVERSIZE_BYTES)
         source = _with_exif(encode(solid(4, 4), "jpg"), _camera_exif())
 
-        with caplog.at_level(logging.WARNING, logger="griptape_nodes.image"), GriptapeImage.open(source) as image:
-            jpeg = image.encode(ImageFormat.JPEG, metadata=ImageMetadata(exif=exif))
-            assert image._buf is None
+        with GriptapeImage.open(source) as image, pytest.raises(ValueError, match="metadata is too large"):
+            image.encode(ImageFormat.JPEG, metadata=ImageMetadata(exif=exif))
 
-        assert read_exif(jpeg, ImageFormat.JPEG) is None
-        assert [record.getMessage() for record in caplog.records] == ["Saved an image as JPEG without its EXIF."]
+        assert read_exif(source, ImageFormat.JPEG) == _camera_exif().to_bytes()
 
     def test_pipeline_output_warns_about_xmp_it_lost(self, caplog: pytest.LogCaptureFixture) -> None:
         jpeg = _with_xmp(_with_exif(encode(solid(8, 8), "jpg"), _camera_exif()))

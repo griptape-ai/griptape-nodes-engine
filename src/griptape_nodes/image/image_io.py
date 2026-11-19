@@ -110,8 +110,13 @@ def _normalized_decoded(buf: oiio.ImageBuf, file_format_name: str) -> Decoded:
         buf.specmod().alpha_channel = 1
     # Formats that store associated alpha (EXR, some TIFF) ignore the config; unassociate them so
     # every buffer held is unassociated.
-    if alpha_channel(buf) is not None and buf.spec().get_int_attribute(UNASSOCIATED_ALPHA, 0) != 1:
-        buf = checked(oiio.ImageBufAlgo.unpremult(buf))
+    if (
+        file_format_name in {"openexr", "tiff"}
+        and alpha_channel(buf) is not None
+        and buf.spec().get_int_attribute(UNASSOCIATED_ALPHA, 0) != 1
+    ):
+        source = buf
+        buf = checked(oiio.ImageBufAlgo.unpremult(source), source)
     return Decoded(buf, file_format_name)
 
 
@@ -139,9 +144,27 @@ def write_file(buf: oiio.ImageBuf, spec: oiio.ImageSpec, path: Path) -> bytes:
         )
         raise ValueError(msg)
     try:
-        if not out.open(str(path), spec) or not buf.write(out):
-            msg = f"Attempted to save an image. Failed because OpenImageIO could not encode it: {out.geterror() or buf.geterror()}"
-            raise ValueError(msg)
-    finally:
+        _write_pixels(out, buf, spec, path)
+    except BaseException:
         out.close()
+        raise
+    closed = out.close()
+    error = out.geterror()
+    checked(buf)
+    if not closed or error:
+        msg = f"Attempted to save an image. Failed while finishing the image file: {error}"
+        raise ValueError(msg)
     return path.read_bytes()
+
+
+def _write_pixels(out: oiio.ImageOutput, buf: oiio.ImageBuf, spec: oiio.ImageSpec, path: Path) -> None:
+    opened = out.open(str(path), spec)
+    error = out.geterror()
+    if not opened or error:
+        msg = f"Attempted to save an image. Failed while opening the image file: {error}"
+        raise ValueError(msg)
+    written = buf.write(out)
+    error = out.geterror() or buf.geterror()
+    if not written or error:
+        msg = f"Attempted to save an image. Failed while writing the image pixels: {error}"
+        raise ValueError(msg)

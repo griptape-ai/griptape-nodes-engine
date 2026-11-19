@@ -22,6 +22,7 @@ from griptape_nodes.image.operations import (
     GRAYSCALE_CHANNELS,
     RGB_CHANNELS,
     RGBA_CHANNELS,
+    alpha_channel,
     checked,
     display_referred,
     is_float,
@@ -111,6 +112,8 @@ def reencoded(  # noqa: PLR0913
     holds_display_values: bool,
 ) -> bytes:
     """Encode ``buf`` with ``requested``'s color profile, then write the rest of it into the container."""
+    _exif_block(requested.exif, image_format, dropped)
+    buf = _output_pixels(buf, image_format, dropped)
     if buf.nchannels == GRAYSCALE_CHANNELS and image_format in _RGB_MINIMUM_FORMATS:
         buf = to_rgb(buf)
     elif buf.nchannels == GRAYSCALE_ALPHA_CHANNELS and image_format != ImageFormat.PNG:
@@ -213,6 +216,10 @@ def _output_spec(
     spec = oiio.ImageSpec(source_spec.width, source_spec.height, buf.nchannels, source_spec.format)
     spec.channelnames = source_spec.channelnames
     spec.attribute(UNASSOCIATED_ALPHA, 1)
+    if image_format == ImageFormat.TIFF:
+        # OIIO 3.2.2 creates an EXIF directory for DateTime but cannot write it empty.
+        # An unspecified color space supplies a valid EXIF entry without claiming sRGB.
+        spec.attribute("Exif:ColorSpace", 65535)
     if quality is None:
         quality = _DEFAULT_QUALITY.get(image_format)
     if image_format == ImageFormat.JPEG and quality is not None:
@@ -228,11 +235,30 @@ def _output_spec(
     return spec
 
 
-def _exif_block(exif: Exif | None, image_format: ImageFormat, dropped: list[str]) -> bytes | None:
+def _output_pixels(buf: oiio.ImageBuf, image_format: ImageFormat, dropped: list[str]) -> oiio.ImageBuf:
+    no_alpha_formats = {
+        ImageFormat.JPEG,
+        ImageFormat.HDR,
+        ImageFormat.PFM,
+        ImageFormat.PPM,
+        ImageFormat.PGM,
+        ImageFormat.PBM,
+    }
+    if image_format in no_alpha_formats and alpha_channel(buf) is not None:
+        dropped.append("alpha")
+        buf = to_rgb(buf)
+    if image_format in {ImageFormat.PGM, ImageFormat.PBM} and buf.nchannels != GRAYSCALE_CHANNELS:
+        buf = checked(oiio.ImageBufAlgo.channel_sum(buf, (0.2126, 0.7152, 0.0722)), buf)
+    if image_format == ImageFormat.EXR and alpha_channel(buf) is not None:
+        return checked(oiio.ImageBufAlgo.premult(buf), buf)
+    return buf
+
+
+def _exif_block(exif: Exif | None, image_format: ImageFormat, _dropped: list[str]) -> bytes | None:
     if not exif:
         return None
     block = exif.to_bytes()
     if image_format == ImageFormat.JPEG and not fits_jpeg_segment(block):
-        dropped.append(_EXIF_KIND)
-        return None
+        msg = "Attempted to write image metadata to a JPEG. Failed because the metadata is too large for a JPEG file."
+        raise ValueError(msg)
     return block

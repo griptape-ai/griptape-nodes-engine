@@ -736,7 +736,9 @@ def _user_comment_text(raw: bytes, byte_order: str) -> str:
     body = raw[_USER_COMMENT_CODE_BYTES:]
     if code == _USER_COMMENT_UNICODE:
         return body.decode(_utf16(byte_order), errors="replace").rstrip("\x00")
-    if len(raw) >= _USER_COMMENT_CODE_BYTES and (code in (_USER_COMMENT_ASCII, b"\x00" * 8) or code.isalpha()):
+    if code == b"JIS\x00\x00\x00\x00\x00":
+        return body.decode("shift_jis", errors="replace").rstrip("\x00")
+    if len(raw) >= _USER_COMMENT_CODE_BYTES and code in (_USER_COMMENT_ASCII, b"\x00" * 8):
         return _text(body.rstrip(b"\x00 "))
     # No character code: text written straight into the tag
     return _text(raw.rstrip(b"\x00"))

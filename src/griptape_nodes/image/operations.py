@@ -28,11 +28,12 @@ _BOX_FILTER_MIN_SHRINK = 3
 _SRGB_LINEAR_LIMIT = 0.0031308
 
 
-def checked(buf: oiio.ImageBuf) -> oiio.ImageBuf:
-    """Return ``buf``, raising ValueError if the OpenImageIO call that made it failed."""
-    if buf.has_error:
-        msg = f"Attempted to transform an image. Failed because OpenImageIO reported: {buf.geterror()}"
-        raise ValueError(msg)
+def checked(buf: oiio.ImageBuf, *sources: oiio.ImageBuf) -> oiio.ImageBuf:
+    """Check consumed sources and their result before returning transformed pixels."""
+    for source in (*sources, buf):
+        if source.has_error:
+            msg = f"Attempted to transform an image. Failed because OpenImageIO reported: {source.geterror()}"
+            raise ValueError(msg)
     return buf
 
 
@@ -61,7 +62,7 @@ def thumbnail(buf: oiio.ImageBuf, step: Thumbnail) -> oiio.ImageBuf:
     spec = buf.spec()
     scale = min(step.max_width / spec.width, step.max_height / spec.height)
     if scale >= 1:
-        return buf.copy()
+        return checked(buf.copy(), buf)
     width = max(1, round(spec.width * scale))
     height = max(1, round(spec.height * scale))
     roi = oiio.ROI(0, width, 0, height, 0, 1, 0, buf.nchannels)
@@ -69,13 +70,13 @@ def thumbnail(buf: oiio.ImageBuf, step: Thumbnail) -> oiio.ImageBuf:
     # Filtering unassociated color would bleed the color of transparent pixels into the edges
     source = buf
     if has_alpha:
-        source = oiio.ImageBufAlgo.premult(buf)
+        source = checked(oiio.ImageBufAlgo.premult(buf), buf)
     # resize widens the filter by the shrink factor, so a tent filter antialiases. Lanczos3
     # takes about 8x longer on a 4000x3000 source.
     filter_name = "triangle"
     if scale * _BOX_FILTER_MIN_SHRINK <= 1:
         filter_name = "box"
-    resized = checked(oiio.ImageBufAlgo.resize(source, filter_name, roi=roi))
+    resized = checked(oiio.ImageBufAlgo.resize(source, filter_name, roi=roi), source, buf)
     if has_alpha:
         resized = checked(oiio.ImageBufAlgo.unpremult(resized))
     return resized
@@ -86,21 +87,21 @@ def to_rgb(buf: oiio.ImageBuf) -> oiio.ImageBuf:
     order: tuple[int | float, ...] = (0, 1, 2)
     if buf.nchannels in (GRAYSCALE_CHANNELS, GRAYSCALE_ALPHA_CHANNELS):
         order = (0, 0, 0)
-    return checked(oiio.ImageBufAlgo.channels(buf, order, ("R", "G", "B")))
+    return checked(oiio.ImageBufAlgo.channels(buf, order, ("R", "G", "B")), buf)
 
 
 def to_rgba(buf: oiio.ImageBuf) -> oiio.ImageBuf:
     """Return four-channel color, with an opaque alpha if there was none."""
     channels = buf.nchannels
     if channels == RGBA_CHANNELS:
-        return buf.copy()
+        return checked(buf.copy(), buf)
     if channels == GRAYSCALE_CHANNELS:
         order: tuple[int | float, ...] = (0, 0, 0, 1.0)
     elif channels == GRAYSCALE_ALPHA_CHANNELS:
         order = (0, 0, 0, 1)
     else:
         order = (0, 1, 2, 1.0)
-    return checked(oiio.ImageBufAlgo.channels(buf, order, ("R", "G", "B", "A")))
+    return checked(oiio.ImageBufAlgo.channels(buf, order, ("R", "G", "B", "A")), buf)
 
 
 def oriented(buf: oiio.ImageBuf, orientation: int) -> oiio.ImageBuf:  # noqa: PLR0911
