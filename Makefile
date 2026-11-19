@@ -181,6 +181,10 @@ check/changelog: ## Check CHANGELOG.md and the changelog.d entries follow Keep a
 changelog: ## Print [Unreleased] as the next release will show it, changelog.d entries folded in.
 	@uv run python scripts/changelog.py render
 
+.PHONY: test/image/minimal
+test/image/minimal: ## Check image processing in an isolated engine-only environment.
+	@uv run --isolated --no-project --with . python scripts/smoke_image_dependencies.py
+
 .PHONY: test  ## Run all tests.
 test: test/unit test/integration test/e2e
 
