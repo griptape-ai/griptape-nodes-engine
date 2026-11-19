@@ -611,13 +611,6 @@ class FlowManager(EngineScoped):
             referenced_workflow_name = workflow_manager.get_current_referenced_workflow()
             workflow.flows.flow_to_referenced_workflow_name[flow] = referenced_workflow_name
 
-        if request.set_as_new_context:
-            logger.warning(
-                "CreateFlowRequest for Flow '%s' set set_as_new_context, which is deprecated and ignored. "
-                "Name the flow on later requests, or send them inside a ContextManager().flow() block.",
-                final_flow_name,
-            )
-
         # Success
         details = f"Successfully created Flow '{final_flow_name}'."
         log_level = logging.DEBUG

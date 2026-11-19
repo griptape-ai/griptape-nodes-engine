@@ -165,6 +165,23 @@ class TestSerializeUnknownFlow:
         assert isinstance(result, SerializeFlowToCommandsResultFailure)
 
 
+class TestSavedFilesRunOnOlderEngines:
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_serialized_flows_say_not_to_make_them_current(self, engine: Engine) -> None:
+        """Codegen writes fields that differ from their default; older engines push a flow unless told not to."""
+        engine.context_manager.push_workflow(workflow_name="wf_older_engines")
+        parent_name = _create_flow(engine, "parent")
+        _create_flow(engine, "child", parent_flow_name=parent_name)
+
+        serialized = _serialize(engine, parent_name)
+
+        assert isinstance(serialized.flow_initialization_command, CreateFlowRequest)
+        assert serialized.flow_initialization_command.set_as_new_context is False
+        child_command = serialized.sub_flows_commands[0].flow_initialization_command
+        assert isinstance(child_command, CreateFlowRequest)
+        assert child_command.set_as_new_context is False
+
+
 class TestSubflowAggregation:
     """A parent Flow's serialization reports its whole subtree, not just its direct nodes."""
 

@@ -701,6 +701,7 @@ class WorkflowSaver(EngineScoped):
             commands.flow_initialization_command = CreateFlowRequest(
                 flow_name=request.flow_name,
                 parent_flow_name=None,
+                set_as_new_context=False,
                 metadata=commands.flow_initialization_command.imported_flow_metadata,
             )
         elif isinstance(commands.flow_initialization_command, CreateFlowRequest):

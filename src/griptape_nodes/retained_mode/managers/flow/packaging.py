@@ -313,6 +313,7 @@ class FlowPackaging(EngineScoped):
 
         create_packaged_flow_request = CreateFlowRequest(
             parent_flow_name=None,  # Standalone flow
+            set_as_new_context=False,  # Let deserializer decide
             metadata=packaged_flow_metadata,
         )
 

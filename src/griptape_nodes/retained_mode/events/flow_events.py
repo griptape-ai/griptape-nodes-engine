@@ -55,7 +55,8 @@ class CreateFlowRequest(RequestPayload, GraphAccessMixin):
     Args:
         parent_flow_name: Name of the parent flow to create the new flow within
         flow_name: Name for the new flow (None for auto-generated)
-        set_as_new_context: Deprecated and ignored. Name the flow on later requests instead.
+        set_as_new_context: Ignored. Name the flow on later requests instead. It defaults to True so that
+            saved files keep writing False, which older engines need.
         metadata: Initial metadata for the flow
 
     Results: CreateFlowResultSuccess (with flow name) | CreateFlowResultFailure (parent not found, name conflicts)
@@ -63,7 +64,7 @@ class CreateFlowRequest(RequestPayload, GraphAccessMixin):
 
     parent_flow_name: str | None
     flow_name: str | None = None
-    set_as_new_context: bool = False
+    set_as_new_context: bool = True
     metadata: dict | None = None
 
 
