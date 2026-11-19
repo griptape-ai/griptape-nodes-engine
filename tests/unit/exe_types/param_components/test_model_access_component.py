@@ -1343,6 +1343,82 @@ class TestRuntimeRepopulationIsNotRepaired:
         assert [record for record in caplog.records if record.levelname == "WARNING"] == []
 
 
+class TestRepairMessageOnTheNode:
+    """A repaired dropdown tells the artist on the node itself, until the model next changes."""
+
+    _MESSAGE_NAME = "model_model_list_updated"
+
+    @staticmethod
+    def _stale_node() -> tuple[_AccessProbeNode, Parameter]:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        _replay_saved_dropdown(param, choices=["alpha", "beta", "retired"])
+        return node, param
+
+    def _message(self, node: _AccessProbeNode):  # noqa: ANN202
+        message = node.get_message_by_name_or_element_id(self._MESSAGE_NAME)
+        assert message is not None
+        return message
+
+    def test_the_message_starts_hidden(self) -> None:
+        node, _helper, _param = _build_probe_node_with_component(model_choices=["alpha", "beta"], default_model="alpha")
+
+        assert self._message(node).ui_options["hide"] is True
+
+    def test_a_repair_shows_a_warning_naming_the_retired_model_and_the_new_selection(self) -> None:
+        node, param = self._stale_node()
+
+        node.set_parameter_value(param.name, "retired", initial_setup=True, skip_before_value_set=True)
+
+        message = self._message(node)
+        assert message.ui_options["hide"] is False
+        assert message.variant == "warning"
+        assert "`retired`" in message.value
+        assert "from `retired` to `beta`" in message.value
+        assert "Save the workflow" in message.value
+
+    def test_it_does_not_claim_a_change_when_the_selection_stayed_put(self) -> None:
+        node, param = self._stale_node()
+
+        node.set_parameter_value(param.name, "alpha", initial_setup=True, skip_before_value_set=True)
+
+        assert "The selected model changed" not in self._message(node).value
+
+    def test_the_next_model_assignment_hides_it(self) -> None:
+        node, param = self._stale_node()
+        node.set_parameter_value(param.name, "retired", initial_setup=True, skip_before_value_set=True)
+
+        node.set_parameter_value(param.name, "alpha")
+
+        assert self._message(node).ui_options["hide"] is True
+
+    def test_nothing_is_shown_when_there_was_nothing_to_repair(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+
+        node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+
+        assert self._message(node).ui_options["hide"] is True
+
+    def test_a_provider_list_never_shows_it(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        param.update_ui_options_key("data", [{"name": "llama3"}, {"name": "mistral"}])
+
+        node._update_option_choices(param.name, ["llama3", "mistral"], "llama3")
+
+        assert self._message(node).ui_options["hide"] is True
+
+
 class TestSelectionReadingApi:
     """The component owns the parameter, so callers never re-derive the current value."""
 
