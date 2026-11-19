@@ -212,37 +212,33 @@ class WorkflowRunner(EngineScoped):
     @handles(RunWorkflowFromScratchRequest)
     async def on_run_workflow_from_scratch_request(self, request: RunWorkflowFromScratchRequest) -> ResultPayload:
         """Close what a clean slate closes (`_clear_slate_for`), then open the file as a workflow."""
-        # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it into a blank slate.
-        with self.engine.workflow_manager.squelch_workflow_altered():
-            # Check if file path exists
-            relative_file_path = request.file_path
-            complete_file_path = self.engine.workflow_registry.get_complete_file_path(
-                relative_file_path=relative_file_path
-            )
-            if not await anyio.Path(complete_file_path).is_file():
-                details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
-                return RunWorkflowFromScratchResultFailure(result_details=details)
+        # Check if file path exists
+        relative_file_path = request.file_path
+        complete_file_path = self.engine.workflow_registry.get_complete_file_path(relative_file_path=relative_file_path)
+        if not await anyio.Path(complete_file_path).is_file():
+            details = f"Failed to find file. Path '{complete_file_path}' doesn't exist."
+            return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            target = self.engine.workflow_registry.find_by_path(str(complete_file_path))
-            close_failure = await self._clear_slate_for(target)
-            if close_failure is not None:
-                details = f"Attempted to run '{complete_file_path}'. Failed because {close_failure}"
-                return RunWorkflowFromScratchResultFailure(result_details=details)
+        target = self.engine.workflow_registry.find_by_path(str(complete_file_path))
+        close_failure = await self._clear_slate_for(target)
+        if close_failure is not None:
+            details = f"Attempted to run '{complete_file_path}'. Failed because {close_failure}"
+            return RunWorkflowFromScratchResultFailure(result_details=details)
 
-            # Opens by the absolute path, as a standalone run does (`push_workflow(file_path=__file__)`),
-            # so both find the same registry entry.
-            execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=None)
-            if not execution_result.execution_successful:
-                return RunWorkflowFromScratchResultFailure(
-                    result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
-                )
-            self._mark_clean_slate_copy(target, execution_result.workflow_id)
-            return RunWorkflowFromScratchResultSuccess(
-                status=execution_result.status,
-                workflow_id=execution_result.workflow_id,
-                open_workflow=self._open_workflow_info(execution_result.workflow_id),
-                result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
+        # Opens by the absolute path, as a standalone run does (`push_workflow(file_path=__file__)`),
+        # so both find the same registry entry.
+        execution_result = await self.run_workflow(relative_file_path=relative_file_path, workflow=None)
+        if not execution_result.execution_successful:
+            return RunWorkflowFromScratchResultFailure(
+                result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
             )
+        self._mark_clean_slate_copy(target, execution_result.workflow_id)
+        return RunWorkflowFromScratchResultSuccess(
+            status=execution_result.status,
+            workflow_id=execution_result.workflow_id,
+            open_workflow=self._open_workflow_info(execution_result.workflow_id),
+            result_details=ResultDetails(*execution_result_details(execution_result, level=logging.DEBUG)),
+        )
 
     @handles(RunWorkflowWithCurrentStateRequest)
     async def on_run_workflow_with_current_state_request(
@@ -308,37 +304,33 @@ class WorkflowRunner(EngineScoped):
             )
             return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-        # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
-        with self.engine.workflow_manager.squelch_workflow_altered():
-            if request.run_with_clean_slate:
-                # Refused before anything is registered or run.
-                close_failure = await self._clear_slate_for(registered)
-                if close_failure is not None:
-                    details = f"Attempted to run workflow '{request.workflow_name}'. Failed because {close_failure}"
-                    return RunWorkflowFromRegistryResultFailure(result_details=details)
+        if request.run_with_clean_slate:
+            # Refused before anything is registered or run.
+            close_failure = await self._clear_slate_for(registered)
+            if close_failure is not None:
+                details = f"Attempted to run workflow '{request.workflow_name}'. Failed because {close_failure}"
+                return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-            try:
-                built = await self.open_and_build_workflow(workflow_name=request.workflow_name)
-            except ContextManager.OpenRefusedError as err:
-                return RunWorkflowFromRegistryResultFailure(result_details=str(err))
-            if built.already_open:
-                details = (
-                    f"Attempted to run workflow '{request.workflow_name}'. Failed because it is already open. "
-                    "Close it first."
-                )
-                return RunWorkflowFromRegistryResultFailure(result_details=details)
-            execution_result = built.execution_result
-            if execution_result is None:
-                details = (
-                    f"Attempted to run workflow '{request.workflow_name}'. Failed because it opened without its file."
-                )
-                return RunWorkflowFromRegistryResultFailure(result_details=details)
-            if not execution_result.execution_successful:
-                return RunWorkflowFromRegistryResultFailure(
-                    result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
-                )
-            if request.run_with_clean_slate:
-                self._mark_clean_slate_copy(registered, built.workflow_id)
+        try:
+            built = await self.open_and_build_workflow(workflow_name=request.workflow_name)
+        except ContextManager.OpenRefusedError as err:
+            return RunWorkflowFromRegistryResultFailure(result_details=str(err))
+        if built.already_open:
+            details = (
+                f"Attempted to run workflow '{request.workflow_name}'. Failed because it is already open. "
+                "Close it first."
+            )
+            return RunWorkflowFromRegistryResultFailure(result_details=details)
+        execution_result = built.execution_result
+        if execution_result is None:
+            details = f"Attempted to run workflow '{request.workflow_name}'. Failed because it opened without its file."
+            return RunWorkflowFromRegistryResultFailure(result_details=details)
+        if not execution_result.execution_successful:
+            return RunWorkflowFromRegistryResultFailure(
+                result_details=ResultDetails(*execution_result_details(execution_result, level=logging.ERROR))
+            )
+        if request.run_with_clean_slate:
+            self._mark_clean_slate_copy(registered, built.workflow_id)
 
         return RunWorkflowFromRegistryResultSuccess(
             status=execution_result.status,
@@ -351,21 +343,20 @@ class WorkflowRunner(EngineScoped):
     async def on_open_workflow_request(self, request: OpenWorkflowRequest) -> ResultPayload:
         """Return the workflow the request names if it is open, else open it and build its file into it."""
         await self.engine.workflow_manager.wait_for_workflows_loaded()
-        with self.engine.workflow_manager.squelch_workflow_altered():
-            try:
-                built = await self.open_and_build_workflow(
-                    workflow_id=request.workflow_id,
-                    workflow_name=request.workflow_name,
-                    display_name=request.display_name,
-                    working_directory=request.working_directory,
-                    create_flow=request.create_flow,
-                )
-            except ContextManager.RequestedWorkflowNotFoundError as err:
-                return WorkflowNotFoundResultFailure(result_details=str(err))
-            except ContextManager.InvalidWorkingDirectoryError as err:
-                return InvalidWorkingDirectoryResultFailure(result_details=str(err))
-            except ContextManager.OpenRefusedError as err:
-                return OpenWorkflowResultFailure(result_details=str(err))
+        try:
+            built = await self.open_and_build_workflow(
+                workflow_id=request.workflow_id,
+                workflow_name=request.workflow_name,
+                display_name=request.display_name,
+                working_directory=request.working_directory,
+                create_flow=request.create_flow,
+            )
+        except ContextManager.RequestedWorkflowNotFoundError as err:
+            return WorkflowNotFoundResultFailure(result_details=str(err))
+        except ContextManager.InvalidWorkingDirectoryError as err:
+            return InvalidWorkingDirectoryResultFailure(result_details=str(err))
+        except ContextManager.OpenRefusedError as err:
+            return OpenWorkflowResultFailure(result_details=str(err))
 
         execution_result = built.execution_result
         if execution_result is not None and not execution_result.execution_successful:

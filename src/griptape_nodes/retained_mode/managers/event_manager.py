@@ -1611,14 +1611,8 @@ class EventManager(EngineScoped):
         refused before dispatch decided.
         """
         operation_depth_mgr = self.engine.operation_depth_manager
-        workflow_mgr = self.engine.workflow_manager
 
         with operation_depth_mgr as depth_manager:
-            # Now see if the WorkflowManager was asking us to squelch altered_workflow_state commands
-            # This prevents situations like loading a workflow (which naturally alters the workflow state)
-            # from coming in and immediately being flagged as being dirty.
-            if workflow_mgr.should_squelch_workflow_altered():
-                callback_result.altered_workflow_state = False
             self._record_workflow_altered(callback_result, request_workflow)
 
             # Override failure log level if requested, except for a crash: `failure_log_level`

@@ -107,8 +107,6 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from contextvars import Token
-    from types import TracebackType
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -123,16 +121,6 @@ T = TypeVar("T")
 logger = logging.getLogger("griptape_nodes")
 
 _SCAN_PROGRESS_COALESCE_KEY = "workflow_scan_progress"
-
-# How many squelch contexts the current context is inside of; see `WorkflowManager.WorkflowSquelchContext`.
-#
-# Scoped to the context rather than to the manager because a squelch belongs to the load that
-# entered it, not to a workflow: a load closes the workflow it starts from and opens the one it
-# loads. A ContextVar is inherited by the requests the load dispatches, the tasks it spawns, and
-# `asyncio.to_thread` work, so edits made from any other task are still reported as edits.
-_squelch_workflow_altered_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
-    "_squelch_workflow_altered_depth", default=0
-)
 
 
 class WorkflowRegistrationResult(NamedTuple):
@@ -183,26 +171,6 @@ class WorkflowManager(EngineScoped):
     # tasks), and it lives on the instance so each engine has its own. A balanced set/reset removes
     # the entry from the Context that set it.
     _referenced_workflow_stack: contextvars.ContextVar[tuple[str, ...]]
-
-    # Track how many contexts we have that intend to squelch (set to False) altered_workflow_state event values.
-    class WorkflowSquelchContext:
-        """Context manager to squelch workflow altered events."""
-
-        def __init__(self, manager: WorkflowManager):
-            self.manager = manager
-            self._token: Token[int] | None = None
-
-        def __enter__(self) -> None:
-            self._token = _squelch_workflow_altered_depth.set(_squelch_workflow_altered_depth.get() + 1)
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            exc_traceback: TracebackType | None,
-        ) -> None:
-            if self._token is not None:
-                _squelch_workflow_altered_depth.reset(self._token)
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -458,13 +426,6 @@ class WorkflowManager(EngineScoped):
             yield
         finally:
             self._referenced_workflow_stack.reset(token)
-
-    def squelch_workflow_altered(self) -> WorkflowSquelchContext:
-        """Suppress workflow-altered events for the duration of the `with` block."""
-        return self.WorkflowSquelchContext(self)
-
-    def should_squelch_workflow_altered(self) -> bool:
-        return _squelch_workflow_altered_depth.get() > 0
 
     def persist_external_workflow_registration(self, full_path: str) -> None:
         """Persist an out-of-workspace workflow path to global config so it survives restarts.
