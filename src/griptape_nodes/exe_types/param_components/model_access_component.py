@@ -224,7 +224,7 @@ class ModelAccessComponent:
             )
         )
         parameter.update_ui_options(self._build_ui_options())
-        parameter.add_converter(self._convert_legacy_value)
+        parameter.add_converter(self._convert_stored_value)
 
         # Migrate a legacy stored value to its canonical choice before
         # considering whether that choice is currently permitted.
@@ -285,9 +285,13 @@ class ModelAccessComponent:
         Nodes that remove and later re-add ``Options`` on the model parameter
         (e.g. after a driver connection is dropped) call this to put the
         component's state back. Idempotent: safe to call when ``Options`` is
-        already present -- ``add_trait`` will replace the existing instance.
+        already present -- the existing trait is removed first, because
+        ``add_trait`` appends rather than replaces and a second ``Options``
+        would leave two dropdowns' worth of converters and validators active.
         """
         parameter = self._parameter
+        for existing in parameter.find_elements_by_type(Options):
+            parameter.remove_trait(existing)
         parameter.add_trait(Options(choices=self._dropdown_choices()))
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
@@ -462,8 +466,8 @@ class ModelAccessComponent:
             return None
         return self._deprecated_values.get(value)
 
-    def _convert_legacy_value(self, value: Any) -> Any:
-        """Migrate a legacy stored value to its canonical choice; everything else passes through.
+    def _convert_stored_value(self, value: Any) -> Any:
+        """Repair a stale saved dropdown, then migrate a legacy stored value to its canonical choice.
 
         Installed as a directly-attached converter (``Parameter.add_converter``)
         rather than hooked into ``before_value_set`` / ``after_value_set``,
@@ -474,11 +478,63 @@ class ModelAccessComponent:
         ``before_value_set`` at all. A converter is the only hook a saved
         workflow's stored value is guaranteed to pass through, so it is the
         only place this migration can live.
+
+        The same property makes it the place to repair the dropdown itself. A
+        saved workflow replays the dropdown it was saved with
+        (``AlterParameterDetailsRequest``) after the node is built and before it
+        sets the stored value, so the value's assignment is the first moment the
+        node can see what the replay left behind.
         """
+        repaired = self._repair_stale_dropdown()
         migrated = self.migrate_value(value)
         if migrated is not None:
-            return migrated
+            value = migrated
+        if repaired and isinstance(value, str):
+            # The trait converters that ran before this one belonged to the stale
+            # ``Options``, so a retired value with no migration passed them. Run the
+            # repaired trait's own, so it lands on ``choices[0]`` like any other
+            # assignment outside the list.
+            for options in self._parameter.find_elements_by_type(Options):
+                for converter in options.converters_for_trait():
+                    value = converter(value)
         return value
+
+    def _repair_stale_dropdown(self) -> bool:
+        """Rebuild the ``Options`` trait and rows if a replayed workflow left retired models in them.
+
+        Returns whether it rebuilt them. Compares model names only: a row's icon,
+        subtitle and label change with the artist's license and are rebuilt by
+        ``refresh``, so a difference there is not staleness.
+
+        A parameter with no ``Options`` trait is left alone. A node strips it
+        deliberately while a driver is connected and puts it back through
+        ``reinstall_options``.
+        """
+        parameter = self._parameter
+        options_traits = parameter.find_elements_by_type(Options)
+        if not options_traits:
+            return False
+        saved_choices = [choice for options in options_traits for choice in options.choices]
+        saved_row_names = self._row_names(parameter.ui_options.get("data"))
+        if (
+            len(options_traits) == 1
+            and options_traits[0].choices == self._dropdown_choices()
+            and saved_row_names == self._model_choices
+        ):
+            return False
+
+        saved_models = [*saved_choices, *saved_row_names]
+        retired = [model for model in dict.fromkeys(saved_models) if model not in self._dropdown_choices()]
+        self.reinstall_options()
+        logger.warning(
+            "Attempted to open the model list for parameter '%s' on node '%s'. The saved workflow listed %s, "
+            "which this node no longer offers, so the list was replaced with the current models. "
+            "Save the workflow to keep the update.",
+            parameter.name,
+            self._node.name,
+            ", ".join(repr(model) for model in retired) if retired else "a different list of models",
+        )
+        return True
 
     def _raise_if_misconfigured(self) -> None:
         """Raise on any constructor misuse, before the component touches the parameter.
@@ -615,3 +671,10 @@ class ModelAccessComponent:
     ) -> None:
         """Handler for the inline refresh button. Delegates to ``refresh()``."""
         self.refresh()
+
+    @staticmethod
+    def _row_names(rows: Any) -> list[Any]:
+        """The ``name`` of each dropdown row in ``rows``, or an empty list if ``rows`` is not a list of rows."""
+        if not isinstance(rows, list):
+            return []
+        return [row.get("name") for row in rows if isinstance(row, dict)]

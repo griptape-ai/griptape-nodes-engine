@@ -278,6 +278,10 @@ self._model_access = ModelAccessComponent(
 
 Each key is accepted wherever a value is assigned, including workflow load, and migrated to its mapped choice. Keys are never offered in the dropdown, so retiring a model means moving it from `model_choices` into `deprecated_values` pointed at its replacement. Every mapped value must be one of `model_choices`, and no key may already be a choice; either mistake raises when the node is constructed. If the model you are retiring was also the `default_model`, point `default_model` at its replacement in the same edit -- `default_model` must always name a current choice, never a retired key, and the component raises if it does not.
 
+A saved workflow also stores the dropdown it was saved with. When such a workflow is opened, `ModelAccessComponent` compares that stored model list with the node's current `model_choices` and replaces it if they differ, so a retired model disappears from the dropdown without any repair code in the node. The engine logs a warning that names the retired models, and the stored selection moves to its `deprecated_values` replacement (or to the first current choice if it has none). The workflow file is not rewritten until the artist saves it. Do not add a converter of your own for this.
+
+If your node removes the `Options` trait (for example while a driver is connected) and later restores it, call `reinstall_options()`. It replaces any `Options` trait already on the parameter, so you do not need to remove it first.
+
 ##### `model_usage`
 
 A node references one or more catalog models by their dict keys. Use this when the node binds to a specific, named set of models. Each entry must resolve to a model somewhere in the catalog at library-load time; unresolved references surface as `UnresolvedModelUsageReferenceProblem`.
