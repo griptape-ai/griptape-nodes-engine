@@ -3,8 +3,10 @@ from enum import StrEnum
 from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
     ExecutionPayload,
     GraphAccessMixin,
+    ProgressEvent,
     RequestPayload,
     ResultDetails,
     ResultPayloadFailure,
@@ -721,6 +723,17 @@ class GriptapeEvent(ExecutionPayload):
     value: DisplayValue
 
 
+def progress_to_execution_event(progress: ProgressEvent) -> ExecutionEvent:
+    """The execution event a streamed progress event reaches clients as."""
+    payload = GriptapeEvent(
+        node_name=progress.node_name,
+        parameter_name=progress.parameter_name,
+        type=type(progress).__name__,
+        value=progress.value,
+    )
+    return ExecutionEvent(payload=payload, open_workflow_id=progress.open_workflow_id)
+
+
 class NodeMetadata(TypedDict, total=False):
     """Metadata dict carried on nodes. node_type and library are required; all other keys are optional."""
 
@@ -736,6 +749,10 @@ class ExecuteNodeRequest(RequestPayload):
     Hydrates the node's input parameters, calls aprocess(), and returns outputs.
     Unlike ResolveNodeRequest, this bypasses flow/DAG machinery and executes
     the node's process method directly.
+
+    NodeExecutor sends it only after choosing, by the node's type, to run the node on its own, and
+    a worker receives it from the orchestrator. Groups and loops never get one. Clients run a node with
+    ResolveNodeRequest, which makes that choice.
 
     Handling depends on where the request lands:
 
@@ -786,9 +803,6 @@ class ExecuteNodeRequest(RequestPayload):
             worker's registry entry for the workflow answers. The worker builds its copy of the
             node in that workflow, so a request with no orchestrator_workflow_id fails rather than
             running without one.
-        lease_id: The lease, on the engine that runs the worker, that the node is sent under. A worker
-            another engine runs asks that engine whether the lease holds it before running the node,
-            and refuses a node sent under none. None for a worker on this machine.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -806,7 +820,6 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
     element_modification_commands: list[RequestPayload] = field(default_factory=list)
-    lease_id: str | None = None
 
 
 @dataclass

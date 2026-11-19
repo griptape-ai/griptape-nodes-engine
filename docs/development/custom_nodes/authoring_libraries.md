@@ -566,6 +566,8 @@ uv sync
 
 ## Documentation Patterns for Node Libraries
 
+A library can ship docs that the editor shows in its Docs panel. See [Writing Docs for Your Library](library_documentation.md). The patterns below are for the README.
+
 ### Comprehensive README Structure
 
 ```markdown

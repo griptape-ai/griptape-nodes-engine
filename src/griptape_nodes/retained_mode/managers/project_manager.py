@@ -738,17 +738,8 @@ class ProjectManager(EngineScoped):
         # The last activation that fully SUCCEEDED. `_current_project_id` is assigned before
         # activation's fallible steps, so reading it mid-switch can observe a project about to be
         # rolled back, and a worker registering in that window would adopt an abandoned one.
-        # Registration replies and switch fan-outs carry this pair instead.
+        # A worker asking which project to be on gets this instead.
         self._committed_project_id: ProjectID = SYSTEM_DEFAULTS_KEY
-        # TODO(griptape-ai/internal#266): delete the generation counters.
-        # They exist only to order adoptions that overlap, and they overlap only because each
-        # inbound message becomes its own coroutine while adoption awaits internally. Draining
-        # activations from a single-consumer queue makes ordering structural -- the wire already
-        # delivers in order -- at which point nothing needs a counter to reconstruct it.
-        self._project_generation: int = 0
-        # Worker-side: the highest generation this engine has adopted, so a stale activation
-        # (an older fan-out, or a registration reply racing a newer switch) is skipped.
-        self._last_adopted_generation: int = -1
         # Set to True at end of on_app_initialization_complete. Guards workspace switch
         # logic so expensive reloads don't fire during startup.
         self._initialization_complete: bool = False
@@ -3483,7 +3474,6 @@ class ProjectManager(EngineScoped):
 
         # Every path that reaches here established the project's layers completely: the
         # requested switch, the boot seed, and the rollback re-activation all commit.
-        self._project_generation += 1
         self._committed_project_id = resolved_project_id
         return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
@@ -3608,40 +3598,14 @@ class ProjectManager(EngineScoped):
                 )
         return project_id in self._successfully_loaded_project_templates
 
-    def committed_project(self) -> tuple[ProjectID, int]:
-        """The last fully-successful activation, as (project id, generation).
+    @property
+    def committed_project_id(self) -> ProjectID:
+        """The project of the last fully-successful activation.
 
         This is what crosses to workers. `current_project_id` can name a project mid-switch that
-        is about to be rolled back; this pair only ever names one whose layers were established.
+        is about to be rolled back; this only ever names one whose layers were established.
         """
-        return (self._committed_project_id, self._project_generation)
-
-    def is_stale_adoption(self, project_id: ProjectID, generation: int) -> bool:
-        """True when `generation` is not newer than the last adoption this engine completed.
-
-        A worker receives activations from two racing sources -- the registration reply and the
-        switch fan-out. Ordering by generation is what makes the outcome deterministic: the
-        newest committed switch wins regardless of arrival order, and a stale one is skipped
-        before it can touch config layers. The generation is recorded separately, via
-        `record_adopted_generation` AFTER the activation succeeds, so a failed adoption does not
-        consume its generation and block a retry of the same switch. The flip side is accepted:
-        a FAILED newer adoption does not make an older in-flight one stale, so the worker can
-        land on the older project -- the orchestrator's loud log of the failed one is the signal
-        for that case.
-        """
-        if generation <= self._last_adopted_generation:
-            logger.debug(
-                "Skipping adoption of project '%s' (generation %d): generation %d already adopted.",
-                project_id,
-                generation,
-                self._last_adopted_generation,
-            )
-            return True
-        return False
-
-    def record_adopted_generation(self, generation: int) -> None:
-        """Mark `generation` as adopted, once its activation has fully succeeded."""
-        self._last_adopted_generation = max(self._last_adopted_generation, generation)
+        return self._committed_project_id
 
     @handles(GetCurrentProjectRequest)
     def on_get_current_project_request(

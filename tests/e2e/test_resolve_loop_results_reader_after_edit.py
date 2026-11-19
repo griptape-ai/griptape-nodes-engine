@@ -136,6 +136,8 @@ async def test_resolving_results_reader_after_editing_an_outside_input_reruns_th
         )
         assert isinstance(resolve_result, ResolveNodeResultSuccess), resolve_result
 
-    assert not engine.flow_manager.check_for_existing_running_flow(), "The flow is still marked as running."
+    assert not engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()), (
+        "The flow is still marked as running."
+    )
     after_node = engine.node_manager.get_node_by_name(after_name)
     assert after_node.parameter_output_values["result"] == ["two-first", "two-second", "two-third"]

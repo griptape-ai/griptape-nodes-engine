@@ -24,11 +24,6 @@ if TYPE_CHECKING:
 class TestLockNodes:
     def test_lock_without_current_context_returns_failure(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="workflow")
-        # Ensure no current node in context
-        ctx = engine.context_manager
-        while ctx.has_current_node():
-            ctx.pop_node()
-
         res = engine.handle_request(SetLockNodeStateRequest(node_name=None, lock=True))
         assert isinstance(res, SetLockNodeStateResultFailure)
         assert "Current Context" in str(res.result_details)

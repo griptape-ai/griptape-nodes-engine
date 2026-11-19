@@ -157,7 +157,7 @@ class TestAddNodesToGroupIterativePath:
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
-        engine.context_manager.push_flow(flow)
+        engine.current_workflow().flows.name_to_parent_name[flow.name] = None
 
     def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:
         """Build a Start/End pair with end_node wired up and both registered."""
@@ -381,7 +381,7 @@ class TestRemoveNodesFromGroupIterativePath:
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
-        engine.context_manager.push_flow(flow)
+        engine.current_workflow().flows.name_to_parent_name[flow.name] = None
 
     def _build_grouped_pair(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode, _ConcreteSubflowGroup]:
         """Build a tethered Start/End pair already sitting inside a subflow group."""
@@ -505,7 +505,7 @@ class TestPlainNodeGroupDoesNotTether:
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
-        engine.context_manager.push_flow(flow)
+        engine.current_workflow().flows.name_to_parent_name[flow.name] = None
 
     def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:
         start = _MockIterativeStartNode("TestStartNode")
@@ -574,7 +574,7 @@ class TestCrossGroupMoveKeepsTetheredCompanion:
         engine.context_manager.push_workflow(workflow_name="test_workflow")
         flow = ControlFlow(name="test_flow", engine=engine)
         engine.object_manager.add_object_by_name_in(engine.current_workflow(), flow.name, flow)
-        engine.context_manager.push_flow(flow)
+        engine.current_workflow().flows.name_to_parent_name[flow.name] = None
 
     def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:
         start = _MockIterativeStartNode("TestStartNode")

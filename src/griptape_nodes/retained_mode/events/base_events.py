@@ -329,9 +329,14 @@ class EventRequest[P: Payload](BaseEvent):
             handler, and every task it starts, acts on that workflow. An id that names no open
             workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
             handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
-            Left out, the request acts on the engine's only open workflow, unless another engine
-            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
-            else: the workflow the request is about.
+            Left out, the request acts on the workflow its caller is bound to, such as a run's own
+            workflow, and a WORKFLOW request with no such caller fails with
+            `WorkflowNotNamedResultFailure`. An OPTIONAL_WORKFLOW request acts on none. A request
+            another engine sent acts on no workflow. A payload field named `workflow_id` is
+            something else: the workflow the request is about.
+        origin_engine_id: The engine this request started at, set by the engine relaying it for the
+            receiving engine. Today that engine is a remote worker the sender runs for the receiver,
+            and the receiver answers the request as its own worker's.
     """
 
     request: P
@@ -341,6 +346,7 @@ class EventRequest[P: Payload](BaseEvent):
     # `require_request_sender()`.
     sender: RequestSender | None = None
     open_workflow_id: str | None = None
+    origin_engine_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
@@ -382,12 +388,14 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events.
 
     Args:
-        open_workflow_id: The open workflow the request acted on: the envelope's `open_workflow_id`
-            when it named one, else the workflow dispatch bound the request to, such as the only
-            open workflow, a run's own workflow, or the workflow a load opened. None when it acted
-            on no workflow. A result payload's own `workflow_id` is something else. For
-            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
-            Save As is a copy that is not open.
+        open_workflow_id: The open workflow the request ran in: the one the envelope named, or
+            with none named, the workflow its caller was bound to, such as a run's own workflow. None for a request that
+            runs in no workflow, such as a HOST request, which ignores the envelope's id even when
+            it opens or closes a workflow; `WorkflowOpenedEvent` and `WorkflowClosedEvent` tell
+            clients of those. A request refused for the workflow its envelope named echoes that id.
+            A result payload's own `workflow_id` is something else. For example,
+            `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a Save As
+            is a copy that is not open.
         engine_id: The engine that sent the result. A client that reached it through a session
             topic learns from this which engine holds the session. None when the result was built
             outside the engine's dispatch, such as by the MCP server or a bootstrap script.
@@ -463,7 +471,10 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 
 # EXECUTION EVENT BASE (this event type is used for the execution of a Griptape Nodes flow)
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
-    """An event from running a flow. `workflow_id` names the open workflow it belongs to, None for a host event.
+    """An event from running a flow. `open_workflow_id` names the open workflow it belongs to, None for a host event.
+
+    It matches a result envelope's `open_workflow_id`, so a client routes both by one field. Left
+    out, `EventManager` fills it in with the bound workflow when the event is queued.
 
     Build one with `WorkflowRuntime.execution_event` for a run's progress, or `BaseNode.execution_event`
     for an event a node reports about itself, naming the workflow it joined. Both go through
@@ -471,7 +482,7 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     """
 
     payload: E
-    workflow_id: str | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an ExecutionEvent, inferring the generic type if needed."""
@@ -521,9 +532,9 @@ class ExecutionGriptapeNodeEvent(BaseEvent):
         return self.wrapped_event.get_request()
 
 
-def build_execution_event(payload: ExecutionPayload, workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
-    """An execution event naming the open workflow `workflow_id` it belongs to, or None for no workflow."""
-    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=workflow_id))
+def build_execution_event(payload: ExecutionPayload, open_workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
+    """An execution event naming the open workflow `open_workflow_id` it belongs to, or None for no workflow."""
+    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, open_workflow_id=open_workflow_id))
 
 
 @dataclass
@@ -531,5 +542,5 @@ class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
-    # The workflow of the node that streamed this. See ExecutionEvent.workflow_id.
-    workflow_id: str | None = field(default=None)
+    # The workflow of the node that streamed this. See ExecutionEvent.open_workflow_id.
+    open_workflow_id: str | None = field(default=None)

@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.109.0"
+version = "0.112.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.16"
@@ -103,6 +103,7 @@ core = "sysmon"
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 pythonpath = ["libraries/griptape_nodes_library"]
+markers = ["worker_processes: the test starts real library worker processes (see tests/worker_processes.py)"]
 
 [tool.ruff]
 line-length = 120
@@ -159,6 +160,7 @@ ignore = [
 "src/griptape_nodes/testing/libraries/**" = ["TID251"]
 # These assert the facade's and the WorkflowRegistry shim's own behavior, so they have to name them.
 "tests/unit/retained_mode/test_engine.py" = ["TID251"]
+"tests/unit/retained_mode/test_facade_workflow.py" = ["TID251"]
 "tests/unit/retained_mode/managers/test_griptape_nodes.py" = ["TID251"]
 "tests/unit/node_library/test_workflow_registry.py" = ["TID251"]
 # Asserts the pickle-era reader's own behavior, so it has to build pickles to feed it.
@@ -176,6 +178,9 @@ ignore = [
 # use every argument.
 "docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
 "docs/development/custom_nodes/example_node_timing_library/**" = ["INP001", "ARG002"]
+"docs/development/custom_nodes/example_node_inputs_library/**" = ["INP001", "TID251"]
+"docs/development/custom_nodes/example_node_blocked_terms_library/**" = ["INP001", "TID251"]
+"docs/development/custom_nodes/example_node_output_check_library/**" = ["INP001", "TID251"]
 "docs/development/custom_nodes/example_request_handler_library/**" = [
   "INP001",
   "TID251",

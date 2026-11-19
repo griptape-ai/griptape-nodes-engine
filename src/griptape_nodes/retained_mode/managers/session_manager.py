@@ -20,8 +20,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppEndSessionRequest,
     AppEndSessionResultFailure,
     AppEndSessionResultSuccess,
-    AppGetSessionRequest,
-    AppGetSessionResultSuccess,
     AppJoinSessionRequest,
     AppJoinSessionResultFailure,
     AppJoinSessionResultSuccess,
@@ -31,9 +29,6 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppStartSessionRequest,
     AppStartSessionResultSuccess,
     SessionClient,
-    SessionHeartbeatRequest,
-    SessionHeartbeatResultFailure,
-    SessionHeartbeatResultSuccess,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.engine_dirs import engine_state_dir
@@ -72,16 +67,25 @@ class SessionManager:
         self,
         engine_identity_manager: EngineIdentityManager,
         event_manager: EventManager | None = None,
+        *,
+        worker: bool = False,
     ) -> None:
         """Initialize the SessionManager.
 
         Args:
             engine_identity_manager: The EngineIdentityManager instance to use for engine ID operations.
             event_manager: The EventManager instance to use for event handling.
+            worker: Set in a library's worker process, which joins no session: it reads no saved
+                sessions, saves none, and has no active session.
         """
         self._engine_identity_manager = engine_identity_manager
-        self._sessions_data = self._load_sessions_data()
-        self._active_session_id = self._get_or_initialize_active_session()
+        self._worker = worker
+        if worker:
+            self._sessions_data = SessionsStorage(sessions=[])
+            self._active_session_id = None
+        else:
+            self._sessions_data = self._load_sessions_data()
+            self._active_session_id = self._get_or_initialize_active_session()
         # In memory only: a client's connection does not outlive the engine process, so
         # persisting it next to the session would resurrect it on restart.
         self._clients: dict[str, SessionClient] = {}
@@ -290,6 +294,9 @@ class SessionManager:
             sessions_data: Sessions data structure to save
             engine_id: Optional engine ID to save engine-specific sessions
         """
+        if self._worker:
+            self._sessions_data = sessions_data
+            return
         session_state_dir = self._get_session_state_dir(engine_id)
         session_state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -362,31 +369,6 @@ class SessionManager:
         except Exception as err:
             details = f"Failed to end session due to '{err}'."
             return AppEndSessionResultFailure(result_details=details)
-
-    @handles(AppGetSessionRequest)
-    def handle_get_session_request(self, _: AppGetSessionRequest) -> ResultPayload:
-        return AppGetSessionResultSuccess(
-            session_id=self.active_session_id,
-            result_details="Session ID retrieved successfully.",
-        )
-
-    @handles(SessionHeartbeatRequest)
-    def handle_session_heartbeat_request(self, request: SessionHeartbeatRequest) -> ResultPayload:  # noqa: ARG002
-        """Handle session heartbeat requests.
-
-        Simply verifies that the session is active and responds with success.
-        """
-        try:
-            active_session_id = self.active_session_id
-            if active_session_id is None:
-                details = "Session heartbeat received but no active session found"
-                return SessionHeartbeatResultFailure(result_details=details)
-
-            details = f"Session heartbeat successful for session: {active_session_id}"
-            return SessionHeartbeatResultSuccess(result_details=details)
-        except Exception as err:
-            details = f"Failed to handle session heartbeat: {err}"
-            return SessionHeartbeatResultFailure(result_details=details)
 
     @staticmethod
     def _find_session_by_id(sessions_data: SessionsStorage, session_id: str) -> SessionData | None:

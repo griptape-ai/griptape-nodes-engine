@@ -18,16 +18,16 @@ from griptape_nodes.app.worker_routing import DropAllLocalObjectsRequest, DropLo
 from griptape_nodes.exe_types.core_types import ParameterType
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.context_events import CloseWorkflowRequest
 from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryRequest,
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.workflow_events import DeleteWorkflowRequest
-from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.resource_manager import LocalObjectEntry
+from griptape_nodes.retained_mode.managers.worker_manager import WorkerRegistration
 from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
-from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowSet
 
 _SECOND_READ_TIMEOUT_SECONDS = 0.25
 
@@ -332,10 +332,10 @@ class TestDropForWorkflow:
         manager = engine.resource_manager
         host_key = manager.put_local_object(Held("host"), owner="Lib A", source="N", key="host")
         engine.context_manager.push_workflow("wf")
-        workflow_id = engine.context_manager.get_current_workflow_id()
+        workflow = engine.current_workflow()
+        workflow_id = workflow.workflow_id
 
-        with engine.bind_workflow(engine.current_workflow()):
-            key = manager.put_local_object(Held("wf"), owner="Lib A", source="N", key="wf")
+        key = manager.put_local_object(Held("wf"), owner="Lib A", source="N", key="wf", workflow=workflow)
 
         entry = manager.entry_for(key)
         host_entry = manager.entry_for(host_key)
@@ -343,6 +343,25 @@ class TestDropForWorkflow:
         assert host_entry is not None
         assert entry.workflow_id == workflow_id
         assert host_entry.workflow_id is None
+
+    def test_an_object_put_before_the_node_joined_is_released_with_its_workflow(self, engine: Engine) -> None:
+        manager = engine.resource_manager
+        engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
+        released: list[str] = []
+        # Put from a node's __init__, which runs before the node joins a workflow.
+        manager.put_local_object(
+            Held("early"), owner="Lib A", source="N@1", key="early", on_drop=lambda value: released.append(value.label)
+        )
+        manager.put_local_object(Held("other"), owner="Lib A", source="M@1", key="other")
+
+        manager.tag_untagged_objects_for_workflow(owner="Lib A", source="N@1", workflow=workflow)
+        manager.drop_objects_for_workflow(workflow.workflow_id)
+
+        assert released == ["early"]
+        other_entry = manager.entry_for(manager.local_object_key("other", owner="Lib A"))
+        assert other_entry is not None
+        assert other_entry.workflow_id is None
 
     def test_parking_for_a_closed_workflow_is_refused_and_records_nothing(self, engine: Engine) -> None:
         manager = engine.resource_manager
@@ -352,8 +371,8 @@ class TestDropForWorkflow:
         with engine.bind_workflow(workflow):
             # Closed by other work, as a node task started before the close sees it.
             contextvars.copy_context().run(engine.context_manager.pop_workflow)
-            with pytest.raises(WorkflowNotOpenError, match="was closed"):
-                manager.put_local_object(Held("late"), owner="Lib A", source="N", key="late")
+        with pytest.raises(WorkflowNotOpenError, match="was closed"):
+            manager.put_local_object(Held("late"), owner="Lib A", source="N", key="late", workflow=workflow)
 
         assert manager.drop_all_local_objects() == 0
 
@@ -479,6 +498,7 @@ class TestWorkflowStateClearReleasesObjects:
         manager = engine.resource_manager
         released: list[str] = []
         engine.context_manager.push_workflow("wf")
+        workflow = engine.current_workflow()
         for library, label in (("Lib A", "a"), ("Lib B", "b")):
             manager.put_local_object(
                 Held(label),
@@ -486,6 +506,7 @@ class TestWorkflowStateClearReleasesObjects:
                 source="N",
                 key="N-slot",
                 on_drop=lambda value: released.append(value.label),
+                workflow=workflow,
             )
 
         engine.clear_current_workflow_data()
@@ -494,21 +515,20 @@ class TestWorkflowStateClearReleasesObjects:
         assert manager.drop_all_local_objects() == 0
 
     def test_closing_one_of_two_open_workflows_releases_only_its_objects(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         manager = engine.resource_manager
         released: list[str] = []
         registry = engine.workflow_registry
         closing = engine.open_workflow(registry.register_unsaved("closing", listed=False).workflow_id)
         staying = engine.open_workflow(registry.register_unsaved("staying", listed=False).workflow_id)
         for workflow, label in ((closing, "closing"), (staying, "staying")):
-            with engine.bind_workflow(workflow):
-                manager.put_local_object(
-                    Held(label),
-                    owner="Lib A",
-                    source="N",
-                    key=label,
-                    on_drop=lambda value: released.append(value.label),
-                )
+            manager.put_local_object(
+                Held(label),
+                owner="Lib A",
+                source="N",
+                key=label,
+                on_drop=lambda value: released.append(value.label),
+                workflow=workflow,
+            )
         manager.put_local_object(
             Held("host"), owner="Lib A", source="N", key="host", on_drop=lambda value: released.append(value.label)
         )
@@ -541,10 +561,7 @@ class TestWorkflowStateClearReleasesObjects:
         engine.context_manager.push_workflow("wf")
         workflow = engine.current_workflow()
 
-        result = engine.event_manager.handle_request(
-            ClearAllObjectStateRequest(i_know_what_im_doing=True),
-            result_context=ResultContext(open_workflow_id=workflow.workflow_id),
-        )
+        result = engine.event_manager.handle_request(CloseWorkflowRequest(workflow_id=workflow.workflow_id))
 
         assert result.succeeded()
         assert engine.open_workflows.all_open() == []
@@ -596,7 +613,7 @@ class TestWorkflowStateClearReleasesObjects:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock(side_effect=RuntimeError("no broker"))),
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": object()}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -621,7 +638,7 @@ class TestWorkflowStateClearReleasesObjects:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock()) as fan_out,
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": object()}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             asyncio.run(worker_manager.broadcast_drop_all_local_objects())
 
@@ -765,7 +782,7 @@ class TestReleaseKeyEverywhere:
         worker_manager = engine.worker_manager
         with (
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": object()}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             yield
 
@@ -810,7 +827,7 @@ class TestReleaseKeyEverywhere:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock()) as fan_out,
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": object()}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             asyncio.run(worker_manager.broadcast_pending_local_object_releases())
 
@@ -838,7 +855,7 @@ class TestReleaseKeyEverywhere:
         with (
             patch.object(worker_manager, "broadcast_to_workers", AsyncMock(side_effect=RuntimeError("no broker"))),
             patch.object(worker_manager, "_transport", object()),
-            patch.object(worker_manager, "_workers", {"w1": object()}),
+            patch.object(worker_manager, "_workers", {"w1": WorkerRegistration(worker_key=None)}),
         ):
             asyncio.run(worker_manager.broadcast_pending_local_object_releases())
 

@@ -62,6 +62,9 @@ class ClearAllObjectStateRequest(RequestPayload):
     Use when: Resetting to clean state, recovering from corruption, starting fresh,
     implementing reset functionality. Requires explicit confirmation.
 
+    Closes every open workflow, whatever the envelope's `open_workflow_id` names. To close one
+    workflow and leave the others open, use CloseWorkflowRequest.
+
     Args:
         i_know_what_im_doing: Confirmation flag that must be set to True to proceed
 

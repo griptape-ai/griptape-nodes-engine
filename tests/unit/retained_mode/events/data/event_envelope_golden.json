@@ -4,6 +4,7 @@
     "response_topic": "t",
     "sender": null,
     "open_workflow_id": null,
+    "origin_engine_id": null,
     "event_type": "EventRequest",
     "request_type": "GetParameterValueRequest",
     "request": {
@@ -23,6 +24,7 @@
         "response_topic": null,
         "sender": null,
         "open_workflow_id": null,
+        "origin_engine_id": null,
         "event_type": "EventRequest",
         "request_type": "GetParameterValueRequest",
         "request": {
@@ -110,7 +112,7 @@
     }
   },
   "ExecutionEvent": {
-    "workflow_id": "wf",
+    "open_workflow_id": "wf",
     "event_type": "ExecutionEvent",
     "payload_type": "CurrentControlNodeEvent",
     "payload": {
@@ -129,7 +131,8 @@
       "is_worker": false,
       "defer_pending_library_resets": false,
       "is_general_purpose_worker": false,
-      "static_server_base_url": null
+      "static_server_base_url": null,
+      "engine_run_id": null
     }
   }
 }

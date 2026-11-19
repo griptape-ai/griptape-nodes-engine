@@ -258,7 +258,7 @@ class SecretsManager:
             logger.debug("Secret '%s' not found in '%s'", secret_name, source)
 
         if should_error_on_not_found:
-            logger.error("Secret '%s' not found", secret_name)
+            SecretsManager._log_missing_secret(secret_name)
         return value
 
     def set_secret(self, secret_name: str, secret_value: str) -> None:
@@ -352,6 +352,10 @@ class SecretsManager:
             return
         os.environ.pop(key, None)
         self._managed_env_keys.discard(key)
+
+    @staticmethod
+    def _log_missing_secret(secret_name: str) -> None:
+        logger.error("Secret '%s' not found", secret_name)
 
     @staticmethod
     def _apply_secret_name_compliance(secret_name: str) -> str:

@@ -5,7 +5,7 @@
     "author": "Griptape",
     "description": "Demonstrates a library that logs how long every node run takes, including the nodes inside groups and loops.",
     "library_version": "0.1.0",
-    "engine_version": "0.97.0",
+    "engine_version": "0.105.0",
     "tags": ["demo", "execution-events"]
   },
   "categories": [

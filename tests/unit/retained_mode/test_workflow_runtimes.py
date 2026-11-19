@@ -47,7 +47,7 @@ from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.run_queue import RunSpec
 from griptape_nodes.retained_mode.request_handlers import RequiredSender
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotOpenError, bound_workflow
-from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError, OpenWorkflowSet
+from griptape_nodes.retained_mode.runtime.open_workflow_set import NoOpenWorkflowError
 from griptape_nodes.retained_mode.variable_types import VariableScope
 from tests.unit.exe_types.mocks import MockNode
 
@@ -57,7 +57,6 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
-    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 
 def _live_machine() -> MagicMock:
@@ -104,27 +103,27 @@ class TestRuntimeLifecycle:
         assert workflow.workflow_id == engine.context_manager.get_current_workflow_id()
         assert len(workflow.objects) == 0
 
-    def test_a_push_while_a_workflow_is_open_is_refused(self, engine: Engine, tmp_path: Path) -> None:
+    def test_a_push_bound_to_an_open_workflow_is_refused(self, engine: Engine, tmp_path: Path) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
         runtime = engine.current_workflow()
         unregistered_file = tmp_path / "never_registered.py"
         unregistered_file.write_text("# stub")
 
-        with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError, match="is already open"):
-            engine.context_manager.push_workflow(workflow_name="inner")
-        with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):
-            engine.context_manager.push_workflow(file_path=str(unregistered_file))
+        with engine.bind_workflow(runtime):
+            with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError, match="is already open"):
+                engine.context_manager.push_workflow(workflow_name="inner")
+            with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):
+                engine.context_manager.push_workflow(file_path=str(unregistered_file))
 
-        assert engine.current_workflow() is runtime
+        assert engine.open_workflows.all_open() == [runtime]
         # Refused before anything is registered.
         assert engine.workflow_registry.find_by_name("inner") is None
         assert engine.workflow_registry.find_by_path(str(unregistered_file)) is None
 
-    def test_popping_the_workflow_closes_it_with_its_context(self, engine: Engine) -> None:
+    def test_popping_the_workflow_closes_it_with_its_flows(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
-        flow = MagicMock(name="flow")
-        engine.context_manager.push_flow(flow)
-        assert engine.current_workflow().context.get_current_flow() is flow
+        engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
+        assert engine.context_manager.has_current_flow()
 
         name = engine.context_manager.pop_workflow()
         engine.context_manager.push_workflow(workflow_name=name)
@@ -138,10 +137,9 @@ class TestRuntimeLifecycle:
             assert not engine.context_manager.has_current_workflow()
         assert engine.context_manager.has_current_workflow()
 
-    def test_closing_the_bound_workflow_leaves_the_work_on_no_workflow_not_another_open_one(
+    def test_closing_the_bound_workflow_refuses_the_rest_of_the_work_rather_than_moving_it(
         self, engine: Engine
     ) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="other")
         other = engine.current_workflow()
         closed = engine.open_workflows.open(
@@ -150,19 +148,19 @@ class TestRuntimeLifecycle:
 
         with engine.bind_workflow(closed):
             engine.context_manager.pop_workflow()
-            assert engine.current_workflow_or_none() is None
+            with pytest.raises(NoOpenWorkflowError):
+                engine.current_workflow()
 
         assert engine.open_workflows.all_open() == [other]
 
-    def test_a_request_acts_on_the_workflow_it_opens_until_it_ends(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
+    def test_a_request_that_pushes_a_workflow_binds_it_for_the_handler_only(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="other")
-        acted_on: list[WorkflowRuntime] = []
+        other = engine.current_workflow()
+        bindings: list[object] = []
 
         def open_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
-            # Two workflows are open once this one opens, so only the binding finds it.
             engine.context_manager.push_workflow(workflow_name="opened")
-            acted_on.append(engine.current_workflow())
+            bindings.append(bound_workflow.get())
             return ResultPayloadSuccess(result_details="ok")
 
         # A request from another engine starts bound to no workflow, so it can open one beside "other".
@@ -174,31 +172,10 @@ class TestRuntimeLifecycle:
             _ReplaceWorkflowRequest(), result_context=ResultContext(sender=RequestSender(engine_id="another-engine"))
         )
 
-        assert engine.open_workflows.all_open()[1] is acted_on[0]
-        assert bound_workflow.get() is None
-
-    def test_a_request_with_no_envelope_id_that_replaces_the_workflow_acts_on_the_next_one(
-        self, engine: Engine
-    ) -> None:
-        engine.context_manager.push_workflow(workflow_name="closed")
-        closed = engine.current_workflow()
-        acted_on: list[WorkflowRuntime] = []
-
-        def replace_workflow(_request: _ReplaceWorkflowRequest) -> ResultPayloadSuccess:
-            # Dispatch bound the request to the only open workflow, the one it closes.
-            engine.context_manager.pop_workflow()
-            engine.context_manager.push_workflow(workflow_name="next")
-            acted_on.append(engine.current_workflow())
-            return ResultPayloadSuccess(result_details="ok")
-
-        engine.event_manager.assign_manager_to_request_type(
-            _ReplaceWorkflowRequest, replace_workflow, without_workflow=None
-        )
-
-        engine.handle_request(_ReplaceWorkflowRequest())
-
-        assert acted_on[0] is not closed
-        assert engine.open_workflows.all_open() == acted_on
+        assert len(engine.open_workflows.all_open()) == 2  # noqa: PLR2004
+        opened = next(workflow for workflow in engine.open_workflows.all_open() if workflow is not other)
+        assert bindings == [opened]
+        assert bound_workflow.get() is other
 
     def test_clear_all_object_state_closes_the_open_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -206,7 +183,9 @@ class TestRuntimeLifecycle:
         result = engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
         assert result.succeeded()
-        assert engine.current_workflow_or_none() is None
+        assert engine.open_workflows.all_open() == []
+        with pytest.raises(WorkflowNotOpenError):
+            engine.current_workflow_or_none()
 
     def test_deleting_the_open_workflow_closes_it(self, engine: Engine) -> None:
         name = engine.context_manager.push_workflow(workflow_name="outer")
@@ -214,7 +193,9 @@ class TestRuntimeLifecycle:
         result = engine.handle_request(DeleteWorkflowRequest(name=name))
 
         assert result.succeeded()
-        assert engine.current_workflow_or_none() is None
+        assert engine.open_workflows.all_open() == []
+        with pytest.raises(WorkflowNotOpenError):
+            engine.current_workflow_or_none()
 
 
 class TestObjectsOnTheRuntime:
@@ -298,7 +279,6 @@ class TestObjectsOnTheRuntime:
         assert engine.object_manager.take_nodes_with_queued_changes() == []
 
     def test_queued_ui_changes_are_taken_from_the_bound_workflow_or_every_open_one(self, engine: Engine) -> None:
-        engine._open_workflows = OpenWorkflowSet(engine, allow_several_open=True)
         engine.context_manager.push_workflow(workflow_name="first")
         first = engine.current_workflow()
         second = engine.open_workflows.open(
@@ -380,7 +360,7 @@ class TestSubstitutionFlagOnTheRuntime:
         result = engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
 
         assert isinstance(result, WorkflowNotNamedResultFailure)
-        assert engine.workflow_manager.variable_substitution.is_enabled() is True
+        assert engine.workflow_manager.variable_substitution.is_enabled(None) is True
 
     def test_the_flag_is_held_by_the_open_workflow(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -388,7 +368,7 @@ class TestSubstitutionFlagOnTheRuntime:
         engine.handle_request(SetVariableSubstitutionEnabledRequest(enabled=False))
 
         assert engine.current_workflow().variables.substitution_enabled is False
-        assert engine.workflow_manager.variable_substitution.is_enabled() is False
+        assert engine.workflow_manager.variable_substitution.is_enabled(engine.current_workflow()) is False
 
     def test_the_flag_does_not_survive_clearing_and_reopening_the_same_workflow(self, engine: Engine) -> None:
         name = engine.context_manager.push_workflow(workflow_name="outer")
@@ -397,7 +377,7 @@ class TestSubstitutionFlagOnTheRuntime:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
         engine.context_manager.push_workflow(workflow_name=name)
 
-        assert engine.workflow_manager.variable_substitution.is_enabled() is True
+        assert engine.workflow_manager.variable_substitution.is_enabled(engine.current_workflow()) is True
 
 
 class TestNodesAndFlowsOnTheRuntime:
@@ -406,13 +386,13 @@ class TestNodesAndFlowsOnTheRuntime:
         engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="canvas"))
         runtime = engine.current_workflow()
         runtime.nodes.name_to_parent_flow_name["node"] = "canvas"
-        engine.flow_manager._global_single_node_resolution = True
+        runtime.flows.global_single_node_resolution = True
 
         assert engine.node_manager.get_node_parent_flow_by_name("node") == "canvas"
         assert runtime.flows.name_to_parent_name == {"canvas": None}
         assert runtime.flows.global_single_node_resolution is True
         assert engine.flow_manager.get_connections() is runtime.flows.connections
-        assert engine.flow_manager.global_dag_builder.connections is runtime.flows.connections
+        assert runtime.flows.global_dag_builder.connections is runtime.flows.connections
 
         engine.context_manager.pop_workflow()
         engine.context_manager.push_workflow(workflow_name="outer")
@@ -420,25 +400,18 @@ class TestNodesAndFlowsOnTheRuntime:
         reopened = engine.current_workflow()
         assert reopened.nodes.name_to_parent_flow_name == {}
         assert reopened.flows.name_to_parent_name == {}
-        assert not engine.flow_manager.global_single_node_resolution
+        assert not reopened.flows.global_single_node_resolution
         assert not engine.flow_manager.does_canvas_exist(reopened)
 
-    def test_lookups_find_no_node_or_run_with_no_workflow_open(self, engine: Engine) -> None:
+    def test_lookups_find_no_node_with_no_workflow_open(self, engine: Engine) -> None:
         with pytest.raises(KeyError, match="could not be found"):
             engine.node_manager.get_node_parent_flow_by_name("node")
-        assert not engine.flow_manager.check_for_existing_running_flow()
-        assert not engine.flow_manager.execution_is_advancing()
 
     def test_listing_the_canvas_flows_with_no_workflow_open_finds_none(self, engine: Engine) -> None:
         result = engine.handle_request(ListFlowsInFlowRequest(parent_flow_name=None))
 
         assert isinstance(result, ListFlowsInFlowResultSuccess), result.result_details
         assert result.flow_names == []
-
-    @pytest.mark.asyncio
-    async def test_resets_are_refused_with_no_workflow_open(self, engine: Engine) -> None:
-        with pytest.raises(NoOpenWorkflowError):
-            engine.flow_manager.reset_global_execution_state()
 
     @pytest.mark.asyncio
     async def test_a_cancelled_run_waking_after_another_workflow_opens_leaves_that_workflows_run_alone(
@@ -495,9 +468,9 @@ class TestNodesAndFlowsOnTheRuntime:
         async def second_body() -> ResultPayload:
             return StartFlowResultSuccess(result_details="second ran")
 
-        running = asyncio.ensure_future(engine.flow_manager.start_run(_RunSpec("flow", first_body)))
+        running = asyncio.ensure_future(engine.flow_manager.start_run(first, _RunSpec("flow", first_body)))
         await asyncio.sleep(0)
-        waiting = engine.flow_manager.submit_run(_RunSpec("flow", second_body))
+        waiting = engine.flow_manager.submit_run(_RunSpec("flow", second_body), flows=first.flows)
 
         assert first.flows.run_in_progress is not None
         assert first.flows.run_queue.snapshot() == [waiting]
@@ -523,7 +496,7 @@ class TestNodesAndFlowsOnTheRuntime:
         runtime = engine.current_workflow()
         tracked_while_running: list[str] = []
 
-        async def close_while_running(*_: object) -> dict:
+        async def close_while_running(*_args: object, **_kwargs: object) -> dict:
             tracked_while_running.extend(runtime.nodes.orch_worker_requests)
             engine.context_manager.pop_workflow()
             msg = "The worker went away."
@@ -532,7 +505,7 @@ class TestNodesAndFlowsOnTheRuntime:
         worker_manager = MagicMock()
         worker_manager.route_to_worker = AsyncMock(side_effect=close_while_running)
         result = await engine.node_manager._execute_node_via_worker(
-            runtime, ExecuteNodeRequest(node_name="node", parameter_values={}), worker_manager, ("worker", "topic")
+            runtime, ExecuteNodeRequest(node_name="node", parameter_values={}), worker_manager, "worker"
         )
 
         assert isinstance(result, ExecuteNodeResultFailure)
@@ -551,11 +524,11 @@ class TestNodesAndFlowsOnTheRuntime:
 
         async def read_run_state() -> dict[str, object]:
             await release.wait()
-            flow_manager = engine.flow_manager
+            flows = engine.current_workflow().flows
             return {
-                "dag_builder": flow_manager.global_dag_builder,
-                "flow_queue": flow_manager.global_flow_queue,
-                "single_node_resolution": flow_manager.global_single_node_resolution,
+                "dag_builder": flows.global_dag_builder,
+                "flow_queue": flows.global_flow_queue,
+                "single_node_resolution": flows.global_single_node_resolution,
             }
 
         async def start_run(_request: _StartRunRequest) -> ResultPayloadSuccess:

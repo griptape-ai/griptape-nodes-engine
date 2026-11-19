@@ -116,6 +116,18 @@ class ExecutionStatusComponent:
         show_warning = not was_successful and not is_placeholder
         self._update_status_group_display_label(show_warning=show_warning)
 
+    def set_was_successful(self, *, was_successful: bool) -> None:
+        """Set whether the operation succeeded, leaving result_details alone.
+
+        For a node whose result_details is an input, such as End Flow: it writes its own message to
+        its output, because set_execution_result would overwrite the input with it.
+
+        Args:
+            was_successful: Whether the operation succeeded
+        """
+        self._update_parameter_value(self._was_successful, was_successful)
+        self._update_status_group_display_label(show_warning=not was_successful)
+
     def clear_execution_status(self, initial_message: str | None = None) -> None:
         """Clear execution status and reset parameters.
 

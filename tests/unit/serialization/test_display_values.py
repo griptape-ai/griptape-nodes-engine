@@ -69,7 +69,7 @@ def _wire(event: Any) -> dict[str, Any]:
 
 
 def _execution_payload(payload: Any) -> dict[str, Any]:
-    return _wire(ExecutionEvent(payload=payload))["payload"]
+    return _wire(ExecutionEvent(payload=payload, open_workflow_id=None))["payload"]
 
 
 def _client_wire(event: Any) -> dict[str, Any]:
@@ -186,7 +186,10 @@ class TestElementDocuments:
 class TestSentToClients:
     def test_parameter_update_has_no_tags(self) -> None:
         event = ExecutionEvent(
-            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=(1, Speed.FAST))
+            payload=ParameterValueUpdateEvent(
+                node_name="n", parameter_name="p", data_type="any", value=(1, Speed.FAST)
+            ),
+            open_workflow_id=None,
         )
 
         assert _client_wire(event)["payload"]["value"] == [1, "fast"]
@@ -194,7 +197,8 @@ class TestSentToClients:
     def test_artifact_is_its_fields(self) -> None:
         image = ImageUrlArtifact("https://example.com/a.png", name="a")
         event = ExecutionEvent(
-            payload=NodeResolvedEvent(node_name="n", parameter_output_values={"image": image}, node_type="T")
+            payload=NodeResolvedEvent(node_name="n", parameter_output_values={"image": image}, node_type="T"),
+            open_workflow_id=None,
         )
 
         sent = _client_wire(event)["payload"]["parameter_output_values"]["image"]
@@ -205,7 +209,8 @@ class TestSentToClients:
 
     def test_value_with_no_plain_data_form_is_sent_as_text(self) -> None:
         event = ExecutionEvent(
-            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=_Opaque())
+            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=_Opaque()),
+            open_workflow_id=None,
         )
 
         assert _client_wire(event)["payload"]["value"] == "opaque thing"
@@ -217,7 +222,9 @@ class TestSentToClients:
             "element_id_to_value": {"a": (1, 2)},
         }
 
-        sent = _client_wire(ExecutionEvent(payload=AlterElementEvent(element_details=document)))["payload"]
+        sent = _client_wire(ExecutionEvent(payload=AlterElementEvent(element_details=document), open_workflow_id=None))[
+            "payload"
+        ]
 
         (child,) = sent["element_details"]["children"]
         assert child["value"] == [1, 2]
@@ -226,7 +233,8 @@ class TestSentToClients:
 
     def test_sending_to_a_client_leaves_the_engine_wire_tagged(self) -> None:
         event = ExecutionEvent(
-            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=(1, 2))
+            payload=ParameterValueUpdateEvent(node_name="n", parameter_name="p", data_type="any", value=(1, 2)),
+            open_workflow_id=None,
         )
         _client_wire(event)
 

@@ -111,7 +111,7 @@ class TestShouldSuppressEventMatching:
         """The pre-existing branch: ExecutionEvent names its payload `payload`, not `result`."""
         event_manager = EventManager()
         event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"))
+            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"), open_workflow_id=None)
         )
         with EventSuppressionContext(event_manager, {CurrentControlNodeEvent}):
             assert event_manager.should_suppress_event(event) is True
@@ -119,7 +119,7 @@ class TestShouldSuppressEventMatching:
     def test_does_not_match_an_unlisted_execution_payload(self) -> None:
         event_manager = EventManager()
         event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"))
+            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"), open_workflow_id=None)
         )
         with EventSuppressionContext(event_manager, {NodeResolvedEvent}):
             assert event_manager.should_suppress_event(event) is False
@@ -353,7 +353,7 @@ class TestSuppressionSetReachability:
         event_manager.initialize_queue(queue)
 
         execution_event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"))
+            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"), open_workflow_id=None)
         )
         with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
             event_manager.put_event(execution_event)
