@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.events.context_events import (
@@ -59,6 +60,54 @@ class TestResultObservers:
             engine.event_manager.remove_result_observer(quiet)
 
         assert str(result_event.result.result_details) == "observed"
+
+    def test_a_raising_observer_leaves_the_result_and_the_other_observers(self, engine: Engine) -> None:
+        workflow = _open(engine)
+        seen: list[str] = []
+
+        def raises(_result: ResultPayload, _workflow: WorkflowRuntime | None) -> None:
+            msg = "observer broke"
+            raise RuntimeError(msg)
+
+        def records(result: ResultPayload, _workflow: WorkflowRuntime | None) -> None:
+            seen.append(type(result).__name__)
+
+        engine.event_manager.add_result_observer(raises)
+        engine.event_manager.add_result_observer(records)
+        try:
+            result_event = engine.event_manager.handle_request(
+                SetFlowMetadataRequest(metadata={}), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+            )
+        finally:
+            engine.event_manager.remove_result_observer(raises)
+            engine.event_manager.remove_result_observer(records)
+
+        assert result_event.result.succeeded()
+        assert seen == ["SetFlowMetadataResultSuccess"]
+
+    def test_observers_that_compare_equal_are_registered_and_removed_apart(self, engine: Engine) -> None:
+        workflow = _open(engine)
+        calls: list[str] = []
+
+        @dataclass
+        class _Observer:
+            name: str
+
+            def __call__(self, _result: ResultPayload, _workflow: WorkflowRuntime | None) -> None:
+                calls.append(self.name)
+
+        first, second = _Observer("same"), _Observer("same")
+        engine.event_manager.add_result_observer(first)
+        engine.event_manager.add_result_observer(second)
+        engine.event_manager.remove_result_observer(first)
+        try:
+            engine.event_manager.handle_request(
+                SetFlowMetadataRequest(metadata={}), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+            )
+        finally:
+            engine.event_manager.remove_result_observer(second)
+
+        assert calls == ["same"]
 
     def test_squelching_a_load_reports_no_change_and_marks_nothing(self, engine: Engine) -> None:
         workflow = _open(engine)

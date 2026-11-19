@@ -783,17 +783,18 @@ class EventManager(EngineScoped):
 
         Observers run inline, in registration order, before the result event is built and before
         post-dispatch hooks, so a change an observer makes to the result reaches every client, and
-        what it records is in place before the caller hears back. Keep them cheap. Registering the
-        same observer twice is a no-op.
+        what it records is in place before the caller hears back. Keep them cheap. A raising observer
+        is logged and skipped, so the caller still gets its result. Registering the same observer
+        object twice is a no-op; matching is by identity, as for post-dispatch hooks.
         """
         with self._result_observers_lock:
-            if observer not in self._result_observers:
+            if not any(existing is observer for existing in self._result_observers):
                 self._result_observers.append(observer)
 
     def remove_result_observer(self, observer: ResultObserver) -> None:
+        """Unregister the observer object registered with `add_result_observer`, if it is registered."""
         with self._result_observers_lock:
-            if observer in self._result_observers:
-                self._result_observers.remove(observer)
+            self._result_observers = [existing for existing in self._result_observers if existing is not observer]
 
     def add_post_dispatch_hook(self, request_type: type[RP], callback: PostDispatchHook) -> None:
         """Register a callback to run after `request_type`'s handler has produced a result.
@@ -1695,7 +1696,15 @@ class EventManager(EngineScoped):
         with self._result_observers_lock:
             observers = list(self._result_observers)
         for observer in observers:
-            observer(result, workflow)
+            try:
+                observer(result, workflow)
+            except Exception:
+                # Observers are arbitrary code, and dispatch still has to answer the caller.
+                logging.getLogger("griptape_nodes").exception(
+                    "Result observer '%s' raised on %s. The request result is unaffected.",
+                    getattr(observer, "__name__", observer),
+                    type(result).__name__,
+                )
 
     def _result_for_handler_exception(
         self, request: RP, exception: Exception, *, context: ResultContext, request_workflow: _RequestWorkflow
