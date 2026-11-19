@@ -63,10 +63,10 @@ consume. A **new_item_to_add** input on the far side collects a value from
 each iteration into the group's **results** output list.
 
 **Execution Mode** (in the group's settings) chooses between running
-iterations **one at a time** or **all at once**. Only sequential mode
-supports the **Skip to Next Iteration** and **Break Out of Loop** control
-inputs — they're hidden automatically when you switch to all-at-once, since
-there's no "next iteration" to skip to once every iteration is already
+iterations **one at a time** or **all at once**. **Skip to Next Iteration**
+works in both modes: an iteration that exits through it adds nothing to
+**results**. Only sequential mode supports **Break Out of Loop** — it's hidden
+automatically when you switch to all-at-once, since every iteration is already
 running concurrently. A **Testing Mode** toggle in settings lets you run just
 one chosen index while you're wiring up the loop body, instead of the whole
 list.
