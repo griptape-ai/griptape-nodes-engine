@@ -70,6 +70,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.testing.libraries import WORKER_BEHAVIOR_LIBRARY_NAME, materialize_worker_behavior_library
 from tests.simulated_worker import SimulatedWorker, sent_from_open_workflow, simulated_worker
+from tests.workflow_context import bind, the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -198,7 +199,7 @@ def _what_the_worker_still_holds(worker: SimulatedWorker) -> dict[str, list[str]
             ]
             held["node parents"] += list(workflow.nodes.name_to_parent_flow_name)
             held["flow parents"] += [
-                name for name in engine.flow_manager._name_to_parent_name if name != _WORKER_COPIES_FLOW_NAME
+                name for name in workflow.flows.name_to_parent_name if name != _WORKER_COPIES_FLOW_NAME
             ]
     return {kind: sorted(names) for kind, names in held.items()}
 
@@ -650,6 +651,7 @@ class TestGraphAccessWhileLoading:
             reopened = await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=saved.workflow_name))
 
         assert isinstance(reopened, RunWorkflowFromRegistryResultSuccess), reopened
+        bind(the_open_workflow(engine))
         assert "while it was loading" not in caplog.text
         for name in names:
             assert engine.node_manager.get_node_by_name(name) is not None, name

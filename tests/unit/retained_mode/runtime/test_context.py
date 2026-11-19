@@ -1,4 +1,4 @@
-"""Tests for WorkflowContextStack, FlowContextState and NodeContextState."""
+"""Tests for WorkflowContextStack."""
 
 from __future__ import annotations
 
@@ -24,159 +24,88 @@ def _node(name: str) -> Mock:
     return node
 
 
-class TestWorkflowContextStack:
-    """WorkflowContextStack flow stack and its task-local overlay."""
+class TestCurrentFlow:
+    def test_outside_every_block_it_is_the_top_level_flow(self) -> None:
+        top = _flow("top")
 
-    @pytest.fixture
-    def stack(self) -> WorkflowContextStack:
-        stack = WorkflowContextStack()
-        stack.push_flow(_flow("root"))
-        return stack
+        assert WorkflowContextStack(lambda: top).get_current_flow() is top
 
-    def test_current_flow_state_raises_when_empty(self) -> None:
-        with pytest.raises(EmptyStackError):
-            WorkflowContextStack().current_flow_state()
+    def test_with_no_top_level_flow_there_is_none(self) -> None:
+        context = WorkflowContextStack(lambda: None)
 
-    def test_pop_flow_raises_when_the_shared_stack_is_empty(self) -> None:
-        with pytest.raises(EmptyStackError, match="Cannot pop Flow: no active Flows in Workflow"):
-            WorkflowContextStack().pop_flow()
+        assert not context.has_current_flow()
+        with pytest.raises(EmptyStackError, match="no top-level flow"):
+            context.get_current_flow()
 
-    def test_shared_exit_action_raises_when_the_shared_stack_was_already_emptied(self) -> None:
-        stack = WorkflowContextStack()
-        exit_flow = stack.enter_flow(_flow("a"))
-        stack.pop_flow()
+    def test_a_flow_block_overrides_the_top_level_flow_until_it_ends(self) -> None:
+        top = _flow("top")
+        inner = _flow("inner")
+        context = WorkflowContextStack(lambda: top)
 
-        with pytest.raises(EmptyStackError, match="Cannot pop Flow: no active Flows in Workflow"):
-            exit_flow()
+        with context.flow(inner):
+            assert context.get_current_flow() is inner
+        assert context.get_current_flow() is top
 
-    def test_overlay_isolates_pushes_and_pops(self, stack: WorkflowContextStack) -> None:
-        with stack.task_local_flow_stack():
-            stack.push_flow(_flow("child"))
-            assert stack.get_current_flow().name == "child"
-            stack.pop_flow()
-            stack.pop_flow()
-            assert not stack.has_current_flow()
-            with pytest.raises(EmptyStackError):
-                stack.pop_flow()
 
-        assert stack.get_current_flow().name == "root"
-        assert len(stack._flow_stack) == 1
+class TestCurrentNode:
+    def test_outside_a_node_block_there_is_none(self) -> None:
+        context = WorkflowContextStack(lambda: _flow("top"))
 
-    def test_shared_exit_action_pops_the_shared_stack_even_inside_an_overlay(self, stack: WorkflowContextStack) -> None:
-        exit_flow = stack.enter_flow(_flow("a"))
+        assert not context.has_current_node()
+        with pytest.raises(EmptyStackError, match="No node is current"):
+            context.get_current_node()
 
-        with stack.task_local_flow_stack():
-            stack.push_flow(_flow("overlay"))
-            exit_flow()
-            assert [state._flow.name for state in stack._flow_stack] == ["root"]
-            assert stack.get_current_flow().name == "overlay"
-            assert stack.pop_flow().name == "overlay"
-            assert stack.get_current_flow().name == "a"
+    def test_a_node_block_sits_in_the_current_flow(self) -> None:
+        top = _flow("top")
+        node = _node("n")
+        context = WorkflowContextStack(lambda: top)
 
-    def test_a_push_in_one_stacks_overlay_does_not_affect_another_stack(self, stack: WorkflowContextStack) -> None:
-        other = WorkflowContextStack()
+        with context.node(node):
+            assert context.get_current_node() is node
+            assert context.get_current_flow() is top
+        assert not context.has_current_node()
 
-        with stack.task_local_flow_stack():
-            stack.push_flow(_flow("child"))
-            assert not other.has_current_flow()
-            assert other._flow_stack == []
+    def test_a_flow_block_inside_a_node_block_has_no_node(self) -> None:
+        context = WorkflowContextStack(lambda: _flow("top"))
+        node = _node("n")
 
-        assert not other.has_current_flow()
+        with context.node(node):
+            with context.flow(_flow("inner")):
+                assert not context.has_current_node()
+            assert context.get_current_node() is node
+
+    def test_a_node_block_needs_a_current_flow(self) -> None:
+        context = WorkflowContextStack(lambda: None)
+
+        with pytest.raises(EmptyStackError), context.node(_node("n")):
+            pytest.fail("should not enter")
+
+
+class TestBlocksBelongToTheirCaller:
+    def test_two_workflows_keep_separate_blocks(self) -> None:
+        first = WorkflowContextStack(lambda: _flow("first_top"))
+        second_top = _flow("second_top")
+        second = WorkflowContextStack(lambda: second_top)
+
+        with first.flow(_flow("inner")):
+            assert second.get_current_flow() is second_top
 
     @pytest.mark.asyncio
-    async def test_a_sibling_task_keeps_using_the_shared_stack_while_another_holds_an_overlay(
-        self, stack: WorkflowContextStack
-    ) -> None:
-        overlay_held = asyncio.Event()
-        sibling_done = asyncio.Event()
+    async def test_a_sibling_task_does_not_see_another_tasks_block(self) -> None:
+        top = _flow("top")
+        context = WorkflowContextStack(lambda: top)
+        entered = asyncio.Event()
+        release = asyncio.Event()
 
-        async def holder() -> None:
-            with stack.task_local_flow_stack():
-                overlay_held.set()
-                await asyncio.wait_for(sibling_done.wait(), timeout=5)
-                assert stack.get_current_flow().name == "root"
+        async def hold() -> None:
+            with context.flow(_flow("held")):
+                entered.set()
+                await release.wait()
 
-        async def sibling() -> None:
-            await asyncio.wait_for(overlay_held.wait(), timeout=5)
-            assert stack.get_current_flow().name == "root"
-            stack.push_flow(_flow("sibling"))
-            sibling_done.set()
+        holder = asyncio.create_task(hold())
+        await entered.wait()
+        seen = context.get_current_flow()
+        release.set()
+        await holder
 
-        await asyncio.gather(holder(), sibling())
-
-        assert [state._flow.name for state in stack._flow_stack] == ["root", "sibling"]
-
-
-class TestAccessorsInsideAnOverlay:
-    """Flow and node accessors act on the task-local stack, never the shared one, inside an overlay."""
-
-    @pytest.fixture
-    def stack(self) -> WorkflowContextStack:
-        stack = WorkflowContextStack()
-        stack.push_flow(_flow("root"))
-        return stack
-
-    def test_flow_context_manager_enters_and_leaves_on_the_overlay(self, stack: WorkflowContextStack) -> None:
-        with stack.task_local_flow_stack():
-            with stack.flow(_flow("child")) as child:
-                assert stack.get_current_flow() is child
-                assert [state._flow.name for state in stack._flow_stack] == ["root"]
-            assert stack.get_current_flow().name == "root"
-
-        assert [state._flow.name for state in stack._flow_stack] == ["root"]
-
-    def test_flow_context_manager_on_the_shared_stack_pops_the_shared_stack(self, stack: WorkflowContextStack) -> None:
-        with stack.flow(_flow("child")):
-            assert [state._flow.name for state in stack._flow_stack] == ["root", "child"]
-
-        assert [state._flow.name for state in stack._flow_stack] == ["root"]
-
-    def test_push_and_pop_node_affect_the_overlay_only(self, stack: WorkflowContextStack) -> None:
-        node = _node("N")
-
-        with stack.task_local_flow_stack():
-            stack.push_node(node)
-            assert stack.has_current_node()
-            assert stack.get_current_node() is node
-            assert not stack._flow_stack[-1].has_current_node()
-            assert stack.pop_node() is node
-            assert not stack.has_current_node()
-
-    def test_node_context_manager_enters_and_leaves_on_the_overlay(self, stack: WorkflowContextStack) -> None:
-        node = _node("N")
-
-        with stack.task_local_flow_stack():
-            with stack.node(node):
-                assert stack.get_current_node() is node
-                assert not stack._flow_stack[-1].has_current_node()
-            assert not stack.has_current_node()
-
-    def test_node_context_manager_leaves_the_flow_it_entered_on_the_overlay(self, stack: WorkflowContextStack) -> None:
-        node = _node("N")
-
-        with stack.task_local_flow_stack():
-            entered_state = stack.current_flow_state()
-            with stack.node(node):
-                stack.push_flow(_flow("other"))
-            assert not entered_state.has_current_node()
-            assert stack.get_current_flow().name == "other"
-
-    def test_has_and_get_current_node_see_the_snapshot_not_later_shared_pushes(
-        self, stack: WorkflowContextStack
-    ) -> None:
-        with stack.task_local_flow_stack():
-            stack._flow_stack[-1].push_node(_node("SharedLater"))
-            assert not stack.has_current_node()
-            with pytest.raises(EmptyStackError):
-                stack.get_current_node()
-
-    def test_node_accessors_raise_without_a_flow_in_the_overlay(self, stack: WorkflowContextStack) -> None:
-        with stack.task_local_flow_stack():
-            stack.pop_flow()
-            assert not stack.has_current_node()
-            with pytest.raises(EmptyStackError):
-                stack.push_node(_node("N"))
-            with pytest.raises(EmptyStackError):
-                stack.pop_node()
-            with pytest.raises(EmptyStackError):
-                stack.get_current_node()
+        assert seen is top

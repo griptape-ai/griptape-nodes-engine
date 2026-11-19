@@ -41,7 +41,7 @@ class EngineLifecycle:
         """Return True until startup finishes, and during a library reload.
 
         Covers the full startup sequence (library and workflow loading), not just the library
-        phase. Reported on the engine heartbeat.
+        phase. Reported on the session snapshot and both heartbeats.
         """
         return self._state is not EngineLifecycleState.READY
 

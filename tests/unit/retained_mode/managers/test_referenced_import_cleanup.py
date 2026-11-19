@@ -154,7 +154,6 @@ class TestExecuteWorkflowImportCleanup:
             Mock(spec=ControlFlow) if name in parents else None
         )
         workflow.context = Mock(spec=WorkflowContextStack)
-        workflow.context.task_local_flow_stack.side_effect = nullcontext
         workflow.context.flow.side_effect = lambda *_args, **_kwargs: nullcontext()
         workflow.handle_request.side_effect = self._handle_request
         return workflow

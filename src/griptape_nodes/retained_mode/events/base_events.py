@@ -329,9 +329,11 @@ class EventRequest[P: Payload](BaseEvent):
             handler, and every task it starts, acts on that workflow. An id that names no open
             workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
             handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
-            Left out, the request acts on the engine's only open workflow, unless another engine
-            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
-            else: the workflow the request is about.
+            Left out, the request acts on the workflow its caller is bound to, such as a run's own
+            workflow, and a WORKFLOW request with no such caller fails with
+            `WorkflowNotNamedResultFailure`. An OPTIONAL_WORKFLOW request acts on none. A request
+            another engine sent acts on no workflow. A payload field named `workflow_id` is
+            something else: the workflow the request is about.
         origin_engine_id: The engine this request started at, set by the engine relaying it for the
             receiving engine. Today that engine is a remote worker the sender runs for the receiver,
             and the receiver answers the request as its own worker's.
@@ -387,7 +389,7 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
 
     Args:
         open_workflow_id: The open workflow the request ran in: the one the envelope named, or
-            with none named, the only open workflow or a run's own workflow. None for a request that
+            with none named, the workflow its caller was bound to, such as a run's own workflow. None for a request that
             runs in no workflow, such as a HOST request, which ignores the envelope's id even when
             it opens or closes a workflow; `WorkflowOpenedEvent` and `WorkflowClosedEvent` tell
             clients of those. A request refused for the workflow its envelope named echoes that id.

@@ -55,6 +55,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.library.sandbox import SUBFLOW_NODE_ICON
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, Settings
+from tests.workflow_context import bind, the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -343,6 +344,7 @@ async def test_saved_workflow_using_a_sandbox_workflow_node_reopens_with_the_rea
     run_result = await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=save_result.workflow_name))
     assert isinstance(run_result, RunWorkflowFromRegistryResultSuccess), run_result
     assert run_result.status == WorkflowStatus.GOOD
+    bind(the_open_workflow(engine))
 
     node = engine.node_manager.get_node_by_name("Shout It")
     assert not isinstance(node, ErrorProxyNode), node
@@ -372,6 +374,7 @@ async def test_saved_workflow_using_a_sandbox_workflow_node_reloads_the_sandbox_
     run_result = await engine.ahandle_request(RunWorkflowFromRegistryRequest(workflow_name=save_result.workflow_name))
     assert isinstance(run_result, RunWorkflowFromRegistryResultSuccess), run_result
     assert run_result.status == WorkflowStatus.GOOD
+    bind(the_open_workflow(engine))
 
     node = engine.node_manager.get_node_by_name("Shout It")
     assert not isinstance(node, ErrorProxyNode), node

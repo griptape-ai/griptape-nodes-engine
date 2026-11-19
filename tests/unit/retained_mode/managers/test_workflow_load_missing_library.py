@@ -84,7 +84,9 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 from griptape_nodes.retained_mode.managers.workflow.loading import LoadProblemFrame
 from griptape_nodes.retained_mode.managers.workflow.running import collate_problems_by_type
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.utils.version_utils import engine_version
+from tests.workflow_context import bind, the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -260,6 +262,7 @@ def _save_two_library_workflow(tmp_path: Path, file_stem: str = "two_library_wor
     assert isinstance(serialize_result, SerializeFlowToCommandsResultSuccess), serialize_result
 
     save_result = engine.workflow_manager.saver._save_workflow_file_inline(
+        workflow=None,
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,
@@ -280,6 +283,7 @@ def _save_flow_as_workflow(engine: Engine, tmp_path: Path, flow_name: str, file_
     serialized = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow_name))
     assert isinstance(serialized, SerializeFlowToCommandsResultSuccess), serialized
     saved = engine.workflow_manager.saver._save_workflow_file_inline(
+        workflow=None,
         destination=ProjectFileDestination(str(tmp_path / f"{file_stem}.py")),
         serialized_flow_commands=serialized.serialized_flow_commands,
         file_name=file_stem,
@@ -329,6 +333,8 @@ def _restart_engine(tmp_path: Path) -> Engine:
     the workflows a restarted editor would find in its workspace.
     """
     reset_root_engine()
+    # A workflow the old engine opened bound this test to it, and that engine is gone.
+    bound_workflow.set(None)
     LibraryRegistry._clear()
     stale = [
         name for name in sys.modules if name.startswith(("gtn_dynamic_module_", LibraryManager.STABLE_NAMESPACE_PREFIX))
@@ -358,8 +364,12 @@ def _rebuild_engine_without_library(tmp_path: Path, *, disabled: bool = False) -
 
 
 def _run(engine: Engine, relative_file_path: str) -> Any:
-    """Run a saved file as node libraries do: into the current workflow, else opened as one."""
-    return asyncio.run(engine.workflow_manager.run_workflow(relative_file_path))
+    """Run a saved file into the current workflow, else opened as one and bound, as a client that opens it works in it."""
+    workflow = engine.current_workflow_or_none()
+    result = asyncio.run(engine.workflow_manager.run_workflow(relative_file_path, workflow))
+    if workflow is None and result.workflow_id is not None:
+        bind(engine.open_workflows.get(result.workflow_id))
+    return result
 
 
 def _register_workflow(engine: Engine, tmp_path: Path, relative_file_path: str) -> str:
@@ -666,6 +676,7 @@ class TestOpenWorkflowRequest:
         result = reopened.handle_request(RunWorkflowFromRegistryRequest(workflow_name=workflow_name))
 
         assert isinstance(result, RunWorkflowFromRegistryResultSuccess), result
+        bind(the_open_workflow(reopened))
         assert not isinstance(_node(reopened, "Kept"), ErrorProxyNode)
         assert isinstance(_node(reopened, "Vanishing"), ErrorProxyNode)
 
@@ -742,9 +753,12 @@ class TestHeadlessLoadRefusesPlaceholders:
         _register(restored, tmp_path / "libraries" / "AvailableNode" / "griptape_nodes_library.json")
         _register(restored, tmp_path / "libraries" / "UnavailableNode" / "griptape_nodes_library.json")
 
-        asyncio.run(LocalWorkflowExecutor()._load_workflow_from_path(relative_path))
+        async def load_and_find_the_node() -> Any:
+            # The executor binds the workflow it opens for the rest of its run, so its caller reads it.
+            await LocalWorkflowExecutor()._load_workflow_from_path(relative_path)
+            return _node(restored, "Vanishing")
 
-        assert not isinstance(_node(restored, "Vanishing"), ErrorProxyNode)
+        assert not isinstance(asyncio.run(load_and_find_the_node()), ErrorProxyNode)
 
 
 class TestNestedSubflowProblemsReachTheOuterLoad:

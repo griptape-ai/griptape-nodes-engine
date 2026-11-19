@@ -34,13 +34,12 @@ class VariableSubstitution(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    def is_enabled(self) -> bool:
-        """Return whether variable substitution is enabled for the open workflow.
+    def is_enabled(self, workflow: WorkflowRuntime | None) -> bool:
+        """Return whether variable substitution is enabled for `workflow`.
 
         Defaults to True, so workflows that have never set the flag get substitution without
-        any migration, and so does work with no workflow open.
+        any migration, and so does work that acts on no workflow (None).
         """
-        workflow = self.engine.current_workflow_or_none()
         if workflow is None:
             return True
         return workflow.variables.substitution_enabled

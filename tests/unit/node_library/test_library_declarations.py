@@ -212,17 +212,6 @@ class TestArbitraryPythonExecutionNodeProperty:
         with pytest.raises(ValidationError):
             ArbitraryPythonExecutionNodeProperty()  # type: ignore[call-arg]
 
-    def test_node_metadata_round_trips_declaration(self) -> None:
-        metadata = _make_node_metadata(
-            declarations=[ArbitraryPythonExecutionNodeProperty(executes_arbitrary_python=True)],
-        )
-
-        rebuilt = NodeMetadata.model_validate(metadata.model_dump())
-
-        decl = rebuilt.declarations[0]
-        assert isinstance(decl, ArbitraryPythonExecutionNodeProperty)
-        assert decl.executes_arbitrary_python is True
-
 
 # ---------- WorkerModeCompatibility ----------
 

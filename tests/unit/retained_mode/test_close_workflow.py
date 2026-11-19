@@ -127,7 +127,9 @@ class TestWorkStillBoundToAClosedWorkflow:
             outcomes: list[object] = [engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="late"))]
             for write in (
                 engine.current_workflow,
-                lambda: engine.resource_manager.put_local_object(object(), owner="Lib", source="N", key="late"),
+                lambda: engine.resource_manager.put_local_object(
+                    object(), owner="Lib", source="N", key="late", workflow=workflow
+                ),
             ):
                 try:
                     write()
@@ -160,7 +162,9 @@ class TestASyncCloseStopsTheRun:
 
         with (
             patch.object(flow_manager, "cancel_all_runs_in", AsyncMock(side_effect=cancel)),
-            patch.object(flow_manager, "reset_global_execution_state", side_effect=lambda: calls.append("reset")),
+            patch.object(
+                flow_manager, "reset_global_execution_state_in", side_effect=lambda _workflow: calls.append("reset")
+            ),
         ):
             engine.context_manager.pop_workflow()
 
@@ -200,9 +204,9 @@ class TestACloseTurnsAwayItsWaitingRuns:
             executed.append("second")
             return StartFlowResultSuccess(result_details="second ran")
 
-        running = asyncio.ensure_future(engine.flow_manager.start_run(_RunSpec("canvas", first)))
+        running = asyncio.ensure_future(engine.flow_manager.start_run(workflow, _RunSpec("canvas", first)))
         await asyncio.sleep(0)
-        waiting = engine.flow_manager.submit_run(_RunSpec("canvas", second))
+        waiting = engine.flow_manager.submit_run(_RunSpec("canvas", second), flows=workflow.flows)
 
         if close == "clear_all":
             cleared = await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

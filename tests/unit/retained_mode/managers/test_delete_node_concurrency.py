@@ -91,35 +91,6 @@ class TestDeleteNodeWhileAwaitingCancel(_DeleteNodeTestBase):
         return gates
 
     @pytest.mark.asyncio
-    async def test_a_flow_pushed_while_the_delete_waits_does_not_break_the_delete(
-        self,
-        engine: Engine,
-        workflow: WorkflowRuntime,
-        flow_with_nodes: ControlFlow,
-        cancel_gates: dict[str, dict[str, asyncio.Event]],
-    ) -> None:
-        """Guard the original `EmptyStackError`, which the context stack now avoids by itself.
-
-        It passes without the delete fix and does not test the remaining hazards, which the next two tests cover.
-        """
-        delete = asyncio.create_task(
-            engine.node_manager.on_delete_node_request(DeleteNodeRequest(node_name="NodeA"), workflow)
-        )
-        await asyncio.wait_for(cancel_gates["NodeA"]["entered"].wait(), timeout=TIMEOUT)
-
-        # Another request makes a new flow the current one while the delete is parked.
-        pushed = engine.handle_request(
-            CreateFlowRequest(parent_flow_name=flow_with_nodes.name, flow_name="Other", set_as_new_context=True)
-        )
-        assert isinstance(pushed, CreateFlowResultSuccess)
-        cancel_gates["NodeA"]["release"].set()
-        result = await asyncio.wait_for(delete, timeout=TIMEOUT)
-
-        assert isinstance(result, DeleteNodeResultSuccess)
-        assert not workflow.context.has_current_node()
-        assert not workflow.context._flow_stack[0].has_current_node()
-
-    @pytest.mark.asyncio
     @pytest.mark.usefixtures("flow_with_nodes")
     async def test_another_task_sees_no_current_node_while_the_delete_waits(
         self,

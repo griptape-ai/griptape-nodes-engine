@@ -1,8 +1,8 @@
 """Clearing all object state must cancel an in-flight run before tearing it down.
 
-`reset_global_execution_state()` drops the run's task bookkeeping and nulls its
+`reset_global_execution_state_in()` drops the run's task bookkeeping and nulls its
 machine state, which makes the flow look idle. Anything that cancels on the
-strength of `check_for_existing_running_flow()` afterwards -- including
+strength of `check_for_existing_running_flow_in()` afterwards -- including
 `Engine.clear_current_workflow_data`, whose whole job here is to "cancel any
 running flow so the delete path doesn't race with execution" -- is then a no-op,
 and the previous run's node tasks carry on: still billing API calls, and still
@@ -38,7 +38,9 @@ class TestClearAllObjectStateCancelsFirst:
 
         with (
             patch.object(flow_manager, "cancel_all_runs_in", AsyncMock(side_effect=cancel)),
-            patch.object(flow_manager, "reset_global_execution_state", side_effect=lambda: calls.append("reset")),
+            patch.object(
+                flow_manager, "reset_global_execution_state_in", side_effect=lambda _workflow: calls.append("reset")
+            ),
         ):
             result = await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -56,7 +58,7 @@ class TestClearAllObjectStateCancelsFirst:
             patch.object(
                 flow_manager, "cancel_all_runs_in", AsyncMock(side_effect=RuntimeError("a node would not stop"))
             ),
-            patch.object(flow_manager, "reset_global_execution_state") as reset,
+            patch.object(flow_manager, "reset_global_execution_state_in") as reset,
         ):
             result = await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
@@ -71,7 +73,7 @@ class TestClearAllObjectStateCancelsFirst:
 
         with (
             patch.object(flow_manager, "_cancel_run", AsyncMock()) as cancel,
-            patch.object(flow_manager, "reset_global_execution_state") as reset,
+            patch.object(flow_manager, "reset_global_execution_state_in") as reset,
         ):
             result = await engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 

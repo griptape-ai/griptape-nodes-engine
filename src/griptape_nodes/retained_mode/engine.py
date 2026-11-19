@@ -30,6 +30,8 @@ from griptape_nodes.node_library.workflow_registry import _WorkflowRegistry
 from griptape_nodes.retained_mode.engine_lifecycle import EngineLifecycle
 from griptape_nodes.retained_mode.engine_transports import EngineNotFoundError
 from griptape_nodes.retained_mode.events.app_events import (
+    AppGetSessionRequest,
+    AppGetSessionResultSuccess,
     AppInitializationComplete,
     EngineHeartbeatRequest,
     EngineHeartbeatResultFailure,
@@ -38,6 +40,9 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
     OpenWorkflowInfo,
+    SessionHeartbeatRequest,
+    SessionHeartbeatResultFailure,
+    SessionHeartbeatResultSuccess,
     WorkflowClosedEvent,
     WorkflowOpenedEvent,
 )
@@ -56,7 +61,6 @@ from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import (
     NO_WORKFLOW,
     NoWorkflow,
-    WorkflowNotNamedError,
     WorkflowNotOpenError,
     bound_workflow,
 )
@@ -742,16 +746,19 @@ class Engine:
     def current_workflow(self) -> WorkflowRuntime:
         """The open workflow the current work acts on, for writes and runs that need one.
 
-        The workflow the current work is bound to, else the engine's only open workflow.
+        The workflow the current work is bound to. Edges that open a workflow bind it
+        (`ContextManager.push_workflow`, the workflow executors).
 
         Raises:
-            NoOpenWorkflowError: The work is bound to no workflow, or is unbound and none is open.
+            NoOpenWorkflowError: The work is bound to no workflow, or is unbound.
             WorkflowNotOpenError: The work is bound to a workflow that has closed.
-            WorkflowNotNamedError: The work is unbound and several workflows are open.
         """
         workflow = self.current_workflow_or_none()
         if workflow is None:
-            msg = "Attempted to change the open workflow. Failed because no workflow is open. Open or create a workflow first."
+            msg = (
+                "Attempted to change the open workflow. Failed because the work is not bound to a workflow. "
+                "Open or create a workflow first, or name one on the request."
+            )
             raise NoOpenWorkflowError(msg)
         return workflow
 
@@ -763,7 +770,6 @@ class Engine:
 
         Raises:
             WorkflowNotOpenError: The work is bound to a workflow that has closed.
-            WorkflowNotNamedError: The work is unbound and several workflows are open.
         """
         bound = bound_workflow.get()
         if bound is NO_WORKFLOW:
@@ -775,25 +781,13 @@ class Engine:
                 "Reopen the workflow and try again."
             )
             raise WorkflowNotOpenError(msg)
-        if bound is not None:
-            return bound
-
-        open_workflows = self._open_workflows.all_open()
-        if len(open_workflows) > 1:
-            msg = (
-                f"Attempted to find the workflow to act on. Failed because {len(open_workflows)} workflows are "
-                "open and the request did not name one."
-            )
-            raise WorkflowNotNamedError(msg)
-        if not open_workflows:
-            return None
-        return open_workflows[0]
+        return bound
 
     def bound_live_workflow_or_none(self) -> WorkflowRuntime | None:
         """The workflow the current work is bound to, while it is still open here or kept by this worker.
 
-        Unlike `current_workflow_or_none`, it never falls back to the only open workflow, so it never
-        raises however many are open. A binding to a workflow closed since it was made finds none.
+        Unlike `current_workflow_or_none`, it never raises: a binding to a workflow closed since it
+        was made finds none.
         """
         bound = bound_workflow.get()
         if bound is None or bound is NO_WORKFLOW:
@@ -934,14 +928,14 @@ class Engine:
             await self._worker_manager.broadcast_local_object_teardown(None)
 
     def clear_current_workflow_data(self) -> None:
-        """Close the current workflow (see `close_workflow`).
+        """Close the workflow the current work is bound to (see `close_workflow`).
 
         Raises:
-            RuntimeError: No workflow is current.
+            RuntimeError: The work is bound to no workflow.
         """
         workflow = self.current_workflow_or_none()
         if workflow is None:
-            msg = "Cannot clear current workflow data without an active workflow context."
+            msg = "Cannot clear current workflow data without a bound workflow."
             raise RuntimeError(msg)
         self.close_workflow(workflow)
 
@@ -978,7 +972,7 @@ class Engine:
             # after it drops the run's bookkeeping, so it must not run ahead of the cancel: the flow
             # would look idle and the cancel would be skipped.
             self.handle_request(CancelAllRunsRequest())
-            self._flow_manager.reset_global_execution_state()
+            self._flow_manager.reset_global_execution_state_in(workflow)
             self._delete_workflow_flows(workflow)
         if len(workflow.objects) > 0:
             msg = (
@@ -1109,6 +1103,33 @@ class Engine:
         except Exception as err:
             details = f"Failed to handle engine heartbeat: {err}"
             return EngineHeartbeatResultFailure(heartbeat_id=request.heartbeat_id, result_details=details)
+
+    @handles(AppGetSessionRequest)
+    def handle_get_session_request(self, request: AppGetSessionRequest) -> ResultPayload:  # noqa: ARG002
+        """Report the active session and a snapshot of this engine for the client connecting to it."""
+        return AppGetSessionResultSuccess(
+            session_id=self._session_manager.active_session_id,
+            engine_version=engine_version,
+            engine_run_id=self._engine_run_id,
+            engine_os=self._os_manager.platform_name(),
+            is_initializing=self._lifecycle.is_initializing(),
+            result_details="Session ID retrieved successfully.",
+        )
+
+    @handles(SessionHeartbeatRequest)
+    def handle_session_heartbeat_request(self, request: SessionHeartbeatRequest) -> ResultPayload:  # noqa: ARG002
+        """Confirm the session is active and report the engine state that changes while a client stays connected."""
+        session_id = self._session_manager.active_session_id
+        if session_id is None:
+            return SessionHeartbeatResultFailure(
+                result_details="Attempted to check the session. Failed because no session is active."
+            )
+        return SessionHeartbeatResultSuccess(
+            session_id=session_id,
+            engine_run_id=self._engine_run_id,
+            is_initializing=self._lifecycle.is_initializing(),
+            result_details=f"Session heartbeat successful for session: {session_id}",
+        )
 
     async def _on_engine_lost(self, engine_id: str) -> None:
         """Settle what a lost engine left behind, on the engine loop.
