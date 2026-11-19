@@ -13,8 +13,9 @@ import pytest
 from griptape_nodes.app.worker_routing import RemoteHandler
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
 from griptape_nodes.retained_mode.engine import Engine, current_engine
-from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+from griptape_nodes.retained_mode.events.app_events import AppConnectionEstablished, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
+    AppEvent,
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
@@ -33,6 +34,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import NodeFinishProcessEvent, NodeProcessOutcome
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
+from griptape_nodes.retained_mode.events.logger_events import LogHandlerEvent
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
@@ -2612,6 +2614,64 @@ class TestExecutionEventsNameTheBoundWorkflow:
 
         with engine.bind_workflow(NO_WORKFLOW):
             open_workflow_id = self._queued(engine.event_manager, queue, event)
+
+        assert open_workflow_id is None
+
+
+class TestNodeLogLinesNameTheBoundWorkflow:
+    """A node's log line names the workflow the node runs in, so it reaches only that workflow's clients."""
+
+    @staticmethod
+    def _queued_workflow_id(engine: Engine, queue: asyncio.Queue, event: AppEvent) -> str | None:
+        engine.event_manager.put_event(event)
+        queued = queue.get_nowait()
+        assert queued is event
+        return queued.open_workflow_id
+
+    def test_a_node_log_line_names_the_bound_workflow(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = AppEvent(payload=LogHandlerEvent(message="m", levelname="INFO", created=1.0, node_name="Text One"))
+
+        with engine.bind_workflow(WorkflowRuntime("bound", MagicMock())):
+            open_workflow_id = self._queued_workflow_id(engine, queue, event)
+
+        assert open_workflow_id == "bound"
+
+    def test_an_engine_log_line_names_no_workflow_even_while_one_is_bound(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = AppEvent(payload=LogHandlerEvent(message="m", levelname="INFO", created=1.0))
+
+        with engine.bind_workflow(WorkflowRuntime("bound", MagicMock())):
+            open_workflow_id = self._queued_workflow_id(engine, queue, event)
+
+        assert open_workflow_id is None
+
+    def test_a_node_log_line_built_with_no_workflow_keeps_naming_none(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = AppEvent(
+            payload=LogHandlerEvent(message="m", levelname="INFO", created=1.0, node_name="Text One"),
+            open_workflow_id=None,
+        )
+
+        with engine.bind_workflow(WorkflowRuntime("bound", MagicMock())):
+            open_workflow_id = self._queued_workflow_id(engine, queue, event)
+
+        assert open_workflow_id is None
+
+    def test_other_app_events_name_no_workflow(self) -> None:
+        engine = Engine()
+        queue: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(queue)
+        event = AppEvent(payload=AppConnectionEstablished())
+
+        with engine.bind_workflow(WorkflowRuntime("bound", MagicMock())):
+            open_workflow_id = self._queued_workflow_id(engine, queue, event)
 
         assert open_workflow_id is None
 
