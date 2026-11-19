@@ -69,7 +69,8 @@ def read_text_chunks(png: bytes) -> dict[str, str]:
             continue
         total_bytes += len(chunk.text)
         if total_bytes > MAX_TOTAL_TEXT_BYTES:
-            break
+            msg = "Attempted to read PNG metadata. Failed because the text metadata exceeds the size limit."
+            raise ValueError(msg)
         texts[chunk.key] = chunk.text
     return texts
 

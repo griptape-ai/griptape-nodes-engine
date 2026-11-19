@@ -1,7 +1,9 @@
 """Cache freshness regression tests."""
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 import numpy as np
@@ -9,6 +11,7 @@ import OpenImageIO as oiio  # noqa: N813
 import pytest
 
 from griptape_nodes.image import GriptapeImage
+from griptape_nodes.image.cache import image_directory_mutation, image_source_access
 from griptape_nodes.image.oiio_config import invalidate_image_cache
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.os_events import RenameFileRequest, RenameFileResultSuccess
@@ -80,6 +83,48 @@ class TestCacheReview:
             engine=engine,
         )
         assert await generator._resolve_source() == path
+
+    def test_source_consumer_blocks_mutation_until_pixels_are_consumed(self, tmp_path: Path) -> None:
+        # Given a reader consuming one source and another source available in parallel.
+        path = tmp_path / "source.png"
+        entered = Event()
+        release = Event()
+        mutated = Event()
+
+        def consume() -> None:
+            with image_source_access(path):
+                entered.set()
+                assert release.wait(5)
+
+        def mutate() -> None:
+            with image_source_access(path):
+                mutated.set()
+
+        # When a mutation races with the reader, the other source remains usable.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            reader = executor.submit(consume)
+            assert entered.wait(5)
+            mutation = executor.submit(mutate)
+            with image_source_access(tmp_path / "other.png"):
+                assert not mutated.is_set()
+            release.set()
+            reader.result(timeout=5)
+            mutation.result(timeout=5)
+
+        # Then the mutation enters after the reader releases its source.
+        assert mutated.is_set()
+
+    def test_directory_gate_released_after_invalidation_failure(self, tmp_path: Path) -> None:
+        with (
+            patch(
+                "griptape_nodes.image.cache.invalidate_all_image_cache", side_effect=[None, OSError("eviction failed")]
+            ),
+            pytest.raises(OSError, match="eviction failed"),
+            image_directory_mutation(),
+        ):
+            pass
+        with image_source_access(tmp_path / "source.png"):
+            pass
 
     def test_cached_missing_source_fails(self, tmp_path: Path) -> None:
         path = tmp_path / "source.png"

@@ -3,7 +3,7 @@ import platform
 import subprocess
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import anyio
 import pytest
@@ -1533,7 +1533,7 @@ class TestDeleteFileRequest:
         file_path = tmp_path / "test.txt"
         file_path.write_text("test content")
 
-        with patch.object(anyio.Path, "unlink", AsyncMock(side_effect=PermissionError("Access denied"))):
+        with patch.object(Path, "unlink", side_effect=PermissionError("Access denied")):
             request = DeleteFileRequest(
                 path=str(file_path),
                 workspace_only=False,

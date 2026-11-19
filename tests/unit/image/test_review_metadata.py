@@ -9,7 +9,7 @@ import pytest
 
 from griptape_nodes.drivers.image_metadata.exif_metadata_driver import ExifMetadataDriver
 from griptape_nodes.drivers.image_metadata.png_metadata_driver import PngMetadataDriver
-from griptape_nodes.image import GriptapeImage, GriptapeImagePipeline
+from griptape_nodes.image import Exif, GriptapeImage, GriptapeImagePipeline, ImageMetadata
 from griptape_nodes.image.png_text_chunks import PNG_SIGNATURE, png_chunk
 from tests.unit.image.sample_images import RED, encode, solid
 
@@ -55,6 +55,20 @@ class TestMetadataReview:
     def test_corrupt_known_signature_fails_at_open(self, source: bytes) -> None:
         with pytest.raises(ValueError, match="could not read"):
             GriptapeImage.open(source)
+
+    @pytest.mark.parametrize("extension", ["png", "jpg", "webp", "tif"])
+    def test_path_metadata_matches_bytes(self, extension: str, tmp_path: Path) -> None:
+        exif = Exif()
+        exif[0x010F] = "Camera"
+        exif[0x0112] = 6
+        exif.set_gps(1, "N")
+        with GriptapeImage.open(encode(solid(64, 64, RED), extension)) as image:
+            assert image.format is not None
+            data = image.encode(image.format, metadata=ImageMetadata(exif=exif))
+        path = tmp_path / f"metadata.{extension}"
+        path.write_bytes(data)
+        with GriptapeImage.open(path) as file_image, GriptapeImage.open(data) as byte_image:
+            assert file_image.metadata == byte_image.metadata
 
     @staticmethod
     def _pixel_chunk(source: bytes) -> bytes:

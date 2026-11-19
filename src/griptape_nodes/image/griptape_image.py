@@ -207,7 +207,8 @@ class GriptapeImage:
         if self._metadata is None:
             if self._source_path is not None and self._format in self._CONTAINER_METADATA_FORMATS:
                 assert self._format is not None  # noqa: S101
-                self._metadata = read_path_metadata(self._source_path, self._format)
+                with image_source_access(self._source_path):
+                    self._metadata = read_path_metadata(self._source_path, self._format)
             else:
                 source = self._source
                 if source is None and self._source_path is None:
@@ -314,16 +315,6 @@ class GriptapeImage:
                 return exif.orientation
         return spec.get_int_attribute("Orientation", _UPRIGHT)
 
-    def _load_source_bytes_if_needed(self) -> bytes | None:
-        if self._source is not None:
-            return self._source
-        if self._source_path is None:
-            return None
-        if self._format in self._CONTAINER_METADATA_FORMATS:
-            self._source = self._source_path.read_bytes()
-            return self._source
-        return None
-
     def _source_bytes_for_splice(self, target_format: ImageFormat) -> bytes | None:
         if self._source is not None:
             return self._source
@@ -332,7 +323,8 @@ class GriptapeImage:
             and target_format == self._format
             and target_format in self._SPLICEABLE_FORMATS
         ):
-            self._source = self._source_path.read_bytes()
+            with image_source_access(self._source_path):
+                self._source = self._source_path.read_bytes()
             return self._source
         return None
 
@@ -469,7 +461,8 @@ class GriptapeImage:
             msg = "Attempted to read an image's header. Failed because the image was closed."
             raise ValueError(msg)
         if self._source_path is not None:
-            header = read_header_file(self._source_path)
+            with image_source_access(self._source_path):
+                header = read_header_file(self._source_path)
         else:
             assert self._source is not None  # noqa: S101
             with temporary_path(self._source_extension()) as path:

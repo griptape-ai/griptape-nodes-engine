@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections import OrderedDict
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Condition, RLock, local
 from typing import TYPE_CHECKING
 from weakref import WeakValueDictionary
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import Iterator
     from pathlib import Path
 
 import OpenImageIO as oiio  # noqa: N813
@@ -99,26 +98,10 @@ def image_directory_mutation() -> Iterator[None]:
         invalidate_all_image_cache()
         yield
     finally:
-        invalidate_all_image_cache()
-        _end_directory_mutation()
-
-
-@asynccontextmanager
-async def async_image_directory_mutation() -> AsyncIterator[None]:
-    """Wait for image consumers without blocking the engine event loop."""
-    acquired = asyncio.create_task(asyncio.to_thread(_begin_directory_mutation))
-    try:
-        await asyncio.shield(acquired)
-    except asyncio.CancelledError:
-        await acquired
-        _end_directory_mutation()
-        raise
-    try:
-        invalidate_all_image_cache()
-        yield
-    finally:
-        invalidate_all_image_cache()
-        _end_directory_mutation()
+        try:
+            invalidate_all_image_cache()
+        finally:
+            _end_directory_mutation()
 
 
 def _begin_directory_mutation() -> None:

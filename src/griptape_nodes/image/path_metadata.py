@@ -103,4 +103,7 @@ def _jpeg_metadata(source: FileMetadataSource) -> bytes:
         if marker[1] in {0xE1, 0xE2}:
             result += marker + length_bytes + source.read_at(position + 4, size - 2)
         position += size + 2
+    else:
+        msg = "Attempted to read JPEG metadata. Failed because the image has too many metadata segments."
+        raise ValueError(msg)
     return bytes(result)
