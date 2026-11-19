@@ -32,7 +32,11 @@ from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowResultFailure,
     StartLocalSubflowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.failure_tree import FailureTreeError, WorkflowNodeFailure
+from griptape_nodes.retained_mode.events.failure_tree import (
+    FailureTreeError,
+    WorkflowNodeFailure,
+    WorkflowRecursionLimitError,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     TRANSIENT_KEY,
     DeleteFlowRequest,
@@ -41,6 +45,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.node_events import GetFlowForNodeRequest, GetFlowForNodeResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
+    ImportWorkflowAsReferencedSubFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     WorkflowStatus,
 )
@@ -432,6 +437,17 @@ class WorkflowNode(ControlNode):
             )
         )
         if not isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
+            # The workflow was refused for nesting too deeply. That ends a surrounding loop early, so it is raised as a
+            # recursion-limit failure, not as a plain load failure.
+            if isinstance(import_result, ImportWorkflowAsReferencedSubFlowResultFailure) and isinstance(
+                import_result.exception, WorkflowRecursionLimitError
+            ):
+                refused = failure_trees.failure_tree_from_exception(self.name, import_result.exception)
+                msg = (
+                    f"Attempted to load the workflow behind node '{self.name}'. "
+                    f"Failed because the workflow could not be loaded: {import_result.exception}"
+                )
+                raise FailureTreeError(refused, msg)
             msg = (
                 f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
                 f"Failed because the workflow could not be loaded: {import_result.result_details}"

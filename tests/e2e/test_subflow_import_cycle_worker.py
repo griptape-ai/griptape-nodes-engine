@@ -69,6 +69,8 @@ from tests.e2e.test_subflow_import_cycle import (
     PATH_SEPARATOR,
     RECURSION_DEPTH_KEY,
     RECURSIVE,
+    RECURSIVE_LOOP,
+    RECURSIVE_LOOP_PARALLEL,
     RUN_SENTENCE,
     WORKFLOW_FILES,
     FixtureWorkflow,
@@ -99,12 +101,15 @@ REGISTERED_WORKFLOWS = [
     COUNTDOWN_FAIL_WORKER,
     COUNTDOWN_GROUP,
     COUNTDOWN_LOOP,
+    RECURSIVE_LOOP,
+    RECURSIVE_LOOP_PARALLEL,
 ]
 ALL_WORKFLOWS = [
     *WORKFLOW_FILES,
     FIXTURE_LIBRARY_DIR / f"{COUNTDOWN_FAIL_WORKER.stem}.py",
 ]
 NODE_ERROR_TYPE = "griptape_nodes.exe_types.node_error.NodeError"
+RECURSION_ERROR_TYPE = "griptape_nodes.retained_mode.events.failure_tree.WorkflowRecursionLimitError"
 WORKER_TRACEBACK_MARKER = "\nWorker traceback:\n"
 
 
@@ -427,6 +432,7 @@ class TestWholeLibraryInWorker(_WorkerBoundaryBase):
         assert outer.error is not None, outer
         assert root_cause in outer.error.message, outer.error
         assert "did not finish" not in outer.error.message, outer.error
+        assert "could not be loaded" not in outer.error.message, outer.error
         # Eleven nodes are too many to list, so the field keeps both ends and counts the rest.
         path = outer.error.fields[FAILED_NODE_PATH_FIELD].split(PATH_SEPARATOR)
         assert path == [
@@ -436,7 +442,7 @@ class TestWholeLibraryInWorker(_WorkerBoundaryBase):
             f"Inner Workflow_{depth - 2}",
             f"Inner Workflow_{depth - 1}",
         ], path
-        assert outer.error.exception_type == "builtins.RuntimeError", outer.error
+        assert outer.error.exception_type == RECURSION_ERROR_TYPE, outer.error
         # The Workflow nodes ran here, so the refusal never crossed the boundary.
         scenario.crossings.assert_only_inner_nodes_crossed()
         assert scenario.forwarded_refusals() == [], scenario.crossings
@@ -467,7 +473,7 @@ class TestWholeLibraryInWorker(_WorkerBoundaryBase):
             "Group_3",
             "Inner Workflow_3",
         ], outer.error
-        assert outer.error.exception_type == "builtins.RuntimeError", outer.error
+        assert outer.error.exception_type == RECURSION_ERROR_TYPE, outer.error
 
     @pytest.mark.usefixtures("loop_library")
     @pytest.mark.asyncio
@@ -505,6 +511,32 @@ class TestWholeLibraryInWorker(_WorkerBoundaryBase):
             "Inner Workflow_2",
             "Failing_2",
         ], outer.error
+
+    @pytest.mark.timeout(60, method="thread")
+    @pytest.mark.usefixtures("loop_library")
+    @pytest.mark.asyncio
+    async def test_recursion_through_a_loop_fails_promptly(
+        self, scenario: _Scenario, create_node: Callable[..., str]
+    ) -> None:
+        """A refusal inside a loop between Workflow nodes, in a hosted library, ends the loop at once."""
+        scenario.host(LIBRARY_NAME)
+
+        parent_flow = scenario.new_parent_flow()
+        create_node(RECURSIVE_LOOP.node_type, "Outer", parent_flow, library_name=LIBRARY_NAME)
+        # Packaging a loop body needs a current flow, which the editor always has.
+        with scenario.engine.context_manager.flow(parent_flow):
+            result = await scenario.engine.ahandle_request(
+                StartFlowRequest(flow_name=parent_flow, flow_node_name="Outer")
+            )
+
+        assert isinstance(result, StartFlowResultFailure), result
+        scenario.crossings.assert_only_inner_nodes_crossed()
+        details = without_worker_traceback(str(result.result_details))
+        root_cause = f"'{scenario.key(RECURSIVE_LOOP)}' contains itself more than {DEFAULT_RECURSION_DEPTH} levels deep"
+        assert details.count(root_cause) == 1, details
+        outer = scenario.node_errors()[-1]
+        assert outer.error is not None, outer
+        assert root_cause in outer.error.message, outer.error
 
 
 class TestWorkflowNodeInIsolatedExecutionGroup(_WorkerBoundaryBase):

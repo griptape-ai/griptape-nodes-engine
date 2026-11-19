@@ -79,6 +79,7 @@ WORKFLOW_FILES = [
     FIXTURE_LIBRARY_DIR / "countdown_loop_workflow.py",
     FIXTURE_LIBRARY_DIR / "mixed_loop_fail_workflow.py",
     FIXTURE_LIBRARY_DIR / "recursive_loop_workflow.py",
+    FIXTURE_LIBRARY_DIR / "recursive_loop_parallel_workflow.py",
 ]
 LOOP_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "iterative_group_library"
 LOOP_LIBRARY_JSON_TEMPLATE = LOOP_LIBRARY_DIR / "griptape_nodes_library.json"
@@ -144,11 +145,15 @@ MIXED_LOOP_FAIL = FixtureWorkflow(node_type="MixedLoopFailWorkflow", stem="mixed
 EVEN_FAILURE_MESSAGE = "The fixture node refused an even-numbered item"
 ODD_FAILURE_MESSAGE = "The fixture node refused an odd-numbered item"
 RECURSIVE_LOOP = FixtureWorkflow(node_type="RecursiveLoopWorkflow", stem="recursive_loop_workflow")
+RECURSIVE_LOOP_PARALLEL = FixtureWorkflow(
+    node_type="RecursiveLoopParallelWorkflow", stem="recursive_loop_parallel_workflow"
+)
 FAILED_NODE_PATH_FIELD = "Failed node path"
 PATH_SEPARATOR = " \u203a "
 RUN_SENTENCE = "Attempted to run the workflow behind node"
 FIXTURE_FAILURE_MESSAGE = "The fixture node refused to run"
 RECURSION_DEPTH_KEY = "max_workflow_recursion_depth"
+RECURSION_ERROR_TYPE = "griptape_nodes.retained_mode.events.failure_tree.WorkflowRecursionLimitError"
 DEFAULT_RECURSION_DEPTH = 10
 
 
@@ -190,6 +195,7 @@ class TestSubflowImportCycle:
             COUNTDOWN_LOOP,
             MIXED_LOOP_FAIL,
             RECURSIVE_LOOP,
+            RECURSIVE_LOOP_PARALLEL,
         ):
             schema["workflow_nodes"].append(
                 {
@@ -538,14 +544,15 @@ class TestSubflowImportCycle:
         assert outer.error is not None, outer
         assert root_cause in outer.error.message, outer.error
         assert "did not finish" not in outer.error.message, outer.error
-        # The innermost Workflow node is the one that was refused. Its load failed like any other, so its details
-        # say the workflow could not be loaded, and it has no path.
+        assert "could not be loaded" not in outer.error.message, outer.error
+        # The innermost Workflow node is the one that was refused. Its details are the refusal's own text,
+        # without the "could not be loaded" sentence that its flattened message adds, and no path.
         innermost = self._node_errors(aput_event)[0]
         assert innermost.node_name == f"Inner Workflow_{depth - 1}", innermost
         assert innermost.error is not None, innermost
-        assert innermost.error.message.startswith("Attempted to load the workflow at"), innermost.error
+        assert innermost.error.message.startswith("Attempted to import workflow"), innermost.error
         assert root_cause in innermost.error.message, innermost.error
-        assert innermost.error.exception_type == "builtins.RuntimeError", innermost.error
+        assert innermost.error.exception_type == RECURSION_ERROR_TYPE, innermost.error
         assert FAILED_NODE_PATH_FIELD not in innermost.error.fields, innermost.error
         assert "could not be loaded" in innermost.error_message, innermost
         # Eleven nodes are too many to list, so the field keeps both ends and counts the rest.
@@ -779,6 +786,70 @@ class TestSubflowImportCycle:
             "Loop_2",
             "Inner Workflow_4",
         ], outer.error
+
+    @pytest.mark.timeout(60, method="thread")
+    @pytest.mark.usefixtures("loop_library")
+    @pytest.mark.asyncio
+    async def test_recursion_through_a_loop_at_the_default_limit_fails_promptly(
+        self,
+        engine: Engine,
+        library_dir: Path,
+        create_node: Callable[..., str],
+        aput_event: AsyncMock,
+    ) -> None:
+        """A refused import inside a loop ends the loop, so the default limit does not re-run the tree per item."""
+        parent_flow = self._new_parent_flow(engine)
+        create_node(RECURSIVE_LOOP.node_type, "Outer", parent_flow, library_name=LIBRARY_NAME)
+
+        # Packaging a loop body needs a current flow, which the editor always has.
+        with engine.context_manager.flow(parent_flow):
+            result = await engine.ahandle_request(StartFlowRequest(flow_name=parent_flow, flow_node_name="Outer"))
+
+        assert isinstance(result, StartFlowResultFailure), result
+        details = str(result.result_details)
+        key = self._key(library_dir, RECURSIVE_LOOP)
+        root_cause = f"'{key}' contains itself more than {DEFAULT_RECURSION_DEPTH} levels deep"
+        assert details.count(root_cause) == 1, details
+        assert RECURSION_DEPTH_KEY in details, details
+        outer = self._node_errors(aput_event)[-1]
+        assert outer.node_name == "Outer", outer
+        assert outer.error is not None, outer
+        assert root_cause in outer.error.message, outer.error
+
+    @pytest.mark.timeout(60, method="thread")
+    @pytest.mark.usefixtures("loop_library")
+    @pytest.mark.asyncio
+    async def test_recursion_through_an_all_at_once_loop_fails_promptly(
+        self,
+        engine: Engine,
+        library_dir: Path,
+        create_node: Callable[..., str],
+        aput_event: AsyncMock,
+        set_recursion_depth: Callable[[int], None],
+    ) -> None:
+        """A refusal inside an all-at-once loop ends every level above it, and the message names the cause once."""
+        # Every level starts all its iterations at once, so the number of imports grows exponentially
+        # with the limit. Keep it small.
+        set_recursion_depth(2)
+        parent_flow = self._new_parent_flow(engine)
+        create_node(RECURSIVE_LOOP_PARALLEL.node_type, "Outer", parent_flow, library_name=LIBRARY_NAME)
+
+        with engine.context_manager.flow(parent_flow):
+            result = await engine.ahandle_request(StartFlowRequest(flow_name=parent_flow, flow_node_name="Outer"))
+
+        assert isinstance(result, StartFlowResultFailure), result
+        key = self._key(library_dir, RECURSIVE_LOOP_PARALLEL)
+        root_cause = f"'{key}' contains itself more than 2 levels deep"
+        details = str(result.result_details)
+        assert details.count(root_cause) == 1, details
+        assert RECURSION_DEPTH_KEY in details, details
+        outer = self._node_errors(aput_event)[-1]
+        assert outer.node_name == "Outer", outer
+        assert outer.error is not None, outer
+        assert outer.error.message.count(root_cause) == 1, outer.error.message
+        assert outer.error.message.count(RUN_SENTENCE) == 1, outer.error.message
+        # The refusal path ran, not the partial-failure summary.
+        assert "Iterative group execution failed" not in outer.error.message, outer.error.message
 
     @pytest.mark.asyncio
     async def test_load_time_recursion_refusal_leaves_no_flows(

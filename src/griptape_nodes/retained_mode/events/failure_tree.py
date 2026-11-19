@@ -21,6 +21,8 @@ class FailureKind(StrEnum):
     VALIDATION = "validation"
     BUDGET_HALT = "budget_halt"
     ENGINE = "engine"
+    CANCELLED = "cancelled"
+    RECURSION_LIMIT = "recursion_limit"
 
 
 @dataclass(frozen=True)
@@ -83,7 +85,14 @@ class LoopFailure:
 
     ``reasons`` holds one entry per distinct failure text, in the order each first appeared, capped
     at the number a loop's message names. ``omitted_reasons`` and ``omitted_iterations`` count what
-    the cap left out.
+    the cap left out. ``reasons`` holds every failure except the early termination that ended the
+    loop and the cancelled iterations, which can include a later early termination with a different text.
+
+    ``early_termination`` is the reason that ended the loop early, if one did, and its ``failure_tree`` has a
+    ``RECURSION_LIMIT`` leaf in it. ``cancelled`` holds the iterations that were stopped because of it, as
+    ``CANCELLED`` leaves named after the loop. ``iterations_run`` is how many iterations a loop got through
+    when it stopped early. A while group has no fixed number of iterations, so one that stops early leaves
+    ``reasons`` empty and the totals None.
     """
 
     # Not hashable: the reasons hold details.
@@ -91,10 +100,13 @@ class LoopFailure:
 
     node_name: str
     reasons: tuple[LoopReason, ...]
-    total_iterations: int
-    failed_iterations: int
+    total_iterations: int | None
+    failed_iterations: int | None
     omitted_reasons: int = 0
     omitted_iterations: int = 0
+    early_termination: LoopReason | None = None
+    cancelled: LoopReason | None = None
+    iterations_run: int | None = None
 
 
 FailureTree = FailureLeaf | WorkflowNodeFailure | GroupFailure | LoopFailure
@@ -120,6 +132,13 @@ class ExecuteNodeFailureError(FailureTreeError):
     def __init__(self, failure_tree: FailureTree, message: str, details: NodeErrorDetails | None = None) -> None:
         super().__init__(failure_tree, message)
         self.details = details
+
+
+class WorkflowRecursionLimitError(RuntimeError):
+    """Why an import was refused: the workflow already contains itself as deep as the recursion limit allows.
+
+    It has no fields or links to show.
+    """
 
 
 class CarriesFailureTree:

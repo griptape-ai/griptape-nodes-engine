@@ -10,6 +10,7 @@ from griptape_nodes.exe_types.node_types import NODE_GROUP_FLOW
 from griptape_nodes.node_library.workflow_registry import WorkflowAddressError
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
+from griptape_nodes.retained_mode.events.failure_tree import WorkflowRecursionLimitError
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
     DeleteFlowResultSuccess,
@@ -134,7 +135,9 @@ class ReferencedWorkflowImport(EngineScoped):
                 "keeps pointing back to it, directly or through another workflow. Make sure the recursion "
                 "stops, or raise the setting."
             )
-            return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
+            return ImportWorkflowAsReferencedSubFlowResultFailure(
+                result_details=details, exception=WorkflowRecursionLimitError(details)
+            )
 
         return None
 

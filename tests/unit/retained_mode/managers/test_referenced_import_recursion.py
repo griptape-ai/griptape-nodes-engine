@@ -9,6 +9,7 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import NODE_GROUP_FLOW
 from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, _WorkflowRegistry
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.failure_tree import WorkflowRecursionLimitError
 from griptape_nodes.retained_mode.events.workflow_events import ImportWorkflowAsReferencedSubFlowResultFailure
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -110,7 +111,7 @@ class TestValidateRecursionDepth(RealWorkflowTree):
 
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure)
 
-    def test_refusal_names_the_workflow_flow_and_limit(
+    def test_refusal_carries_the_recursion_limit_error(
         self, importer: ReferencedWorkflowImport, workflow: WorkflowRuntime, saved_workflow: Workflow
     ) -> None:
         innermost = self._add_nested_imports(workflow, 3)
@@ -118,6 +119,8 @@ class TestValidateRecursionDepth(RealWorkflowTree):
         result = importer._validate_recursion_depth(workflow, innermost, saved_workflow)
 
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultFailure)
+        assert isinstance(result.exception, WorkflowRecursionLimitError)
+        assert str(result.exception) == str(result.result_details)
         assert "'wf' contains itself more than 2 levels deep" in str(result.result_details)
         assert "into flow 'import_2'" in str(result.result_details)
 

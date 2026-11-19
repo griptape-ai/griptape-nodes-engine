@@ -18,6 +18,8 @@ Workflow node between Start Flow and End Flow:
   The loop one fails where its countdown ends.
 - `recursive_loop_workflow.py` has a for-each loop group whose body runs this same
   workflow every iteration, with no branch to stop it.
+- `recursive_loop_parallel_workflow.py` is the same with the loop set to run its
+  iterations all at once.
 - `mixed_loop_fail_workflow.py` runs a loop whose body node fails differently for even and odd
   iterations.
 
@@ -335,6 +337,23 @@ RECURSIVE_LOOP = WorkflowTarget(
         ConnectionSpec(START_NODE_NAME, "text", END_NODE_NAME, "result"),
     ],
 )
+# Like RECURSIVE_LOOP, but the loop runs its iterations all at once.
+RECURSIVE_LOOP_PARALLEL = WorkflowTarget(
+    stem="recursive_loop_parallel_workflow",
+    description="Runs this workflow again on every iteration of an all-at-once loop, with nothing to stop it.",
+    nodes=[
+        NodeSpec("TextStartNode", START_NODE_NAME),
+        NodeSpec(
+            "ProbeForEachGroupNode",
+            LOOP_NODE_NAME,
+            library_name=LOOP_LIBRARY_NAME,
+            parameter_values={"execution_mode": "Run Group Items All at Once"},
+        ),
+        NodeSpec("RecursiveLoopParallelWorkflow", WORKFLOW_NODE_PREFIX, parent_group=LOOP_NODE_NAME),
+        NodeSpec("TextEndNode", END_NODE_NAME),
+    ],
+    connections=RECURSIVE_LOOP.connections,
+)
 # Generated in this order: nested runs shout, so shout comes first.
 TARGETS = [
     SHOUT,
@@ -352,6 +371,7 @@ TARGETS = [
     COUNTDOWN_LOOP,
     MIXED_LOOP_FAIL,
     RECURSIVE_LOOP,
+    RECURSIVE_LOOP_PARALLEL,
 ]
 # Workflow node types registered against placeholder files so the real files can reference them.
 EXTRA_WORKFLOW_NODES = {
@@ -368,6 +388,7 @@ EXTRA_WORKFLOW_NODES = {
     "CountdownGroupWorkflow": COUNTDOWN_GROUP.stem,
     "CountdownLoopWorkflow": COUNTDOWN_LOOP.stem,
     "RecursiveLoopWorkflow": RECURSIVE_LOOP.stem,
+    "RecursiveLoopParallelWorkflow": RECURSIVE_LOOP_PARALLEL.stem,
 }
 
 

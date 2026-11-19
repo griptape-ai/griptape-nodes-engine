@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from griptape_nodes.common import failure_trees
@@ -10,6 +12,7 @@ from griptape_nodes.common.failure_trees import (
     FAILED_NODE_PATH_SEPARATOR,
     MAX_REPORTED_ITERATION_FAILURES,
     IterationFailure,
+    IterationOutcome,
 )
 from griptape_nodes.exe_types.node_error import NodeError, NodeErrorLink
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
@@ -26,7 +29,9 @@ from griptape_nodes.retained_mode.events.failure_tree import (
     GroupFailure,
     IterationRange,
     LoopFailure,
+    LoopReason,
     WorkflowNodeFailure,
+    WorkflowRecursionLimitError,
 )
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.utils.budget_refusal import BudgetExceededError, BudgetRefusal
@@ -34,6 +39,10 @@ from griptape_nodes.utils.budget_refusal import BudgetExceededError, BudgetRefus
 
 def _leaf(node_name: str, message: str = "boom", kind: FailureKind = FailureKind.RAISED) -> FailureLeaf:
     return FailureLeaf(node_name=node_name, kind=kind, details=NodeErrorDetails(message=message))
+
+
+def _early(node_name: str, message: str = "too deep") -> FailureLeaf:
+    return _leaf(node_name, message, kind=FailureKind.RECURSION_LIMIT)
 
 
 def _leaf_of(failure_tree: FailureTree) -> FailureLeaf:
@@ -48,6 +57,10 @@ def _loop_of(failure_tree: FailureTree) -> LoopFailure:
 
 def _iteration_failures(details: list[str]) -> list[IterationFailure]:
     return [IterationFailure(iteration_index=index, detail=detail) for index, detail in enumerate(details)]
+
+
+def _early_iteration(index: int, detail: str = "too deep") -> IterationFailure:
+    return IterationFailure(iteration_index=index, detail=detail, failure_tree=_early("Inner", detail))
 
 
 def _loop_message(total_iterations: int, iteration_failures: list[IterationFailure]) -> str:
@@ -112,6 +125,16 @@ class TestFailureTreeFromException:
             kind=FailureKind.RAISED,
             details=NodeErrorDetails(message="the text", exception_type="builtins.RuntimeError"),
         )
+
+    def test_a_recursion_limit_error_is_a_recursion_limit_leaf_with_the_nodes_details(self) -> None:
+        failure_tree = failure_trees.failure_tree_from_exception(
+            "Inner Workflow", WorkflowRecursionLimitError("too deep")
+        )
+
+        assert isinstance(failure_tree, FailureLeaf)
+        assert failure_tree.kind is FailureKind.RECURSION_LIMIT
+        assert failure_tree.node_name == "Inner Workflow"
+        assert failure_tree.details.message == "too deep"
 
 
 class TestOtherBuilders:
@@ -273,6 +296,28 @@ class TestFailureTreeFromSubflowResult:
             failure_trees.failure_tree_from_subflow_result(ExecuteNodeResultFailure(result_details="words"), {}) is None
         )
 
+    def test_renames_the_failures_behind_a_loops_early_termination_and_cancelled_reasons(self) -> None:
+        loop = LoopFailure(
+            node_name="Loop_copy",
+            reasons=(),
+            total_iterations=2,
+            failed_iterations=2,
+            early_termination=LoopReason(
+                iterations=(IterationRange(first=1, last=1),), detail="d", failure_tree=_early("X_copy")
+            ),
+            cancelled=LoopReason(
+                iterations=(IterationRange(first=2, last=2),), detail="c", failure_tree=_leaf("Loop_copy")
+            ),
+        )
+
+        result = _loop_of(failure_trees.renamed(loop, {"X_copy": "X", "Loop_copy": "Loop"}))
+
+        assert result.node_name == "Loop"
+        assert result.early_termination is not None
+        assert result.early_termination.failure_tree == _early("X")
+        assert result.cancelled is not None
+        assert result.cancelled.failure_tree == _leaf("Loop")
+
 
 class TestRenamed:
     def test_renames_the_failure_and_everything_inside_it(self) -> None:
@@ -378,6 +423,105 @@ class TestLoopFailureFromIterations:
 
         assert result.reasons[0].failure_tree is None
 
+    def test_it_carries_the_iterations_run(self) -> None:
+        result = failure_trees.loop_failure_from_iterations("Loop", 3, _iteration_failures(["a"]), iterations_run=1)
+
+        assert result.iterations_run == 1
+
+    def test_an_early_termination_has_its_own_field_and_is_not_among_the_reasons(self) -> None:
+        early = _early("Inner")
+        failures = [
+            IterationFailure(iteration_index=0, detail="ordinary", failure_tree=_leaf("Body", "ordinary")),
+            IterationFailure(iteration_index=1, detail="too deep", failure_tree=early),
+        ]
+
+        result = failure_trees.loop_failure_from_iterations("Loop", 4, failures, iterations_run=2)
+
+        assert [reason.detail for reason in result.reasons] == ["ordinary"]
+        assert result.early_termination == LoopReason(
+            iterations=(IterationRange(first=2, last=2),), detail="too deep", failure_tree=early
+        )
+        assert result.failed_iterations == 2  # noqa: PLR2004
+
+    def test_an_early_termination_buried_in_a_workflow_node_has_its_own_field(self) -> None:
+        buried = _workflow_node("Outer", _early("Inner"))
+        failures = [
+            IterationFailure(iteration_index=0, detail="ordinary", failure_tree=_leaf("Body")),
+            IterationFailure(iteration_index=1, detail="refused", failure_tree=buried),
+        ]
+
+        result = failure_trees.loop_failure_from_iterations("Loop", 2, failures)
+
+        assert result.early_termination is not None
+        assert result.early_termination.detail == "refused"
+        assert [reason.detail for reason in result.reasons] == ["ordinary"]
+
+    def test_cancelled_iterations_have_their_own_field_named_after_the_loop(self) -> None:
+        failures = [
+            failure_trees.iteration_failure_from_cancellation("Loop", 0),
+            IterationFailure(iteration_index=1, detail="refused", failure_tree=_early("Inner")),
+            failure_trees.iteration_failure_from_cancellation("Loop", 2),
+        ]
+
+        result = failure_trees.loop_failure_from_iterations("Loop", 3, failures)
+
+        assert result.reasons == ()
+        assert result.cancelled is not None
+        assert result.cancelled.iterations == (IterationRange(first=1, last=1), IterationRange(first=3, last=3))
+        assert result.cancelled.failure_tree == failures[0].failure_tree
+
+    def test_ordinary_reasons_are_capped_without_counting_the_early_termination(self) -> None:
+        failures = _iteration_failures([f"reason {index}" for index in range(MAX_REPORTED_ITERATION_FAILURES + 2)])
+        failures.append(IterationFailure(iteration_index=len(failures), detail="refused", failure_tree=_early("X")))
+
+        result = failure_trees.loop_failure_from_iterations("Loop", len(failures), failures)
+
+        assert len(result.reasons) == MAX_REPORTED_ITERATION_FAILURES
+        assert result.omitted_reasons == 2  # noqa: PLR2004
+        assert result.omitted_iterations == 2  # noqa: PLR2004
+        assert result.early_termination is not None
+
+    def test_a_second_early_termination_text_is_kept_among_the_reasons_in_order(self) -> None:
+        failures = [
+            IterationFailure(iteration_index=0, detail="first", failure_tree=_early("A", "first")),
+            IterationFailure(iteration_index=1, detail="second", failure_tree=_early("B", "second")),
+        ]
+
+        result = failure_trees.loop_failure_from_iterations("Loop", 2, failures)
+
+        assert result.early_termination is not None
+        assert result.early_termination.detail == "first"
+        assert [reason.detail for reason in result.reasons] == ["second"]
+
+    def test_later_early_terminations_share_the_cap_with_the_ordinary_reasons(self) -> None:
+        failures = [IterationFailure(iteration_index=index, detail=f"reason {index}") for index in range(5)]
+        failures.append(IterationFailure(iteration_index=5, detail="first", failure_tree=_early("A", "first")))
+        failures.append(IterationFailure(iteration_index=6, detail="second", failure_tree=_early("B", "second")))
+
+        result = failure_trees.loop_failure_from_iterations("Loop", 7, failures)
+
+        assert result.early_termination is not None
+        assert result.early_termination.detail == "first"
+        assert len(result.reasons) == MAX_REPORTED_ITERATION_FAILURES
+        assert result.omitted_reasons == 1
+        assert result.omitted_iterations == 1
+        assert _loop_message(7, failures) == (
+            "Attempted to run all 7 iterations of loop 'Loop'. Failed because 7 of them did not finish.\n"
+            "  Iteration 1: reason 0\n"
+            "  Iteration 2: reason 1\n"
+            "  Iteration 3: reason 2\n"
+            "  Iteration 4: reason 3\n"
+            "  Iteration 5: reason 4\n"
+            "  ... and 2 more reason(s) affecting 2 iteration(s). See the engine log for every iteration."
+        )
+
+    def test_there_is_no_early_termination_or_cancelled_reason_without_one(self) -> None:
+        result = failure_trees.loop_failure_from_iterations("Loop", 2, _iteration_failures(["a"]))
+
+        assert result.early_termination is None
+        assert result.cancelled is None
+        assert result.iterations_run is None
+
 
 class TestRenderLoopMessage:
     """The text of a loop's failure: what was attempted, how much was lost, then the reasons."""
@@ -451,6 +595,108 @@ class TestRenderLoopMessage:
             "Attempted to run all 3 iterations of loop 'Loop'. Failed because 0 of them did not finish."
         )
 
+    def test_says_how_many_iterations_were_never_run(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations("Loop", 3, [_early_iteration(0)], iterations_run=1)
+
+        assert failure_trees.render_loop_message(loop) == (
+            "Attempted to run all 3 iterations of loop 'Loop'. Failed because 1 of them did not finish. "
+            "The remaining 2 iterations were not run.\n"
+            "  Iteration 1: too deep"
+        )
+
+    def test_says_it_in_the_singular_for_one_unrun_iteration(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations("Loop", 2, [_early_iteration(0)], iterations_run=1)
+
+        assert failure_trees.render_loop_message(loop) == (
+            "Attempted to run all 2 iterations of loop 'Loop'. Failed because 1 of them did not finish. "
+            "The remaining iteration was not run.\n"
+            "  Iteration 1: too deep"
+        )
+
+    def test_says_nothing_when_every_iteration_was_run(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations("Loop", 1, [_early_iteration(0)], iterations_run=1)
+
+        assert failure_trees.render_loop_message(loop) == (
+            "Attempted to run all 1 iterations of loop 'Loop'. Failed because 1 of them did not finish.\n"
+            "  Iteration 1: too deep"
+        )
+
+    def test_an_early_termination_among_ordinary_failures_is_in_the_order_it_happened(self) -> None:
+        failures = [
+            IterationFailure(iteration_index=0, detail="ordinary", failure_tree=_leaf("Body", "ordinary")),
+            _early_iteration(1),
+        ]
+
+        loop = failure_trees.loop_failure_from_iterations("Loop", 4, failures, iterations_run=2)
+
+        assert failure_trees.render_loop_message(loop) == (
+            "Attempted to run all 4 iterations of loop 'Loop'. Failed because 2 of them did not finish. "
+            "The remaining 2 iterations were not run.\n"
+            "  Iteration 1: ordinary\n"
+            "  Iteration 2: too deep"
+        )
+
+    def test_an_early_termination_before_ordinary_failures_comes_first(self) -> None:
+        failures = [
+            _early_iteration(0),
+            IterationFailure(iteration_index=1, detail="ordinary", failure_tree=_leaf("Body", "ordinary")),
+        ]
+
+        assert _loop_message(2, failures) == (
+            "Attempted to run all 2 iterations of loop 'Loop'. Failed because 2 of them did not finish.\n"
+            "  Iteration 1: too deep\n"
+            "  Iteration 2: ordinary"
+        )
+
+    def test_a_parallel_early_termination_names_its_cancelled_siblings_and_has_no_iterations_run(self) -> None:
+        failures = [
+            failure_trees.iteration_failure_from_cancellation("Loop", 0),
+            _early_iteration(1),
+            failure_trees.iteration_failure_from_cancellation("Loop", 2),
+            IterationFailure(iteration_index=3, detail="ordinary", failure_tree=_leaf("Body", "ordinary")),
+        ]
+
+        assert _loop_message(4, failures) == (
+            "Attempted to run all 4 iterations of loop 'Loop'. Failed because 4 of them did not finish.\n"
+            "  Iterations 1, 3: Stopped because another iteration ran a workflow nested deeper than "
+            "`max_workflow_recursion_depth` allows.\n"
+            "  Iteration 2: too deep\n"
+            "  Iteration 4: ordinary"
+        )
+
+    def test_an_early_termination_past_the_cap_shows_only_in_the_count(self) -> None:
+        failures = _iteration_failures([f"reason {index}" for index in range(5)])
+        failures.append(_early_iteration(5))
+
+        loop = failure_trees.loop_failure_from_iterations("Loop", 6, failures, iterations_run=6)
+
+        assert failure_trees.render_loop_message(loop) == (
+            "Attempted to run all 6 iterations of loop 'Loop'. Failed because 6 of them did not finish.\n"
+            "  Iteration 1: reason 0\n"
+            "  Iteration 2: reason 1\n"
+            "  Iteration 3: reason 2\n"
+            "  Iteration 4: reason 3\n"
+            "  Iteration 5: reason 4\n"
+            "  ... and 1 more reason(s) affecting 1 iteration(s). See the engine log for every iteration."
+        )
+
+    def test_the_count_adds_reasons_the_ordinary_cap_left_out_to_those_the_merge_left_out(self) -> None:
+        failures = _iteration_failures([f"reason {index}" for index in range(7)])
+        failures.append(_early_iteration(7))
+
+        message = failure_trees.render_loop_message(failure_trees.loop_failure_from_iterations("Loop", 8, failures))
+
+        assert message.endswith(
+            "  ... and 3 more reason(s) affecting 3 iteration(s). See the engine log for every iteration."
+        )
+
+    def test_a_while_group_names_the_iteration_that_ended_it_and_why(self) -> None:
+        loop = failure_trees.loop_failure_from_while_iteration("While", 3, _early_iteration(2))
+
+        assert failure_trees.render_loop_message(loop) == (
+            "Attempted to run iteration 3 of while group 'While'. Failed because too deep"
+        )
+
 
 def _workflow_node(name: str, inner: FailureTree) -> WorkflowNodeFailure:
     return WorkflowNodeFailure(node_name=name, inner=inner)
@@ -503,6 +749,51 @@ class TestFailedNodePath:
 
     def test_a_node_directly_inside_is_a_path_of_one(self) -> None:
         assert _path_below(_workflow_node("Outer", _leaf("Node"))) == ["Node"]
+
+    def test_goes_on_through_an_early_termination_even_beside_other_reasons(self) -> None:
+        early = _early("Inner")
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop",
+            3,
+            [
+                IterationFailure(iteration_index=0, detail="ordinary", failure_tree=_leaf("Body", "ordinary")),
+                IterationFailure(iteration_index=1, detail="other", failure_tree=_leaf("Body", "other")),
+                IterationFailure(iteration_index=2, detail="refused", failure_tree=early),
+            ],
+        )
+
+        assert _path_below(_workflow_node("Outer", loop)) == ["Loop", "Inner"]
+
+    def test_goes_on_through_an_early_termination_beside_cancelled_siblings(self) -> None:
+        early = _early("Inner")
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop",
+            3,
+            [
+                failure_trees.iteration_failure_from_cancellation("Loop", 0),
+                IterationFailure(iteration_index=1, detail="refused", failure_tree=early),
+                failure_trees.iteration_failure_from_cancellation("Loop", 2),
+            ],
+        )
+
+        assert _path_below(_workflow_node("Outer", loop)) == ["Loop", "Inner"]
+
+    def test_goes_on_through_an_early_termination_inside_a_workflow_node(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop",
+            2,
+            [
+                IterationFailure(iteration_index=0, detail="ordinary", failure_tree=_leaf("Body")),
+                IterationFailure(
+                    iteration_index=1, detail="refused", failure_tree=_workflow_node("Deeper", _early("Inner"))
+                ),
+            ],
+        )
+
+        assert _path_below(_workflow_node("Outer", loop)) == ["Loop", "Deeper", "Inner"]
+
+    def test_an_early_termination_directly_inside_is_a_path_of_one(self) -> None:
+        assert _path_below(_workflow_node("Outer", _early("Inner"))) == ["Inner"]
 
 
 class TestNestedWorkflowMessage:
@@ -567,6 +858,39 @@ class TestNestedWorkflowMessage:
         assert "node 'Loop' inside it failed" in message
         assert "loop 'Loop'" in message
         assert "Loop_copy" not in message
+
+    def test_an_early_termination_named_after_a_workflow_node_is_not_counted_as_one(self) -> None:
+        early = _early("Inner", "refused")
+
+        message = failure_trees.nested_workflow_message(_workflow_node("Outer", _workflow_node("Middle", early)))
+
+        assert message == (
+            "Attempted to run the workflow behind node 'Outer'. "
+            "Failed because node 'Inner', inside a nested Workflow node, failed: refused"
+        )
+
+    def test_a_refused_load_named_after_a_workflow_node_is_not_counted(self) -> None:
+        group = GroupFailure(node_name="Group", inner=_workflow_node("Inner", _early("Inner")))
+
+        assert failure_trees.nested_workflow_message(_workflow_node("Outer", group)) == (
+            "Attempted to run the workflow behind node 'Outer'. "
+            "Failed because node 'Inner', inside a nested Workflow node, failed: too deep"
+        )
+
+    def test_a_loop_ended_early_is_reported_by_what_ended_it_not_the_loops_summary(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop",
+            3,
+            [
+                IterationFailure(iteration_index=0, detail="ordinary", failure_tree=_leaf("Body", "ordinary")),
+                _early_iteration(1),
+            ],
+            iterations_run=2,
+        )
+
+        assert failure_trees.nested_workflow_message(_workflow_node("Outer", loop)) == (
+            "Attempted to run the workflow behind node 'Outer'. Failed because node 'Inner' inside it failed: too deep"
+        )
 
 
 class TestRenderErrorDetailsOfAWorkflowNodeFailure:
@@ -835,3 +1159,156 @@ class TestIterationFailureDetail:
 class TestEncounteredAProblemMessage:
     def test_names_the_node_and_the_text(self) -> None:
         assert failure_trees.encountered_a_problem_message("G", "boom") == "Node 'G' encountered a problem: boom"
+
+
+class TestLoopFailureFromWhileIteration:
+    def test_is_a_loop_on_the_while_group_with_the_iteration_as_its_early_termination(self) -> None:
+        iteration = _early_iteration(1)
+
+        loop = failure_trees.loop_failure_from_while_iteration("While", 2, iteration)
+
+        assert loop.node_name == "While"
+        assert loop.reasons == ()
+        assert loop.early_termination == LoopReason(
+            iterations=(IterationRange(first=2, last=2),), detail="too deep", failure_tree=iteration.failure_tree
+        )
+        assert loop.iterations_run == 2  # noqa: PLR2004
+
+    def test_does_not_set_the_totals_so_it_is_never_worded_as_every_iteration_failing(self) -> None:
+        loop = failure_trees.loop_failure_from_while_iteration("While", 1, _early_iteration(0))
+
+        assert loop.total_iterations is None
+        assert loop.failed_iterations is None
+
+    def test_the_path_goes_through_it_to_the_early_termination(self) -> None:
+        loop = failure_trees.loop_failure_from_while_iteration("While", 1, _early_iteration(0))
+
+        assert _path_below(_workflow_node("Outer", loop)) == ["While", "Inner"]
+
+
+class TestIterationFailureFromCancellation:
+    def test_is_a_cancelled_leaf_named_after_the_loop_with_its_own_reason(self) -> None:
+        iteration = failure_trees.iteration_failure_from_cancellation("Loop", 3)
+
+        assert iteration.iteration_index == 3  # noqa: PLR2004
+        leaf = _leaf_of(iteration.failure_tree)  # type: ignore[arg-type]
+        assert leaf.kind is FailureKind.CANCELLED
+        assert leaf.node_name == "Loop"
+        assert leaf.details.message == iteration.detail
+
+    def test_says_another_iteration_ran_a_workflow_nested_too_deeply(self) -> None:
+        assert failure_trees.iteration_failure_from_cancellation("Loop", 0).detail == (
+            "Stopped because another iteration ran a workflow nested deeper than `max_workflow_recursion_depth` allows."
+        )
+
+
+class TestHasEarlyTermination:
+    def test_finds_an_early_termination_deep_in_the_tree(self) -> None:
+        group = GroupFailure(node_name="Group", inner=_workflow_node("Inner", _early("Deepest")))
+        loop = LoopFailure(
+            node_name="Loop",
+            reasons=(),
+            total_iterations=1,
+            failed_iterations=1,
+            early_termination=LoopReason(iterations=(IterationRange(first=1, last=1),), detail="d", failure_tree=group),
+        )
+
+        assert failure_trees.has_early_termination(_workflow_node("Outer", GroupFailure("G", loop)))
+        assert failure_trees.has_early_termination(group)
+        assert failure_trees.has_early_termination(_early("Deepest"))
+
+    def test_does_not_find_one_that_is_absent(self) -> None:
+        loop = failure_trees.loop_failure_from_iterations(
+            "Loop", 1, [IterationFailure(iteration_index=0, detail="d", failure_tree=_leaf("X"))]
+        )
+        tree = _workflow_node("Outer", GroupFailure(node_name="Group", inner=loop))
+
+        assert not failure_trees.has_early_termination(tree)
+        assert not failure_trees.has_early_termination(_leaf("Budget", kind=FailureKind.BUDGET_HALT))
+        assert not failure_trees.has_early_termination(_leaf("Loop", kind=FailureKind.CANCELLED))
+
+
+class TestIterationsRunBeforeEarlyTermination:
+    def test_counts_up_to_and_including_the_iteration_that_ended_the_loop(self) -> None:
+        failures = [_early_iteration(1)]
+
+        assert failure_trees.iterations_run_before_early_termination(failures) == 2  # noqa: PLR2004
+
+    def test_is_none_when_the_last_failure_is_ordinary(self) -> None:
+        failures = [IterationFailure(iteration_index=1, detail="ordinary", failure_tree=_leaf("Body"))]
+
+        assert failure_trees.iterations_run_before_early_termination(failures) is None
+
+    def test_is_none_when_the_last_failure_names_no_failure_tree(self) -> None:
+        assert failure_trees.iterations_run_before_early_termination(_iteration_failures(["said nothing"])) is None
+
+    def test_is_none_when_there_are_no_failures(self) -> None:
+        assert failure_trees.iterations_run_before_early_termination([]) is None
+
+
+class TestTaskHitEarlyTermination:
+    @pytest.mark.asyncio
+    async def test_a_cancelled_task_is_not_one(self) -> None:
+        async def run_forever() -> IterationOutcome:
+            await asyncio.sleep(3600)
+            return IterationOutcome(iteration_index=0, succeeded=True, detail="")
+
+        task = asyncio.ensure_future(run_forever())
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert not failure_trees.task_hit_early_termination(task)
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_raised_is_not_one(self) -> None:
+        async def fail() -> IterationOutcome:
+            msg = "boom"
+            raise ValueError(msg)
+
+        task = asyncio.ensure_future(fail())
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert not failure_trees.task_hit_early_termination(task)
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_returned_success_is_not_one(self) -> None:
+        async def succeed() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=True, detail="")
+
+        task = asyncio.ensure_future(succeed())
+        await asyncio.gather(task)
+
+        assert not failure_trees.task_hit_early_termination(task)
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_returned_an_ordinary_failure_is_not_one(self) -> None:
+        async def fail() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x", failure_tree=_leaf("Body"))
+
+        task = asyncio.ensure_future(fail())
+        await asyncio.gather(task)
+
+        assert not failure_trees.task_hit_early_termination(task)
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_returned_a_failure_without_a_tree_is_not_one(self) -> None:
+        async def fail() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x")
+
+        task = asyncio.ensure_future(fail())
+        await asyncio.gather(task)
+
+        assert not failure_trees.task_hit_early_termination(task)
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_returned_an_early_termination_is_one(self) -> None:
+        early = _workflow_node("Outer", _early("Inner"))
+
+        async def refused() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x", failure_tree=early)
+
+        task = asyncio.ensure_future(refused())
+        await asyncio.gather(task)
+
+        assert failure_trees.task_hit_early_termination(task)
