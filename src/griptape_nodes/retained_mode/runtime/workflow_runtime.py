@@ -50,12 +50,26 @@ class WorkflowRuntime:
         self.nodes = WorkflowNodes()
         self.flows = WorkflowFlows(self)
         self.variables = WorkflowVariables()
-        # Set by a request that changes the workflow, cleared when the workflow's own file is written.
-        self.has_unsaved_changes = False
+        self._has_unsaved_changes = False
         # Why the latest run failed, cleared when the next starts.
         self.last_run_error: str | None = None
         # The state clients were last told of, so `Engine.report_workflow_state` tells them only of a change.
         self.reported_state: OpenWorkflowState | None = None
+
+    @property
+    def has_unsaved_changes(self) -> bool:
+        """Whether a request changed it since it opened or its own file was last written."""
+        return self._has_unsaved_changes
+
+    def mark_changed(self) -> None:
+        """Record that a request changed it, and tell clients if that is news."""
+        self._has_unsaved_changes = True
+        self.engine.report_workflow_state(self)
+
+    def mark_unchanged(self) -> None:
+        """Record that its own file or a fresh open holds everything in it, and tell clients if that is news."""
+        self._has_unsaved_changes = False
+        self.engine.report_workflow_state(self)
 
     def state(self) -> OpenWorkflowState:
         """Its unsaved changes and runs, as clients are told of them."""

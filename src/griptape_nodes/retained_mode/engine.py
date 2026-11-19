@@ -1029,10 +1029,12 @@ class Engine:
                 err,
             )
         finally:
-            build_ended = self._opening_workflows.pop(workflow)
             if not workflow.closed:
                 # What the block built, its file's graph or a new workflow's flow, is where its changes start.
-                workflow.has_unsaved_changes = False
+                # Cleared while it is still opening, so only its `WorkflowOpenedEvent` reports it.
+                workflow.mark_unchanged()
+            build_ended = self._opening_workflows.pop(workflow)
+            if not workflow.closed:
                 opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
                 workflow.reported_state = opened_event.open_workflow.state
                 self._event_manager.put_event(AppEvent(payload=opened_event))

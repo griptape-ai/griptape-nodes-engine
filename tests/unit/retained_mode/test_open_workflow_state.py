@@ -110,6 +110,13 @@ class TestUnsavedChanges:
 
         assert engine.open_workflow_info(workflow).state == OpenWorkflowState()
 
+    def test_opening_reports_its_state_only_on_the_opened_event(self, engine: Engine, queue: asyncio.Queue) -> None:
+        _state_events(queue)
+
+        _open(engine, "quiet")
+
+        assert _state_events(queue) == []
+
     @pytest.mark.usefixtures("workspace")
     def test_a_saved_workflow_opens_with_none(self, engine: Engine) -> None:
         opened = asyncio.run(engine.ahandle_request(OpenWorkflowRequest(display_name="saved", create_flow=True)))

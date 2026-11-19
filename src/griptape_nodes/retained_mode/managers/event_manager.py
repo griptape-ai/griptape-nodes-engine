@@ -1675,9 +1675,7 @@ class EventManager(EngineScoped):
         """Mark the workflow a request acted on as having unsaved changes when its result says it changed it."""
         if not result.altered_workflow_state or request_workflow is None or request_workflow.workflow is None:
             return
-        workflow = request_workflow.workflow
-        workflow.has_unsaved_changes = True
-        self.engine.report_workflow_state(workflow)
+        request_workflow.workflow.mark_changed()
 
     def _result_for_handler_exception(
         self, request: RP, exception: Exception, *, context: ResultContext, request_workflow: _RequestWorkflow
