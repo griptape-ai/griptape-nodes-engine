@@ -219,7 +219,7 @@ class TestSpendRequestsAreForwardedFromWorkers:
         assert [budget.budget_name for budget in result.exception.refusal.budgets] == ["Studio monthly"]
 
         # The node raises it, as the docs say to, and the worker words the halt for that node.
-        failure = NodeManager(MagicMock(), engine=MagicMock())._execution_failure(result.exception, "Upscale")
+        failure = NodeManager(MagicMock(), engine=MagicMock()).execution_failure(result.exception, "Upscale")
         assert str(failure.result_details).startswith(BUDGET_HALT_PREFIX)
         assert "'Upscale'" in str(failure.result_details)
         assert '"Studio monthly"' in str(failure.result_details)
