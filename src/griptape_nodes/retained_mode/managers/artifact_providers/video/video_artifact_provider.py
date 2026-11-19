@@ -405,25 +405,43 @@ class VideoArtifactProvider(BaseArtifactProvider):
             logger.warning("Attempted to find video stream in '%s'. No video stream found.", source_path)
             return None
 
-        width = int(video_stream.get("width", 0))
-        height = int(video_stream.get("height", 0))
         codec = video_stream.get("codec_name", "unknown")
 
-        # Parse frame rate from r_frame_rate (e.g., "30/1" or "24000/1001")
-        frame_rate = 0.0
-        r_frame_rate = video_stream.get("r_frame_rate", "0/1")
-        if "/" in r_frame_rate:
-            num, den = r_frame_rate.split("/")
-            if int(den) != 0:
-                frame_rate = int(num) / int(den)
+        # ffprobe fields are strings or numbers we don't control; a value that won't convert means no metadata.
+        try:
+            width = int(video_stream.get("width", 0))
+            height = int(video_stream.get("height", 0))
 
-        # Duration from stream or format level
-        duration_seconds = float(video_stream.get("duration", 0.0))
-        if duration_seconds == 0.0:
-            format_info = probe_data.get("format", {})
-            duration_seconds = float(format_info.get("duration", 0.0))
+            # Parse frame rate from r_frame_rate (e.g., "30/1" or "24000/1001")
+            frame_rate = 0.0
+            r_frame_rate = video_stream.get("r_frame_rate", "0/1")
+            if "/" in r_frame_rate:
+                num, den = r_frame_rate.split("/")
+                if int(den) != 0:
+                    frame_rate = int(num) / int(den)
 
-        file_size = Path(source_path).stat().st_size
+            # Duration from stream or format level
+            duration_seconds = float(video_stream.get("duration", 0.0))
+            if duration_seconds == 0.0:
+                format_info = probe_data.get("format", {})
+                duration_seconds = float(format_info.get("duration", 0.0))
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "Attempted to read video properties from '%s'. Failed due to unexpected ffprobe output: %s",
+                source_path,
+                exc,
+            )
+            return None
+
+        try:
+            file_size = Path(source_path).stat().st_size
+        except OSError as exc:
+            logger.warning(
+                "Attempted to read the file size of '%s'. Failed due to: %s",
+                source_path,
+                exc,
+            )
+            return None
 
         return VideoArtifactMetadata(
             width=width,
