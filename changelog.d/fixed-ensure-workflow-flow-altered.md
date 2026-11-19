@@ -1,2 +1,1 @@
-- `EnsureWorkflowAndFlowRequest` no longer reports `altered_workflow_state` when the workflow
-  already had its flow and the request changed nothing.
+- `EnsureWorkflowAndFlowRequest` no longer marks a workflow as changed when it already had a flow.
