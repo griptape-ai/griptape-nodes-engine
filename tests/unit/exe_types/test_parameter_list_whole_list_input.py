@@ -5,7 +5,7 @@ list set on it becomes rows.
 """
 
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -245,7 +245,8 @@ class TestWholeListWarnings:
                 max_items=2,
             )
         )
-        node.set_parameter_value("capped", ["a", "b", "c"])
+        # A value loaded from a saved workflow is not checked, so the node's own read is the last place to warn.
+        node.set_parameter_value("capped", ["a", "b", "c"], initial_setup=True)
 
         with patch("griptape_nodes.exe_types.node_types.logger") as mock_logger:
             value = node.get_parameter_value("capped")
@@ -253,3 +254,161 @@ class TestWholeListWarnings:
         # The node decides how to truncate; the engine only surfaces the mismatch.
         assert value == ["a", "b", "c"]
         assert mock_logger.warning.called
+
+
+class TestMaxItemsCountsListsInRows:
+    """A list in a row counts as its items unless the list's own items may be lists."""
+
+    @staticmethod
+    def _node_with_one_full_row(input_types: list[str], *, max_items: int) -> tuple[MockNode, ParameterList]:
+        node = MockNode()
+        parameter_list = ParameterList(
+            name="refs",
+            tooltip="t",
+            input_types=input_types,
+            allowed_modes={ParameterMode.INPUT},
+            max_items=max_items,
+        )
+        node.add_parameter(parameter_list)
+        node.set_parameter_value(parameter_list.add_child_parameter().name, ["a", "b", "c"])
+        return node, parameter_list
+
+    @pytest.mark.parametrize(
+        "input_types",
+        [["ImageUrlArtifact"], ["ImageUrlArtifact", "list", "list[ImageUrlArtifact]"]],
+    )
+    def test_a_list_in_a_row_counts_as_its_items(self, input_types: list[str]) -> None:
+        node, parameter_list = self._node_with_one_full_row(input_types, max_items=4)
+        second_row = parameter_list.add_child_parameter()
+
+        with pytest.raises(ValueError, match="would bring it to 5"):
+            node.set_parameter_value(second_row.name, ["d", "e"])
+
+    @pytest.mark.parametrize("input_types", [["any"], ["list"], ["str", "any", "list"]])
+    def test_a_list_in_a_row_of_a_list_that_holds_lists_is_one_item(self, input_types: list[str]) -> None:
+        node, parameter_list = self._node_with_one_full_row(input_types, max_items=2)
+        second_row = parameter_list.add_child_parameter()
+
+        node.set_parameter_value(second_row.name, ["d", "e"])
+
+        assert node.get_parameter_value(second_row.name) == ["d", "e"]
+
+
+class TestMaxItemsCountsWhatTheNodeReads:
+    """`max_items` counts the items a node reads with `get_parameter_list_value`, wherever they come from.
+
+    A list of `["ImageUrlArtifact", "list"]` stores a list in a row as its items, so the stored value,
+    the read, and the count agree.
+    """
+
+    NESTED_ITEM_TYPES: ClassVar[list[str]] = ["ImageUrlArtifact", "list"]
+
+    @staticmethod
+    def _node(*, max_items: int) -> tuple[MockNode, ParameterList]:
+        node = MockNode()
+        parameter_list = ParameterList(
+            name="refs",
+            tooltip="t",
+            input_types=TestMaxItemsCountsWhatTheNodeReads.NESTED_ITEM_TYPES,
+            allowed_modes={ParameterMode.INPUT},
+            max_items=max_items,
+        )
+        node.add_parameter(parameter_list)
+        return node, parameter_list
+
+    @pytest.mark.usefixtures("disconnected")
+    def test_rows_fill_the_limit_exactly_when_the_node_reads_that_many_items(self) -> None:
+        limit = 4
+        node, parameter_list = self._node(max_items=limit)
+        for value in (["a", None, "b"], "c", ["d"]):
+            node.set_parameter_value(parameter_list.add_child_parameter().name, value)
+
+        assert len(node.get_parameter_list_value("refs")) == limit
+        with pytest.raises(ValueError, match="is full: it holds at most 4 items"):
+            node.set_parameter_value(parameter_list.add_child_parameter().name, "e")
+
+    @pytest.mark.usefixtures("connected")
+    def test_a_connected_list_counts_its_entries_the_way_rows_count(self) -> None:
+        limit = 3
+        node, parameter_list = self._node(max_items=limit)
+        node.set_parameter_value("refs", ["a", None, ["b", "c"], None])
+
+        assert len(node.get_parameter_list_value("refs")) == limit
+        with pytest.raises(ValueError, match="is full: it holds at most 3 items"):
+            node.set_parameter_value(parameter_list.add_child_parameter().name, "d")
+
+    @pytest.mark.usefixtures("disconnected")
+    def test_lists_nested_inside_a_row_count_every_item_the_node_reads(self) -> None:
+        limit = 3
+        node, parameter_list = self._node(max_items=limit)
+        node.set_parameter_value(parameter_list.add_child_parameter().name, [["a", "b"], "c"])
+
+        assert len(node.get_parameter_list_value("refs")) == limit
+        with pytest.raises(ValueError, match="is full: it holds at most 3 items"):
+            node.set_parameter_value(parameter_list.add_child_parameter().name, "d")
+
+    @pytest.mark.usefixtures("disconnected")
+    def test_the_stored_value_holds_the_items_the_node_reads(self) -> None:
+        node, parameter_list = self._node(max_items=5)
+        node.set_parameter_value(parameter_list.add_child_parameter().name, [["a", None], "b"])
+        node.set_parameter_value(parameter_list.add_child_parameter().name, "c")
+
+        assert node.get_parameter_value("refs") == ["a", "b", "c"]
+        assert node.get_parameter_value("refs") == node.get_parameter_list_value("refs")
+
+    @pytest.mark.usefixtures("connected")
+    def test_an_item_added_to_a_list_already_past_its_limit_says_the_list_is_full(self) -> None:
+        """A count here would disagree with the list's "Too many items" message, which counts what is offered."""
+        node, parameter_list = self._node(max_items=3)
+        node.parameter_values["refs"] = ["a", "b", "c", "d"]
+
+        with pytest.raises(ValueError, match="is full: it holds at most 3 items") as refused:
+            node.set_parameter_value(parameter_list.add_child_parameter().name, "e")
+
+        assert "bring it to" not in str(refused.value)
+
+    @pytest.mark.usefixtures("disconnected")
+    def test_a_nested_list_of_only_empty_values_counts_as_no_items(self) -> None:
+        limit = 2
+        node, parameter_list = self._node(max_items=limit)
+        node.set_parameter_value(parameter_list.add_child_parameter().name, [[None, None]])
+
+        node.set_parameter_value(parameter_list.add_child_parameter().name, ["a", "b"])
+
+        assert node.get_parameter_list_value("refs") == ["a", "b"]
+
+    @pytest.mark.usefixtures("disconnected")
+    def test_a_list_whose_items_are_lists_counts_each_entry_as_one_item(self) -> None:
+        """With `list` alone, a list in a row is one item: the node reads it whole, not flattened."""
+        node = MockNode()
+        parameter_list = ParameterList(
+            name="sets", tooltip="t", input_types=["list"], allowed_modes={ParameterMode.INPUT}, max_items=2
+        )
+        node.add_parameter(parameter_list)
+        node.set_parameter_value(parameter_list.add_child_parameter().name, ["a", "b"])
+
+        node.set_parameter_value(parameter_list.add_child_parameter().name, ["c"])
+
+        assert node.get_parameter_value("sets") == [["a", "b"], ["c"]]
+
+    @pytest.mark.usefixtures("connected")
+    def test_the_run_time_warning_counts_items_the_way_the_checks_do(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A value that got past the checks, for example one saved before them, is still caught when read."""
+        node, parameter_list = self._node(max_items=2)
+        row = parameter_list.add_child_parameter()
+        node.parameter_values["refs"] = [["a", "b"]]
+        node.parameter_values[row.name] = "c"
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node.get_parameter_value("refs")
+
+        assert "received 3 item(s) but accepts at most 2" in caplog.text
+
+    def test_the_list_tells_the_editor_whether_it_opens_nested_lists(self) -> None:
+        _node, typed = self._node(max_items=2)
+        whole_entries = ParameterList(
+            name="sets", tooltip="t", input_types=["list"], allowed_modes={ParameterMode.INPUT}
+        )
+
+        assert typed.to_dict()["opens_nested_lists"] is True
+        assert whole_entries.to_dict()["opens_nested_lists"] is False

@@ -7,7 +7,7 @@ import threading
 import uuid
 import warnings
 from abc import ABC
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -29,7 +29,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterMode,
     ParameterTypeBuiltin,
 )
-from griptape_nodes.exe_types.list_rows import ListRows, handle_container_parameter
+from griptape_nodes.exe_types.list_rows import ListRows, flattened_items, handle_container_parameter
 from griptape_nodes.exe_types.local_objects import LocalObjectScope
 from griptape_nodes.exe_types.node_loading import loading_node_name
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
@@ -1265,6 +1265,7 @@ class BaseNode(ABC):
         # to be assigned will NOT be set.
         candidate_value = self._list_rows.convert_and_validate(parameter, value, initial_setup=initial_setup)
         self._list_rows.check_row_within_max_items(parameter, candidate_value, initial_setup=initial_setup)
+        self._list_rows.check_connected_list_within_max_items(parameter, candidate_value, initial_setup=initial_setup)
 
         # Allow custom node logic to prepare and possibly mutate the value before it is actually set.
         if not initial_setup:
@@ -1454,16 +1455,9 @@ class BaseNode(ABC):
         Returns:
             list: Flattened list of items from the param.
         """
-
-        def _flatten(items: Iterable[Any]) -> Generator[Any, None, None]:
-            for item in items:
-                if isinstance(item, Iterable) and not isinstance(item, (str, bytes, dict)):
-                    yield from _flatten(item)
-                elif item is not None:
-                    yield item
-
         raw = self.get_parameter_value(param) or []  # ← Fallback for None
-        return list(_flatten(raw))
+        # The same flattening `max_items` counts with, so the limit covers exactly these items.
+        return list(flattened_items(raw))
 
     def remove_parameter_value(self, param_name: str) -> None:
         parameter = self.get_parameter_by_name(param_name)
@@ -2094,6 +2088,10 @@ class BaseNode(ABC):
 
         return self._param_has_incoming_connection(param_name)
 
+    def incoming_value_overrun_reason(self, target: Parameter, value: Any) -> str | None:
+        """Why a connection delivering `value` to `target` would put more items in its list than `max_items` allows."""
+        return self._list_rows.incoming_overrun_reason(target, value)
+
     def _connected_list_with_rows(self, parameter_list: ParameterList) -> list[Any]:
         """The list a connection delivered, followed by the items of the list's own rows.
 
@@ -2101,12 +2099,15 @@ class BaseNode(ABC):
         """
         items = self._list_rows.connected_then_rows(parameter_list, self.parameter_values[parameter_list.name])
         max_items = parameter_list.max_items
-        if max_items is not None and len(items) > max_items:
+        if max_items is None:
+            return items
+        item_count = self._list_rows.offered_item_count(parameter_list, {})
+        if item_count > max_items:
             logger.warning(
                 "Node '%s' list '%s' received %d item(s) but accepts at most %d. The node runs with all of them.",
                 self.name,
                 parameter_list.name,
-                len(items),
+                item_count,
                 max_items,
             )
         return items

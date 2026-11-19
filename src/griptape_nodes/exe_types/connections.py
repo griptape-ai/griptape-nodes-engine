@@ -1,13 +1,34 @@
 import logging
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import BaseNode, Connection, NodeResolutionState
 
 logger = logging.getLogger("griptape_nodes")
+
+
+class SourceValue(NamedTuple):
+    """The value a connection hands its target, and whether the source had one to give."""
+
+    value: Any
+    found: bool
+
+
+def value_on_connection(source_node: BaseNode, source_param: Parameter) -> SourceValue:
+    """The value a connection hands to its target: the resolved output, else the set value, else the default.
+
+    `found` is False when the source has none of those.
+    """
+    if source_param.name in source_node.parameter_output_values:
+        return SourceValue(value=source_node.parameter_output_values[source_param.name], found=True)
+    if source_param.name in source_node.parameter_values:
+        return SourceValue(value=source_node._get_raw_parameter_value(source_param.name), found=True)
+    if source_param.default_value:
+        return SourceValue(value=source_param.default_value, found=True)
+    return SourceValue(value=None, found=False)
 
 
 class Direction(StrEnum):

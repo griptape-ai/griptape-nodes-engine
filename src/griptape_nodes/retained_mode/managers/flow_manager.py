@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
+from griptape_nodes.exe_types.connections import value_on_connection
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterContainer,
@@ -1033,7 +1034,7 @@ class FlowManager(EngineScoped):
             if (
                 isinstance(target_param, ParameterList)
                 and accepts_incoming_type(target_param.row_input_types, source_param.output_type)
-                and not self._parameter_list_is_full(target_param)
+                and target_node._list_rows.full_reason(target_param) is None
             ):
                 details = (
                     f"{details.rstrip()}. "
@@ -1065,6 +1066,16 @@ class FlowManager(EngineScoped):
                 f'Connection failed : "{target_node_name}.{request.target_parameter_name}" rejected the connection '
             )
             return CreateConnectionResultFailure(result_details=details)
+
+        # A list that cannot hold what this connection delivers is refused up front, so nothing is
+        # connected and then undone. Only a value the source already holds can be counted.
+        if self._should_pass_value_on_connection(request, source_param, target_node):
+            overrun_reason = target_node.incoming_value_overrun_reason(
+                target_param, value_on_connection(source_node, source_param).value
+            )
+            if overrun_reason is not None:
+                details = f'Attempted to connect "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{target_param.connection_label}". Failed because {overrun_reason}'
+                return CreateConnectionResultFailure(result_details=details)
 
         # Based on user feedback, if a connection already exists in a scenario where only ONE such connection can exist
         # (e.g., connecting to a data input that already has a connection, or from a control output that is already wired up),
@@ -1233,19 +1244,9 @@ class FlowManager(EngineScoped):
         details = f'Connected "{source_node_name}.{request.source_parameter_name}" to "{target_node_name}.{request.target_parameter_name}".{replaced_details}'
 
         # Now update the parameter values if it exists.
-        # check if it's been resolved/has a value in parameter_output_values
-        if source_param.name in source_node.parameter_output_values:
-            value = source_node.parameter_output_values[source_param.name]
-        # if it doesn't let's use the one in parameter_values! that's the most updated.
-        elif source_param.name in source_node.parameter_values:
-            value = source_node._get_raw_parameter_value(source_param.name)
-        # if not even that.. then does it have a default value?
-        elif source_param.default_value:
-            value = source_param.default_value
-        else:
-            value = None
-            if isinstance(target_param, ParameterContainer):
-                target_node.kill_parameter_children(target_param)
+        source_value = value_on_connection(source_node, source_param)
+        if not source_value.found and isinstance(target_param, ParameterContainer):
+            target_node.kill_parameter_children(target_param)
         # Set the parameter value (including None/empty values) unless we're in initial setup
         # Skip propagation for:
         # 1. Control Parameters as they should not receive values
@@ -1254,8 +1255,7 @@ class FlowManager(EngineScoped):
         is_control_parameter = (
             ParameterType.attempt_get_builtin(source_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
         )
-        is_dest_node_locked = target_node.lock
-        if (not is_control_parameter) and (not is_dest_node_locked) and (not request.initial_setup):
+        if self._should_pass_value_on_connection(request, source_param, target_node):
             # When creating a connection, pass the initial value from source to target parameter
             # Set incoming_connection_source fields to identify this as legitimate connection value passing
             # (not manual property setting) so it bypasses the INPUT+PROPERTY connection blocking logic
@@ -1263,7 +1263,7 @@ class FlowManager(EngineScoped):
                 SetParameterValueRequest(
                     parameter_name=target_param.name,
                     node_name=target_node.name,
-                    value=value,
+                    value=source_value.value,
                     data_type=source_param.type,
                     incoming_connection_source_node_name=source_node.name,
                     incoming_connection_source_parameter_name=source_param.name,
@@ -1287,6 +1287,7 @@ class FlowManager(EngineScoped):
                 source_node.set_post_init_connections_modified()
             if isinstance(target_node, ErrorProxyNode):
                 target_node.set_post_init_connections_modified()
+        self.engine.node_manager.refresh_over_limit(workflow, target_node, target_param)
 
         result = CreateConnectionResultSuccess(result_details=details, replaced_connection=replaced_connection)
 
@@ -1465,6 +1466,8 @@ class FlowManager(EngineScoped):
             source_node.set_post_init_connections_modified()
         if isinstance(target_node, ErrorProxyNode):
             target_node.set_post_init_connections_modified()
+
+        self.engine.node_manager.refresh_over_limit(workflow, target_node, target_param)
 
         result = DeleteConnectionResultSuccess(result_details=details)
         return result
@@ -2435,11 +2438,13 @@ class FlowManager(EngineScoped):
             raise RuntimeError(_CANCELLED_BEFORE_STARTING)
 
     @staticmethod
-    def _parameter_list_is_full(parameter_list: ParameterList) -> bool:
-        """Whether `parameter_list` has reached its `max_items`, so another slot would be refused."""
-        if parameter_list.max_items is None:
-            return False
-        return len(parameter_list) >= parameter_list.max_items
+    def _should_pass_value_on_connection(
+        request: CreateConnectionRequest, source_param: Parameter, target_node: BaseNode
+    ) -> bool:
+        is_control_parameter = (
+            ParameterType.attempt_get_builtin(source_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
+        )
+        return not is_control_parameter and not target_node.lock and not request.initial_setup
 
     @staticmethod
     def _of_run(result: ResultPayload, run_id: str | None) -> ResultPayload:

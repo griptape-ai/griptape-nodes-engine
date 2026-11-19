@@ -297,9 +297,8 @@ class TestParameterPassthroughFailing:
     """Golden case 6: handing an upstream value to the node's input is refused, before the node runs."""
 
     DETAILS_TEXT = (
-        "Failed to set parameter value for node 'Refuses' and parameter 'text'. Details: Attempted to set "
-        "parameter value for 'Refuses.text'. Failed because before_value_set hook raised exception: "
-        "The text cannot be 'poison'."
+        "Attempted to set parameter value for 'Refuses.text'. Failed because before_value_set hook raised "
+        "exception: The text cannot be 'poison'."
     )
     RUN_MESSAGE = f"Parameter passthrough failed for node 'Refuses': {DETAILS_TEXT}"
 

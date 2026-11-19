@@ -6,25 +6,29 @@ import json
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from asyncio_thread_runner import ThreadRunner
+from griptape.artifacts import ImageUrlArtifact
 from PIL import Image, ImageFile
 from PIL.PngImagePlugin import PngInfo
 
 from griptape_nodes.exe_types.connections import Connections
-from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterGroup, ParameterList, ParameterMode
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.base_events import ResultPayload
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
+    DeleteConnectionRequest,
+    DeleteConnectionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelAllRunsRequest,
@@ -38,6 +42,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ResolveNodeResultFailure,
     StartFlowFromNodeRequest,
     StartFlowFromNodeResultFailure,
+    StartFlowFromNodeResultSuccess,
     StartFlowRequest,
     StartFlowResultFailure,
     StartFlowResultSuccess,
@@ -55,10 +60,16 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.node_events import BatchSetNodeLockStateRequest, SetLockNodeStateRequest
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
+    AddParameterToNodeResultFailure,
     AddParameterToNodeResultSuccess,
+    RemoveParameterFromNodeRequest,
+    RemoveParameterFromNodeResultSuccess,
+    SetParameterValueRequest,
+    SetParameterValueResultFailure,
 )
 from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesResultSuccess
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
@@ -2054,6 +2065,77 @@ class _ImageCollector(DataNode):
         pass
 
 
+class _LimitedImageCollector(DataNode):
+    """Collects at most five images, with the limit set when the list is built, as library nodes do."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(ParameterList(name="items", type="ImageUrlArtifact", tooltip="", max_items=5))
+
+    def process(self) -> None:
+        pass
+
+
+class _GroupedLimitedImageCollector(DataNode):
+    """The same five-image list, inside a group."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        with ParameterGroup(name="References") as references:
+            ParameterList(name="items", type="ImageUrlArtifact", tooltip="", max_items=5)
+        self.add_node_element(references)
+
+    def process(self) -> None:
+        pass
+
+
+class _GrowableListSource(DataNode):
+    """Outputs `count` images as one list, so a test can grow it after it was connected."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(
+            Parameter(name="count", type="int", default_value=1, tooltip="", allowed_modes={ParameterMode.PROPERTY})
+        )
+        self.add_parameter(
+            Parameter(name="images", type="list[ImageUrlArtifact]", tooltip="", allowed_modes={ParameterMode.OUTPUT})
+        )
+
+    def process(self) -> None:
+        count = self.get_parameter_value("count")
+        self.parameter_output_values["images"] = [
+            ImageUrlArtifact(value=f"https://example.com/{n}.png") for n in range(count)
+        ]
+
+
+class _RecomputingListSource(_GrowableListSource):
+    """Rebuilds its list when `count` changes, the way CreateImageList does when an item is added."""
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:
+        if parameter.name == "count":
+            self.parameter_output_values["images"] = [
+                ImageUrlArtifact(value=f"https://example.com/{n}.png") for n in range(value)
+            ]
+
+
+class _RowListSource(DataNode):
+    """Outputs its rows as one list and rebuilds it whenever the list changes, like CreateImageList."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(ParameterList(name="rows", type="ImageUrlArtifact", tooltip=""))
+        self.add_parameter(
+            Parameter(name="images", type="list[ImageUrlArtifact]", tooltip="", allowed_modes={ParameterMode.OUTPUT})
+        )
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:  # noqa: ARG002
+        if parameter.name == "rows" or parameter.name.startswith("rows_"):
+            self.parameter_output_values["images"] = self.get_parameter_list_value("rows")
+
+    def process(self) -> None:
+        pass
+
+
 class TestConnectingToParameterList:
     """A ParameterList is filled through child slots, so connections target a slot, not the list."""
 
@@ -2161,6 +2243,602 @@ class TestConnectingToParameterList:
 
         assert isinstance(result, CreateConnectionResultFailure)
         assert "AddParameterToNodeRequest" not in str(result.result_details)
+
+    def test_connecting_to_a_full_list_fails_and_leaves_no_connection(self, engine: Engine, flow_name: str) -> None:
+        _ = flow_name
+        workflow = engine.current_workflow()
+        collector = engine.node_manager.get_node_by_name_in(workflow, "Collector")
+        items = collector.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+        slot_names = []
+        for _index in range(2):
+            slot = engine.handle_request(
+                AddParameterToNodeRequest(node_name="Collector", parent_container_name="items")
+            )
+            assert isinstance(slot, AddParameterToNodeResultSuccess)
+            slot_names.append(slot.parameter_name)
+        collector.parameter_values[slot_names[0]] = ImageUrlArtifact(value="https://example.com/a.png")
+        items._max_items = 1
+        source = engine.node_manager.get_node_by_name_in(workflow, "Source")
+        source.parameter_output_values["image"] = ImageUrlArtifact(value="https://example.com/b.png")
+
+        result = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="image",
+                target_node_name="Collector",
+                target_parameter_name=slot_names[1],
+            )
+        )
+
+        assert isinstance(result, CreateConnectionResultFailure)
+        assert "holds at most 1 items" in str(result.result_details)
+        assert workflow.flows.connections.get_all_incoming_connections(collector) == []
+
+    def _fill_rows_and_offer_a_list(self, engine: Engine, row_count: int, list_size: int) -> None:
+        workflow = engine.current_workflow()
+        collector = engine.node_manager.get_node_by_name_in(workflow, "Collector")
+        items = collector.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+        for _index in range(row_count):
+            slot = engine.handle_request(
+                AddParameterToNodeRequest(node_name="Collector", parent_container_name="items")
+            )
+            assert isinstance(slot, AddParameterToNodeResultSuccess)
+            collector.parameter_values[slot.parameter_name] = ImageUrlArtifact(value="https://example.com/a.png")
+        items._max_items = 5
+        source = engine.node_manager.get_node_by_name_in(workflow, "Source")
+        source_param = source.get_parameter_by_name("image")
+        assert source_param is not None
+        source_param.type = "list[ImageUrlArtifact]"
+        source.parameter_output_values["image"] = [ImageUrlArtifact(value="https://example.com/b.png")] * list_size
+
+    def _connect_list_to_collector(self, engine: Engine) -> ResultPayload:
+        return engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="image",
+                target_node_name="Collector",
+                target_parameter_name="items",
+            )
+        )
+
+    def test_the_last_slot_that_fits_receives_its_value(self, engine: Engine, flow_name: str) -> None:
+        _ = flow_name
+        workflow = engine.current_workflow()
+        collector = engine.node_manager.get_node_by_name_in(workflow, "Collector")
+        items = collector.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+        items._max_items = 3
+        source = engine.node_manager.get_node_by_name_in(workflow, "Source")
+        artifact = ImageUrlArtifact(value="https://example.com/b.png")
+        source.parameter_output_values["image"] = artifact
+
+        for _index in range(3):
+            slot = engine.handle_request(
+                AddParameterToNodeRequest(node_name="Collector", parent_container_name="items")
+            )
+            assert isinstance(slot, AddParameterToNodeResultSuccess)
+            result = engine.handle_request(
+                CreateConnectionRequest(
+                    source_node_name="Source",
+                    source_parameter_name="image",
+                    target_node_name="Collector",
+                    target_parameter_name=slot.parameter_name,
+                )
+            )
+            assert isinstance(result, CreateConnectionResultSuccess)
+
+        assert [collector.parameter_values[row.name] for row in items.get_child_parameters()] == [artifact] * 3
+
+    def test_a_list_that_overruns_max_items_with_the_rows_is_refused(self, engine: Engine, flow_name: str) -> None:
+        _ = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=3, list_size=3)
+
+        result = self._connect_list_to_collector(engine)
+
+        assert isinstance(result, CreateConnectionResultFailure)
+        assert "holds at most 5 items" in str(result.result_details)
+        assert "Exception" not in str(result.result_details)
+        collector = engine.node_manager.get_node_by_name_in(engine.current_workflow(), "Collector")
+        assert engine.current_workflow().flows.connections.get_all_incoming_connections(collector) == []
+
+    def test_a_list_source_that_has_not_run_connects_and_is_refused_once_it_delivers(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        _ = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=3, list_size=3)
+        workflow = engine.current_workflow()
+        source = engine.node_manager.get_node_by_name_in(workflow, "Source")
+        source.parameter_output_values["image"] = []
+        assert isinstance(self._connect_list_to_collector(engine), CreateConnectionResultSuccess)
+
+        result = engine.handle_request(
+            SetParameterValueRequest(
+                node_name="Collector",
+                parameter_name="items",
+                value=[ImageUrlArtifact(value="https://example.com/b.png")] * 3,
+                incoming_connection_source_node_name="Source",
+                incoming_connection_source_parameter_name="image",
+            )
+        )
+
+        assert isinstance(result, SetParameterValueResultFailure)
+        assert "holds at most 5 items" in str(result.result_details)
+
+    def _fill_rows_and_add_an_empty_slot(self, engine: Engine, *, filled_rows: int, max_items: int) -> str:
+        """Fill `filled_rows` rows holding one item each, cap the list, then add one free slot and name it."""
+        workflow = engine.current_workflow()
+        collector = engine.node_manager.get_node_by_name_in(workflow, "Collector")
+        items = collector.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+        for _index in range(filled_rows):
+            slot = engine.handle_request(
+                AddParameterToNodeRequest(node_name="Collector", parent_container_name="items")
+            )
+            assert isinstance(slot, AddParameterToNodeResultSuccess)
+            collector.parameter_values[slot.parameter_name] = ImageUrlArtifact(value="https://example.com/a.png")
+        items._max_items = max_items
+        empty = engine.handle_request(AddParameterToNodeRequest(node_name="Collector", parent_container_name="items"))
+        assert isinstance(empty, AddParameterToNodeResultSuccess)
+        return empty.parameter_name
+
+    def _connect_list_to_slot(self, engine: Engine, slot_name: str, *, item_count: int) -> ResultPayload:
+        workflow = engine.current_workflow()
+        source = engine.node_manager.get_node_by_name_in(workflow, "Source")
+        source_param = source.get_parameter_by_name("image")
+        assert source_param is not None
+        source_param.type = "list[ImageUrlArtifact]"
+        source.parameter_output_values["image"] = [ImageUrlArtifact(value="https://example.com/b.png")] * item_count
+        return engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="image",
+                target_node_name="Collector",
+                target_parameter_name=slot_name,
+            )
+        )
+
+    def test_a_list_connected_into_a_slot_counts_every_item_it_holds(self, engine: Engine, flow_name: str) -> None:
+        """One free slot left, but the list being connected holds two items, so it does not fit."""
+        _ = flow_name
+        slot = self._fill_rows_and_add_an_empty_slot(engine, filled_rows=13, max_items=14)
+
+        result = self._connect_list_to_slot(engine, slot, item_count=2)
+
+        assert isinstance(result, CreateConnectionResultFailure)
+        details = str(result.result_details)
+        assert "holds at most 14 items, and this would bring it to 15" in details
+        # The slot is named by its list, not by the uuid in its real name.
+        assert "ParameterListUniqueParamID" not in details
+        assert '"Collector.items"' in details
+
+    @pytest.mark.asyncio
+    async def test_a_list_that_grows_after_it_was_connected_fails_the_run(self, engine: Engine, flow_name: str) -> None:
+        workflow = engine.current_workflow()
+        flow = engine.flow_manager.get_flow_by_name_in(workflow, flow_name)
+        growing = _GrowableListSource(name="Growing")
+        flow.add_node(growing)
+        engine.object_manager.add_object_by_name_in(workflow, growing.name, growing)
+        workflow.nodes.name_to_parent_flow_name[growing.name] = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=3, list_size=0)
+        slot = engine.handle_request(AddParameterToNodeRequest(node_name="Collector", parent_container_name="items"))
+        assert isinstance(slot, AddParameterToNodeResultSuccess)
+        connected = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Growing",
+                source_parameter_name="images",
+                target_node_name="Collector",
+                target_parameter_name=slot.parameter_name,
+            )
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess)
+
+        fits = await engine.flow_manager.on_start_flow_from_node_request(
+            StartFlowFromNodeRequest(node_name="Collector"), workflow
+        )
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        overruns = await engine.flow_manager.on_start_flow_from_node_request(
+            StartFlowFromNodeRequest(node_name="Collector"), workflow
+        )
+
+        assert isinstance(fits, StartFlowFromNodeResultSuccess), fits
+        assert isinstance(overruns, StartFlowFromNodeResultFailure), overruns
+        assert "holds at most 5 items" in str(overruns.result_details)
+        assert "ParameterListUniqueParamID" not in str(overruns.result_details)
+
+    def _limited_collector_fed_by_a_growing_list(
+        self,
+        engine: Engine,
+        flow_name: str,
+        source_type: type[_GrowableListSource] = _RecomputingListSource,
+        collector_type: type[DataNode] = _LimitedImageCollector,
+    ) -> tuple[BaseNode, str]:
+        """A five-item list with three filled rows, and a fourth row connected to a one-image list.
+
+        Returns the collector and the connected row's name.
+        """
+        workflow = engine.current_workflow()
+        flow = engine.flow_manager.get_flow_by_name_in(workflow, flow_name)
+        for node in (source_type(name="Growing"), collector_type(name="Limited")):
+            flow.add_node(node)
+            engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+            workflow.nodes.name_to_parent_flow_name[node.name] = flow_name
+        limited = engine.node_manager.get_node_by_name_in(workflow, "Limited")
+        for _index in range(3):
+            row = engine.handle_request(AddParameterToNodeRequest(node_name="Limited", parent_container_name="items"))
+            assert isinstance(row, AddParameterToNodeResultSuccess)
+            limited.parameter_values[row.parameter_name] = ImageUrlArtifact(value="https://example.com/a.png")
+        slot = engine.handle_request(AddParameterToNodeRequest(node_name="Limited", parent_container_name="items"))
+        assert isinstance(slot, AddParameterToNodeResultSuccess)
+        growing = engine.node_manager.get_node_by_name_in(workflow, "Growing")
+        growing.parameter_output_values["images"] = [ImageUrlArtifact(value="https://example.com/0.png")]
+        connected = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Growing",
+                source_parameter_name="images",
+                target_node_name="Limited",
+                target_parameter_name=slot.parameter_name,
+            )
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess)
+        return limited, slot.parameter_name
+
+    @staticmethod
+    def _over_limit(node: BaseNode) -> dict[str, int] | None:
+        items = node.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+        return items.over_limit
+
+    def test_a_list_within_its_limit_is_not_over_it(self, engine: Engine, flow_name: str) -> None:
+        limited, _slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+
+        assert self._over_limit(limited) is None
+
+    def test_the_over_limit_state_is_sent_to_the_editor_but_not_saved(self, engine: Engine, flow_name: str) -> None:
+        limited, _slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        items = limited.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+
+        assert items.to_dict()["over_limit"] == {"item_count": 6, "max_items": 5}
+        assert "over_limit" not in items.save_dict()
+
+    def test_a_list_that_grows_past_the_limit_is_over_it_until_it_fits(self, engine: Engine, flow_name: str) -> None:
+        limited, _slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        when_over = self._over_limit(limited)
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=2))
+
+        assert when_over == {"item_count": 6, "max_items": 5}
+        assert self._over_limit(limited) is None
+
+    def test_a_list_inside_a_group_is_marked_over_the_limit_too(self, engine: Engine, flow_name: str) -> None:
+        limited, _slot_name = self._limited_collector_fed_by_a_growing_list(
+            engine, flow_name, collector_type=_GroupedLimitedImageCollector
+        )
+
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+
+        assert self._over_limit(limited) == {"item_count": 6, "max_items": 5}
+
+    def test_deleting_the_connection_clears_over_limit(self, engine: Engine, flow_name: str) -> None:
+        limited, slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        assert self._over_limit(limited) is not None
+
+        deleted = engine.handle_request(
+            DeleteConnectionRequest(
+                source_node_name="Growing",
+                source_parameter_name="images",
+                target_node_name="Limited",
+                target_parameter_name=slot_name,
+            )
+        )
+
+        assert isinstance(deleted, DeleteConnectionResultSuccess)
+        assert self._over_limit(limited) is None
+
+    def test_removing_a_row_to_make_room_clears_over_limit(self, engine: Engine, flow_name: str) -> None:
+        limited, slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        assert self._over_limit(limited) is not None
+        items = limited.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+        plain_row = next(row for row in items.get_child_parameters() if row.name != slot_name)
+
+        removed = engine.handle_request(
+            RemoveParameterFromNodeRequest(node_name="Limited", parameter_name=plain_row.name)
+        )
+
+        assert isinstance(removed, RemoveParameterFromNodeResultSuccess)
+        assert self._over_limit(limited) is None
+
+    @pytest.mark.asyncio
+    async def test_a_row_removed_from_a_worker_thread_clears_what_the_loop_set(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        """The loop thread sets `over_limit`, then a `to_thread` pool thread removes a row.
+
+        Each call recomputes `over_limit` from the list as it is, so the last call leaves it right
+        whichever thread made it.
+        """
+        limited, slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        assert self._over_limit(limited) is not None
+        items = limited.get_parameter_by_name("items")
+        assert isinstance(items, ParameterList)
+        plain_row = next(row for row in items.get_child_parameters() if row.name != slot_name)
+
+        removed = await asyncio.to_thread(
+            engine.handle_request, RemoveParameterFromNodeRequest(node_name="Limited", parameter_name=plain_row.name)
+        )
+
+        assert isinstance(removed, RemoveParameterFromNodeResultSuccess)
+        assert self._over_limit(limited) is None
+
+    def test_refreshing_twice_leaves_over_limit_the_same(self, engine: Engine, flow_name: str) -> None:
+        limited, slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        workflow = engine.current_workflow()
+        slot = limited.get_parameter_by_name(slot_name)
+        assert slot is not None
+        before = self._over_limit(limited)
+
+        engine.node_manager.refresh_over_limit(workflow, limited, slot)
+        engine.node_manager.refresh_over_limit(workflow, limited, slot)
+
+        assert self._over_limit(limited) == before
+
+    def test_locking_the_list_clears_over_limit_and_unlocking_sets_it_again(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        """A locked node doesn't run, so its list is never over the limit while it is locked."""
+        limited, _slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+
+        engine.handle_request(SetLockNodeStateRequest(node_name="Limited", lock=True))
+        while_locked = self._over_limit(limited)
+        engine.handle_request(BatchSetNodeLockStateRequest(node_names=["Limited"], lock=False))
+
+        assert while_locked is None
+        assert self._over_limit(limited) is not None
+
+    @pytest.mark.asyncio
+    async def test_running_only_the_source_marks_the_list_over_limit(self, engine: Engine, flow_name: str) -> None:
+        """A source that only builds its list when it runs. Running it alone pushes nothing downstream."""
+        limited, _slot_name = self._limited_collector_fed_by_a_growing_list(
+            engine, flow_name, source_type=_GrowableListSource
+        )
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        before_the_run = self._over_limit(limited)
+
+        ran = await engine.flow_manager.on_start_flow_from_node_request(
+            StartFlowFromNodeRequest(node_name="Growing"), engine.current_workflow()
+        )
+
+        assert isinstance(ran, StartFlowFromNodeResultSuccess), ran
+        assert before_the_run is None
+        assert self._over_limit(limited) is not None
+
+    def test_a_loaded_workflow_already_over_the_limit_marks_the_list_over_limit(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        """A saved workflow makes its connections first, then restores values and saved outputs, as `initial_setup`."""
+        workflow = engine.current_workflow()
+        flow = engine.flow_manager.get_flow_by_name_in(workflow, flow_name)
+        for node in (_RecomputingListSource(name="Growing"), _LimitedImageCollector(name="Limited")):
+            flow.add_node(node)
+            engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+            workflow.nodes.name_to_parent_flow_name[node.name] = flow_name
+        limited = engine.node_manager.get_node_by_name_in(workflow, "Limited")
+        slots = [
+            engine.handle_request(AddParameterToNodeRequest(node_name="Limited", parent_container_name="items"))
+            for _index in range(4)
+        ]
+        assert all(isinstance(slot, AddParameterToNodeResultSuccess) for slot in slots)
+        connected = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Growing",
+                source_parameter_name="images",
+                target_node_name="Limited",
+                target_parameter_name=cast("AddParameterToNodeResultSuccess", slots[3]).parameter_name,
+                initial_setup=True,
+            )
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess)
+        for slot in slots[:3]:
+            engine.handle_request(
+                SetParameterValueRequest(
+                    node_name="Limited",
+                    parameter_name=cast("AddParameterToNodeResultSuccess", slot).parameter_name,
+                    value=ImageUrlArtifact(value="https://example.com/a.png"),
+                    initial_setup=True,
+                )
+            )
+
+        engine.handle_request(
+            SetParameterValueRequest(
+                node_name="Growing",
+                parameter_name="images",
+                value=[ImageUrlArtifact(value=f"https://example.com/{n}.png") for n in range(3)],
+                is_output=True,
+                initial_setup=True,
+            )
+        )
+
+        assert self._over_limit(limited) is not None
+
+    def test_removing_an_item_from_the_source_list_clears_over_limit(self, engine: Engine, flow_name: str) -> None:
+        """The source rebuilds its output from its shorter list; the list it feeds must be checked again."""
+        workflow = engine.current_workflow()
+        flow = engine.flow_manager.get_flow_by_name_in(workflow, flow_name)
+        for node in (_RowListSource(name="Rows"), _LimitedImageCollector(name="Limited")):
+            flow.add_node(node)
+            engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+            workflow.nodes.name_to_parent_flow_name[node.name] = flow_name
+        limited = engine.node_manager.get_node_by_name_in(workflow, "Limited")
+        for _index in range(4):
+            row = engine.handle_request(AddParameterToNodeRequest(node_name="Limited", parent_container_name="items"))
+            assert isinstance(row, AddParameterToNodeResultSuccess)
+        slots = cast("ParameterList", limited.get_parameter_by_name("items")).get_child_parameters()
+        for slot in slots[:3]:
+            limited.parameter_values[slot.name] = ImageUrlArtifact(value="https://example.com/a.png")
+        connected = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Rows",
+                source_parameter_name="images",
+                target_node_name="Limited",
+                target_parameter_name=slots[3].name,
+            )
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess)
+        source_rows = []
+        for n in range(3):
+            row = engine.handle_request(AddParameterToNodeRequest(node_name="Rows", parent_container_name="rows"))
+            assert isinstance(row, AddParameterToNodeResultSuccess)
+            source_rows.append(row.parameter_name)
+            engine.handle_request(
+                SetParameterValueRequest(
+                    node_name="Rows",
+                    parameter_name=row.parameter_name,
+                    value=ImageUrlArtifact(value=f"https://example.com/{n}.png"),
+                )
+            )
+        shown_with_three = self._over_limit(limited) is not None
+
+        removed = engine.handle_request(RemoveParameterFromNodeRequest(node_name="Rows", parameter_name=source_rows[0]))
+
+        assert isinstance(removed, RemoveParameterFromNodeResultSuccess)
+        assert shown_with_three
+        assert self._over_limit(limited) is None
+
+    def test_removing_an_item_from_the_source_list_makes_room_to_add_one(self, engine: Engine, flow_name: str) -> None:
+        """The connected item holds the source's shorter list, so an item can be added in its place."""
+        workflow = engine.current_workflow()
+        flow = engine.flow_manager.get_flow_by_name_in(workflow, flow_name)
+        for node in (_RowListSource(name="Rows"), _LimitedImageCollector(name="Limited")):
+            flow.add_node(node)
+            engine.object_manager.add_object_by_name_in(workflow, node.name, node)
+            workflow.nodes.name_to_parent_flow_name[node.name] = flow_name
+        limited = engine.node_manager.get_node_by_name_in(workflow, "Limited")
+        for _index in range(3):
+            row = engine.handle_request(AddParameterToNodeRequest(node_name="Limited", parent_container_name="items"))
+            assert isinstance(row, AddParameterToNodeResultSuccess)
+        slots = cast("ParameterList", limited.get_parameter_by_name("items")).get_child_parameters()
+        for slot in slots[:2]:
+            limited.parameter_values[slot.name] = ImageUrlArtifact(value="https://example.com/a.png")
+        connected = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name="Rows",
+                source_parameter_name="images",
+                target_node_name="Limited",
+                target_parameter_name=slots[2].name,
+            )
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess)
+        source_rows = []
+        for n in range(3):
+            row = engine.handle_request(AddParameterToNodeRequest(node_name="Rows", parent_container_name="rows"))
+            assert isinstance(row, AddParameterToNodeResultSuccess)
+            source_rows.append(row.parameter_name)
+            engine.handle_request(
+                SetParameterValueRequest(
+                    node_name="Rows",
+                    parameter_name=row.parameter_name,
+                    value=ImageUrlArtifact(value=f"https://example.com/{n}.png"),
+                )
+            )
+        full = engine.handle_request(AddParameterToNodeRequest(node_name="Limited", parent_container_name="items"))
+
+        engine.handle_request(RemoveParameterFromNodeRequest(node_name="Rows", parameter_name=source_rows[0]))
+        added = engine.handle_request(AddParameterToNodeRequest(node_name="Limited", parent_container_name="items"))
+
+        assert isinstance(full, AddParameterToNodeResultFailure)
+        assert len(limited.get_parameter_value(slots[2].name)) == 2  # noqa: PLR2004
+        assert isinstance(added, AddParameterToNodeResultSuccess)
+
+    def test_over_limit_leaves_a_badge_the_library_set_on_the_list(self, engine: Engine, flow_name: str) -> None:
+        limited, _slot_name = self._limited_collector_fed_by_a_growing_list(engine, flow_name)
+        items = limited.get_parameter_by_name("items")
+        assert items is not None
+        items.set_badge(variant="info", title="Media Upload", message="Uploaded for you.")
+
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=3))
+        engine.handle_request(SetParameterValueRequest(node_name="Growing", parameter_name="count", value=2))
+
+        badge = items.get_badge()
+        assert badge is not None
+        assert badge.title == "Media Upload"
+
+    def test_a_list_that_fits_with_the_rows_connects(self, engine: Engine, flow_name: str) -> None:
+        _ = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=2, list_size=3)
+
+        result = self._connect_list_to_collector(engine)
+
+        assert isinstance(result, CreateConnectionResultSuccess)
+
+    def test_no_item_can_be_added_when_a_connected_list_fills_the_list(self, engine: Engine, flow_name: str) -> None:
+        """An item that could not be filled in is refused when it is asked for, not after it is offered."""
+        _ = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=0, list_size=5)
+        assert isinstance(self._connect_list_to_collector(engine), CreateConnectionResultSuccess)
+
+        result = engine.handle_request(AddParameterToNodeRequest(node_name="Collector", parent_container_name="items"))
+
+        assert isinstance(result, AddParameterToNodeResultFailure)
+        assert "is full: it holds at most 5 items" in str(result.result_details)
+
+    def test_items_holding_one_value_each_fill_the_list_exactly(self, engine: Engine, flow_name: str) -> None:
+        """`max_items` items of one value each still fit, so a plain list behaves as it always did."""
+        _ = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=5, list_size=0)
+
+        result = engine.handle_request(AddParameterToNodeRequest(node_name="Collector", parent_container_name="items"))
+
+        assert isinstance(result, AddParameterToNodeResultFailure)
+        assert "is full: it holds at most 5 items" in str(result.result_details)
+
+    def test_an_item_holding_an_empty_list_leaves_room_for_another(self, engine: Engine, flow_name: str) -> None:
+        """An empty list counts nothing, so the list still takes a fifth image beside it under max_items=5."""
+        _ = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=4, list_size=0)
+        workflow = engine.current_workflow()
+        collector = engine.node_manager.get_node_by_name_in(workflow, "Collector")
+        empty_list = engine.handle_request(
+            AddParameterToNodeRequest(node_name="Collector", parent_container_name="items")
+        )
+        assert isinstance(empty_list, AddParameterToNodeResultSuccess)
+        collector.parameter_values[empty_list.parameter_name] = []
+
+        result = engine.handle_request(AddParameterToNodeRequest(node_name="Collector", parent_container_name="items"))
+
+        assert isinstance(result, AddParameterToNodeResultSuccess)
+
+    def test_an_empty_item_counts_nothing_until_it_has_a_value(self, engine: Engine, flow_name: str) -> None:
+        """An item holding a list of 3 counts as 3, and an empty item as nothing, under max_items=5."""
+        _ = flow_name
+        self._fill_rows_and_offer_a_list(engine, row_count=0, list_size=0)
+        workflow = engine.current_workflow()
+        collector = engine.node_manager.get_node_by_name_in(workflow, "Collector")
+        image = ImageUrlArtifact(value="https://example.com/a.png")
+        added = []
+        for _index in range(3):
+            item = engine.handle_request(
+                AddParameterToNodeRequest(node_name="Collector", parent_container_name="items")
+            )
+            assert isinstance(item, AddParameterToNodeResultSuccess)
+            added.append(item.parameter_name)
+        collector.parameter_values[added[0]] = [image] * 3
+        collector.parameter_values[added[1]] = image
+        collector.parameter_values[added[2]] = image
+
+        full = engine.handle_request(AddParameterToNodeRequest(node_name="Collector", parent_container_name="items"))
+
+        assert isinstance(full, AddParameterToNodeResultFailure)
+        assert "is full: it holds at most 5 items" in str(full.result_details)
 
 
 class TestTaskLocalFlowCreationRecord:
