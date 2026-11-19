@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Self
 
+from griptape_nodes.image.cache import image_source_access
 from griptape_nodes.image.containers import (
     is_complete,
     read_exif,
@@ -54,7 +55,8 @@ from griptape_nodes.image.operations import (
     to_rgb,
     to_rgba,
 )
-from griptape_nodes.image.pipeline import Flatten, Orient, PipelineStep, Thumbnail, ToRGB, ToRGBA
+from griptape_nodes.image.path_metadata import read_path_metadata
+from griptape_nodes.image.pipeline import Flatten, Orient, PipelineStep, RoundCorners, Thumbnail, ToRGB, ToRGBA
 from griptape_nodes.image.pixel_type import PixelType
 from griptape_nodes.image.png_text_chunks import read_text_chunks
 
@@ -91,7 +93,9 @@ class GriptapeImage:
     or hold open file handles.
     """
 
-    _SPLICEABLE_FORMATS: ClassVar[frozenset[ImageFormat]] = frozenset({ImageFormat.PNG, ImageFormat.JPEG})
+    _SPLICEABLE_FORMATS: ClassVar[frozenset[ImageFormat]] = frozenset(
+        {ImageFormat.PNG, ImageFormat.JPEG, ImageFormat.WEBP}
+    )
 
     _CONTAINER_METADATA_FORMATS: ClassVar[frozenset[ImageFormat]] = frozenset(
         {ImageFormat.JPEG, ImageFormat.PNG, ImageFormat.WEBP, ImageFormat.TIFF}
@@ -200,14 +204,38 @@ class GriptapeImage:
         if self._closed:
             return ImageMetadata()
         if self._metadata is None:
-            source = self._load_source_bytes_if_needed()
-            if source is None and self._source_path is None:
-                return ImageMetadata()
-            self._metadata = self._read_metadata(source)
+            if self._source_path is not None and self._format in self._CONTAINER_METADATA_FORMATS:
+                assert self._format is not None  # noqa: S101
+                self._metadata = read_path_metadata(self._source_path, self._format)
+            else:
+                source = self._source
+                if source is None and self._source_path is None:
+                    return ImageMetadata()
+                self._metadata = self._read_metadata(source)
         exif = None
         if self._metadata.exif is not None:
             exif = self._metadata.exif.copy()
         return replace(self._metadata, text=dict(self._metadata.text), exif=exif)
+
+    @property
+    def orientation(self) -> int:
+        """Display orientation read from attached metadata or the image header."""
+        return self._header_orientation(self._spec())
+
+    def with_metadata(self, metadata: ImageMetadata) -> GriptapeImage:
+        """Return an independent image wrapper carrying the supplied metadata."""
+        exif = None
+        if metadata.exif is not None:
+            exif = metadata.exif.copy()
+        return type(self)(
+            source=self._source,
+            source_path=self._source_path,
+            buf=self._buf,
+            image_format=self._format,
+            metadata=replace(metadata, text=dict(metadata.text), exif=exif),
+            extra_metadata_kinds=self._extra_kinds,
+            display_encoded=self._display_encoded,
+        )
 
     def close(self) -> None:
         """Release the source and decoded pixels."""
@@ -249,15 +277,27 @@ class GriptapeImage:
             if not own_metadata:
                 encoded = spliced(source, image_format, requested, dropped)
         else:
-            encoded = reencoded(
-                self._decoded(),
-                image_format,
-                quality,
-                requested,
-                dropped,
-                optimize=optimize,
-                holds_display_values=self._holds_display_values(),
-            )
+            if self._source_path is not None:
+                with image_source_access(self._source_path):
+                    encoded = reencoded(
+                        self._decoded(),
+                        image_format,
+                        quality,
+                        requested,
+                        dropped,
+                        optimize=optimize,
+                        holds_display_values=self._holds_display_values(),
+                    )
+            else:
+                encoded = reencoded(
+                    self._decoded(),
+                    image_format,
+                    quality,
+                    requested,
+                    dropped,
+                    optimize=optimize,
+                    holds_display_values=self._holds_display_values(),
+                )
             if own_metadata or requested.exif or requested.text:
                 dropped.extend(self._extra_metadata_kinds())
         if dropped:
@@ -319,7 +359,7 @@ class GriptapeImage:
 
     def _extra_metadata_kinds(self) -> list[str]:
         if self._extra_kinds is None:
-            source = self._load_source_bytes_if_needed()
+            source = self._source
             if source is None:
                 return []
             self._extra_kinds = read_extra_metadata_kinds(source, self._format)
@@ -350,7 +390,15 @@ class GriptapeImage:
             exif[EXIF_ORIENTATION_TAG] = orientation
         return ImageMetadata(text=text, exif=exif, icc_profile=spec_icc_profile(spec))
 
+    def run_pipeline(self, steps: Sequence[PipelineStep]) -> GriptapeImage:
+        """Apply validated image steps while coordinating cached source consumption."""
+        if self._source_path is not None:
+            with image_source_access(self._source_path):
+                return self._run_pipeline(steps)
+        return self._run_pipeline(steps)
+
     def _run_pipeline(self, steps: Sequence[PipelineStep]) -> GriptapeImage:
+        """Apply image steps and release intermediate images."""
         current: GriptapeImage = self
         try:
             for step in steps:
@@ -379,7 +427,10 @@ class GriptapeImage:
             return self._derive(to_rgb(self._decoded()), step)
         if isinstance(step, ToRGBA):
             return self._derive(to_rgba(self._decoded()), step)
-        return self._derive(rounded(self._decoded(), step), step)
+        if isinstance(step, RoundCorners):
+            return self._derive(rounded(self._decoded(), step), step)
+        msg = f"Attempted to transform an image. Failed because the step {type(step).__name__} is unsupported."
+        raise TypeError(msg)
 
     def _derive(self, buf: oiio.ImageBuf, step: PipelineStep | None) -> GriptapeImage:
         metadata = self.metadata
@@ -463,8 +514,9 @@ class GriptapeImage:
             with path.open("rb") as handle:
                 head = handle.read(SNIFF_MIN_HEADER_BYTES)
             image = cls(source=None, source_path=path, buf=None, image_format=sniff_image_format(head))
+        header = image._read_header()
         if image.format is None:
-            image._format = ImageFormat.from_name(image._read_header().file_format_name)
+            image._format = ImageFormat.from_name(header.file_format_name)
         return image
 
 

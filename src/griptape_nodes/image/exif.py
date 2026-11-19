@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 import numpy as np
 
 from griptape_nodes.image.exif_tags import EXIF_IFD_TAGS
+from griptape_nodes.image.metadata_reader import MAX_METADATA_READ_BYTES, BytesMetadataSource, MetadataSource
 
 if TYPE_CHECKING:
     from collections.abc import ItemsView
@@ -459,6 +460,25 @@ class Exif:
         self._thumbnail = data[offset : offset + length]
 
 
+def tiff_metadata_from_source(source: MetadataSource) -> TiffMetadata:
+    """Read classic TIFF metadata without fetching strips, tiles or other pages."""
+    header = _tiff_header(source.read_at(0, min(source.size, _HEADER_BYTES)))
+    if header is None:
+        return TiffMetadata(Exif(), None)
+    reader = _BlockReader(source, header.byte_order, tiff_file=True)
+    exif = Exif()
+    exif._byte_order = header.byte_order
+    exif._ifd0 = reader.directory(header.ifd0_offset).entries
+    exif._exif_ifd = reader.sub_directory(exif._ifd0, EXIF_OFFSET_TAG)
+    exif._gps_ifd = reader.sub_directory(exif._ifd0, EXIF_GPSINFO_TAG)
+    exif._interop_ifd = reader.sub_directory(exif._exif_ifd, EXIF_INTEROP_TAG)
+    icc = exif._ifd0.pop(EXIF_ICC_PROFILE_TAG, None)
+    profile = None
+    if icc is not None and icc.field_type in _BYTES_TYPES and icc.raw:
+        profile = icc.raw
+    return TiffMetadata(exif, profile)
+
+
 def tiff_metadata(data: bytes) -> TiffMetadata:
     """Return the EXIF and ICC profile a TIFF file carries.
 
@@ -533,11 +553,15 @@ class _BlockReader:
     block stores each value once, so only entries overlapping one another can pass the cap.
     """
 
-    def __init__(self, data: bytes, byte_order: str) -> None:
-        self._data = data
+    def __init__(self, data: bytes | MetadataSource, byte_order: str, *, tiff_file: bool = False) -> None:
+        if isinstance(data, bytes):
+            self._data = BytesMetadataSource(data)
+        else:
+            self._data = data
         self._byte_order = byte_order
+        self._tiff_file = tiff_file
         self._visited: set[int] = set()
-        self._remaining_value_bytes = len(data)
+        self._remaining_value_bytes = min(self._data.size, MAX_METADATA_READ_BYTES)
 
     def sub_directory(self, parent: dict[int, _Entry], pointer_tag: int) -> dict[int, _Entry]:
         offset = _single_integer(parent.pop(pointer_tag, None), self._byte_order)
@@ -549,17 +573,19 @@ class _BlockReader:
         """Read the IFD at ``offset``, skipping entries whose type is unknown or whose data lies outside the block."""
         data = self._data
         byte_order = self._byte_order
-        if offset in self._visited or offset < _HEADER_BYTES or offset + 2 > len(data):
+        if offset in self._visited or offset < _HEADER_BYTES or offset + 2 > data.size:
             return _Directory({}, 0)
         self._visited.add(offset)
-        (count,) = struct.unpack(f"{byte_order}H", data[offset : offset + 2])
+        (count,) = struct.unpack(f"{byte_order}H", data.read_at(offset, 2))
         entries_start = offset + 2
         # A count running past the end keeps the entries that fit
-        count = min(count, (len(data) - entries_start) // _ENTRY_BYTES)
+        count = min(count, (data.size - entries_start) // _ENTRY_BYTES)
         entries: dict[int, _Entry] = {}
         for index in range(count):
             position = entries_start + index * _ENTRY_BYTES
-            tag, field_type, value_count = struct.unpack(f"{byte_order}HHI", data[position : position + 8])
+            tag, field_type, value_count = struct.unpack(f"{byte_order}HHI", data.read_at(position, 8))
+            if self._tiff_file and not (_is_tiff_exif_tag(tag) or tag in _POINTER_TAGS or tag == EXIF_ICC_PROFILE_TAG):
+                continue
             unit_bytes = _TYPE_BYTES.get(field_type)
             if unit_bytes is None:
                 continue
@@ -567,19 +593,19 @@ class _BlockReader:
             if size > self._remaining_value_bytes:
                 continue
             if size <= _INLINE_BYTES:
-                raw = data[position + 8 : position + 8 + size]
+                raw = data.read_at(position + 8, size)
             else:
-                (value_offset,) = struct.unpack(f"{byte_order}I", data[position + 8 : position + 12])
-                if value_offset + size > len(data):
+                (value_offset,) = struct.unpack(f"{byte_order}I", data.read_at(position + 8, 4))
+                if value_offset + size > data.size:
                     continue
-                raw = data[value_offset : value_offset + size]
+                raw = data.read_at(value_offset, size)
             self._remaining_value_bytes -= size
             entries[tag] = _Entry(field_type, raw)
 
         next_position = entries_start + count * _ENTRY_BYTES
         next_offset = 0
-        if next_position + 4 <= len(data):
-            (next_offset,) = struct.unpack(f"{byte_order}I", data[next_position : next_position + 4])
+        if next_position + 4 <= data.size:
+            (next_offset,) = struct.unpack(f"{byte_order}I", data.read_at(next_position, 4))
         return _Directory(entries, next_offset)
 
 

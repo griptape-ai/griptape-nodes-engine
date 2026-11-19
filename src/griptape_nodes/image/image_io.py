@@ -9,6 +9,8 @@ from typing import NamedTuple
 
 import OpenImageIO as oiio  # noqa: N813
 
+from griptape_nodes.files.path_utils import canonicalize_for_io
+from griptape_nodes.image.cache import refresh_image_cache
 from griptape_nodes.image.operations import GRAYSCALE_ALPHA_CHANNELS, alpha_channel, checked
 
 # Keeps alpha as stored in the file. OpenImageIO otherwise premultiplies on read and divides it
@@ -73,7 +75,8 @@ def read_cached_file(path: Path) -> Decoded:
     """
     oiio.attribute("imagebuf:use_imagecache", 1)
     oiio.ImageCache(shared=True).attribute("unassociatedalpha", 1)
-    buf = oiio.ImageBuf(str(path))
+    refresh_image_cache(path)
+    buf = oiio.ImageBuf(str(canonicalize_for_io(path)))
     if not buf.read(0, 0, force=False) or buf.has_error:
         msg = f"Attempted to decode an image. Failed because OpenImageIO could not read it: {buf.geterror()}"
         raise ValueError(msg)

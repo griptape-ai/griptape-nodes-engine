@@ -280,14 +280,14 @@ class TestReading:
             assert image.metadata.text == {}
             assert image._buf is None
 
-    def test_unreadable_header_raises_on_metadata(self) -> None:
+    def test_unreadable_header_raises_at_open(self) -> None:
         # A zeroed BMP header can reuse dimensions left by an earlier OIIO BMP read.
         width = 6
         with GriptapeImage.open(encode(solid(width, 4, RED), "bmp")) as valid_image:
             assert valid_image.width == width
 
-        with GriptapeImage.open(b"GIF89a" + bytes(64)) as image, pytest.raises(ValueError, match="could not read"):
-            _ = image.metadata
+        with pytest.raises(ValueError, match="could not read"):
+            GriptapeImage.open(b"GIF89a" + bytes(64))
 
 
 class TestPixelDepth:

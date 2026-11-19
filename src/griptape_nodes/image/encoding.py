@@ -29,7 +29,7 @@ from griptape_nodes.image.operations import (
     to_rgb,
     to_rgba,
 )
-from griptape_nodes.image.png_text_chunks import insert_text_chunks
+from griptape_nodes.image.png_text_chunks import insert_text_chunks, replace_text_chunks
 
 if TYPE_CHECKING:
     from griptape_nodes.image.exif import Exif
@@ -75,9 +75,6 @@ _DEFAULT_QUALITY = {ImageFormat.JPEG: 75, ImageFormat.WEBP: 80}
 # Chunks OpenImageIO adds to every PNG besides its empty EXIF: color tags claiming sRGB whatever the
 # source was. Dropped so a PNG carries only the color profile and EXIF it was given.
 _PNG_DROPPED_CHUNKS = frozenset({b"sRGB", b"gAMA", b"cHRM"})
-
-# Text chunks dropped from a source PNG whose metadata is rewritten in place
-_PNG_TEXT_CHUNKS = frozenset({b"tEXt", b"zTXt", b"iTXt"})
 
 # Bytes 16-20 of an ICC profile name the color space it describes
 _ICC_COLOR_SPACE = slice(16, 20)
@@ -150,10 +147,22 @@ def spliced(source: bytes, image_format: ImageFormat, metadata: ImageMetadata, d
     exif_block = _exif_block(metadata.exif, image_format, dropped)
     if image_format == ImageFormat.JPEG:
         return replace_jpeg_exif(source, exif_block)
-    encoded = replace_png_exif(source, exif_block, dropped_chunks=_PNG_TEXT_CHUNKS)
-    if metadata.text:
-        encoded = insert_text_chunks(encoded, metadata.text)
-    return encoded
+    if image_format == ImageFormat.WEBP:
+        with temporary_path(".webp") as path:
+            path.write_bytes(source)
+            header = oiio.ImageInput.open(str(path))
+            if header is None:
+                msg = "Attempted to update WebP metadata. Failed because the image header could not be read."
+                raise ValueError(msg)
+            try:
+                spec = header.spec()
+                return add_webp_exif(
+                    source, exif_block, width=spec.width, height=spec.height, has_alpha=spec.nchannels == RGBA_CHANNELS
+                )
+            finally:
+                header.close()
+    encoded = replace_png_exif(source, exif_block)
+    return replace_text_chunks(encoded, metadata.text)
 
 
 def icc_profile_fits(icc_profile: bytes, channels: int) -> bool:

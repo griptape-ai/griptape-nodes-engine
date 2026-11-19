@@ -134,15 +134,12 @@ class GriptapeImagePipeline:
         """
         steps = _plan_steps(self._steps, self._orientation())
         self._steps.clear()
-        return self._image._run_pipeline(steps)
+        return self._image.run_pipeline(steps)
 
     def _orientation(self) -> int:
         if not any(isinstance(step, _ExifTranspose) for step in self._steps):
             return _UPRIGHT
-        exif = self._image.metadata.exif
-        if exif is None:
-            return _UPRIGHT
-        return exif.orientation
+        return self._image.orientation
 
 
 @dataclass(frozen=True)

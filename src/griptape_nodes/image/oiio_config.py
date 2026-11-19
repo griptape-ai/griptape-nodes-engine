@@ -6,15 +6,11 @@ from typing import TYPE_CHECKING
 
 import OpenImageIO as oiio  # noqa: N813
 
-from griptape_nodes.files.path_utils import canonicalize_for_identity
+from griptape_nodes.image.cache import invalidate_image_cache  # noqa: F401 - retained public import path
 from griptape_nodes.retained_mode.managers.settings import OPENIMAGEIO_KEY, OpenImageIOSettings, Settings
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
-
-_WINDOWS_LONG_PATH_PREFIX = "\\\\?\\"
 
 
 def apply_openimageio_settings(config_manager: ConfigManager) -> OpenImageIOSettings:
@@ -46,20 +42,3 @@ def apply_openimageio_settings(config_manager: ConfigManager) -> OpenImageIOSett
     cache.attribute("unassociatedalpha", 1)
     cache.attribute("failure_retries", settings.failure_retries)
     return settings
-
-
-def invalidate_image_cache(path: str | Path) -> None:
-    """Evict cached tiles and close any open ImageInput handle for ``path`` in the shared ImageCache.
-
-    Args:
-        path: Local file path to invalidate.
-    """
-    cache = oiio.ImageCache(shared=True)
-    raw = str(path)
-    candidates = {raw}
-    if raw.startswith(_WINDOWS_LONG_PATH_PREFIX):
-        candidates.add(raw.removeprefix(_WINDOWS_LONG_PATH_PREFIX))
-    candidates.add(str(canonicalize_for_identity(path)))
-
-    for candidate in candidates:
-        cache.invalidate(candidate, True)

@@ -8,11 +8,25 @@ from contextlib import contextmanager
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Protocol
 
 from griptape_nodes.image import GriptapeImage, ImageFormat
 
-MetadataImageInput = GriptapeImage | bytes | Path | str | Any
+
+class LegacyMetadataImage(Protocol):
+    """Image objects accepted from separately versioned libraries."""
+
+    @property
+    def format(self) -> str | None:
+        """The encoded container name."""
+        ...
+
+    def save(self, fp: BytesIO, format: str | None = None, **params: object) -> None:  # noqa: A002
+        """Save pixels and optional metadata to a binary buffer."""
+        ...
+
+
+MetadataImageInput = GriptapeImage | bytes | Path | str | LegacyMetadataImage
 
 
 @contextmanager
@@ -59,7 +73,9 @@ def opening_metadata_image(image: MetadataImageInput) -> Iterator[GriptapeImage]
             info_text = {k: v for k, v in raw_info.items() if isinstance(k, str) and isinstance(v, str)}
             if info_text:
                 merged_text = {**info_text, **opened.metadata.text}
-                opened._metadata = replace(opened.metadata, text=merged_text)
+                with opened.with_metadata(replace(opened.metadata, text=merged_text)) as attached:
+                    yield attached
+                return
         yield opened
 
 

@@ -111,6 +111,9 @@ def is_complete(data: bytes, image_format: ImageFormat) -> bool:
     if image_format == ImageFormat.PNG:
         chunks = _png_chunks(data)
         return bool(chunks) and chunks[-1].kind == b"IEND" and chunks[-1].payload_end + 4 <= len(data)
+    if image_format == ImageFormat.WEBP:
+        chunks = _webp_chunks(data)
+        return data.startswith(b"RIFF") and bool(chunks) and int.from_bytes(data[4:8], "little") + 8 == len(data)
     return False
 
 
@@ -165,19 +168,26 @@ def replace_png_exif(encoded: bytes, exif: bytes | None, *, dropped_chunks: froz
     return bytes(kept)
 
 
-def add_webp_exif(encoded: bytes, exif: bytes, *, width: int, height: int, has_alpha: bool) -> bytes:
-    """Return a WEBP with an EXIF chunk, converting a simple WEBP to the extended (VP8X) layout it needs."""
-    chunks = encoded[_WEBP_HEADER_BYTES:]
+def add_webp_exif(encoded: bytes, exif: bytes | None, *, width: int, height: int, has_alpha: bool) -> bytes:
+    """Replace WebP EXIF while preserving compressed pixels and unrelated chunks."""
+    chunks = b"".join(
+        encoded[chunk.start : chunk.payload_end + ((chunk.payload_end - chunk.payload_start) & 1)]
+        for chunk in _webp_chunks(encoded)
+        if chunk.kind != b"EXIF"
+    )
     if chunks[:4] == b"VP8X":
-        flags = chunks[8] | _WEBP_VP8X_EXIF_FLAG
+        flags = chunks[8] & ~_WEBP_VP8X_EXIF_FLAG
+        if exif is not None:
+            flags |= _WEBP_VP8X_EXIF_FLAG
         chunks = chunks[:8] + bytes([flags]) + chunks[9:]
-    else:
+    elif exif is not None:
         flags = _WEBP_VP8X_EXIF_FLAG
         if has_alpha:
             flags |= _WEBP_VP8X_ALPHA_FLAG
         canvas = bytes([flags, 0, 0, 0]) + (width - 1).to_bytes(3, "little") + (height - 1).to_bytes(3, "little")
         chunks = b"VP8X" + struct.pack("<I", len(canvas)) + canvas + chunks
-    chunks += b"EXIF" + struct.pack("<I", len(exif)) + exif + b"\x00" * (len(exif) & 1)
+    if exif is not None:
+        chunks += b"EXIF" + struct.pack("<I", len(exif)) + exif + b"\x00" * (len(exif) & 1)
     return b"RIFF" + struct.pack("<I", len(chunks) + 4) + b"WEBP" + chunks
 
 

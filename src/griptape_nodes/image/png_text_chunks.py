@@ -74,6 +74,27 @@ def read_text_chunks(png: bytes) -> dict[str, str]:
     return texts
 
 
+def replace_text_chunks(png: bytes, texts: Mapping[str, str]) -> bytes:
+    """Replace readable PNG text and preserve unrelated undecodable chunks verbatim."""
+    kept = bytearray(PNG_SIGNATURE)
+    position = len(PNG_SIGNATURE)
+    while position + _CHUNK_HEADER_BYTES <= len(png):
+        length, kind = struct.unpack(">I4s", png[position : position + _CHUNK_HEADER_BYTES])
+        end = position + _CHUNK_HEADER_BYTES + length + _CHUNK_CRC_BYTES
+        if end > len(png):
+            msg = "Attempted to update PNG metadata. Failed because an image chunk is incomplete."
+            raise ValueError(msg)
+        payload = png[position + _CHUNK_HEADER_BYTES : end - _CHUNK_CRC_BYTES]
+        retain = kind not in _TEXT_CHUNK_TYPES
+        if kind in _TEXT_CHUNK_TYPES and _decode_text_chunk(kind, payload) is None:
+            key = payload.partition(b"\x00")[0].decode("latin-1")
+            retain = key not in texts
+        if retain:
+            kept += png[position:end]
+        position = end
+    return insert_text_chunks(bytes(kept), texts)
+
+
 def insert_text_chunks(png: bytes, texts: Mapping[str, str]) -> bytes:
     """Return ``png`` with a text chunk per entry of ``texts`` inserted before the first IDAT chunk.
 
@@ -131,7 +152,7 @@ def _decompress_text(data: bytes) -> bytes:
     """
     decompressor = zlib.decompressobj()
     text = decompressor.decompress(data, MAX_COMPRESSED_TEXT_BYTES)
-    if decompressor.unconsumed_tail:
+    if decompressor.unconsumed_tail or not decompressor.eof:
         msg = "Attempted to read a PNG text chunk. Failed because it decompresses past the size limit."
         raise zlib.error(msg)
     return text
