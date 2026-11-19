@@ -46,6 +46,7 @@ from griptape_nodes.exe_types.node_types import (
     StartNode,
 )
 from griptape_nodes.exe_types.variable_resolver import VariableResolver
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import ISOLATED_EXECUTION_IN_WORKER, is_beta_enabled
@@ -371,7 +372,7 @@ class NodeExecutor(EngineScoped):
                 workflow, self._node_finish_process_event(start_event, outcome=outcome, failure=failure)
             )
 
-    async def _run_node(self, workflow: WorkflowRuntime, node: BaseNode) -> None:
+    async def _run_node(self, workflow: WorkflowRuntime, node: BaseNode) -> None:  # noqa: C901, PLR0911
         """Run the given node by the path its type and execution environment call for.
 
         Args:
@@ -414,6 +415,10 @@ class NodeExecutor(EngineScoped):
             # Handle iterative loop nodes - check if we need to package and execute the loop
             if isinstance(node, BaseIterativeEndNode):
                 await self.handle_loop_execution(node)
+                return
+
+            if isinstance(node, WorkflowNode):
+                await self._run_workflow_node(node)
                 return
 
             # Resolved here because only this process has workflow context to resolve it FROM;
@@ -463,6 +468,20 @@ class NodeExecutor(EngineScoped):
             # A connection torn down while this node was running left its input value in place so the
             # node could finish on it. Now that it has, drop it.
             node.reset_deferred_input_values()
+
+    async def _run_workflow_node(self, node: WorkflowNode) -> None:
+        """Run a Workflow node in this process and outside any node's run, as a local group runs.
+
+        It loads a workflow file and runs it as a subflow, which is graph work rather than node code:
+        inside a node's run, strict mode and the other running-node checks would treat the loaded
+        workflow as the node's own code. Failures are built as ExecuteNodeRequest builds them, so
+        budget-halt failures read the same.
+        """
+        try:
+            await node.aprocess()
+        except Exception as exc:
+            failure = self.engine.node_manager.execution_failure(exc, node.name)
+            raise self._execute_node_failed_error(node.name, failure, failure.exception) from failure.exception
 
     def _node_start_process_event(
         self, workflow: WorkflowRuntime, node: BaseNode, loop_body_scope: LoopBodyScope | None
