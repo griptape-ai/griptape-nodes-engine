@@ -59,6 +59,15 @@ Griptape Nodes employs a specific search order to load settings from environment
     - Once settings are loaded, the `ConfigManager` uses the final resolved `workspace_directory`.
     - Modifications made at runtime (e.g., registering custom workflows) are typically saved by the `ConfigManager` into a `griptape_nodes_config.json` file located within this resolved `workspace_directory`.
 
+## Recovering an Invalid User Configuration
+
+When a settings write finds invalid JSON in your user configuration file, the engine preserves
+that file before saving the updated settings. The first backup is `griptape_nodes_config.bak`.
+Later backups use the next available numbered name, such as `griptape_nodes_config.1.bak`.
+Existing backups are kept. If the backup cannot be written, the settings change fails and the
+original configuration file remains unchanged. Check the engine log for the backup path or
+failure details.
+
 ## Loading Examples
 
 Here are a few scenarios to illustrate how configuration files are located and loaded:
