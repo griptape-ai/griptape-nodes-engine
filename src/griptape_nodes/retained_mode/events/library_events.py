@@ -334,6 +334,12 @@ class DescribeNodeTypeRequest(RequestPayload):
     EventRequestBatch: that keeps names, types, modes, defaults and dropdown `options`, which is
     what wiring and setting values needs.
 
+    Descriptions are cached per node type until a library is loaded, reloaded or unloaded, or a
+    node type is registered again, so describing a whole library is fast after the first time. The
+    include_* flags only choose what is returned, never whether it is read again. Dropdown choices
+    a node builds from the machine it runs on (such as downloaded models) are the ones offered when
+    the node type was first described after the last registration change.
+
     Args:
         node_type: Name of the node type to describe
         library: Name of the library providing the node type. If omitted and exactly one
