@@ -80,21 +80,26 @@ class TestConnectControlWireThroughGroupRaisesOnFailure:
             target_parameter=Parameter(name="exec_in", tooltip=""),
         )
 
-        mock_create_connection = create_autospec(
-            engine.flow_manager.on_create_connection_request,
+        # _create_connection dispatches through _handle_request_in_workflow -> Engine.handle_request,
+        # not a direct call to the manager's handler method, so that is the point to intercept: a
+        # request type's handler is resolved once at registration time (register_request_handlers),
+        # so patching engine.flow_manager.on_create_connection_request afterwards would not be seen
+        # by this dispatch at all.
+        mock_handle = create_autospec(
+            engine.handle_request,
             side_effect=[
                 CreateConnectionResultSuccess(result_details="outer leg created"),
                 CreateConnectionResultFailure(result_details="no such parameter 'exec_in' on 'Member'"),
             ],
         )
-        monkeypatch.setattr(engine.flow_manager, "on_create_connection_request", mock_create_connection)
+        monkeypatch.setattr(engine, "handle_request", mock_handle)
 
         with pytest.raises(RuntimeError):
             group._connect_control_wire_through_group(old_connection, is_incoming=True)
 
         assert group._entry_wire_owner is None
         expected_attempts = 2  # the outer leg (succeeds) and the inner leg (fails)
-        assert mock_create_connection.call_count == expected_attempts
+        assert mock_handle.call_count == expected_attempts
 
 
 class TestGetAllNodes:

@@ -14,6 +14,7 @@ Data wires are untouched: they still get a proxy parameter each.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
@@ -22,7 +23,12 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import NodeResolutionState
-from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest, CreateConnectionResultSuccess
+from griptape_nodes.retained_mode.events.base_events import GriptapeNodeEvent
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+    DeleteConnectionRequest,
+)
 from griptape_nodes.retained_mode.events.execution_events import (
     StartFlowRequest,
     StartFlowResultSuccess,
@@ -163,6 +169,44 @@ GROUPED_CHAIN = {
     "Child.exec_out->G.group_complete (internal)",
     "G.group_exec_out->Down.exec_in",
 }
+
+
+def _drain(queue: asyncio.Queue) -> list[object]:
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    return events
+
+
+_ConnectionKey = tuple[str, str, str, str]
+
+
+def _broadcast_connections(events: list[object], request_type: type) -> set[_ConnectionKey]:
+    """Successful (source_node, source_param, target_node, target_param) results broadcast for `request_type`.
+
+    Only `GriptapeNodeEvent` entries count: that is the wrapper `Engine.handle_request` puts on the
+    queue when `request.broadcast_result` is set and the result is not suppressed, so a connection's
+    `(source, target)` pair showing up here is proof the result actually reached a connected client,
+    not just that the connection was made.
+    """
+    keys = set()
+    for event in events:
+        if not isinstance(event, GriptapeNodeEvent):
+            continue
+        request = event.wrapped_event.request
+        if not isinstance(request, request_type):
+            continue
+        if not event.wrapped_event.succeeded():
+            continue
+        keys.add(
+            (
+                request.source_node_name,
+                request.source_parameter_name,
+                request.target_node_name,
+                request.target_parameter_name,
+            )
+        )
+    return keys
 
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
@@ -388,6 +432,51 @@ class TestGroupingAControlChain:
         assert "Child.exec_out->Down.exec_in" in _edges(engine, "Child", control_only=True)
         # Nothing is left stranded on the now-empty group.
         assert _edges(engine, "G", control_only=True) == set()
+
+
+@pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
+class TestControlWireMutationsAreBroadcast:
+    """A control-wire create/delete used to call the manager's handler method directly.
+
+    That bypassed `Engine.handle_request` entirely. The connection was really made or removed --
+    confirmed by every assertion elsewhere in this file -- but the result never reached a
+    connected client, since only `Engine.handle_request` puts a result on the broadcast queue.
+    This grouped it with a real event queue in place to prove the result actually goes out, not
+    just that the graph changed.
+    """
+
+    def test_grouping_a_control_chain_broadcasts_both_outer_legs(self, engine: Engine, flow: str) -> None:
+        _ = flow
+        _chain(engine)
+        events: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(events)
+
+        _group(engine, ["Child"])
+
+        broadcast = _broadcast_connections(_drain(events), CreateConnectionRequest)
+        assert ("Up", "exec_out", "G", "group_exec_in") in broadcast
+        assert ("G", "group_exec_out", "Down", "exec_in") in broadcast
+
+    def test_ungrouping_the_only_member_broadcasts_the_restored_wire(self, engine: Engine, flow: str) -> None:
+        """Leaving the group restores the member's own wire.
+
+        Leaving the group deletes the outer wire and recreates it straight to the member -- both
+        of those must themselves be broadcast, not just the membership change around them.
+        """
+        _ = flow
+        _chain(engine)
+        _group(engine, ["Child"])
+        events: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(events)
+
+        result = engine.handle_request(RemoveNodeFromNodeGroupRequest(node_names=["Child"], node_group_name="G"))
+        assert isinstance(result, RemoveNodeFromNodeGroupResultSuccess), result
+
+        drained = _drain(events)
+        deleted = _broadcast_connections(drained, DeleteConnectionRequest)
+        created = _broadcast_connections(drained, CreateConnectionRequest)
+        assert ("Up", "exec_out", "G", "group_exec_in") in deleted
+        assert ("Up", "exec_out", "Child", "exec_in") in created
 
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")

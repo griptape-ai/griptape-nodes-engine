@@ -6,5 +6,7 @@
   could have been its own. Grouping a node in the editor no longer deletes its data wires.
   Groups saved before this still stop at the group. Ungroup and regroup the node, or wire the group's
   `Flow Out` (`On Complete` on a loop) to the next node by hand; the old extra ports stay on the group.
+  Grouping or ungrouping a node, or wiring a control connection across a group boundary by hand, now
+  shows the resulting connection immediately instead of only after reopening the workflow.
   [#6210](https://github.com/griptape-ai/griptape-nodes-engine/issues/6210)
   [#5487](https://github.com/griptape-ai/griptape-nodes-engine/issues/5487)

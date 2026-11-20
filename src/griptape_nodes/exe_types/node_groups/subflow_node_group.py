@@ -604,15 +604,17 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     self._exit_wire_owner = (old_connection.source_node.name, old_connection.source_parameter.name)
 
     def _delete_connection(self, source: str, source_param: str, target: str, target_param: str) -> None:
-        result = self.engine.flow_manager.on_delete_connection_request(
-            DeleteConnectionRequest(
-                source_parameter_name=source_param,
-                target_parameter_name=target_param,
-                source_node_name=source,
-                target_node_name=target,
-            ),
-            self._require_workflow(),
+        # Goes through _handle_request_in_workflow, not a direct call to the manager's handler
+        # method, so the result is dispatched through Engine.handle_request and broadcast to
+        # connected clients -- a direct call creates the real connection change but never tells
+        # anyone it happened. See create_connections_for_proxy, which uses the same dispatch.
+        request = DeleteConnectionRequest(
+            source_parameter_name=source_param,
+            target_parameter_name=target_param,
+            source_node_name=source,
+            target_node_name=target,
         )
+        result = self._handle_request_in_workflow(request)
         if result.failed():
             msg = f"{self.name}: Failed to delete connection from {source}.{source_param} to {target}.{target_param}: {result.result_details}"
             raise RuntimeError(msg)
@@ -620,16 +622,15 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
     def _create_connection(
         self, source: str, source_param: str, target: str, target_param: str, *, is_node_group_internal: bool = False
     ) -> None:
-        result = self.engine.flow_manager.on_create_connection_request(
-            CreateConnectionRequest(
-                source_parameter_name=source_param,
-                target_parameter_name=target_param,
-                source_node_name=source,
-                target_node_name=target,
-                is_node_group_internal=is_node_group_internal,
-            ),
-            self._require_workflow(),
+        # See the comment in _delete_connection: same dispatch, same reason.
+        request = CreateConnectionRequest(
+            source_parameter_name=source_param,
+            target_parameter_name=target_param,
+            source_node_name=source,
+            target_node_name=target,
+            is_node_group_internal=is_node_group_internal,
         )
+        result = self._handle_request_in_workflow(request)
         if result.failed():
             msg = f"{self.name}: Failed to create connection from {source}.{source_param} to {target}.{target_param}: {result.result_details}"
             raise RuntimeError(msg)
