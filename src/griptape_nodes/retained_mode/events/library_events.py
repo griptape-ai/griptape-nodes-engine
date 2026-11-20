@@ -247,6 +247,8 @@ class ParameterDescription:
         max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
         options: The choices a dropdown or multi-select offers, or None when the parameter is
             neither. Read from ui_options, but kept when ui_options are left out.
+        deprecation: Message naming what to use instead, when the parameter is deprecated and kept only so
+            older workflows load (None if the parameter is current). Leave deprecated parameters out of new work.
     """
 
     name: str
@@ -267,6 +269,7 @@ class ParameterDescription:
     element_type: str
     max_items: int | None
     options: list[DisplayValue] | None = None
+    deprecation: str | None = None
 
     @classmethod
     def from_parameter(cls, param: Parameter) -> ParameterDescription:
@@ -297,6 +300,7 @@ class ParameterDescription:
             element_type=param_dict["element_type"],
             max_items=max_items,
             options=_choices_from_ui_options(param_dict["ui_options"]),
+            deprecation=param_dict["deprecation"],
         )
 
 
