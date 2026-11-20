@@ -242,6 +242,16 @@ class BaseNodeElement:
                 return found
         return None
 
+    def find_element_by_type_and_name(self, element_type: type[N], element_name: str) -> N | None:
+        """The first descendant of ``element_type`` named ``element_name``, in ``find_elements_by_type`` order."""
+        for child in self._children:
+            if isinstance(child, element_type) and child.name == element_name:
+                return child
+            found = child.find_element_by_type_and_name(element_type, element_name)
+            if found is not None:
+                return found
+        return None
+
     def find_elements_by_type(self, element_type: type[N], *, find_recursively: bool = True) -> list[N]:
         """Returns a list of child elements that are instances of type specified. Optionally do this recursively."""
         elements: list[N] = []

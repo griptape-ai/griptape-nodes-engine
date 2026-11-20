@@ -1158,20 +1158,13 @@ class BaseNode(ABC):
         return None
 
     def get_parameter_by_name(self, param_name: str) -> Parameter | None:
-        for parameter in self.parameters:
-            if param_name == parameter.name:
-                return parameter
-        return None
+        return self.root_ui_element.find_element_by_type_and_name(Parameter, param_name)
 
     def get_element_by_name_and_type(
         self, elem_name: str, element_type: type[BaseNodeElement] | None = None
     ) -> BaseNodeElement | None:
         find_type = element_type if element_type is not None else BaseNodeElement
-        element_items = self.root_ui_element.find_elements_by_type(find_type)
-        for element_item in element_items:
-            if elem_name == element_item.name:
-                return element_item
-        return None
+        return self.root_ui_element.find_element_by_type_and_name(find_type, elem_name)
 
     def set_parameter_value(
         self,
