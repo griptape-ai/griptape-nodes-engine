@@ -521,6 +521,20 @@ class TestParameter:
         assert "settable" in param_false_dict
         assert param_false_dict["settable"] is False
 
+    def test_traits_go_in_the_same_order_every_time(self) -> None:
+        # A set of traits iterates in an order that varies from one set to the next.
+        orders = {
+            tuple(
+                type(trait).__name__
+                for trait in _make_param(
+                    traits={Slider(min_val=0, max_val=1), Options(choices=["a"])}
+                ).find_elements_by_type(Trait)
+            )
+            for _ in range(20)
+        }
+
+        assert orders == {("Options", "Slider")}
+
 
 class TestDiffParameters:
     def test_traits_in_another_order_are_no_difference(self) -> None:
