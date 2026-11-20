@@ -18,7 +18,13 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.flow_events import (
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
+)
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
     SerializeNodeToCommandsRequest,
     SerializeNodeToCommandsResultSuccess,
 )
@@ -618,3 +624,41 @@ class TestBehaviorComesFromTheNode:
         reloaded = _round_trip(engine, node)
 
         assert _control(reloaded, "reload", Button).on_click_callback.__self__ is not node  # type: ignore[union-attr]
+
+
+class TestReferenceCopiesAreSharedInABatch:
+    """Serializing compares each node with a copy its type builds, and one copy serves a whole save."""
+
+    def test_one_copy_per_type_is_built_for_a_flow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        _ensure_workflow(engine)
+        for name in ("first", "second"):
+            created = engine.handle_request(
+                CreateNodeRequest(
+                    node_type=_DeclaredControls.__name__, specific_library_name=_LIBRARY_NAME, node_name=name
+                )
+            )
+            assert isinstance(created, CreateNodeResultSuccess), created.result_details
+        built = []
+        original_init = _DeclaredControls.__init__
+
+        def counting_init(self: _DeclaredControls, **kwargs) -> None:
+            built.append(kwargs["name"])
+            original_init(self, **kwargs)
+
+        monkeypatch.setattr(_DeclaredControls, "__init__", counting_init)
+        flow = engine.current_workflow().top_level_flow()
+        assert flow is not None
+
+        result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow.name))
+
+        assert isinstance(result, SerializeFlowToCommandsResultSuccess)
+        assert built == ["REFERENCE NODE"]
+
+    def test_a_copy_is_not_kept_past_its_batch(self, engine: Engine) -> None:
+        node = _add_declared_node(engine, "source")
+
+        with engine.node_manager.sharing_reference_nodes():
+            first = engine.node_manager._reference_node_for(node)
+            assert engine.node_manager._reference_node_for(node) is first
+        with engine.node_manager.sharing_reference_nodes():
+            assert engine.node_manager._reference_node_for(node) is not first
