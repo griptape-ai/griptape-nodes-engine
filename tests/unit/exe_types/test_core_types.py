@@ -535,6 +535,19 @@ class TestParameter:
 
         assert orders == {("Options", "Slider")}
 
+    def test_traits_of_one_kind_go_in_the_same_order_every_time(self) -> None:
+        orders = {
+            tuple(
+                tuple(trait.choices)
+                for trait in _make_param(
+                    traits={Options(choices=["a"]), Options(choices=["b"]), Options(choices=["c"])}
+                ).find_elements_by_type(Options)
+            )
+            for _ in range(20)
+        }
+
+        assert orders == {(("a",), ("b",), ("c",))}
+
 
 class TestDiffParameters:
     def test_traits_in_another_order_are_no_difference(self) -> None:
