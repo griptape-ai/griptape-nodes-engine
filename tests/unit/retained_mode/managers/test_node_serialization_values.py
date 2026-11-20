@@ -79,7 +79,7 @@ class _FailsToEncode:
 
 
 class TestSerializedParameterValueTracker:
-    """The tracker records, per value hash, whether a value is serializable and its pool UUID."""
+    """The tracker records, per value, whether it is serializable and its pool UUID."""
 
     def test_unseen_hash_reports_not_in_tracker(self) -> None:
         tracker = SerializedParameterValueTracker()
@@ -91,13 +91,20 @@ class TestSerializedParameterValueTracker:
         tracker.add_as_serializable("value_hash", unique_uuid)
 
         assert tracker.get_tracker_state("value_hash") == SerializedParameterValueTracker.TrackerState.SERIALIZABLE
-        assert tracker.get_uuid_for_value_hash("value_hash") == unique_uuid
+        assert tracker.get_uuid_for_value("value_hash") == unique_uuid
 
     def test_not_serializable_hash_reports_not_serializable(self) -> None:
         tracker = SerializedParameterValueTracker()
         tracker.add_as_not_serializable("bad_value")
 
         assert tracker.get_tracker_state("bad_value") == SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
+
+    def test_a_value_built_for_one_read_is_not_mistaken_for_the_next(self) -> None:
+        """A list parameter's items are built on each read. A freed list's identity must not be reused."""
+        tracker = SerializedParameterValueTracker()
+        tracker.add_as_not_serializable(["first read"])
+
+        assert tracker.get_tracker_state(["second read"]) == SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
 
     def test_serializable_count_counts_distinct_values_not_not_serializable_ones(self) -> None:
         tracker = SerializedParameterValueTracker()
@@ -178,7 +185,7 @@ class TestHandleValueHashing:
         assert first.unique_value_uuid == second.unique_value_uuid
         assert _CountsEncodes.encode_count == 1
 
-    def test_non_serializable_parameter_skips_and_marks_tracker(self) -> None:
+    def test_non_serializable_parameter_skips_without_marking_the_value(self) -> None:
         tracker = SerializedParameterValueTracker()
         pool: dict[Any, Any] = {}
         value = "opted out"
@@ -187,7 +194,19 @@ class TestHandleValueHashing:
 
         assert command is None
         assert pool == {}
-        assert tracker.get_tracker_state(id(value)) == SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
+        assert tracker.get_tracker_state(value) == SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
+
+    def test_a_value_one_parameter_opted_out_of_is_saved_for_another_parameter_holding_it(self) -> None:
+        tracker = SerializedParameterValueTracker()
+        pool: dict[Any, Any] = {}
+        shared = "held by both"
+
+        opted_out = _pool_value(shared, tracker, pool, parameter=_make_param("hidden", serializable=False))
+        saved = _pool_value(shared, tracker, pool, parameter=_make_param("kept"))
+
+        assert opted_out is None
+        assert saved is not None
+        assert set(pool.values()) == {shared}
 
     def test_value_with_no_plain_data_form_is_skipped_and_not_retried(self) -> None:
         tracker = SerializedParameterValueTracker()
