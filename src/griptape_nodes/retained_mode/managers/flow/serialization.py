@@ -433,7 +433,13 @@ class FlowSerialization(EngineScoped):
         return aggregated_commands
 
     @handles(SerializeFlowToCommandsRequest)
-    def on_serialize_flow_to_commands(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_serialize_flow_to_commands(
+        self, request: SerializeFlowToCommandsRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        with self.engine.node_manager.sharing_reference_nodes():
+            return self._serialize_flow_to_commands(request, workflow)
+
+    def _serialize_flow_to_commands(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: SerializeFlowToCommandsRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         flow_name = request.flow_name
