@@ -1270,10 +1270,9 @@ class FlowPackaging(EngineScoped):
                     encoded.reason,
                 )
                 continue
-            value_id = id(param_value)
             unique_param_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
             unique_parameter_uuid_to_values[unique_param_uuid] = encoded
-            serialized_parameter_value_tracker.add_as_serializable(value_id, unique_param_uuid)
+            serialized_parameter_value_tracker.add_as_serializable(param_value, unique_param_uuid)
 
             # Create set parameter value command
             set_value_request = SetParameterValueRequest(
