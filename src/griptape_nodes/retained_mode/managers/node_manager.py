@@ -5589,8 +5589,9 @@ class NodeManager(EngineScoped):
         """Pool ``value``'s encoded form under a hash of its content and return the command that restores it.
 
         Returns None when the value is not to be saved: the parameter opted out, or the value has no
-        plain-data form. The tracker remembers each object's outcome, so a value shared by several
-        parameters is encoded once.
+        plain-data form. The tracker remembers each object's encoding outcome, so a value shared by
+        several parameters is encoded once. It does not remember an opt-out, which is a property of
+        the parameter rather than the value.
         """
         tracker_status = serialized_parameter_value_tracker.get_tracker_state(value)
         match tracker_status:
@@ -5599,9 +5600,9 @@ class NodeManager(EngineScoped):
             case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
                 return None
             case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
-                # Author opt-out, e.g. drivers and file handles.
+                # Author opt-out, e.g. drivers and file handles. It belongs to this parameter, so the
+                # tracker does not keep it: another parameter holding the same object may be saved.
                 if not parameter.serializable:
-                    serialized_parameter_value_tracker.add_as_not_serializable(value)
                     return None
                 encoded = try_encode(value)
                 if isinstance(encoded, Unencodable):
