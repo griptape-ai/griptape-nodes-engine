@@ -1,3 +1,4 @@
-- Switching projects now closes every open workflow, including other tabs'. Before, a workflow left
-  open saved its next outputs into the new project's folders. Switching now fails while a workflow is
-  running, so a run's outputs can't end up split across two projects.
+- **Breaking:** Switching projects (`SetCurrentProjectRequest`) now closes every open workflow, so a
+  workflow left open, such as in another tab, no longer saves its outputs into the new project's
+  folders. Reopen the workflows you need after switching. Switching now fails while a workflow is
+  running, so wait for the run to finish or cancel it first.
