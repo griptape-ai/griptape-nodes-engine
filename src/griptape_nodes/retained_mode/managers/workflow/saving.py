@@ -456,6 +456,10 @@ class WorkflowSaver(EngineScoped):
             continues_open_workflow=continues_open_workflow,
             continues_in_copy=continues_in_copy,
         )
+        # The open workflow's file now holds its graph, unless the save wrote a copy and left it on its own.
+        if continues_open_workflow or continues_in_copy:
+            workflow.has_unsaved_changes = False
+            self.engine.report_workflow_state(workflow)
 
         details = f"Successfully saved workflow to: {save_file_result.file_path}"
         return SaveWorkflowResultSuccess(

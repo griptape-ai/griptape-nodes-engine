@@ -811,6 +811,7 @@ class ContextManager(EngineScoped):
             created_workflow=False,
             created_flow=created_flow,
             open_workflow=self.engine.open_workflow_info(workflow),
+            altered_workflow_state=created_flow,
             result_details=(
                 f"Workflow '{workflow_name}' and Flow '{flow_name}' are ready "
                 f"(created_workflow=False, created_flow={created_flow})."

@@ -160,8 +160,8 @@ workflow the same way. On such a thread they find none.
 need no change: `push_workflow` now binds the workflow it opens, so the calls after it act on that
 workflow, and `pop_workflow` ends the binding.
 
-`WorkflowNotNamedError` in `griptape_nodes.retained_mode.runtime.binding` is no longer raised.
-Code that catches it keeps working; drop the catch when convenient.
+**Library authors.** `WorkflowNotNamedError` is removed from `griptape_nodes.retained_mode.runtime.binding`.
+Drop any import or `except` that names it.
 
 ## Parameter values keep their type
 
