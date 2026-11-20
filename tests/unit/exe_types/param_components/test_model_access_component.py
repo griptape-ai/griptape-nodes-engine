@@ -1163,6 +1163,262 @@ class TestReinstallOptionsKeepsLegacyValues:
         assert {row["name"] for row in param.ui_options["data"]} == {"alpha", "beta"}
 
 
+class TestReinstallOptionsReplaces:
+    def test_reinstall_with_options_present_leaves_exactly_one(self) -> None:
+        """add_trait appends, so reinstall must remove the old Options itself."""
+        _node, helper, param = _build_probe_node_with_component(model_choices=["alpha", "beta"], default_model="alpha")
+        (original,) = param.find_elements_by_type(Options)
+
+        helper.reinstall_options()
+
+        (replacement,) = param.find_elements_by_type(Options)
+        assert replacement is not original
+
+
+def _replay_saved_dropdown(param: Parameter, *, choices: list[str]) -> None:
+    """What a saved workflow does after building the node: restore the dropdown it was saved with."""
+    (options_trait,) = param.find_elements_by_type(Options)
+    options_trait.apply_state({"choices": choices})
+    param.ui_options = {**param.ui_options, "data": [{"name": choice} for choice in choices]}
+
+
+class TestStaleSavedDropdownRepair:
+    """A workflow saved before a model was retired replays that model's dropdown on load."""
+
+    def test_replayed_choices_and_rows_are_replaced_by_the_current_models(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        _replay_saved_dropdown(param, choices=["alpha", "beta", "retired"])
+
+        node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert options_trait.choices == ["alpha", "beta", "retired"]
+        assert [row["name"] for row in param.ui_options["data"]] == ["alpha", "beta"]
+        assert node.get_parameter_value(param.name) == "beta"
+
+    def test_a_retired_value_lands_on_its_replacement(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        _replay_saved_dropdown(param, choices=["alpha", "beta", "retired"])
+
+        node.set_parameter_value(param.name, "retired", initial_setup=True, skip_before_value_set=True)
+
+        assert node.get_parameter_value(param.name) == "beta"
+
+    def test_the_repaired_dropdown_keeps_a_single_options_trait(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        (stale_options,) = param.find_elements_by_type(Options)
+        _replay_saved_dropdown(param, choices=["alpha", "beta", "retired"])
+
+        node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert options_trait is not stale_options
+
+    def test_the_repair_warns_and_names_the_retired_models(self, caplog: pytest.LogCaptureFixture) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        _replay_saved_dropdown(param, choices=["alpha", "beta", "retired"])
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+
+        messages = [record.getMessage() for record in caplog.records if record.levelname == "WARNING"]
+        assert len(messages) == 1
+        assert "'retired'" in messages[0]
+        assert node.name in messages[0]
+
+    def test_it_repairs_once_and_then_stays_quiet(self, caplog: pytest.LogCaptureFixture) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        _replay_saved_dropdown(param, choices=["alpha", "beta", "retired"])
+        node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+        caplog.clear()
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node.set_parameter_value(param.name, "alpha")
+
+        assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
+    def test_a_current_dropdown_is_left_alone_and_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+        )
+        (original,) = param.find_elements_by_type(Options)
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+
+        assert param.find_elements_by_type(Options) == [original]
+        assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
+    def test_a_node_that_stripped_options_is_not_given_them_back(self) -> None:
+        """A node removes Options while a driver is connected; assigning a value must not undo that."""
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        for trait in param.find_elements_by_type(Options):
+            param.remove_trait(trait)
+
+        node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+
+        assert param.find_elements_by_type(Options) == []
+
+
+class TestRuntimeRepopulationIsNotRepaired:
+    """A node may point the dropdown at another list on purpose; only retired models mark it stale."""
+
+    def test_a_third_party_provider_list_survives_the_value_assignment(self, caplog: pytest.LogCaptureFixture) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        param.update_ui_options_key("data", [{"name": "llama3"}, {"name": "mistral"}])
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node._update_option_choices(param.name, ["llama3", "mistral"], "llama3")
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert options_trait.choices == ["llama3", "mistral"]
+        assert [row["name"] for row in param.ui_options["data"]] == ["llama3", "mistral"]
+        assert node.get_parameter_value(param.name) == "llama3"
+        assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
+    def test_a_provider_list_that_includes_a_retired_id_survives(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A provider can legitimately offer an id this node has retired, alongside models it never offered."""
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        provider_models = ["retired", "llama3", "mistral"]
+        param.update_ui_options_key("data", [{"name": name} for name in provider_models])
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node._update_option_choices(param.name, provider_models, "llama3")
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert options_trait.choices == provider_models
+        assert [row["name"] for row in param.ui_options["data"]] == provider_models
+        assert node.get_parameter_value(param.name) == "llama3"
+        assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
+    def test_switching_back_to_the_component_choices_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The Griptape Cloud branch passes model_choices without the deprecated keys."""
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        param.update_ui_options_key("data", [{"name": "llama3"}, {"name": "mistral"}])
+        node._update_option_choices(param.name, ["llama3", "mistral"], "llama3")
+
+        with caplog.at_level("WARNING", logger="griptape_nodes"):
+            node._update_option_choices(param.name, helper.model_choices, "alpha")
+            helper.reinstall_options()
+
+        assert node.get_parameter_value(param.name) == "alpha"
+        assert [record for record in caplog.records if record.levelname == "WARNING"] == []
+
+
+class TestRepairMessageOnTheNode:
+    """A repaired dropdown tells the artist on the node itself, until the model next changes."""
+
+    _MESSAGE_NAME = "model_model_list_updated"
+
+    @staticmethod
+    def _stale_node() -> tuple[_AccessProbeNode, Parameter]:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        _replay_saved_dropdown(param, choices=["alpha", "beta", "retired"])
+        return node, param
+
+    def _message(self, node: _AccessProbeNode):  # noqa: ANN202
+        message = node.get_message_by_name_or_element_id(self._MESSAGE_NAME)
+        assert message is not None
+        return message
+
+    def test_the_message_starts_hidden(self) -> None:
+        node, _helper, _param = _build_probe_node_with_component(model_choices=["alpha", "beta"], default_model="alpha")
+
+        assert self._message(node).ui_options["hide"] is True
+
+    def test_a_repair_shows_a_warning_naming_the_retired_model_and_the_new_selection(self) -> None:
+        node, param = self._stale_node()
+
+        node.set_parameter_value(param.name, "retired", initial_setup=True, skip_before_value_set=True)
+
+        message = self._message(node)
+        assert message.ui_options["hide"] is False
+        assert message.variant == "warning"
+        assert "`retired`" in message.value
+        assert "from `retired` to `beta`" in message.value
+        assert "Save the workflow" in message.value
+
+    def test_it_does_not_claim_a_change_when_the_selection_stayed_put(self) -> None:
+        node, param = self._stale_node()
+
+        node.set_parameter_value(param.name, "alpha", initial_setup=True, skip_before_value_set=True)
+
+        assert "The selected model changed" not in self._message(node).value
+
+    def test_the_next_model_assignment_hides_it(self) -> None:
+        node, param = self._stale_node()
+        node.set_parameter_value(param.name, "retired", initial_setup=True, skip_before_value_set=True)
+
+        node.set_parameter_value(param.name, "alpha")
+
+        assert self._message(node).ui_options["hide"] is True
+
+    def test_nothing_is_shown_when_there_was_nothing_to_repair(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+
+        node.set_parameter_value(param.name, "beta", initial_setup=True, skip_before_value_set=True)
+
+        assert self._message(node).ui_options["hide"] is True
+
+    def test_a_provider_list_never_shows_it(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"retired": "beta"},
+        )
+        param.update_ui_options_key("data", [{"name": "llama3"}, {"name": "mistral"}])
+
+        node._update_option_choices(param.name, ["llama3", "mistral"], "llama3")
+
+        assert self._message(node).ui_options["hide"] is True
+
+
 class TestSelectionReadingApi:
     """The component owns the parameter, so callers never re-derive the current value."""
 
