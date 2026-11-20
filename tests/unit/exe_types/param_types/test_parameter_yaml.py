@@ -1,5 +1,6 @@
 import pytest
 
+from griptape_nodes.exe_types.core_types import InvalidParameterValueError
 from griptape_nodes.exe_types.param_types.parameter_yaml import ParameterYaml
 
 PROSE_WITH_COLON = "CHAR: Annie\nSTYLE:\n  - EDIT: should feel tactile and handled: soft cotton, rough canvas\n"
@@ -7,7 +8,7 @@ PROSE_WITH_COLON = "CHAR: Annie\nSTYLE:\n  - EDIT: should feel tactile and handl
 
 def _rejection(value: str) -> str:
     parameter = ParameterYaml(name="yaml")
-    with pytest.raises(ValueError, match="not valid YAML") as exc_info:
+    with pytest.raises(InvalidParameterValueError, match="Invalid YAML") as exc_info:
         parameter._convert_to_yaml(value)
     return str(exc_info.value)
 
@@ -16,7 +17,7 @@ class TestInvalidYamlMessage:
     def test_colon_in_a_value_suggests_quoting_or_a_block_scalar(self) -> None:
         message = _rejection(PROSE_WITH_COLON)
 
-        assert "a value contains a colon followed by a space" in message
+        assert "A colon followed by a space starts a new key" in message
         assert "wrap the value in quotes" in message
         assert "key: |" in message
 
@@ -36,22 +37,23 @@ class TestInvalidYamlMessage:
 
         assert "day is out of range for month" in message
 
-    def test_names_the_line_and_column(self) -> None:
+    def test_names_and_quotes_the_line(self) -> None:
         message = _rejection(PROSE_WITH_COLON)
 
-        assert "line 3, column 42" in message
-        assert "Line 3: - EDIT: should feel tactile and handled: soft cotton, rough canvas" in message
+        assert message.startswith(
+            "Invalid YAML on line 3: - EDIT: should feel tactile and handled: soft cotton, rough canvas\n"
+        )
 
     def test_other_errors_skip_the_colon_hint(self) -> None:
         message = _rejection("a: [1, 2")
 
-        assert "line 1, column 9" in message
+        assert "Invalid YAML on line 1: a: [1, 2" in message
         assert "wrap the value in quotes" not in message
 
     def test_misindented_key_skips_the_colon_hint(self) -> None:
         message = _rejection("a: b\n  c: d")
 
-        assert "mapping values are not allowed here" in message
+        assert "Mapping values are not allowed here." in message
         assert "wrap the value in quotes" not in message
 
     @pytest.mark.parametrize(
