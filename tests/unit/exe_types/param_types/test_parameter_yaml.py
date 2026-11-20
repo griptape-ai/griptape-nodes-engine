@@ -41,7 +41,7 @@ class TestInvalidYamlMessage:
         message = _rejection(PROSE_WITH_COLON)
 
         assert message.startswith(
-            "Invalid YAML on line 3: - EDIT: should feel tactile and handled: soft cotton, rough canvas\n"
+            "Invalid YAML on line 3: - EDIT: should feel tactile and handled: soft cotton, rough canvas\n\n"
         )
 
     def test_other_errors_skip_the_colon_hint(self) -> None:

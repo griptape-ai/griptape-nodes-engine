@@ -3081,7 +3081,7 @@ class NodeManager(EngineScoped):
         try:
             finalized_value, modified = self._set_and_pass_through_values(request, node)
         except InvalidParameterValueError as err:
-            details = f"Couldn't set '{node_name}.{request.parameter_name}'. {err}"
+            details = f"Couldn't set '{node_name}.{request.parameter_name}'.\n\n{err}"
             return SetParameterValueResultFailure(result_details=details)
         except Exception as err:
             details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because Exception: {err}"

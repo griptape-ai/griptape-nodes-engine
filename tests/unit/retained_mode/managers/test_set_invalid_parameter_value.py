@@ -36,6 +36,6 @@ def test_rejected_yaml_reports_only_the_yaml_message(engine: Engine, tmp_path: P
 
     assert isinstance(result, SetParameterValueResultFailure), result
     assert str(result.result_details).startswith(
-        "Couldn't set 'YAML Input.yaml'. Invalid YAML on line 2: hi2: there: here\n"
+        "Couldn't set 'YAML Input.yaml'.\n\nInvalid YAML on line 2: hi2: there: here\n\n"
         "A colon followed by a space starts a new key."
     )

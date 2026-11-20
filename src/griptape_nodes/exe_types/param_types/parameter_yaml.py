@@ -33,10 +33,10 @@ def _describe_yaml_error(value: str, error: Exception) -> str:
 
     # Several words before the colon read as prose; a lone word is more likely a misplaced key.
     if error.problem == _MAPPING_VALUES_PROBLEM and " " in line[: error.problem_mark.column].strip():
-        return f"{heading}\nA colon followed by a space starts a new key. {_colon_in_value_hint(line)}"
+        return f"{heading}\n\nA colon followed by a space starts a new key. {_colon_in_value_hint(line)}"
 
     problem = error.problem or "invalid syntax"
-    return f"{heading}\n{problem[0].upper()}{problem[1:]}."
+    return f"{heading}\n\n{problem[0].upper()}{problem[1:]}."
 
 
 class ParameterYaml(Parameter):
