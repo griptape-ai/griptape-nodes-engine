@@ -296,6 +296,24 @@ class TestNodeLockChanges:
         assert result.succeeded(), result.result_details
         assert engine.open_workflow_info(workflow).state.has_unsaved_changes
 
+    def test_locking_a_locked_node_changes_nothing(self, engine: Engine) -> None:
+        workflow = _open(engine, "locked")
+        _add_node(workflow, {}).lock = True
+
+        result = _send(engine, SetLockNodeStateRequest(node_name="node", lock=True), workflow)
+
+        assert result.succeeded(), result.result_details
+        assert not engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+    def test_locking_nodes_together_that_are_all_locked_changes_nothing(self, engine: Engine) -> None:
+        workflow = _open(engine, "locked")
+        _add_node(workflow, {}).lock = True
+
+        result = _send(engine, BatchSetNodeLockStateRequest(node_names=["node"], lock=True), workflow)
+
+        assert result.succeeded(), result.result_details
+        assert not engine.open_workflow_info(workflow).state.has_unsaved_changes
+
 
 @dataclass
 class _Spec(RunSpec):
