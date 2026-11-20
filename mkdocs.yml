@@ -192,6 +192,7 @@ plugins:
           - development/custom_nodes/node_isolation_with_workers.md: Running a library's node execution in a worker subprocess for dependency isolation
           - development/custom_nodes/passing_unserializable_values.md: Passing pipelines, tensors and other unserializable values between nodes across a worker process boundary
           - development/custom_nodes/strict_mode.md: Strict-mode rules checked while a node executes
+          - development/designs/artifact_provenance.md: Design for immutable per-save provenance records with lineage, history, and a query API
         Reference:
           - reference/command_line_interface.md: gtn CLI reference
           - reference/configuration_reference.md: Every engine setting with type, default, and env var
@@ -580,6 +581,8 @@ nav:
           - Strict Mode Reference: development/custom_nodes/strict_mode.md
           - Example Control Node: development/custom_nodes/example_control_node.py
           - Example NodeError Node: development/custom_nodes/example_node_error_node.py
+      - Designs:
+          - Artifact Provenance: development/designs/artifact_provenance.md
       - For Agents: for_agents.md
   - Reference:
       - Command Line Interface: reference/command_line_interface.md

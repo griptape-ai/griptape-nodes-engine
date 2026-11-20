@@ -17,6 +17,7 @@ from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT
 from griptape_nodes.utils import resolve_workspace_path
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
     from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.os_manager import OSManager
@@ -127,7 +128,7 @@ class LocalStorageDriver(BaseStorageDriver):
             "file_path": str(resolved_path),
         }
 
-    def save_file(
+    def save_file(  # noqa: PLR0913
         self,
         path: Path,
         file_content: bytes,
@@ -135,6 +136,7 @@ class LocalStorageDriver(BaseStorageDriver):
         *,
         skip_metadata_injection: bool = False,
         file_metadata: SidecarContent | None = None,
+        provenance: ProvenanceContent | None = None,
     ) -> str:
         """Save a file to local storage by writing directly to disk.
 
@@ -144,6 +146,7 @@ class LocalStorageDriver(BaseStorageDriver):
             existing_file_policy: How to handle existing files. Defaults to OVERWRITE.
             skip_metadata_injection: If True, skip automatic workflow metadata injection.
             file_metadata: Optional caller-provided context for sidecar metadata generation.
+            provenance: Optional provenance election forwarded to the write; None preserves the legacy shim behavior.
 
         Returns:
             The absolute file path where the file was saved.
@@ -161,6 +164,7 @@ class LocalStorageDriver(BaseStorageDriver):
                 existing_file_policy=existing_file_policy,
                 skip_metadata_injection=skip_metadata_injection,
                 file_metadata=file_metadata,
+                provenance=provenance,
             )
         )
 

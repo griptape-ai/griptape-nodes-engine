@@ -10,10 +10,12 @@ from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.project_output_parameter import ProjectOutputParameter
 from griptape_nodes.files.file import FileDestination
 from griptape_nodes.files.project_file import ProjectFileDestination, file_destination_from_spec
+from griptape_nodes.node_library.library_registry import LibraryRegistry, LibraryRegistryError
 from griptape_nodes.retained_mode.events.destination_events import (
     GetConnectedFileDestinationRequest,
     GetConnectedFileDestinationResultSuccess,
 )
+from griptape_nodes.retained_mode.file_metadata.provenance_record import ProducingNodeIdentity
 from griptape_nodes.traits.file_system_picker import FileSystemPicker
 
 
@@ -125,5 +127,33 @@ class ProjectFileParameter(ProjectOutputParameter):
             self._node.workflow,
             filename,
             self._situation_name,
+            producing_node=self._producing_node_identity(),
             **extra_vars,
+        )
+
+    def _producing_node_identity(self) -> ProducingNodeIdentity:
+        """Attested identity of the saving node, for the provenance record.
+
+        This component KNOWS which node is saving, so the record never falls
+        back to the engine's resolving-node inference (which picks the wrong
+        node in parallel flows). The node's "library" metadata entry is only
+        the disambiguation hint (multiple libraries can register the same node
+        type); the registry is the authority for the library's name and version.
+        """
+        node_type = type(self._node).__name__
+        library_name: str | None = self._node.metadata.get("library")
+        library_version: str | None = None
+        try:
+            library = LibraryRegistry.get_library_for_node_type(node_type, library_name)
+        except LibraryRegistryError:
+            # Unregistered node type (e.g. a bare test node): keep the hint, no version.
+            pass
+        else:
+            library_name = library.get_library_data().name
+            library_version = library.get_metadata().library_version
+        return ProducingNodeIdentity(
+            name=self._node.name,
+            node_type=node_type,
+            library_name=library_name,
+            library_version=library_version,
         )

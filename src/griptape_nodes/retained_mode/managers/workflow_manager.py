@@ -6,6 +6,7 @@ import logging
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
@@ -112,6 +113,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
     from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecutionResult
@@ -462,6 +464,36 @@ class WorkflowManager(EngineScoped):
     def squelch_workflow_altered(self) -> WorkflowSquelchContext:
         """Suppress workflow-altered events for the duration of the `with` block."""
         return self.WorkflowSquelchContext(self)
+
+    def render_workflow_file_content(
+        self,
+        *,
+        serialized_flow_commands: SerializedFlowCommands,
+        file_name: str,
+        creation_date: datetime | None = None,
+    ) -> str:
+        """Render the exact workflow .py content a save would write, without touching disk or the registry.
+
+        Used by provenance capture to embed a durable workflow snapshot in
+        records: the .py format is the engine's versioned, migration-supported
+        container, so the rendered text can be extracted and loaded years later.
+        No version stamps roll and nothing is registered.
+
+        Raises:
+            TypeError: If the engine version cannot be determined.
+            ValueError: If the metadata header cannot be generated.
+        """
+        if creation_date is None:
+            creation_date = datetime.now(tz=UTC)
+        workflow_metadata = self.codegen.generate_workflow_metadata_from_commands(
+            serialized_flow_commands=serialized_flow_commands,
+            file_name=file_name,
+            creation_date=creation_date,
+        )
+        return self.codegen.generate_workflow_file_content(
+            serialized_flow_commands=serialized_flow_commands,
+            workflow_metadata=workflow_metadata,
+        )
 
     def should_squelch_workflow_altered(self) -> bool:
         return _squelch_workflow_altered_depth.get() > 0

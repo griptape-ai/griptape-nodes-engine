@@ -7,7 +7,6 @@ resolves for the only open one until clients name theirs on the request envelope
 
 from __future__ import annotations
 
-import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -308,8 +307,15 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
         assert Path(result.final_file_path) == _folder(tmp_path / "addressed" / "outputs" / "notes.txt")
         assert not (tmp_path / "open" / "outputs").exists()
 
-    def test_a_sidecar_records_the_addressed_workflow(self, nothing_open: Engine, tmp_path: Path) -> None:
-        open_workflow = _open(nothing_open, tmp_path / "open")
+    def test_legacy_file_metadata_writes_land_in_the_addressed_workflow_without_a_sidecar(
+        self, nothing_open: Engine, tmp_path: Path
+    ) -> None:
+        """The mutable sidecar is retired; `file_metadata` shims into provenance capture instead.
+
+        The write still lands in the addressed workflow's directory, no `.griptape-nodes-metadata`
+        sidecar appears, and with no project provenance election nothing records either.
+        """
+        _open(nothing_open, tmp_path / "open")
         addressed = _open(nothing_open, tmp_path / "addressed")
         written = tmp_path / "addressed" / "notes.txt"
 
@@ -322,11 +328,11 @@ class TestFileHandlersResolveForTheDispatchedWorkflow:
         )
 
         assert isinstance(result, WriteFileResultSuccess), result.result_details
-        sidecars = list((tmp_path / "addressed" / ".griptape-nodes-metadata").rglob("notes.txt.json"))
-        assert len(sidecars) == 1
-        recorded_name = json.loads(sidecars[0].read_text())["workflow"]["name"]
-        assert recorded_name == nothing_open.workflow_registry.get(addressed.workflow_id).name
-        assert recorded_name != nothing_open.workflow_registry.get(open_workflow.workflow_id).name
+        assert Path(result.final_file_path) == written
+        assert not (tmp_path / "addressed" / ".griptape-nodes-metadata").exists()
+        assert not (tmp_path / "open" / ".griptape-nodes-metadata").exists()
+        assert result.provenance is None
+        assert not list(tmp_path.rglob("griptape-nodes-provenance"))
 
     def test_list_directory_resolves_a_macro_for_the_addressed_workflow(
         self, nothing_open: Engine, tmp_path: Path

@@ -34,6 +34,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     MacroPath,
     SetCurrentProjectRequest,
 )
+from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceRecord, load_record_yaml
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent, SituationMetadata
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
@@ -59,6 +60,13 @@ async def _write(engine: Engine, template: str, content: bytes | str, **kwargs: 
 def _written_name(result: object) -> str:
     assert isinstance(result, WriteFileResultSuccess), result
     return Path(result.final_file_path).name
+
+
+def _record_of(result: object) -> ProvenanceRecord:
+    """Load the provenance record a successful write reported."""
+    assert isinstance(result, WriteFileResultSuccess), result
+    assert result.provenance is not None
+    return load_record_yaml(Path(result.provenance.record_path).read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -191,14 +199,15 @@ class TestImageSavePaths:
         assert stage.call_count == 0
 
     @pytest.mark.asyncio
-    async def test_the_sidecar_records_the_values_the_path_used(self, engine: Engine) -> None:
+    async def test_the_record_captures_the_values_the_path_used(self, engine: Engine) -> None:
+        """The provenance record's situation carries the `media.*` values the path resolved with."""
         template = "{outputs}/render_{media.width}.png"
         metadata = SidecarContent(situation=SituationMetadata(name="custom", macro=template, variables={}))
-        with patch("griptape_nodes.retained_mode.managers.filesystem.file_writing.write_sidecar") as write_sidecar:
-            await _write(engine, template, _png_bytes(12, 5), file_metadata=metadata)
+        result = await _write(engine, template, _png_bytes(12, 5), file_metadata=metadata)
 
-        recorded = write_sidecar.call_args.args[1]
-        assert recorded.situation.variables == {
+        record = _record_of(result)
+        assert record.situation is not None
+        assert record.situation.variables == {
             "media.width": "12",
             "media.height": "5",
             "media.channels": "3",
@@ -206,28 +215,34 @@ class TestImageSavePaths:
         }
 
     @pytest.mark.asyncio
-    async def test_reused_sidecar_metadata_does_not_carry_values_into_the_next_save(self, engine: Engine) -> None:
+    async def test_reused_metadata_does_not_carry_values_into_the_next_save(self, engine: Engine) -> None:
+        """Each record describes its own write; the caller's reused metadata object stays untouched."""
         template = "{outputs}/render{media.width?:^_}.{file_extension}"
         metadata = SidecarContent(
             situation=SituationMetadata(name="custom", macro=template, variables={"file_extension": "png"})
         )
-        with patch("griptape_nodes.retained_mode.managers.filesystem.file_writing.write_sidecar") as write_sidecar:
-            request = WriteFileRequest(
-                file_path=MacroPath(ParsedMacro(template), {"file_extension": "png"}),
-                content=_png_bytes(12, 5),
-                file_metadata=metadata,
-            )
-            await engine.os_manager.writer.on_write_file_request(request, engine.current_workflow())
-            request = WriteFileRequest(
-                file_path=MacroPath(ParsedMacro(template), {"file_extension": "txt"}),
-                content="just text",
-                file_metadata=metadata,
-            )
-            await engine.os_manager.writer.on_write_file_request(request, engine.current_workflow())
+        request = WriteFileRequest(
+            file_path=MacroPath(ParsedMacro(template), {"file_extension": "png"}),
+            content=_png_bytes(12, 5),
+            file_metadata=metadata,
+        )
+        first = await engine.os_manager.writer.on_write_file_request(request, engine.current_workflow())
+        request = WriteFileRequest(
+            file_path=MacroPath(ParsedMacro(template), {"file_extension": "png"}),
+            content=_png_bytes(7, 5),
+            file_metadata=metadata,
+        )
+        second = await engine.os_manager.writer.on_write_file_request(request, engine.current_workflow())
 
-        image_sidecar, text_sidecar = (call.args[1] for call in write_sidecar.call_args_list)
-        assert image_sidecar.situation.variables["media.width"] == "12"
-        assert text_sidecar.situation.variables == {"file_extension": "png"}
+        first_record = _record_of(first)
+        second_record = _record_of(second)
+        assert first_record.situation is not None
+        assert first_record.situation.variables is not None
+        assert first_record.situation.variables["media.width"] == "12"
+        assert second_record.situation is not None
+        assert second_record.situation.variables is not None
+        assert second_record.situation.variables["media.width"] == "7"
+        # The caller's object is untouched: nothing from either write leaked into it.
         assert metadata.situation is not None
         assert metadata.situation.variables == {"file_extension": "png"}
 

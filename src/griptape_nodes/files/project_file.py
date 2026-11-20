@@ -16,8 +16,11 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectResultSuccess,
     MacroPath,
 )
+from griptape_nodes.retained_mode.file_metadata.provenance_record import (
+    ProducingNodeIdentity,
+    ProvenanceContent,
+)
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
-    SidecarContent,
     SituationMetadata,
     SituationPolicy,
 )
@@ -54,6 +57,7 @@ def file_destination_from_spec(spec: FileDestinationSpec, workflow: "WorkflowRun
         append=spec.append,
         create_parents=spec.create_parents,
         file_metadata=spec.file_metadata,
+        provenance=spec.provenance,
         coerce_extension_to_match_bytes=spec.coerce_extension_to_match_bytes,
         workflow=workflow,
     )
@@ -108,6 +112,8 @@ class ProjectFileDestination(FileDestination):
         cls,
         filename: str,
         situation: str,
+        *,
+        producing_node: ProducingNodeIdentity | None = None,
         **extra_vars: str | int,
     ) -> "ProjectFileDestination":
         """Build a ProjectFileDestination from a project situation template.
@@ -121,12 +127,15 @@ class ProjectFileDestination(FileDestination):
         Args:
             filename: Filename to parse into base and extension components.
             situation: Situation name to look up in the current project.
+            producing_node: Explicit identity of the node performing the save,
+                recorded in the provenance record. When omitted, the engine
+                infers the node from flow state and flags the record as inferred.
             **extra_vars: Additional macro variables (e.g., node_name="MyNode", _index=1).
 
         Raises:
             ValueError: If the filename is a URL that names no local file.
         """
-        return cls.from_situation_in_workflow(None, filename, situation, **extra_vars)
+        return cls.from_situation_in_workflow(None, filename, situation, producing_node=producing_node, **extra_vars)
 
     @classmethod
     def from_situation_in_workflow(
@@ -135,6 +144,8 @@ class ProjectFileDestination(FileDestination):
         /,
         filename: str,
         situation: str,
+        *,
+        producing_node: ProducingNodeIdentity | None = None,
         **extra_vars: str | int,
     ) -> "ProjectFileDestination":
         """`from_situation`, looking the situation up and writing in `workflow`.
@@ -218,15 +229,16 @@ class ProjectFileDestination(FileDestination):
         # The URI keeps its own flag because `file:///renders/out.png` is not is_absolute()
         # on Windows, where a driveless path is current-drive-relative; without it that URI
         # would fall into sub_dirs on Windows only.
-        # No sidecar metadata: the situation macro + variables won't re-resolve to the
-        # actual on-disk location, so recording them would produce a dishonest
-        # provenance trail.
+        # Provenance still captures (the record's path, hash, and node are the
+        # on-disk truth), but its situation block is dropped -- the situation
+        # macro + variables won't re-resolve to the actual on-disk location, so
+        # recording them would produce a dishonest provenance trail.
         if local_path_from_uri is not None or parts.directory.is_absolute():
             return cls(
                 filename,
                 existing_file_policy=existing_file_policy,
                 create_parents=create_dirs,
-                file_metadata=None,
+                provenance=ProvenanceContent(producing_node=producing_node, situation=None),
                 workflow=workflow,
             )
 
@@ -250,17 +262,15 @@ class ProjectFileDestination(FileDestination):
         # same derived values the write used.
         macro_path = MacroPath(ParsedMacro(resolved.macro_template), variables)
 
-        file_metadata = (
-            SidecarContent(
-                situation=SituationMetadata(
-                    name=situation,
-                    macro=situation_obj.macro,
-                    policy=SituationPolicy(
-                        on_collision=situation_obj.policy.on_collision,
-                        create_dirs=situation_obj.policy.create_dirs,
-                    ),
-                    variables={k: str(v) for k, v in macro_path.variables.items()},
+        situation_metadata = (
+            SituationMetadata(
+                name=situation,
+                macro=situation_obj.macro,
+                policy=SituationPolicy(
+                    on_collision=situation_obj.policy.on_collision,
+                    create_dirs=situation_obj.policy.create_dirs,
                 ),
+                variables={k: str(v) for k, v in macro_path.variables.items()},
             )
             if situation_obj is not None
             else None
@@ -270,6 +280,6 @@ class ProjectFileDestination(FileDestination):
             macro_path,
             existing_file_policy=existing_file_policy,
             create_parents=create_dirs,
-            file_metadata=file_metadata,
+            provenance=ProvenanceContent(producing_node=producing_node, situation=situation_metadata),
             workflow=workflow,
         )
