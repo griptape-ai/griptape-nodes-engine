@@ -259,6 +259,23 @@ class TestBaseNodeElement:
         elements = ui_element.find_elements_by_type(element_type)
         assert len(elements) == num_expected
 
+    def test_find_element_by_type_and_name_returns_the_first_in_tree_order(self) -> None:
+        with BaseNodeElement() as root:
+            with ParameterGroup(name="shared"):
+                first = _make_param("shared")
+            second = _make_param("shared")
+
+        assert root.find_element_by_type_and_name(Parameter, "shared") is first
+        assert root.find_elements_by_type(Parameter) == [first, second]
+
+    def test_find_element_by_type_and_name_skips_other_types(self) -> None:
+        with BaseNodeElement() as root:
+            ParameterGroup(name="shared")
+            parameter = _make_param("shared")
+
+        assert root.find_element_by_type_and_name(Parameter, "shared") is parameter
+        assert root.find_element_by_type_and_name(Parameter, "missing") is None
+
     def test_remove_child(self, ui_element: BaseNodeElement) -> None:
         element_to_remove = ui_element.find_element_by_id("leaf1")
 
