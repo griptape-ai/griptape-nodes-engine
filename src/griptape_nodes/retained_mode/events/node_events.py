@@ -297,8 +297,12 @@ class SetNodeMetadataRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetNodeMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Node metadata updated successfully. New metadata stored and available for future requests."""
+class SetNodeMetadataResultSuccess(ResultPayloadSuccess):
+    """Node metadata updated successfully. New metadata stored and available for future requests.
+
+    `altered_workflow_state` is False when the request changed no value, or only recorded the size of a
+    node that had none, as the editor does the first time it draws a node.
+    """
 
 
 @dataclass
@@ -329,8 +333,10 @@ class BatchSetNodeMetadataRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class BatchSetNodeMetadataResultSuccess(ResultPayloadSuccess):
     """Batch node metadata update completed successfully.
+
+    `altered_workflow_state` is True when any node's update altered it, as `SetNodeMetadataResultSuccess` decides.
 
     Args:
         updated_nodes: List of node names that were successfully updated

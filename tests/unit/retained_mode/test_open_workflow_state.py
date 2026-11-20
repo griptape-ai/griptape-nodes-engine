@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.app_events import (
     OpenWorkflowState,
     WorkflowRunState,
@@ -27,6 +28,11 @@ from griptape_nodes.retained_mode.events.context_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import StartFlowResultFailure, StartFlowResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import SetFlowMetadataRequest
+from griptape_nodes.retained_mode.events.node_events import (
+    BatchSetNodeMetadataRequest,
+    SetNodeMetadataRequest,
+    SetNodeMetadataResultSuccess,
+)
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
@@ -200,6 +206,72 @@ class TestUnsavedChanges:
 
         assert isinstance(result, SaveWorkflowResultSuccess), result.result_details
         assert not engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+
+def _add_node(workflow: WorkflowRuntime, metadata: dict[str, Any]) -> MagicMock:
+    node = MagicMock(spec=BaseNode)
+    node.name = "node"
+    node.metadata = metadata
+    workflow.objects.add(node.name, node)
+    return node
+
+
+class TestNodeMetadataChanges:
+    def test_recording_the_size_of_a_node_that_has_none_changes_nothing(self, engine: Engine) -> None:
+        workflow = _open(engine, "drawn")
+        node = _add_node(workflow, {"position": {"x": 0, "y": 0}})
+
+        result = _send(
+            engine,
+            SetNodeMetadataRequest(
+                node_name="node",
+                metadata={"position": {"x": 0, "y": 0}, "size": {"width": 600, "height": 632}},
+            ),
+            workflow,
+        )
+
+        assert isinstance(result, SetNodeMetadataResultSuccess), result.result_details
+        assert node.metadata["size"] == {"width": 600, "height": 632}
+        assert not engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+    def test_writing_the_values_it_already_has_changes_nothing(self, engine: Engine) -> None:
+        workflow = _open(engine, "drawn")
+        _add_node(workflow, {"position": {"x": 5, "y": 5}, "size": {"width": 10, "height": 10}})
+
+        _send(engine, SetNodeMetadataRequest(node_name="node", metadata={"position": {"x": 5, "y": 5}}), workflow)
+
+        assert not engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            pytest.param({"size": {"width": 20, "height": 20}}, id="resize"),
+            pytest.param({"position": {"x": 9, "y": 9}}, id="move"),
+            pytest.param({"size": {"width": 10, "height": 10}, "color": "red"}, id="first size with another change"),
+        ],
+    )
+    def test_a_change_marks_it(self, engine: Engine, metadata: dict[str, Any]) -> None:
+        workflow = _open(engine, "edited")
+        existing = {"position": {"x": 5, "y": 5}}
+        if "color" not in metadata:
+            existing["size"] = {"width": 10, "height": 10}
+        _add_node(workflow, existing)
+
+        _send(engine, SetNodeMetadataRequest(node_name="node", metadata=metadata), workflow)
+
+        assert engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+    def test_a_batch_marks_it_when_one_node_changed(self, engine: Engine) -> None:
+        workflow = _open(engine, "edited")
+        _add_node(workflow, {"position": {"x": 5, "y": 5}})
+
+        size_only = BatchSetNodeMetadataRequest(node_metadata_updates={"node": {"size": {"width": 1, "height": 1}}})
+        _send(engine, size_only, workflow)
+        assert not engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+        moved = BatchSetNodeMetadataRequest(node_metadata_updates={"node": {"position": {"x": 6, "y": 6}}})
+        _send(engine, moved, workflow)
+        assert engine.open_workflow_info(workflow).state.has_unsaved_changes
 
 
 @dataclass
