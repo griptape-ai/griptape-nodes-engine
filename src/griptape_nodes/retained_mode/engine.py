@@ -114,6 +114,7 @@ if TYPE_CHECKING:
         StaticFilesManager,
     )
     from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+    from griptape_nodes.retained_mode.managers.undo.manager import UndoManager
     from griptape_nodes.retained_mode.managers.user_manager import UserManager
     from griptape_nodes.retained_mode.managers.variable_manager import (
         VariablesManager,
@@ -232,6 +233,7 @@ class Engine:
     _manifest_manager: ManifestManager
     _budget_manager: BudgetManager
     _diagnostics_manager: DiagnosticsManager
+    _undo_manager: UndoManager
     _worker_manager: WorkerManager
     _lifecycle: EngineLifecycle
     _workflow_registry: _WorkflowRegistry
@@ -276,6 +278,7 @@ class Engine:
             StaticFilesManager,
         )
         from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+        from griptape_nodes.retained_mode.managers.undo.manager import UndoManager
         from griptape_nodes.retained_mode.managers.user_manager import UserManager
         from griptape_nodes.retained_mode.managers.variable_manager import (
             VariablesManager,
@@ -342,6 +345,7 @@ class Engine:
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
         self._budget_manager = BudgetManager(self._event_manager, engine=self)
         self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
+        self._undo_manager = UndoManager(self._event_manager, engine=self)
         # Attached by the app; None while this engine cannot reach other engines.
         self._engine_transports: EngineTransports | None = None
         self._lifecycle = EngineLifecycle(self)
@@ -467,6 +471,10 @@ class Engine:
     @property
     def diagnostics_manager(self) -> DiagnosticsManager:
         return self._diagnostics_manager
+
+    @property
+    def undo_manager(self) -> UndoManager:
+        return self._undo_manager
 
     @property
     def worker_manager(self) -> WorkerManager:
