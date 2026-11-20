@@ -4502,7 +4502,7 @@ class NodeManager(EngineScoped):
             workflow: The workflow the group is in
             group_node: The group node to serialize
             unique_uuid_to_values: Shared pool of encoded parameter values, keyed by content
-            serialized_parameter_value_tracker: Tracker for parameter value hashes
+            serialized_parameter_value_tracker: Remembers how each value was saved
             serialize_all_parameter_values: If True, capture every parameter value on the group and
                 on each child, not just the ones the ordinary save condition would record
 
@@ -5622,26 +5622,25 @@ class NodeManager(EngineScoped):
         plain-data form. The tracker remembers each object's outcome, so a value shared by several
         parameters is encoded once.
         """
-        value_id = id(value)
-        tracker_status = serialized_parameter_value_tracker.get_tracker_state(value_id)
+        tracker_status = serialized_parameter_value_tracker.get_tracker_state(value)
         match tracker_status:
             case SerializedParameterValueTracker.TrackerState.SERIALIZABLE:
-                unique_uuid = serialized_parameter_value_tracker.get_uuid_for_value_hash(value_id)
+                unique_uuid = serialized_parameter_value_tracker.get_uuid_for_value(value)
             case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
                 return None
             case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
                 # Author opt-out, e.g. drivers and file handles.
                 if not parameter.serializable:
-                    serialized_parameter_value_tracker.add_as_not_serializable(value_id)
+                    serialized_parameter_value_tracker.add_as_not_serializable(value)
                     return None
                 encoded = try_encode(value)
                 if isinstance(encoded, Unencodable):
                     logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, encoded.reason)
-                    serialized_parameter_value_tracker.add_as_not_serializable(value_id)
+                    serialized_parameter_value_tracker.add_as_not_serializable(value)
                     return None
                 unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
                 unique_parameter_uuid_to_values[unique_uuid] = encoded
-                serialized_parameter_value_tracker.add_as_serializable(value_id, unique_uuid)
+                serialized_parameter_value_tracker.add_as_serializable(value, unique_uuid)
 
         # Serialize it
         set_value_command = SetParameterValueRequest(
@@ -5680,7 +5679,7 @@ class NodeManager(EngineScoped):
             parameter (Parameter): The parameter object containing metadata
             node (BaseNode): The node object that contains the parameter
             unique_parameter_uuid_to_values (dict[SerializedNodeCommands.UniqueParameterValueUUID, Any]): Dictionary mapping unique value UUIDs to values
-            serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
+            serialized_parameter_value_tracker (SerializedParameterValueTracker): Remembers how each value was saved, by identity
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
 

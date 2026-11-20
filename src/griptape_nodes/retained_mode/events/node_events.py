@@ -514,52 +514,44 @@ class SerializedNodeCommands:
 
 @dataclass
 class SerializedParameterValueTracker:
-    """Tracks the serialization state of parameter value hashes.
+    """Remembers how each value met while serializing was saved, so a value several parameters share is encoded once.
 
-    This class manages the relationship between value hashes and their unique UUIDs,
-    indicating whether a value is serializable or not. It allows the addition of both
-    serializable and non-serializable value hashes and provides methods to retrieve
-    the serialization state and unique UUIDs for given value hashes.
-
-    Attributes:
-        _value_hash_to_unique_value_uuid (dict[Any, SerializedNodeCommands.UniqueParameterValueUUID]):
-            A dictionary mapping value hashes to their unique UUIDs when they are serializable.
-        _non_serializable_value_hashes (set[Any]):
-            A set of value hashes that are not serializable.
+    Values are told apart by identity, and the tracker holds every value it has seen. A value read
+    from a node can be built on each read, such as a list parameter's items, and without the hold it
+    could be freed and its identity reused by another value, which would then be saved as the first.
     """
 
     class TrackerState(Enum):
-        """State of a value hash in the tracker."""
+        """How a value was saved."""
 
         NOT_IN_TRACKER = auto()
         SERIALIZABLE = auto()
         NOT_SERIALIZABLE = auto()
 
-    _value_hash_to_unique_value_uuid: dict[Any, SerializedNodeCommands.UniqueParameterValueUUID] = field(
-        default_factory=dict
-    )
-    _non_serializable_value_hashes: set[Any] = field(default_factory=set)
+    # Keyed by id(value). Each entry holds the value, so the id stays its own.
+    _serializable: dict[int, tuple[Any, SerializedNodeCommands.UniqueParameterValueUUID]] = field(default_factory=dict)
+    _non_serializable: dict[int, Any] = field(default_factory=dict)
 
-    def get_tracker_state(self, value_hash: Any) -> TrackerState:
-        if value_hash in self._non_serializable_value_hashes:
+    def get_tracker_state(self, value: Any) -> TrackerState:
+        if id(value) in self._non_serializable:
             return SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
-        if value_hash in self._value_hash_to_unique_value_uuid:
+        if id(value) in self._serializable:
             return SerializedParameterValueTracker.TrackerState.SERIALIZABLE
         return SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
 
     def add_as_serializable(
-        self, value_hash: Any, unique_value_uuid: SerializedNodeCommands.UniqueParameterValueUUID
+        self, value: Any, unique_value_uuid: SerializedNodeCommands.UniqueParameterValueUUID
     ) -> None:
-        self._value_hash_to_unique_value_uuid[value_hash] = unique_value_uuid
+        self._serializable[id(value)] = (value, unique_value_uuid)
 
-    def add_as_not_serializable(self, value_hash: Any) -> None:
-        self._non_serializable_value_hashes.add(value_hash)
+    def add_as_not_serializable(self, value: Any) -> None:
+        self._non_serializable[id(value)] = value
 
-    def get_uuid_for_value_hash(self, value_hash: Any) -> SerializedNodeCommands.UniqueParameterValueUUID:
-        return self._value_hash_to_unique_value_uuid[value_hash]
+    def get_uuid_for_value(self, value: Any) -> SerializedNodeCommands.UniqueParameterValueUUID:
+        return self._serializable[id(value)][1]
 
     def get_serializable_count(self) -> int:
-        return len(self._value_hash_to_unique_value_uuid)
+        return len(self._serializable)
 
 
 @dataclass
