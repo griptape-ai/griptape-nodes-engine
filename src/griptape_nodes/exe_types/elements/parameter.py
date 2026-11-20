@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 import warnings
@@ -25,7 +26,12 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
-from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value, changed_trait_states
+from griptape_nodes.exe_types.trait_state import (
+    TraitStateEntry,
+    as_saved_state_value,
+    changed_trait_states,
+    same_trait_states,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -260,10 +266,12 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
             },
         )
         if traits:
-            for trait in traits:
-                # Add a trait as a child
+            # A set holds no order, so traits go in by kind and then by state, which shows them
+            # the same way every time.
+            instances = [instantiate_trait(trait) for trait in traits]
+            for trait in sorted(instances, key=_trait_order):
                 # UI options are now traits! sorry!
-                self.add_child(instantiate_trait(trait))
+                self.add_child(trait)
         if badge is not None:
             set_initial_badge(self, badge)
         self.type = type
@@ -826,7 +834,7 @@ def diff_parameters(parameter: Parameter, other: Parameter) -> dict:
     for key, self_value in self_dict.items():
         other_value = other_dict.get(key, None)
         if key == "traits":
-            if self_value != other_value:
+            if not same_trait_states(self_value, other_dict["traits"]):
                 differences[key] = changed_trait_states(self_value, other_dict["traits"])
         # handle children here
         elif isinstance(self_value, BaseNodeElement) and isinstance(other_value, BaseNodeElement):
@@ -870,3 +878,9 @@ def diff_list_values(self_value: Any, other_value: Any, differences: dict, key: 
             break
     if list_differences:
         differences[key] = other_value
+
+
+def _trait_order(trait: Trait) -> tuple[str, str, str]:
+    """Order traits by name, then module, then saved state, so no two different traits tie."""
+    saved_state = {key: as_saved_state_value(value).value for key, value in trait.to_state().items()}
+    return (type(trait).__name__, type(trait).__module__, json.dumps(saved_state, sort_keys=True))
