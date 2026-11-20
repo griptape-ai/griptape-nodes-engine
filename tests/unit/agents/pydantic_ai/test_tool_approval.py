@@ -139,7 +139,7 @@ class TestNeedsApproval:
 
 class TestGtnToolRequiresApproval:
     @pytest.mark.parametrize("request_type", sorted(GTN_APPROVAL_REQUIRED_REQUESTS))
-    def test_tools_that_run_work_ask(self, request_type: str) -> None:
+    def test_tools_that_run_work_or_close_workflows_ask(self, request_type: str) -> None:
         assert _gtn_tool_requires_approval(_ctx(ON), _tool(f"GriptapeNodes_{request_type}"), {}) is True
 
     @pytest.mark.parametrize(
@@ -161,6 +161,11 @@ class TestGtnToolRequiresApproval:
         assert _gtn_tool_requires_approval(_ctx(ON), batch, _batch("CreateNodeRequest")) is False
         assert _gtn_tool_requires_approval(_ctx(ON), batch, mixed) is True
         assert _gtn_tool_requires_approval(_ctx(granted), batch, mixed) is False
+
+    def test_a_batch_that_clears_everything_asks(self) -> None:
+        args = _batch("CreateNodeRequest", "ClearAllObjectStateRequest")
+
+        assert _gtn_tool_requires_approval(_ctx(ON), _tool(GTN_BATCH_TOOL_NAME), args) is True
 
 
 class TestUserToolRequiresApproval:
