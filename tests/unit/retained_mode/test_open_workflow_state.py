@@ -29,7 +29,9 @@ from griptape_nodes.retained_mode.events.context_events import (
 from griptape_nodes.retained_mode.events.execution_events import StartFlowResultFailure, StartFlowResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import SetFlowMetadataRequest
 from griptape_nodes.retained_mode.events.node_events import (
+    BatchSetNodeLockStateRequest,
     BatchSetNodeMetadataRequest,
+    SetLockNodeStateRequest,
     SetNodeMetadataRequest,
     SetNodeMetadataResultSuccess,
 )
@@ -271,6 +273,27 @@ class TestNodeMetadataChanges:
 
         moved = BatchSetNodeMetadataRequest(node_metadata_updates={"node": {"position": {"x": 6, "y": 6}}})
         _send(engine, moved, workflow)
+        assert engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+
+class TestNodeLockChanges:
+    # A saved workflow keeps each node's lock, so locking one is a change to save.
+    def test_locking_a_node_marks_it(self, engine: Engine) -> None:
+        workflow = _open(engine, "locked")
+        _add_node(workflow, {})
+
+        result = _send(engine, SetLockNodeStateRequest(node_name="node", lock=True), workflow)
+
+        assert result.succeeded(), result.result_details
+        assert engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+    def test_locking_nodes_together_marks_it(self, engine: Engine) -> None:
+        workflow = _open(engine, "locked")
+        _add_node(workflow, {})
+
+        result = _send(engine, BatchSetNodeLockStateRequest(node_names=["node"], lock=True), workflow)
+
+        assert result.succeeded(), result.result_details
         assert engine.open_workflow_info(workflow).state.has_unsaved_changes
 
 
