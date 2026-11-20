@@ -41,7 +41,7 @@ from griptape_nodes.retained_mode.events.undo_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
 from griptape_nodes.retained_mode.managers.undo.element_ids import element_ids, restore_element_ids
-from griptape_nodes.retained_mode.managers.undo.run_state import carry_over_run_state
+from griptape_nodes.retained_mode.managers.undo.run_state import carry_over_run_state, same_edits
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.serialization.commands import decode_commands, encode_commands
 from griptape_nodes.serialization.values import ValueEncodeError, dump_json
@@ -65,10 +65,15 @@ _REBUILD_EVENTS = frozenset({ResultPayload, ExecutionPayload})
 
 @dataclass(frozen=True)
 class _Recording:
-    """The step a request and everything it dispatches belong to."""
+    """The step a request and everything it dispatches belong to.
+
+    Args:
+        workflow: The workflow the step changes.
+        label: What the step is called, or None for a client's change outside any step.
+    """
 
     workflow: WorkflowRuntime
-    label: str
+    label: str | None
 
 
 # Nested requests, and tasks a request starts, inherit the step through the context.
@@ -80,6 +85,8 @@ class DispatchScope:
     token: Token[_Recording | None]
     # The workflow whose step the request is part of, or None for a run, which is part of none.
     workflow: WorkflowRuntime | None
+    # Whether the request is part of a step, rather than a change outside any step.
+    in_step: bool = True
 
 
 class UndoManager(EngineScoped):
@@ -92,20 +99,23 @@ class UndoManager(EngineScoped):
     ) -> DispatchScope | None:
         """Start recording a request that is part of a step. Call before its handler runs.
 
-        Only an outermost request in an undo group is recorded: a request it dispatches belongs to
-        it already. A request in a group other than the one being recorded starts a new step, so
-        the workflow is checkpointed first, while it still shows the end of the step before.
-        Everything a run changes is taken as a change outside any step.
+        Only an outermost request is recorded: a request it dispatches belongs to it already. A
+        request in a group other than the one being recorded starts a new step, so the workflow is
+        checkpointed first, while it still shows the end of the step before. A request in no group
+        is a change outside any step. Everything a run changes is taken as a change outside any
+        step too, but only a client's change drops what could be redone.
         """
         if isinstance(request, RunControlMixin):
             if _recording.get() is None:
                 return None
             return DispatchScope(token=_recording.set(None), workflow=None)
-        if not outermost or workflow is None or request.undo_group is None:
+        if not outermost or workflow is None:
             return None
         history = workflow.undo
         if history.restoring or isinstance(request, (UndoRequest, RedoRequest)):
             return None
+        if request.undo_group is None:
+            return self._begin_change_outside_steps(workflow)
         if request.undo_group != history.open_group:
             self._checkpoint(workflow)
             history.open_group = request.undo_group
@@ -118,8 +128,14 @@ class UndoManager(EngineScoped):
         if scope is None:
             return
         _recording.reset(scope.token)
-        if scope.workflow is not None:
+        if scope.workflow is None:
+            return
+        if scope.in_step:
             scope.workflow.undo.in_flight -= 1
+            return
+        # Checkpointed now rather than at the next step, so that a change that drops what could be
+        # redone stops clients offering it at once.
+        self._checkpoint(scope.workflow)
 
     def note_altered(self, workflow: WorkflowRuntime, request: RequestPayload) -> None:
         """Note that a request changed ``workflow``, as its result reported."""
@@ -128,14 +144,17 @@ class UndoManager(EngineScoped):
         if history.restoring or isinstance(request, (UndoRequest, RedoRequest)):
             return
         recording = _recording.get()
-        if recording is not None and recording.workflow is workflow:
-            # A label sent later in the group names the step. The first request names it otherwise.
-            if request.undo_label is not None:
-                history.pending_label = request.undo_label
-            elif history.pending_label is None:
-                history.pending_label = recording.label
-        else:
+        if recording is None or recording.workflow is not workflow:
+            # A run's change, or a client's change made while there was nothing to redo.
             history.stale = True
+        elif recording.label is None:
+            history.stale = True
+            history.edited = True
+        # A label sent later in the group names the step. The first request names it otherwise.
+        elif request.undo_label is not None:
+            history.pending_label = request.undo_label
+        elif history.pending_label is None:
+            history.pending_label = recording.label
 
     @handles(UndoRequest)
     async def on_undo_request(self, request: UndoRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG002
@@ -196,6 +215,14 @@ class UndoManager(EngineScoped):
         self.engine.report_workflow_state(workflow)
         return RedoResultSuccess(label=following.label or "", result_details=f"Redid '{following.label}'.")
 
+    def _begin_change_outside_steps(self, workflow: WorkflowRuntime) -> DispatchScope | None:
+        """Start recording a client's request in no group, which drops what could be redone if it changes the workflow."""
+        # With nothing to redo, it is only a change outside any step, which the next checkpoint takes in.
+        if workflow.undo.redo_label is None:
+            return None
+        token = _recording.set(_Recording(workflow=workflow, label=None))
+        return DispatchScope(token=token, workflow=workflow, in_step=False)
+
     def _checkpoint(self, workflow: WorkflowRuntime) -> None:
         """Take a checkpoint if the workflow may differ from the current one."""
         if not workflow.undo.needs_checkpoint:
@@ -221,6 +248,16 @@ class UndoManager(EngineScoped):
             history.clear()
             self.engine.report_workflow_state(workflow)
             return False
+        current = history.current()
+        # A redo would rebuild the workflow without what a client changed since, so it is dropped.
+        # Run results are carried into any rebuild, so a run changes nothing a redo would lose.
+        if (
+            history.edited
+            and history.redo_label is not None
+            and current is not None
+            and not same_edits(_decode(current.commands), decode_commands(json.loads(text), SerializedFlowCommands))
+        ):
+            history.drop_redo()
         history.record(zlib.compress(text.encode(), _COMPRESSION_LEVEL))
         self.engine.report_workflow_state(workflow)
         return True
