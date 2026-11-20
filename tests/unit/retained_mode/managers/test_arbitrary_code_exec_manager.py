@@ -1,3 +1,7 @@
+import asyncio
+
+import pytest
+
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.arbitrary_python_events import (
     RunArbitraryPythonStringRequest,
@@ -121,3 +125,29 @@ class TestArbitraryCodeExecManager:
         assert isinstance(result, RunArbitraryPythonStringResultSuccess)
         assert result.found_variable_values == {"a": 1, "b": "hello", "c": [1, 2, 3]}
         assert result.missing_variables == []
+
+    @pytest.mark.asyncio
+    async def test_a_slow_script_leaves_the_engine_loop_free(self, engine: Engine) -> None:
+        run = asyncio.create_task(
+            engine.ahandle_request(RunArbitraryPythonStringRequest(python_string="import time\ntime.sleep(1)"))
+        )
+        await asyncio.sleep(0.1)
+        still_running = not run.done()
+        result = await run
+
+        assert still_running
+        assert isinstance(result, RunArbitraryPythonStringResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_scripts_running_at_once_each_capture_their_own_output(self, engine: Engine) -> None:
+        def script(name: str) -> RunArbitraryPythonStringRequest:
+            return RunArbitraryPythonStringRequest(
+                python_string=f"import time\nfor _ in range(3):\n    print('{name}')\n    time.sleep(0.05)"
+            )
+
+        first, second = await asyncio.gather(engine.ahandle_request(script("a")), engine.ahandle_request(script("b")))
+
+        assert isinstance(first, RunArbitraryPythonStringResultSuccess)
+        assert isinstance(second, RunArbitraryPythonStringResultSuccess)
+        assert first.python_output == "a\n" * 3
+        assert second.python_output == "b\n" * 3

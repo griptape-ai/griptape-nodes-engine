@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import functools
 import io
 import re
-from contextlib import redirect_stdout
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.retained_mode.events.arbitrary_python_events import (
@@ -12,6 +12,7 @@ from griptape_nodes.retained_mode.events.arbitrary_python_events import (
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
+from griptape_nodes.utils.async_utils import to_node_code_thread
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -38,42 +39,44 @@ class ArbitraryCodeExecManager:
         event_manager.register_request_handlers(self)
 
     @handles(RunArbitraryPythonStringRequest)
-    def on_run_arbitrary_python_string_request(
+    async def on_run_arbitrary_python_string_request(
         self, request: RunArbitraryPythonStringRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Run the request's Python, bound to `workflow` so the requests it sends act on it.
 
-        With no workflow handed it runs unbound, so its requests act as an unaddressed client's do.
+        With no workflow handed it runs unbound, so its requests act as an unaddressed client's do. It
+        runs off the engine loop like node code, so a slow script doesn't stall every open workflow.
         """
         token = bound_workflow.set(workflow)
         try:
-            return self._run_python_string(request)
+            return await to_node_code_thread(self._run_python_string, request)
         finally:
             bound_workflow.reset(token)
 
     def _run_python_string(self, request: RunArbitraryPythonStringRequest) -> ResultPayload:
         try:
             string_buffer = io.StringIO()
-            with redirect_stdout(string_buffer):
-                # Use a shared namespace for both globals and locals in exec() to make some behavior possible and more intuitive:
-                #
-                # 1. RECURSION: Without this namespace, recursive functions defined inside exec() fail with
-                #    "NameError: name 'function_name' is not defined" when they try to call themselves.
-                #    Why? When exec() runs with default parameters, functions defined in the exec'd code
-                #    exist in this method's local scope. But inside the exec'd functions, Python looks in the program's
-                #    global scope (outside this method) and the function's own local scope - neither of which
-                #    contains the recursive function definition. By passing the same dict as both globals and locals,
-                #    any function defined in exec'd code becomes visible in what exec'd code sees as
-                #    "global" scope, allowing recursive calls to find the function definition.
-                #
-                # 2. ISOLATION: An isolated namespace prevents exec'd code from accessing or modifying
-                #    variables in the outer program scope, protecting read/write access to sensitive engine data.
-                # For the PR that implements this behavior alongside an Execute Python and List Files node, see https://github.com/griptape-ai/griptape-nodes-engine/pull/2087
+            # Use a shared namespace for both globals and locals in exec() to make some behavior possible and more intuitive:
+            #
+            # 1. RECURSION: Without this namespace, recursive functions defined inside exec() fail with
+            #    "NameError: name 'function_name' is not defined" when they try to call themselves.
+            #    Why? When exec() runs with default parameters, functions defined in the exec'd code
+            #    exist in this method's local scope. But inside the exec'd functions, Python looks in the program's
+            #    global scope (outside this method) and the function's own local scope - neither of which
+            #    contains the recursive function definition. By passing the same dict as both globals and locals,
+            #    any function defined in exec'd code becomes visible in what exec'd code sees as
+            #    "global" scope, allowing recursive calls to find the function definition.
+            #
+            # 2. ISOLATION: An isolated namespace prevents exec'd code from accessing or modifying
+            #    variables in the outer program scope, protecting read/write access to sensitive engine data.
+            # For the PR that implements this behavior alongside an Execute Python and List Files node, see https://github.com/griptape-ai/griptape-nodes-engine/pull/2087
 
-                namespace = {"__builtins__": __builtins__}
-                exec(  # noqa: S102
-                    request.python_string, namespace, namespace
-                )
+            # The script's `print` writes to its own buffer. Redirecting sys.stdout instead would swap it
+            # for the whole process, and two scripts running at once would restore each other's buffer.
+            namespace = {"__builtins__": __builtins__, "print": functools.partial(print, file=string_buffer)}
+            exec(  # noqa: S102
+                request.python_string, namespace, namespace
+            )
 
             python_output = strip_ansi_codes(string_buffer.getvalue())
             found_variable_values: dict[str, Any] = {}
