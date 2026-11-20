@@ -1,3 +1,5 @@
+import datetime
+
 import pytest
 
 from griptape_nodes.exe_types.core_types import InvalidParameterValueError
@@ -11,6 +13,16 @@ def _rejection(value: str) -> str:
     with pytest.raises(InvalidParameterValueError, match="Invalid YAML") as exc_info:
         parameter._convert_to_yaml(value)
     return str(exc_info.value)
+
+
+def _stdlib_date_error(year: int, month: int, day: int) -> str:
+    # The wording varies by Python version, so tests compare against the stdlib rather than a literal.
+    try:
+        datetime.date(year, month, day)
+    except ValueError as e:
+        return str(e)
+    msg = f"{year}-{month}-{day} is a valid date"
+    raise AssertionError(msg)
 
 
 class TestInvalidYamlMessage:
@@ -35,7 +47,7 @@ class TestInvalidYamlMessage:
     def test_invalid_date_is_reported_as_invalid_yaml(self) -> None:
         message = _rejection("shot: 2024-02-30\n")
 
-        assert "day is out of range for month" in message
+        assert _stdlib_date_error(2024, 2, 30) in message
 
     def test_names_and_quotes_the_line(self) -> None:
         message = _rejection(PROSE_WITH_COLON)
