@@ -16,7 +16,9 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from griptape_nodes.exe_types.node_types import NodeResolutionState
+from griptape_nodes.exe_types.node_types import NodeDependencies, NodeResolutionState
+from griptape_nodes.serialization.commands import encode_commands
+from griptape_nodes.serialization.values import dump_json
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
@@ -50,6 +52,54 @@ def carry_over_run_state(target: SerializedFlowCommands, live: SerializedFlowCom
                 live_node.level.unique_parameter_uuid_to_values[command.unique_value_uuid]
             )
     return target
+
+
+def same_edits(one: SerializedFlowCommands, other: SerializedFlowCommands) -> bool:
+    """Whether two serializations of a workflow differ in nothing but what a rebuild keeps from the live one.
+
+    That is run results, which ``carry_over_run_state`` carries over: each node's resolution, its
+    outputs, and the values that reach its inputs through connections. Workflow variables too, which
+    a rebuild leaves as they are. Changes both in place.
+    """
+    return _edits_text(one) == _edits_text(other)
+
+
+def _edits_text(commands: SerializedFlowCommands) -> str:
+    levels = _levels(commands)
+    connected = {
+        (connection.target_node_uuid, connection.target_parameter_name)
+        for level in levels
+        for connection in level.serialized_connections
+    }
+    for level in levels:
+        for node_commands in level.serialized_node_commands:
+            node_commands.create_node_command.resolution = ""
+            node_commands.node_dependencies = NodeDependencies()
+        level.set_parameter_value_commands = {
+            node_uuid: [
+                command
+                for command in set_value_commands
+                if not command.set_parameter_value_command.is_output
+                and (node_uuid, command.set_parameter_value_command.parameter_name) not in connected
+            ]
+            for node_uuid, set_value_commands in level.set_parameter_value_commands.items()
+        }
+        level.serialized_variable_commands = []
+        level.node_dependencies = NodeDependencies()
+        level.node_types_used = set()
+    referenced = {
+        command.unique_value_uuid
+        for level in levels
+        for set_value_commands in level.set_parameter_value_commands.values()
+        for command in set_value_commands
+    }
+    for level in levels:
+        level.unique_parameter_uuid_to_values = {
+            value_uuid: value
+            for value_uuid, value in level.unique_parameter_uuid_to_values.items()
+            if value_uuid in referenced
+        }
+    return dump_json(encode_commands(commands))
 
 
 @dataclass
