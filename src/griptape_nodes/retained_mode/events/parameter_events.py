@@ -276,8 +276,10 @@ class SetParameterValueRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetParameterValueResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class SetParameterValueResultSuccess(ResultPayloadSuccess):
     """Parameter value set successfully. Value may have been processed or converted.
+
+    `altered_workflow_state` is False when the parameter already had the value.
 
     Args:
         finalized_value: The actual value stored after processing
