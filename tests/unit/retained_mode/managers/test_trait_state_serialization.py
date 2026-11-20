@@ -42,6 +42,10 @@ _LIBRARY_NAME = "trait-state-serialization-test-library"
 
 NARROWED_MAX = 50
 
+# What `_DeclaredControls.__init__` reads to offer the model's choices. A test flips it to stand in for
+# engine state, like the model catalog, that changes what a node type builds between saves.
+_declared_node_config = {"model_choices": ["a", "b"]}
+
 
 class _ModelPicker(BaseNode):
     """A node that grows a dropdown and a button at run time, as a model picker does."""
@@ -103,7 +107,7 @@ class _DeclaredControls(BaseNode):
         self.add_parameter(width)
 
         model = Parameter(name="model", type="str", input_types=["str"], output_type="str", tooltip="t")
-        model.add_trait(Options(choices=["a", "b"]))
+        model.add_trait(Options(choices=list(_declared_node_config["model_choices"])))
         self.add_parameter(model)
 
         reload_button = Parameter(name="reload", type="str", input_types=["str"], output_type="str", tooltip="t")
@@ -626,6 +630,19 @@ class TestBehaviorComesFromTheNode:
         assert _control(reloaded, "reload", Button).on_click_callback.__self__ is not node  # type: ignore[union-attr]
 
 
+def _saved_model_traits(engine: Engine) -> list[dict[str, Any]] | None:
+    """The trait changes a flow save records for the `model` parameter, or None if it records none."""
+    flow = engine.current_workflow().top_level_flow()
+    assert flow is not None
+    result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow.name))
+    assert isinstance(result, SerializeFlowToCommandsResultSuccess)
+    for node_commands in result.serialized_flow_commands.serialized_node_commands:
+        for command in node_commands.element_modification_commands:
+            if isinstance(command, AlterParameterDetailsRequest) and command.parameter_name == "model":
+                return command.traits
+    return None
+
+
 class TestReferenceCopiesAreSharedInABatch:
     """Serializing compares each node with a copy its type builds, and one copy serves a whole save."""
 
@@ -654,11 +671,24 @@ class TestReferenceCopiesAreSharedInABatch:
         assert isinstance(result, SerializeFlowToCommandsResultSuccess)
         assert built == ["REFERENCE NODE"]
 
-    def test_a_copy_is_not_kept_past_its_batch(self, engine: Engine) -> None:
-        node = _add_declared_node(engine, "source")
+    def test_what_a_type_builds_is_read_again_by_the_next_save(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_workflow(engine)
+        created = engine.handle_request(
+            CreateNodeRequest(
+                node_type=_DeclaredControls.__name__, specific_library_name=_LIBRARY_NAME, node_name="source"
+            )
+        )
+        assert isinstance(created, CreateNodeResultSuccess), created.result_details
+        assert _saved_model_traits(engine) is None
 
-        with engine.node_manager.sharing_reference_nodes():
-            first = engine.node_manager._reference_node_for(node)
-            assert engine.node_manager._reference_node_for(node) is first
-        with engine.node_manager.sharing_reference_nodes():
-            assert engine.node_manager._reference_node_for(node) is not first
+        monkeypatch.setitem(_declared_node_config, "model_choices", ["c"])
+
+        assert _saved_model_traits(engine) == [
+            {
+                "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
+                "trait_state": {"choices": ["a", "b"]},
+            }
+        ]
