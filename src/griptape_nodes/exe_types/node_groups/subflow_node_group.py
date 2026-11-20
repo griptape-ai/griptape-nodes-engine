@@ -543,6 +543,15 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         of the pair is never at risk: control_in is an input and inner_exit is an input, and neither
         is single-target.
 
+        inner_exit specifically allows fan-in: every joiner on the exit side still gets its own inner
+        leg drawn into it, even when the port is already wired, because inner_exit is multi-target.
+        What that joiner must not get is the outer wire's ownership -- _exit_wire_owner only ever
+        transfers to the join that also won control_out (exit_already_wired is False), the same
+        condition that gates whether the outer leg itself gets drawn. A later joiner's inner leg must
+        never silently displace the real owner's claim on the outer wire, or release/absorb will later
+        look for an owner who no longer has the wire and leave it stranded on the group instead of
+        following whoever is actually left.
+
         Goes through _create_connection, which raises if a connection could not be made, rather than
         building CreateConnectionRequest objects and discarding the result: a failed connection must
         not leave an owner recorded for a wire that does not exist. Ownership is set only once the
@@ -592,7 +601,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     self.inner_exit.name,
                     is_node_group_internal=True,
                 )
-                self._exit_wire_owner = (old_connection.source_node.name, old_connection.source_parameter.name)
+                if not exit_already_wired:
+                    self._exit_wire_owner = (old_connection.source_node.name, old_connection.source_parameter.name)
 
     def _delete_connection(self, source: str, source_param: str, target: str, target_param: str) -> None:
         result = self.engine.flow_manager.on_delete_connection_request_in_workflow(

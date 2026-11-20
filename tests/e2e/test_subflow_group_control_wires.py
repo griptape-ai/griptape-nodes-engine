@@ -267,6 +267,128 @@ class TestGroupingAControlChain:
         assert "Z.exec_out->G.group_complete (internal)" in _edges(engine, "G")
         assert "G.group_exec_out->Down2.exec_in" not in _edges(engine, "G")
 
+    def test_grouping_a_third_wired_node_does_not_steal_either_port(self, engine: Engine, flow: str) -> None:
+        """inner_entry and control_out stay single-owner with a third contender behind the second.
+
+        test_grouping_a_second_wired_node_does_not_steal_the_entry_port / ..._exit_port only prove
+        a second pre-wired node can't clobber the first member's leg. This drags in a third
+        independently-wired chain on each side, after a second has already joined and already
+        fallen back, to confirm the same fallback holds for whoever queues up behind it too --
+        including that inner_exit's fan-in (every exit-side joiner gets its own inner leg, since
+        inner_exit accepts more than one) never hands exit_wire_owner to a joiner that didn't also
+        win the outer control_out wire.
+        """
+        _ = flow
+        _chain(engine)
+        _group(engine, ["Child"])
+        group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
+
+        # Second entry contender, as in test_grouping_a_second_wired_node_does_not_steal_the_entry_port.
+        _node(engine, "EchoNode", "Up2")
+        _node(engine, "EchoNode", "Y2")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Y2", value="Y2")
+        ).succeeded()
+        _connect(engine, "Up2", "exec_out", "Y2", "exec_in")
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Y2"], node_group_name="G"))
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        # Second exit contender, as in test_grouping_a_second_wired_node_does_not_steal_the_exit_port.
+        _node(engine, "EchoNode", "Z2")
+        _node(engine, "EchoNode", "Down2")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Z2", value="Z2")
+        ).succeeded()
+        _connect(engine, "Z2", "exec_out", "Down2", "exec_in")
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Z2"], node_group_name="G"))
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        # Third entry contender, queuing up behind the second.
+        _node(engine, "EchoNode", "Up3")
+        _node(engine, "EchoNode", "Y3")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Y3", value="Y3")
+        ).succeeded()
+        _connect(engine, "Up3", "exec_out", "Y3", "exec_in")
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Y3"], node_group_name="G"))
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        # Third exit contender, queuing up behind the second.
+        _node(engine, "EchoNode", "Z3")
+        _node(engine, "EchoNode", "Down3")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Z3", value="Z3")
+        ).succeeded()
+        _connect(engine, "Z3", "exec_out", "Down3", "exec_in")
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Z3"], node_group_name="G"))
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        # The first member's legs -- and its recorded ownership of both -- are exactly what they
+        # were, unaffected by either the second or third join.
+        assert group._entry_wire_owner == ("Child", "exec_in")
+        assert group._exit_wire_owner == ("Child", "exec_out")
+        assert "G.on_start->Child.exec_in (internal)" in _edges(engine, "G")
+        assert "G.group_exec_out->Down.exec_in" in _edges(engine, "G")
+
+        # The third contender falls back exactly like the second one did: no inner leg stolen on
+        # the entry side, no outer leg stolen on the exit side, no ownership recorded for it.
+        assert "Up3.exec_out->G.group_exec_in" in _edges(engine, "Up3", control_only=True)
+        assert "G.on_start->Y3.exec_in (internal)" not in _edges(engine, "G")
+        assert "G.group_exec_out->Down3.exec_in" not in _edges(engine, "G")
+        # The exit side's inner leg still fans in for both later joiners -- that part is correct and
+        # intentional, it's only ownership of the outer wire that must not have moved.
+        assert "Z2.exec_out->G.group_complete (internal)" in _edges(engine, "G")
+        assert "Z3.exec_out->G.group_complete (internal)" in _edges(engine, "G")
+
+    def test_removing_exit_contenders_out_of_order_leaves_the_owners_wire_with_it(
+        self, engine: Engine, flow: str
+    ) -> None:
+        """Removing later exit-side joiners first must not stop the real owner reclaiming its wire.
+
+        Regression test for exit_wire_owner being reassigned to every exit-side joiner regardless of
+        whether it won the outer control_out wire (inner_exit fans in, so every joiner draws an inner
+        leg). With that bug, removing the joiners in this order reset exit_wire_owner to Child's
+        rightful claim at the wrong moments, so by the time Child itself left -- the last node still
+        feeding inner_exit -- _release_control_exit no longer recognized it as the owner and left
+        G.group_exec_out->Down.exec_in stranded on the group with nothing inside driving it: the same
+        silent control-chain break #6210/#5487 this file exists to guard against.
+        """
+        _ = flow
+        _chain(engine)
+        _group(engine, ["Child"])
+
+        _node(engine, "EchoNode", "Z2")
+        _node(engine, "EchoNode", "Down2")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Z2", value="Z2")
+        ).succeeded()
+        _connect(engine, "Z2", "exec_out", "Down2", "exec_in")
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Z2"], node_group_name="G"))
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        _node(engine, "EchoNode", "Z3")
+        _node(engine, "EchoNode", "Down3")
+        assert engine.handle_request(
+            SetParameterValueRequest(parameter_name="text", node_name="Z3", value="Z3")
+        ).succeeded()
+        _connect(engine, "Z3", "exec_out", "Down3", "exec_in")
+        result = engine.handle_request(AddNodesToNodeGroupRequest(node_names=["Z3"], node_group_name="G"))
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+
+        # Remove the two later joiners first, then the real owner last.
+        remove_z2 = engine.handle_request(RemoveNodeFromNodeGroupRequest(node_names=["Z2"], node_group_name="G"))
+        assert isinstance(remove_z2, RemoveNodeFromNodeGroupResultSuccess), remove_z2
+        remove_z3 = engine.handle_request(RemoveNodeFromNodeGroupRequest(node_names=["Z3"], node_group_name="G"))
+        assert isinstance(remove_z3, RemoveNodeFromNodeGroupResultSuccess), remove_z3
+        remove_child = engine.handle_request(RemoveNodeFromNodeGroupRequest(node_names=["Child"], node_group_name="G"))
+        assert isinstance(remove_child, RemoveNodeFromNodeGroupResultSuccess), remove_child
+
+        # Child owned the outer wire the whole time, so leaving reclaims it straight to Down.
+        assert "Up.exec_out->Child.exec_in" in _edges(engine, "Child", control_only=True)
+        assert "Child.exec_out->Down.exec_in" in _edges(engine, "Child", control_only=True)
+        # Nothing is left stranded on the now-empty group.
+        assert _edges(engine, "G", control_only=True) == set()
+
 
 @pytest.mark.skipif(not SUBFLOW_LIBRARY_JSON.exists(), reason="subflow fixture library missing")
 class TestUngrouping:
