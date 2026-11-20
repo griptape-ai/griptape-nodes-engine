@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -50,9 +51,9 @@ def projects(engine: Engine, tmp_path: Path) -> Iterator[_Projects]:
         project_dir = tmp_path / name
         project_dir.mkdir()
         project_yml = project_dir / "project_template.yml"
-        project_yml.write_text(
-            f'"project_template_schema_version": "1.0.0"\n"name": "{name}"\n"workspace_dir": "{workspace}"\n'
-        )
+        # JSON is valid YAML, and it escapes the backslashes in a Windows path.
+        template = {"project_template_schema_version": "1.0.0", "name": name, "workspace_dir": str(workspace)}
+        project_yml.write_text(json.dumps(template))
         loaded = engine.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         assert isinstance(loaded, LoadProjectTemplateResultSuccess), loaded.result_details
         ids.append(loaded.project_id)
