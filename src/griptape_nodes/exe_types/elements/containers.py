@@ -332,6 +332,24 @@ class ParameterList(ParameterContainer):
         """Return whether a row's `value` contributes its items rather than one item."""
         return isinstance(value, list) and self._rows_add_list_items
 
+    def row_value_counts_as_items(self, value: Any) -> bool:
+        """Return whether `max_items` counts a row's list `value` as its items rather than as one item.
+
+        A list that names a concrete item type next to `list` or `list[...]` (`["ImageArtifact", "list"]`)
+        is saying a row may take a list of those items, and the node reads them one by one with
+        `get_parameter_list_value`. Only a list whose items may themselves be lists (`any`, `all`, or
+        `list` alone) holds a list in a row as one item.
+        """
+        if not isinstance(value, list):
+            return False
+        if self._rows_add_list_items:
+            return True
+        base_types = {ParameterType._extract_base_type(item_type.lower()) for item_type in self._own_input_types()}
+        whole_item_bases = {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value}
+        if base_types & whole_item_bases:
+            return False
+        return bool(base_types - {"list"})
+
     def _custom_setter_for_property_output_type(self, value: str | None) -> None:
         # If we are setting a type, we need to propagate this to our children as well.
         for child in self._children:

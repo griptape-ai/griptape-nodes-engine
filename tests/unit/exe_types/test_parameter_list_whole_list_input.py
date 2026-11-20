@@ -245,7 +245,8 @@ class TestWholeListWarnings:
                 max_items=2,
             )
         )
-        node.set_parameter_value("capped", ["a", "b", "c"])
+        # A value loaded from a saved workflow is not checked, so the node's own read is the last place to warn.
+        node.set_parameter_value("capped", ["a", "b", "c"], initial_setup=True)
 
         with patch("griptape_nodes.exe_types.node_types.logger") as mock_logger:
             value = node.get_parameter_value("capped")
@@ -253,3 +254,41 @@ class TestWholeListWarnings:
         # The node decides how to truncate; the engine only surfaces the mismatch.
         assert value == ["a", "b", "c"]
         assert mock_logger.warning.called
+
+
+class TestMaxItemsCountsListsInRows:
+    """A list in a row counts as its items unless the list's own items may be lists."""
+
+    @staticmethod
+    def _node_with_one_full_row(input_types: list[str], *, max_items: int) -> tuple[MockNode, ParameterList]:
+        node = MockNode()
+        parameter_list = ParameterList(
+            name="refs",
+            tooltip="t",
+            input_types=input_types,
+            allowed_modes={ParameterMode.INPUT},
+            max_items=max_items,
+        )
+        node.add_parameter(parameter_list)
+        node.set_parameter_value(parameter_list.add_child_parameter().name, ["a", "b", "c"])
+        return node, parameter_list
+
+    @pytest.mark.parametrize(
+        "input_types",
+        [["ImageUrlArtifact"], ["ImageUrlArtifact", "list", "list[ImageUrlArtifact]"]],
+    )
+    def test_a_list_in_a_row_counts_as_its_items(self, input_types: list[str]) -> None:
+        node, parameter_list = self._node_with_one_full_row(input_types, max_items=4)
+        second_row = parameter_list.add_child_parameter()
+
+        with pytest.raises(ValueError, match="would hold 5 items"):
+            node.set_parameter_value(second_row.name, ["d", "e"])
+
+    @pytest.mark.parametrize("input_types", [["any"], ["list"], ["str", "any", "list"]])
+    def test_a_list_in_a_row_of_a_list_that_holds_lists_is_one_item(self, input_types: list[str]) -> None:
+        node, parameter_list = self._node_with_one_full_row(input_types, max_items=2)
+        second_row = parameter_list.add_child_parameter()
+
+        node.set_parameter_value(second_row.name, ["d", "e"])
+
+        assert node.get_parameter_value(second_row.name) == ["d", "e"]

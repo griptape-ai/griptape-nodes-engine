@@ -518,6 +518,15 @@ class ExecuteDagState(State):
                 else:
                     output_value = upstream_node._get_raw_parameter_value(upstream_parameter.name)
 
+                # A list only knows how many items it really receives once the node above it has run,
+                # so this is the first point the limit can be checked against real values. Checked
+                # here rather than read back from the failed request, whose details would arrive
+                # wrapped in two more "Failed because Exception:" layers.
+                overrun_reason = current_node.incoming_value_overrun_reason(parameter, output_value)
+                if overrun_reason is not None:
+                    msg = f'Attempted to pass "{upstream_node.name}.{upstream_parameter.name}" into "{current_node.name}.{parameter.connection_label}". Failed because {overrun_reason}'
+                    raise RuntimeError(msg)
+
                 # Pass the value through using the same mechanism as normal resolution
                 result = await context.workflow.ahandle_request(
                     SetParameterValueRequest(

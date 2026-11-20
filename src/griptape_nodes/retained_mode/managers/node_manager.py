@@ -309,6 +309,8 @@ logger = logging.getLogger("griptape_nodes")
 # so a legitimately-stored None does not collide with "missing".
 _PARAM_MISSING = object()
 
+_REFUSED_VALUE_BADGE_TITLE = "Value not updated"
+
 # A worker's own top-level flow, under which each execution's copy of a node gets a flow of its own.
 # Nodes and flows share one namespace, so the name is one no node is given.
 _WORKER_COPIES_FLOW_NAME = "__worker_node_copies__"
@@ -3111,15 +3113,14 @@ class NodeManager(EngineScoped):
                 )
                 is_dest_node_locked = target_node.lock
                 if (not is_control_parameter) and (not is_dest_node_locked):
-                    workflow.handle_request(
-                        SetParameterValueRequest(
-                            parameter_name=target_parameter.name,
-                            node_name=target_node.name,
-                            value=finalized_value,
-                            data_type=object_type,  # Do type instead of output type, because it hasn't been processed.
-                            incoming_connection_source_node_name=node.name,
-                            incoming_connection_source_parameter_name=parameter.name,
-                        )
+                    self._pass_value_downstream(
+                        workflow,
+                        source_node=node,
+                        source_parameter=parameter,
+                        target_node=target_node,
+                        target_parameter=target_parameter,
+                        value=finalized_value,
+                        data_type=object_type,  # Do type instead of output type, because it hasn't been processed.
                     )
 
         # Propagate side-effect output changes to downstream nodes.
@@ -3144,15 +3145,14 @@ class NodeManager(EngineScoped):
                 for target_node, target_parameter in conn_targets:
                     if target_node.lock:
                         continue
-                    workflow.handle_request(
-                        SetParameterValueRequest(
-                            parameter_name=target_parameter.name,
-                            node_name=target_node.name,
-                            value=new_value,
-                            data_type=output_param.output_type,
-                            incoming_connection_source_node_name=node.name,
-                            incoming_connection_source_parameter_name=output_param.name,
-                        )
+                    self._pass_value_downstream(
+                        workflow,
+                        source_node=node,
+                        source_parameter=output_param,
+                        target_node=target_node,
+                        target_parameter=target_parameter,
+                        value=new_value,
+                        data_type=output_param.output_type,
                     )
 
         # Cool.
@@ -3161,6 +3161,43 @@ class NodeManager(EngineScoped):
             finalized_value=finalized_value, data_type=parameter.type, result_details=details
         )
         return result
+
+    def _pass_value_downstream(  # noqa: PLR0913
+        self,
+        workflow: WorkflowRuntime,
+        *,
+        source_node: BaseNode,
+        source_parameter: Parameter,
+        target_node: BaseNode,
+        target_parameter: Parameter,
+        value: Any,
+        data_type: str,
+    ) -> None:
+        """Hand a changed value to a connected parameter, and say on it when the target refuses the value.
+
+        A refused value (a list that would go over `max_items`, for example) leaves the target holding its
+        old value, which would otherwise look current. The error badge stays until a value is accepted.
+        """
+        result = workflow.handle_request(
+            SetParameterValueRequest(
+                parameter_name=target_parameter.name,
+                node_name=target_node.name,
+                value=value,
+                data_type=data_type,
+                incoming_connection_source_node_name=source_node.name,
+                incoming_connection_source_parameter_name=source_parameter.name,
+            )
+        )
+        if result.failed():
+            target_parameter.set_badge(
+                variant="error",
+                title=_REFUSED_VALUE_BADGE_TITLE,
+                message=f'The new value of "{source_node.name}.{source_parameter.name}" was not passed on, so this still holds the old value. {result.result_details}',
+            )
+            return
+        badge = target_parameter.get_badge()
+        if badge is not None and badge.title == _REFUSED_VALUE_BADGE_TITLE:
+            target_parameter.clear_badge()
 
     def _discard_stale_output_value(self, node: BaseNode, parameter_name: str, output_snapshot: dict[str, Any]) -> None:
         """Discard the output value that the set we just applied has invalidated.

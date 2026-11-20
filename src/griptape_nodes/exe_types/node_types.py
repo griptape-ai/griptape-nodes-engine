@@ -1219,6 +1219,7 @@ class BaseNode(ABC):
         # to be assigned will NOT be set.
         candidate_value = self._list_rows.convert_and_validate(parameter, value, initial_setup=initial_setup)
         self._list_rows.check_row_within_max_items(parameter, candidate_value, initial_setup=initial_setup)
+        self._list_rows.check_connected_list_within_max_items(parameter, candidate_value, initial_setup=initial_setup)
 
         # Allow custom node logic to prepare and possibly mutate the value before it is actually set.
         if not initial_setup:
@@ -2018,6 +2019,10 @@ class BaseNode(ABC):
             return True
 
         return self._param_has_incoming_connection(param_name)
+
+    def incoming_value_overrun_reason(self, target: Parameter, value: Any) -> str | None:
+        """Why a connection delivering `value` to `target` would put more items in its list than `max_items` allows."""
+        return self._list_rows.incoming_overrun_reason(target, value)
 
     def _connected_list_with_rows(self, parameter_list: ParameterList) -> list[Any]:
         """The list a connection delivered, followed by the items of the list's own rows.
