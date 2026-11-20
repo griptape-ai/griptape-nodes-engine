@@ -110,6 +110,7 @@ plugins:
           - guides/editor/working_with_nodes.md: Adding, selecting, wiring, and editing nodes on the canvas
           - guides/editor/node_groups.md: Groups, subflows, and iterative group types (ForEach, For Loop, Retry)
           - guides/editor/running_workflows.md: Running, stopping, logs, error history, and saving
+          - guides/editor/undo_and_redo.md: Taking back and putting back changes to a workflow
           - guides/editor/media_editors.md: Built-in viewers and editors for images, video, audio, 3D, and splats
           - guides/editor/managing_models_and_libraries.md: Model Management and Library Management windows
           - guides/editor/beta_features.md: Turning experimental beta features on and off
@@ -294,6 +295,7 @@ nav:
           - Working with Nodes: guides/editor/working_with_nodes.md
           - Node Groups: guides/editor/node_groups.md
           - Running Workflows: guides/editor/running_workflows.md
+          - Undo and Redo: guides/editor/undo_and_redo.md
           - Media Viewers and Editors: guides/editor/media_editors.md
           - Managing Models and Libraries: guides/editor/managing_models_and_libraries.md
           - Beta Features: guides/editor/beta_features.md

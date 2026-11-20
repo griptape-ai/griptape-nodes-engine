@@ -1614,6 +1614,14 @@ class EventManager(EngineScoped):
         workflow_mgr = self.engine.workflow_manager
 
         with operation_depth_mgr as depth_manager:
+            # Before the squelch below, which only keeps a load from marking the workflow unsaved:
+            # the undo history has to know of every change, or an undo would take it back.
+            if (
+                callback_result.altered_workflow_state
+                and request_workflow is not None
+                and request_workflow.workflow is not None
+            ):
+                self.engine.undo_manager.note_altered(request_workflow.workflow, request)
             # Now see if the WorkflowManager was asking us to squelch altered_workflow_state commands
             # This prevents situations like loading a workflow (which naturally alters the workflow state)
             # from coming in and immediately being flagged as being dirty.
@@ -1929,8 +1937,13 @@ class EventManager(EngineScoped):
         request_id_token = _active_request_id.set(result_context.get("request_id"))
         # Act on the workflow the request names, in the handler and every task it spawns.
         binding_token = self._bind_request_workflow(handler_call.request_workflow)
+        undo_scope = None
         try:
             try:
+                # Before the handler, so a request that starts an undo step finds the step before checkpointed.
+                undo_scope = self.engine.undo_manager.begin_dispatch(
+                    request, handler_call.request_workflow.workflow, outermost=is_outermost_request
+                )
                 # Actually make the handler callback (support both sync and async):
                 with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
                     result_payload: ResultPayload = await call_function(handler_call.function, request)
@@ -1951,6 +1964,7 @@ class EventManager(EngineScoped):
                 request_workflow=handler_call.request_workflow,
             )
         finally:
+            self.engine.undo_manager.end_dispatch(undo_scope)
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
@@ -2075,8 +2089,13 @@ class EventManager(EngineScoped):
         request_id_token = _active_request_id.set(result_context.get("request_id"))
         # Act on the workflow the request names, in the handler and every task it spawns.
         binding_token = self._bind_request_workflow(handler_call.request_workflow)
+        undo_scope = None
         try:
             try:
+                # Before the handler, so a request that starts an undo step finds the step before checkpointed.
+                undo_scope = self.engine.undo_manager.begin_dispatch(
+                    request, handler_call.request_workflow.workflow, outermost=is_outermost_request
+                )
                 with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
                     result_payload = self._invoke_handler_from_sync(callback, handler_call.function, request)
 
@@ -2096,6 +2115,7 @@ class EventManager(EngineScoped):
                 request_workflow=handler_call.request_workflow,
             )
         finally:
+            self.engine.undo_manager.end_dispatch(undo_scope)
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
