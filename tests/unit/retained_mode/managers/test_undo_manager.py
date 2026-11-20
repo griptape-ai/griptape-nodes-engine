@@ -20,6 +20,7 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import ResolveNodeRequest
+from griptape_nodes.retained_mode.events.flow_events import SetFlowMetadataRequest
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     DeleteNodeRequest,
@@ -364,6 +365,19 @@ class TestAStepThatChangesNothing:
 
         assert _value(workflow, "a") == ""
 
+    def test_does_not_name_the_next_undo(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _ok(
+            engine,
+            workflow,
+            SetNodeMetadataRequest(node_name="a", metadata={"position": {"x": 1, "y": 1}}, undo_label="Move a"),
+            "drag",
+        )
+
+        _set(engine, workflow, "a", "", group="leave the field")
+
+        assert workflow.undo.undo_label == "Move a"
+
     def test_the_same_workflow_checkpoints_the_same(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         _add(engine, workflow, "a")
         _add(engine, workflow, "b")
@@ -461,12 +475,14 @@ class TestAClientCatchingUpAfterAnUndo:
         self, engine: Engine, workflow: WorkflowRuntime
     ) -> None:
         """An editor that writes back what it shows after an undo sends it without a group."""
+        _ok(engine, workflow, SetFlowMetadataRequest(metadata={"note": 1}), "annotate")
         _add(engine, workflow, "a")
         _set(engine, workflow, "a", "first", group="type")
         _undo(engine, workflow)
 
-        written_back = _ok(engine, workflow, SetParameterValueRequest(node_name="a", parameter_name="value", value=""))
+        written_back = _ok(engine, workflow, SetFlowMetadataRequest(metadata={"note": 1}))
 
+        # Reported as a change, so it is the checkpoint that tells it changed nothing.
         assert written_back.altered_workflow_state
         assert workflow.undo.redo_label == "Set Parameter Value"
         _redo(engine, workflow)
@@ -474,12 +490,13 @@ class TestAClientCatchingUpAfterAnUndo:
 
     def test_a_run_since_the_undo_is_not_a_change(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         """A rebuild carries over the latest results, so a redo loses nothing a run changed."""
+        _ok(engine, workflow, SetFlowMetadataRequest(metadata={"note": 1}), "annotate")
         _add(engine, workflow, "a")
         _set(engine, workflow, "a", "first", group="type")
         _undo(engine, workflow)
         _ran(workflow, "a")
 
-        _ok(engine, workflow, SetParameterValueRequest(node_name="a", parameter_name="value", value=""))
+        _ok(engine, workflow, SetFlowMetadataRequest(metadata={"note": 1}))
 
         assert workflow.undo.redo_label == "Set Parameter Value"
 
