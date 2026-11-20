@@ -65,12 +65,8 @@ def clean_object_state(engine: Engine) -> Generator[None, None, None]:
         engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
-def _create_flow(
-    engine: Engine, flow_name: str, *, parent_flow_name: str | None = None, set_as_new_context: bool = True
-) -> str:
-    result = engine.handle_request(
-        CreateFlowRequest(parent_flow_name=parent_flow_name, flow_name=flow_name, set_as_new_context=set_as_new_context)
-    )
+def _create_flow(engine: Engine, flow_name: str, *, parent_flow_name: str | None = None) -> str:
+    result = engine.handle_request(CreateFlowRequest(parent_flow_name=parent_flow_name, flow_name=flow_name))
     assert isinstance(result, CreateFlowResultSuccess), result
     return result.flow_name
 
@@ -117,8 +113,6 @@ def _deserialize_into_fresh_context(
     engine: Engine,
     serialized_flow_commands: SerializedFlowCommands,
     workflow_name: str,
-    *,
-    pop_flow_context_after: bool = True,
 ) -> DeserializeFlowFromCommandsResultSuccess:
     """Replay commands the way an image-metadata restore does, and require success.
 
@@ -130,9 +124,7 @@ def _deserialize_into_fresh_context(
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     engine.context_manager.push_workflow(workflow_name=workflow_name)
     result = engine.handle_request(
-        DeserializeFlowFromCommandsRequest(
-            serialized_flow_commands=serialized_flow_commands, pop_flow_context_after=pop_flow_context_after
-        )
+        DeserializeFlowFromCommandsRequest(serialized_flow_commands=serialized_flow_commands)
     )
     assert isinstance(result, DeserializeFlowFromCommandsResultSuccess), result
     return result
@@ -180,8 +172,9 @@ class TestSubflowAggregation:
     def test_subflow_appears_in_sub_flows_commands_with_its_nodes(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="wf_subflow_shape")
         parent_name = _create_flow(engine, "parent")
-        child_name = _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
-        _create_node(engine, "ChildNode", "child_node")
+        child_name = _create_flow(engine, "child", parent_flow_name=parent_name)
+        with engine.context_manager.flow("child"):
+            _create_node(engine, "ChildNode", "child_node")
 
         serialized = _serialize(engine, parent_name)
 
@@ -196,8 +189,9 @@ class TestSubflowAggregation:
         engine.context_manager.push_workflow(workflow_name="wf_node_types_used")
         parent_name = _create_flow(engine, "parent")
         _create_node(engine, "SharedTypeNode", "parent_node_1", library="lib_shared")
-        _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
-        _create_node(engine, "SharedTypeNode", "child_node_1", library="lib_shared")
+        _create_flow(engine, "child", parent_flow_name=parent_name)
+        with engine.context_manager.flow("child"):
+            _create_node(engine, "SharedTypeNode", "child_node_1", library="lib_shared")
 
         serialized = _serialize(engine, parent_name)
 
@@ -211,8 +205,9 @@ class TestSubflowAggregation:
         engine.context_manager.push_workflow(workflow_name="wf_node_dependencies")
         parent_name = _create_flow(engine, "parent")
         _create_node(engine, "ParentDepNode", "parent_node", library="lib_parent_only")
-        _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
-        _create_node(engine, "ChildDepNode", "child_node", library="lib_child_only")
+        _create_flow(engine, "child", parent_flow_name=parent_name)
+        with engine.context_manager.flow("child"):
+            _create_node(engine, "ChildDepNode", "child_node", library="lib_child_only")
 
         serialized = _serialize(engine, parent_name)
 
@@ -228,9 +223,9 @@ class TestConnectionAggregationAndDedup:
         engine.context_manager.push_workflow(workflow_name="wf_cross_boundary")
         parent_name = _create_flow(engine, "parent")
         source_name = _create_node(engine, "SourceNode", "source_node")
-        _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
-        target_name = _create_node(engine, "TargetNode", "target_node")
-        engine.context_manager.pop_flow()
+        _create_flow(engine, "child", parent_flow_name=parent_name)
+        with engine.context_manager.flow("child"):
+            target_name = _create_node(engine, "TargetNode", "target_node")
         _connect(engine, source_name, "exec_out", target_name, "exec_in")
 
         serialized = _serialize(engine, parent_name)
@@ -289,11 +284,10 @@ class TestNodeCreationBeforeConnectionWiring:
         engine.context_manager.push_workflow(workflow_name="wf_deep_nesting")
         parent_name = _create_flow(engine, "parent")
         source_name = _create_node(engine, "SourceNode", "source_node")
-        _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
-        _create_flow(engine, "grandchild", parent_flow_name="child", set_as_new_context=True)
-        target_name = _create_node(engine, "TargetNode", "target_node")
-        engine.context_manager.pop_flow()
-        engine.context_manager.pop_flow()
+        _create_flow(engine, "child", parent_flow_name=parent_name)
+        _create_flow(engine, "grandchild", parent_flow_name="child")
+        with engine.context_manager.flow("grandchild"):
+            target_name = _create_node(engine, "TargetNode", "target_node")
         _connect(engine, source_name, "exec_out", target_name, "exec_in")
 
         serialized = _serialize(engine, parent_name)
@@ -338,9 +332,9 @@ class TestNodeNameMappings:
         engine.context_manager.push_workflow(workflow_name="wf_name_mappings")
         parent_name = _create_flow(engine, "parent")
         parent_node_name = _create_node(engine, "ParentNode", "parent_node")
-        _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
-        child_node_name = _create_node(engine, "ChildNode", "child_node")
-        engine.context_manager.pop_flow()
+        _create_flow(engine, "child", parent_flow_name=parent_name)
+        with engine.context_manager.flow("child"):
+            child_node_name = _create_node(engine, "ChildNode", "child_node")
 
         serialized = _serialize(engine, parent_name)
 
@@ -417,46 +411,6 @@ class TestDeserializeFailureCleanup:
         assert not engine.object_manager.has_object_with_name(parent_name)
 
 
-class TestPopFlowContextAfter:
-    """``pop_flow_context_after`` leaves the context stack the way the caller found it."""
-
-    @pytest.mark.usefixtures("clean_object_state")
-    def test_true_pops_the_pushed_flow_context(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="wf_pop_true")
-        parent_name = _create_flow(engine, "parent")
-        serialized = _serialize(engine, parent_name)
-
-        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        engine.context_manager.push_workflow(workflow_name="wf_pop_true_restored")
-        assert not engine.context_manager.has_current_flow()
-
-        result = engine.handle_request(
-            DeserializeFlowFromCommandsRequest(serialized_flow_commands=serialized, pop_flow_context_after=True)
-        )
-        assert isinstance(result, DeserializeFlowFromCommandsResultSuccess), result
-
-        assert not engine.context_manager.has_current_flow()
-
-    @pytest.mark.usefixtures("clean_object_state")
-    def test_false_leaves_the_new_flow_on_the_context_stack(self, engine: Engine) -> None:
-        engine.context_manager.push_workflow(workflow_name="wf_pop_false")
-        parent_name = _create_flow(engine, "parent")
-        serialized = _serialize(engine, parent_name)
-
-        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        engine.context_manager.push_workflow(workflow_name="wf_pop_false_restored")
-        assert not engine.context_manager.has_current_flow()
-
-        result = engine.handle_request(
-            DeserializeFlowFromCommandsRequest(serialized_flow_commands=serialized, pop_flow_context_after=False)
-        )
-        assert isinstance(result, DeserializeFlowFromCommandsResultSuccess), result
-
-        assert engine.context_manager.has_current_flow()
-        assert engine.context_manager.get_current_flow().name == result.flow_name
-        engine.context_manager.pop_flow()
-
-
 class TestUniqueValuePoolSharedAcrossSubtree:
     """A value shared by nodes in different Flows of the same subtree should pool to one entry."""
 
@@ -466,10 +420,10 @@ class TestUniqueValuePoolSharedAcrossSubtree:
         parent_name = _create_flow(engine, "parent")
         parent_node_name = _create_node(engine, "ParentValueNode", "parent_value_node")
         _set_value(engine, parent_node_name, "payload", value="shared-across-boundary")
-        _create_flow(engine, "child", parent_flow_name=parent_name, set_as_new_context=True)
-        child_node_name = _create_node(engine, "ChildValueNode", "child_value_node")
-        _set_value(engine, child_node_name, "payload", value="shared-across-boundary")
-        engine.context_manager.pop_flow()
+        _create_flow(engine, "child", parent_flow_name=parent_name)
+        with engine.context_manager.flow("child"):
+            child_node_name = _create_node(engine, "ChildValueNode", "child_value_node")
+            _set_value(engine, child_node_name, "payload", value="shared-across-boundary")
 
         serialized = _serialize(engine, parent_name)
 

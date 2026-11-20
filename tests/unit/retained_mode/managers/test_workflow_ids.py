@@ -41,7 +41,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultSuccess,
@@ -89,6 +88,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
+from tests.workflow_context import bind, clear_all_object_state, send_in_the_open_workflow_async
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -131,17 +131,18 @@ def _open_new_workflow(engine: Engine, display_name: str) -> str:
     result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name=display_name))
     assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
     assert result.workflow_id is not None
+    bind(engine.open_workflows.get(result.workflow_id))
     return result.workflow_id
 
 
 def _save(engine: Engine, request: SaveWorkflowRequest | None = None) -> SaveWorkflowResultSuccess:
-    result = _run(engine, request or SaveWorkflowRequest())
+    result = asyncio.run(send_in_the_open_workflow_async(engine, request or SaveWorkflowRequest()))
     assert isinstance(result, SaveWorkflowResultSuccess), result.result_details
     return result
 
 
 def _close(engine: Engine) -> None:
-    engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    clear_all_object_state(engine)
 
 
 def _saved_workflow(engine: Engine, display_name: str) -> SaveWorkflowResultSuccess:
@@ -378,7 +379,7 @@ class TestWritePathsKeepOrMintAnId:
     def test_save_subflow_keeps_the_parent_id(self, project_engine: Engine) -> None:
         workflow_id = _open_new_workflow(project_engine, "parent")
         saved = _save(project_engine)
-        top = project_engine.handle_request(GetTopLevelFlowRequest())
+        top = project_engine.open_workflows.get(workflow_id).handle_request(GetTopLevelFlowRequest())
         assert isinstance(top, GetTopLevelFlowResultSuccess)
         subflow = project_engine.handle_request(
             CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="Sub", set_as_new_context=False)
@@ -483,12 +484,12 @@ class TestIdsAcrossRescans:
         engine.config_manager.workspace_path = workspace / "shots"
         failure = asyncio.run(
             engine.project_manager._reload_after_project_switch(
-                "shots", workspace_changed=True, library_config_changed=False
+                "shots", close_workflows=True, workspace_changed=True, library_config_changed=False
             )
         )
 
         assert failure is None
-        assert not engine.context_manager.has_current_workflow()
+        assert engine.open_workflows.all_open() == []
         assert _id_at(engine, opened_file) == opened_id
         assert _id_at(engine, closed_file) == closed_id
         assert engine.workflow_registry.get(closed_id or "").name == "closed"
@@ -818,7 +819,7 @@ class TestFirstSave:
         opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="Scratch"))
         assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess)
 
-        saved = _run(engine, SaveWorkflowRequest(file_name="current/comp"))
+        saved = asyncio.run(send_in_the_open_workflow_async(engine, SaveWorkflowRequest(file_name="current/comp")))
 
         assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
         assert saved.workflow_id == opened.workflow_id
@@ -831,7 +832,7 @@ class TestIdsOnResults:
         engine = current_engine()
         workflow_id = _open_new_workflow(engine, "reported")
 
-        context = engine.handle_request(GetWorkflowContextRequest())
+        context = engine.open_workflows.get(workflow_id).handle_request(GetWorkflowContextRequest())
         heartbeat = engine.handle_request(EngineHeartbeatRequest(heartbeat_id="beat"))
 
         assert isinstance(context, GetWorkflowContextSuccess)
@@ -1010,7 +1011,7 @@ class TestIdentityAcrossTheWorkflowLifecycle:
         reopened = _run(engine, RunWorkflowFromRegistryRequest(workflow_name=moved.new_workflow_name))
         assert isinstance(reopened, RunWorkflowFromRegistryResultSuccess), reopened.result_details
         assert reopened.workflow_id == workflow_id
-        assert engine.context_manager.get_current_workflow_id() == workflow_id
+        assert [open_workflow.workflow_id for open_workflow in engine.open_workflows.all_open()] == [workflow_id]
         _close(engine)
 
         _scan(engine, workspace)
@@ -1284,9 +1285,9 @@ class TestLibraryWorkflowsOpenAsCopies:
 
     def test_asking_for_the_run_command_of_an_open_copy_asks_to_save_it_first(self, project_engine: Engine) -> None:
         library = _library_workflow(project_engine, "library_flow")
-        _open_library_workflow(project_engine, "open_by_id", library)
+        copy_id = _open_library_workflow(project_engine, "open_by_id", library)
 
-        result = _run(project_engine, GetWorkflowRunCommandRequest())
+        result = asyncio.run(project_engine.open_workflows.get(copy_id).ahandle_request(GetWorkflowRunCommandRequest()))
 
         assert isinstance(result, GetWorkflowRunCommandResultFailure)
         assert "isn't saved" in str(result.result_details)
@@ -1299,7 +1300,7 @@ class TestSaveAsContinuingInTheCopy:
         """Open a workflow, save it, then add a flow the save doesn't hold, and return its id."""
         workflow_id = _open_new_workflow(engine, "original")
         _save(engine)
-        top_level = engine.handle_request(GetTopLevelFlowRequest())
+        top_level = engine.open_workflows.get(workflow_id).handle_request(GetTopLevelFlowRequest())
         assert isinstance(top_level, GetTopLevelFlowResultSuccess)
         created = engine.handle_request(
             CreateFlowRequest(parent_flow_name=top_level.flow_name, flow_name="unsaved_edit", set_as_new_context=False)

@@ -1,6 +1,6 @@
 """A node whose Griptape Cloud call was refused over budget fails as a budget halt naming that node.
 
-Every node failure passes through ``NodeManager._execution_failure``, so no node type has to
+Every node failure passes through ``NodeManager.execution_failure``, so no node type has to
 recognize the refusal itself. These drive it with the three shapes a refusal arrives in: the raw
 Cloud 403, a halt a Cloud driver raised before it knew which node it was running in, and a halt
 already worded for its node.
@@ -49,7 +49,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         wrapped.__cause__ = _cloud_refusal()
 
         with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
-            failure = _node_manager()._execution_failure(wrapped, "Upscale")
+            failure = _node_manager().execution_failure(wrapped, "Upscale")
 
         assert isinstance(failure.exception, BudgetExceededError)
         assert failure.exception.node_name == "Upscale"
@@ -63,7 +63,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         wrapped = RuntimeError("Attempted to upscale the video. Failed due to a 403.")
         wrapped.__cause__ = _cloud_refusal()
 
-        failure = _node_manager()._execution_failure(wrapped, "Upscale")
+        failure = _node_manager().execution_failure(wrapped, "Upscale")
 
         halt = failure.exception
         assert halt is not None
@@ -78,7 +78,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         wrapped = RuntimeError("the driver gave up")
         wrapped.__cause__ = driver_halt
 
-        failure = _node_manager()._execution_failure(wrapped, "Upscale")
+        failure = _node_manager().execution_failure(wrapped, "Upscale")
 
         assert isinstance(failure.exception, BudgetExceededError)
         assert failure.exception.node_name == "Upscale"
@@ -93,7 +93,7 @@ class TestExecutionFailureNamesTheRefusedNode:
         outer = RuntimeError("the subflow failed")
         outer.__cause__ = inner
 
-        failure = _node_manager()._execution_failure(outer, "Group")
+        failure = _node_manager().execution_failure(outer, "Group")
 
         assert failure.exception is inner
         assert str(failure.result_details) == str(inner)
@@ -101,7 +101,7 @@ class TestExecutionFailureNamesTheRefusedNode:
     def test_an_ordinary_failure_is_reported_as_before(self) -> None:
         error = ValueError("the image was empty")
 
-        failure = _node_manager()._execution_failure(error, "Blur")
+        failure = _node_manager().execution_failure(error, "Blur")
 
         assert failure.exception is error
         assert str(failure.result_details) == "Attempted to execute node 'Blur'. Failed with error: the image was empty"

@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import json
 import logging
 import threading
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
-from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.topics import REQUEST_TOPIC, client_response_topic
 
 if TYPE_CHECKING:
@@ -19,7 +17,6 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.api_client.client import Client
-    from griptape_nodes.retained_mode.events.base_events import EventRequest
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +37,9 @@ class _PendingRequest:
     # the full payload dict instead of rejecting it with
     # ``Exception(error_msg)``. The default (False) preserves the
     # original "failure -> raised exception" contract that
-    # ``request``/``request_from_worker``/``request_batch`` already
-    # rely on. The worker fan-out path opts in so the orchestrator can
-    # cattrs-structure the failure dict back into a real
-    # ``ResultPayloadFailure`` (preserving exception fidelity over the
-    # wire).
+    # ``request``/``request_batch`` already rely on. A caller that
+    # structures the failure dict back into a real ``ResultPayloadFailure``
+    # opts in, so the exception survives the wire.
     resolve_failures_as_payload: bool = False
 
 
@@ -124,6 +119,8 @@ class RequestClient:
         payload: dict[str, Any],
         topic: str | None = None,
         timeout_ms: int | None = None,
+        *,
+        open_workflow_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a request and wait for its response.
 
@@ -139,6 +136,8 @@ class RequestClient:
             payload: Request payload data
             topic: Optional per-call request topic override (defaults to request_topic_fn())
             timeout_ms: Optional timeout in milliseconds
+            open_workflow_id: Id of the open workflow the request runs in, sent on its envelope.
+                Left out, the engine decides, as `EventRequest.open_workflow_id` describes.
 
         Returns:
             Response data from the server
@@ -163,13 +162,7 @@ class RequestClient:
             self._subscribed_response_topics.add(response_topic)
 
         # Send the request as an EventRequest
-        event_payload = {
-            "event_type": "EventRequest",
-            "request_type": request_type,
-            "request_id": request_id,
-            "request": payload,
-            "response_topic": response_topic,
-        }
+        event_payload = _event_request(request_type, request_id, payload, response_topic, open_workflow_id)
 
         logger.debug("Sending request %s: %s", request_id, request_type)
 
@@ -195,68 +188,6 @@ class RequestClient:
             logger.debug("Request %s completed successfully", request_id)
             return result
 
-    async def request_from_worker(
-        self,
-        event_request: EventRequest,
-        request_topic: str,
-        worker_response_topic: str,
-        timeout_ms: int | None = None,
-    ) -> dict[str, Any]:
-        """Publish a worker's EventRequest to another engine, its orchestrator or its host, and await the EventResult.
-
-        Sets event_request.response_topic to worker_response_topic so that engine
-        replies on a topic this RequestClient is subscribed to. Tracks the future by
-        event_request.request_id (generated if missing), publishes the serialized
-        EventRequest to request_topic, and awaits the matching response.
-
-        Args:
-            event_request: EventRequest wrapping the RequestPayload to forward.
-            request_topic: Topic the engine asked listens on.
-            worker_response_topic: Topic this worker listens on for the reply.
-            timeout_ms: Optional timeout in milliseconds.
-
-        Returns:
-            The response payload dict (EventResultSuccess or EventResultFailure shape).
-
-        Raises:
-            TimeoutError: If no response arrives before timeout_ms.
-        """
-        if not event_request.request_id:
-            event_request.request_id = str(uuid.uuid4())
-        request_id = event_request.request_id
-        event_request.response_topic = worker_response_topic
-        # Before tracking, so a request that cannot be sent leaves no pending response behind.
-        payload_dict = json.loads(converters.engine.dumps(event_request))
-
-        response_future = await self._track_request(request_id)
-
-        if worker_response_topic not in self._subscribed_response_topics:
-            await self.client.subscribe(worker_response_topic)
-            self._subscribed_response_topics.add(worker_response_topic)
-
-        logger.debug("Forwarding request %s on %s", request_id, request_topic)
-
-        try:
-            await self.client.publish("EventRequest", payload_dict, request_topic)
-
-            if timeout_ms:
-                timeout_sec = timeout_ms / 1000
-                result = await asyncio.wait_for(asyncio.wrap_future(response_future), timeout=timeout_sec)
-            else:
-                result = await asyncio.wrap_future(response_future)
-
-        except TimeoutError as e:
-            self.discard_request(request_id)
-            msg = f"Forwarded request {request_id} timed out"
-            raise TimeoutError(msg) from e
-
-        except Exception:
-            self.discard_request(request_id)
-            raise
-        else:
-            logger.debug("Forwarded request %s completed", request_id)
-            return result
-
     async def request_batch(
         self,
         requests: list[tuple[str, dict[str, Any]]],
@@ -264,6 +195,7 @@ class RequestClient:
         timeout_ms: int | None = None,
         *,
         return_exceptions: bool = False,
+        open_workflow_id: str | None = None,
     ) -> list[Any]:
         """Send a batch of requests in one frame and gather their responses.
 
@@ -279,6 +211,8 @@ class RequestClient:
             timeout_ms: Optional timeout applied to the whole batch.
             return_exceptions: If True, failures and timeouts are returned in
                 their slot instead of raising. Matches asyncio.gather semantics.
+            open_workflow_id: Id of the open workflow every inner request runs in, as `request`
+                takes it.
 
         Returns:
             Responses in submission order. When return_exceptions is False, a
@@ -312,15 +246,7 @@ class RequestClient:
             payload = {**raw_payload, "request_id": request_id}
             futures.append(await self._track_request(request_id))
             request_ids.append(request_id)
-            inner_events.append(
-                {
-                    "event_type": "EventRequest",
-                    "request_type": request_type,
-                    "request_id": request_id,
-                    "request": payload,
-                    "response_topic": response_topic,
-                }
-            )
+            inner_events.append(_event_request(request_type, request_id, payload, response_topic, open_workflow_id))
 
         batch_payload = {"event_type": "EventRequestBatch", "requests": inner_events}
         logger.debug("Sending batch of %d requests on %s", len(inner_events), request_topic)
@@ -582,3 +508,23 @@ class RequestClient:
                 return True
 
         return False
+
+
+def _event_request(
+    request_type: str,
+    request_id: str,
+    payload: dict[str, Any],
+    response_topic: str,
+    open_workflow_id: str | None,
+) -> dict[str, Any]:
+    """Build an EventRequest envelope, naming `open_workflow_id` only when there is one."""
+    event_request: dict[str, Any] = {
+        "event_type": "EventRequest",
+        "request_type": request_type,
+        "request_id": request_id,
+        "request": payload,
+        "response_topic": response_topic,
+    }
+    if open_workflow_id is not None:
+        event_request["open_workflow_id"] = open_workflow_id
+    return event_request

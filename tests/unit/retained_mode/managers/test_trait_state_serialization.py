@@ -30,6 +30,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.slider import Slider
+from tests.workflow_context import bind, the_open_workflow
 
 _LIBRARY_NAME = "trait-state-serialization-test-library"
 
@@ -131,9 +132,17 @@ def _registered_node_type() -> Generator[None, None, None]:
     LibraryRegistry._clear()
 
 
-def _add_node(engine: Engine, name: str) -> _ModelPicker:
+def _ensure_workflow(engine: Engine) -> None:
+    """Open the test's workflow with its flow, unless an earlier step already did."""
+    if engine.current_workflow_or_none() is not None:
+        return
     context = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="trait_state_test"))
     assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
+    bind(the_open_workflow(engine))
+
+
+def _add_node(engine: Engine, name: str) -> _ModelPicker:
+    _ensure_workflow(engine)
     node = _ModelPicker(name=name, metadata={"library": _LIBRARY_NAME, "node_type": _ModelPicker.__name__})
     engine.object_manager.add_object_by_name_in(engine.current_workflow(), name, node)
     return node
@@ -322,8 +331,7 @@ class TestAnUnsaveableTraitValueDegradesTheSaveInsteadOfFailingIt:
     """A value with no saved form costs that one value, not the whole save."""
 
     def test_serializing_still_succeeds(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
-        context = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="trait_state_test"))
-        assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
+        _ensure_workflow(engine)
         node = _MisdeclaredTraitNode(
             name="broken_node", metadata={"library": _LIBRARY_NAME, "node_type": _MisdeclaredTraitNode.__name__}
         )
@@ -478,8 +486,7 @@ class TestFromStateRaisingAnUnexpectedError:
 
 
 def _add_declared_node(engine: Engine, name: str) -> _DeclaredControls:
-    context = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="trait_state_test"))
-    assert isinstance(context, EnsureWorkflowAndFlowResultSuccess)
+    _ensure_workflow(engine)
     node = _DeclaredControls(name=name, metadata={"library": _LIBRARY_NAME, "node_type": _DeclaredControls.__name__})
     engine.object_manager.add_object_by_name_in(engine.current_workflow(), name, node)
     return node

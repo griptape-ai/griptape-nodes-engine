@@ -248,17 +248,17 @@ class TestFlowManagerDagBuilderIntegration:
 
         engine.current_workflow_or_none.return_value = runtime
         flow_manager = FlowManager(MagicMock(spec=EventManager), engine=engine)
-        flow_manager.global_dag_builder.node_to_reference["node"] = MagicMock()
+        runtime.flows.global_dag_builder.node_to_reference["node"] = MagicMock()
 
         mock_control_flow = MagicMock()
         mock_control_flow.cancel_flow = AsyncMock()
         mock_control_flow.context.flow_name = "test_flow"
-        flow_manager._global_control_flow_machine = mock_control_flow
+        runtime.flows.global_control_flow_machine = mock_control_flow
 
         with patch.object(flow_manager, "_flow_is_running", return_value=True):
-            await flow_manager._cancel_run(flow_manager._current_flows())
+            await flow_manager._cancel_run(runtime.flows)
 
-        assert flow_manager.global_dag_builder.node_to_reference == {}
+        assert runtime.flows.global_dag_builder.node_to_reference == {}
 
     def test_dag_builder_prevents_duplicate_node_addition_after_clear(self) -> None:
         """Test that DAG builder prevents duplicate node addition and allows re-addition after clear."""

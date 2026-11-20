@@ -57,10 +57,6 @@ class _ValueNode(DataNode):
 class TestRetainedModeLock:
     def test_lock_without_current_context_returns_failure(self, engine: Engine) -> None:
         engine.context_manager.push_workflow(workflow_name="lock_no_node_wf")
-        # Ensure empty current context for nodes
-        ctx = engine.context_manager
-        while ctx.has_current_node():
-            ctx.pop_node()
         res = engine.handle_request(SetLockNodeStateRequest(node_name=None, lock=True))
         assert isinstance(res, SetLockNodeStateResultFailure)
         assert "Current Context" in str(res.result_details)

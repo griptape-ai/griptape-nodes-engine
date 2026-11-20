@@ -46,6 +46,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ENV_VAR_PREFIX
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.serialization.values import decode_value
 
 if TYPE_CHECKING:
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.drivers.storage import StorageBackend
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         self._skip_library_loading = skip_library_loading
         self._workflows_to_register = workflows_to_register or []
         self._save_on_failure_path = save_on_failure_path
+        self._workflow: WorkflowRuntime | None = None
 
     async def __aenter__(self) -> Self:
         """Async context manager entry: initialize queue and broadcast app initialization."""
@@ -115,8 +118,13 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     ) -> None:
         """Async context manager exit."""
         # TODO: Broadcast shutdown https://github.com/griptape-ai/griptape-nodes-engine/issues/2149
-        if exc_val is not None and self._save_on_failure_path is not None:
-            await self._save_failed_workflow(exc_val)
+        try:
+            if exc_val is not None and self._save_on_failure_path is not None:
+                await self._save_failed_workflow(exc_val)
+        finally:
+            if self._workflow is not None and bound_workflow.get() is self._workflow:
+                bound_workflow.set(None)
+            self._workflow = None
 
     def _get_workflow_name(self) -> str:
         """The name a failed workflow's file starts with.
@@ -246,6 +254,12 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             msg = f"Failed to load workflow from path {workflow_path}"
             _raise_load_error(msg)
 
+        # The requests below and `_save_failed_workflow` name no workflow, so bind the one this run opened.
+        if isinstance(result, RunWorkflowFromScratchResultSuccess) and result.workflow_id is not None:
+            engine = GriptapeNodes.get_instance()
+            self._workflow = engine.open_workflows.get(result.workflow_id)
+            bound_workflow.set(self._workflow)
+
         # A FLAWED load succeeded but is missing pieces -- placeholders stand in for nodes whose
         # library would not register. That trade is right in the editor, where an artist can see
         # the placeholders and decide; here there is nobody to see them, so a run would silently
@@ -368,55 +382,70 @@ class LocalWorkflowExecutor(WorkflowExecutor):
             return
 
         try:
-            # _get_workflow_name() can fail if the context manager is in a bad state at failure time;
-            # fall back to a generic name rather than letting that secondary failure surface.
-            try:
-                workflow_name = self._get_workflow_name()
-            except Exception:
-                logger.warning("save_failed_workflow: could not retrieve workflow name; using 'workflow'.")
-                workflow_name = "workflow"
-
-            top_level_flow_result = await GriptapeNodes.ahandle_request(GetTopLevelFlowRequest())
-            if not isinstance(top_level_flow_result, GetTopLevelFlowResultSuccess):
-                logger.error("save_failed_workflow: could not get top-level flow; skipping save.")
+            # Bound again here: the failure may surface in a context the run's binding didn't reach.
+            engine = GriptapeNodes.get_instance()
+            workflow = self._workflow
+            if workflow is None:
+                workflow = engine.current_workflow_or_none()
+            if workflow is None:
+                logger.error("save_failed_workflow: the run is bound to no workflow; skipping save.")
                 return
-
-            serialized_flow_result = await GriptapeNodes.ahandle_request(
-                SerializeFlowToCommandsRequest(
-                    flow_name=top_level_flow_result.flow_name,
-                    include_create_flow_command=True,
-                )
-            )
-            if not isinstance(serialized_flow_result, SerializeFlowToCommandsResultSuccess):
-                logger.error("save_failed_workflow: could not serialize flow; skipping save.")
-                return
-
-            target_path = await self._resolve_failure_save_path(workflow_name)
-            if target_path is None:
-                return
-
-            timestamp = datetime.now(UTC).isoformat()
-            if isinstance(error, BaseException):
-                error_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-            else:
-                error_text = str(error)
-            description = f"Workflow failed at {timestamp}.\n\n{error_text}"
-
-            file_name = Path(target_path).stem
-            save_result = await GriptapeNodes.ahandle_request(
-                SaveWorkflowFileFromSerializedFlowRequest(
-                    serialized_flow_commands=serialized_flow_result.serialized_flow_commands,
-                    file_name=file_name,
-                    file_path=target_path,
-                    description=description,
-                )
-            )
-            if isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
-                logger.info("Saved failed workflow state to %s", save_result.file_path)
-            else:
-                logger.error("save_failed_workflow: save request failed: %s", save_result)
+            with engine.bind_workflow(workflow):
+                # _get_workflow_name() can fail if the context manager is in a bad state at failure time;
+                # fall back to a generic name rather than letting that secondary failure surface.
+                try:
+                    workflow_name = self._get_workflow_name()
+                except Exception:
+                    logger.warning("save_failed_workflow: could not retrieve workflow name; using 'workflow'.")
+                    workflow_name = "workflow"
+                await self._save_workflow_state(workflow_name, error)
         except Exception:
             logger.exception("save_failed_workflow: unexpected error during failure save (original error unchanged).")
+
+    async def _save_workflow_state(self, workflow_name: str, error: BaseException | str) -> None:
+        """Save the bound workflow's flow state to the failure path, logging why when it can't."""
+        top_level_flow_result = await GriptapeNodes.ahandle_request(GetTopLevelFlowRequest())
+        if (
+            not isinstance(top_level_flow_result, GetTopLevelFlowResultSuccess)
+            or top_level_flow_result.flow_name is None
+        ):
+            logger.error("save_failed_workflow: could not get top-level flow; skipping save.")
+            return
+
+        serialized_flow_result = await GriptapeNodes.ahandle_request(
+            SerializeFlowToCommandsRequest(
+                flow_name=top_level_flow_result.flow_name,
+                include_create_flow_command=True,
+            )
+        )
+        if not isinstance(serialized_flow_result, SerializeFlowToCommandsResultSuccess):
+            logger.error("save_failed_workflow: could not serialize flow; skipping save.")
+            return
+
+        target_path = await self._resolve_failure_save_path(workflow_name)
+        if target_path is None:
+            return
+
+        timestamp = datetime.now(UTC).isoformat()
+        if isinstance(error, BaseException):
+            error_text = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        else:
+            error_text = str(error)
+        description = f"Workflow failed at {timestamp}.\n\n{error_text}"
+
+        file_name = Path(target_path).stem
+        save_result = await GriptapeNodes.ahandle_request(
+            SaveWorkflowFileFromSerializedFlowRequest(
+                serialized_flow_commands=serialized_flow_result.serialized_flow_commands,
+                file_name=file_name,
+                file_path=target_path,
+                description=description,
+            )
+        )
+        if not isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
+            logger.error("save_failed_workflow: save request failed: %s", save_result)
+            return
+        logger.info("Saved failed workflow state to %s", save_result.file_path)
 
     async def arun(
         self,

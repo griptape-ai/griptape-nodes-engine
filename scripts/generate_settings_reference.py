@@ -486,8 +486,8 @@ def _render_markdown(rows: list[SettingRow], entry_types: list[EntryType]) -> st
         "`griptape_nodes_config.json` file (see [Engine Configuration](../guides/configuration.md) for the load "
         "order). A nested setting is listed under its full dotted key, the form `griptape-nodes config show` "
         "accepts and the env var names below are built from. A config file nests each part of that key as a JSON "
-        'object, so `worker.heartbeat_timeout_s` is `{"worker": {"heartbeat_timeout_s": 30}}`; a flat '
-        '`"worker.heartbeat_timeout_s"` key is ignored. Settings with a `GTN_CONFIG_*` env var, including the '
+        'object, so `worker.library_load_timeout_s` is `{"worker": {"library_load_timeout_s": 30}}`; a flat '
+        '`"worker.library_load_timeout_s"` key is ignored. Settings with a `GTN_CONFIG_*` env var, including the '
         "`GTN_CONFIG_<PATH>` form with `__` between the parts of a dotted key and the `GTN_CONFIG_<NAME>__<KEY>` "
         "form for a mapping-valued setting's entries, can also be overridden from the environment; list-valued "
         "settings must be edited in a config file unless their environment variable is marked as taking a JSON list. "

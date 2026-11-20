@@ -128,8 +128,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType, QueueItem
-from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, WorkflowNotNamedError, bound_workflow
+from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.variable_types import VariableScope
+from tests.workflow_context import the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -213,17 +214,17 @@ class _RawThreadNode(ControlNode):
 
     async def aprocess(self) -> None:
         engine = self.engine
+        workflow = self.workflow
+        assert workflow is not None
         built_in_node_code = File(_RAW_THREAD_FILE)
         _RawThreadNode.seen["in_node_code"] = built_in_node_code.resolve()
 
         def in_raw_thread() -> None:
             _RawThreadNode.seen["built_in_node_code"] = built_in_node_code.resolve()
             _RawThreadNode.seen["built_for_the_node"] = File(_RAW_THREAD_FILE, workflow=self.workflow).resolve()
-            try:
-                _RawThreadNode.seen["ambient"] = engine.current_workflow_or_none()
-            except WorkflowNotNamedError as err:
-                _RawThreadNode.seen["ambient"] = err
+            _RawThreadNode.seen["ambient"] = engine.current_workflow_or_none()
             _RawThreadNode.seen["ambient_resolve"] = engine.handle_request(_resolve(_RAW_THREAD_FILE))
+            _RawThreadNode.seen["resolve_in_the_nodes_workflow"] = workflow.handle_request(_resolve(_RAW_THREAD_FILE))
 
         thread = threading.Thread(target=in_raw_thread)
         thread.start()
@@ -311,9 +312,7 @@ def _nodes_in(engine: Engine, workflow: WorkflowRuntime, flow: str = "canvas") -
 
 
 def _failed_for_no_workflow_named(result: ResultPayload) -> bool:
-    return isinstance(getattr(result, "exception", None), WorkflowNotNamedError) or "did not name one" in str(
-        result.result_details
-    )
+    return "did not name one" in str(result.result_details)
 
 
 def _park(name: str) -> asyncio.Event:
@@ -431,19 +430,23 @@ class TestEachWorkflowSeesOnlyItsOwn:
 
     def test_context_is_per_workflow(self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]) -> None:
         a, b = two_open
-        extra = _send(engine, CreateFlowRequest(parent_flow_name=None, flow_name="second", set_as_new_context=True), a)
+        extra = _send(engine, CreateFlowRequest(parent_flow_name=None, flow_name="second"), a)
         assert extra.succeeded(), extra.result_details
+        second = engine.flow_manager.get_flow_by_name_in(a, "second")
 
-        context_a = _send(engine, GetWorkflowContextRequest(), a)
-        context_b = _send(engine, GetWorkflowContextRequest(), b)
-        top_b = _send(engine, GetTopLevelFlowRequest(), b)
+        with a.context.flow(second):
+            context_a = _send(engine, GetWorkflowContextRequest(), a)
+            context_b = _send(engine, GetWorkflowContextRequest(), b)
+            top_b = _send(engine, GetTopLevelFlowRequest(), b)
+            current_a = a.context.get_current_flow().name
+            current_b = b.context.get_current_flow().name
 
         assert isinstance(context_a, GetWorkflowContextSuccess)
         assert isinstance(context_b, GetWorkflowContextSuccess)
         assert context_a.workflow_id == a.workflow_id
         assert context_b.workflow_id == b.workflow_id
-        assert a.context.get_current_flow().name == "second"
-        assert b.context.get_current_flow().name == "canvas"
+        assert current_a == "second"
+        assert current_b == "canvas"
         assert isinstance(top_b, GetTopLevelFlowResultSuccess)
         assert top_b.flow_name == "canvas"
 
@@ -649,7 +652,7 @@ class TestCloseOneWhileTheOtherRuns:
 
 # Requests the editor plausibly sends with no envelope id, each paired with whether it still works with
 # two workflows open. Ordered so the destructive ones come last; every one either fails or acts on
-# host state, so none of them changes A or B.
+# host state or on no workflow, so none of them changes A or B.
 _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
     ("EngineHeartbeatRequest", lambda: EngineHeartbeatRequest(heartbeat_id="hb")),
     ("GetEngineVersionRequest", GetEngineVersionRequest),
@@ -690,14 +693,10 @@ _NO_ID_REQUESTS: list[tuple[str, Callable[[], RequestPayload]]] = [
     ("CancelFlowRequest", lambda: CancelFlowRequest(flow_name="canvas")),
     ("SaveWorkflowRequest", SaveWorkflowRequest),
     ("DeleteNodeRequest", lambda: DeleteNodeRequest(node_name="n")),
-    ("EnsureWorkflowAndFlowRequest", lambda: EnsureWorkflowAndFlowRequest(display_name="C")),
 ]
 
-# What the sweep found: the requests that fail with WorkflowNotNamedError when no id is sent.
+# What the sweep found: the requests that fail with WorkflowNotNamedResultFailure when no id is sent.
 _FAIL_WITHOUT_AN_ID = {
-    "ResolveMacroPathRequest {workspace_dir}",
-    "ResolveMacroPathRequest {workflow_dir}",
-    "GetWorkflowContextRequest",
     "ListFlowsInCurrentContextRequest",
     "GetTopLevelFlowRequest",
     "ListNodesInFlowRequest",
@@ -710,7 +709,6 @@ _FAIL_WITHOUT_AN_ID = {
     "GetFlowStateRequest",
     "ListVariablesRequest",
     "GetVariableSubstitutionEnabledRequest",
-    "GetWorkflowRunCommandRequest",
     "SetParameterValueRequest",
     "CreateNodeRequest",
     "CreateFlowRequest",
@@ -720,7 +718,13 @@ _FAIL_WITHOUT_AN_ID = {
     "CancelFlowRequest",
     "SaveWorkflowRequest",
     "DeleteNodeRequest",
-    "EnsureWorkflowAndFlowRequest",
+}
+
+# The requests that work without a workflow and act on none when no id is sent, failing only where
+# they need one.
+_NEED_A_WORKFLOW_WITHOUT_AN_ID = {
+    "ResolveMacroPathRequest {workflow_dir}",
+    "GetWorkflowRunCommandRequest",
 }
 
 
@@ -761,8 +765,8 @@ class TestRequestsWithNoEnvelopeId:
                 outcomes[label] = f"other failure: {result.result_details}"
 
         failed = {label for label, outcome in outcomes.items() if outcome == "not named"}
-        other = {label: outcome for label, outcome in outcomes.items() if outcome.startswith("other")}
-        assert other == {}
+        other = {label for label, outcome in outcomes.items() if outcome.startswith("other")}
+        assert other == _NEED_A_WORKFLOW_WITHOUT_AN_ID
         assert failed == _FAIL_WITHOUT_AN_ID
         # Nothing an unnamed request did reached either workflow.
         assert engine.open_workflows.all_open() == [a, b]
@@ -978,15 +982,13 @@ class TestHeldObjects:
         a, b = two_open
         released: list[str] = []
         resources = engine.resource_manager
-        # Held while each workflow's node runs, which is bound to it.
-        with engine.bind_workflow(a):
-            key_a = resources.put_local_object(
-                "model for A", owner="Lib", source="node_in_A", key="a", on_drop=lambda _v: released.append("A")
-            )
-        with engine.bind_workflow(b):
-            resources.put_local_object(
-                "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B")
-            )
+        # Held for the workflow each node belongs to.
+        key_a = resources.put_local_object(
+            "model for A", owner="Lib", source="node_in_A", key="a", on_drop=lambda _v: released.append("A"), workflow=a
+        )
+        resources.put_local_object(
+            "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B"), workflow=b
+        )
 
         engine.close_workflow(b)
 
@@ -1014,14 +1016,12 @@ class TestHeldObjects:
         engine.close_workflow(a)
         released: list[str] = []
         resources = engine.resource_manager
-        with engine.bind_workflow(NO_WORKFLOW):
-            resources.put_local_object(
-                "shared model", owner="Lib", source="host", key="h", on_drop=lambda _v: released.append("host")
-            )
-        with engine.bind_workflow(b):
-            resources.put_local_object(
-                "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B")
-            )
+        resources.put_local_object(
+            "shared model", owner="Lib", source="host", key="h", on_drop=lambda _v: released.append("host")
+        )
+        resources.put_local_object(
+            "model for B", owner="Lib", source="node_in_B", key="b", on_drop=lambda _v: released.append("B"), workflow=b
+        )
 
         with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all:
             result = _send(engine, CloseWorkflowRequest(workflow_id=b.workflow_id), None)
@@ -1038,9 +1038,10 @@ class TestHeldObjects:
         a, b = two_open
         released: list[str] = []
         resources = engine.resource_manager
-        for workflow, label in ((a, "A"), (b, "B"), (NO_WORKFLOW, "host")):
-            with engine.bind_workflow(workflow):
-                resources.put_local_object(label, owner="Lib", source=label, key=label, on_drop=released.append)
+        for workflow, label in ((a, "A"), (b, "B"), (None, "host")):
+            resources.put_local_object(
+                label, owner="Lib", source=label, key=label, on_drop=released.append, workflow=workflow
+            )
 
         with patch.object(engine.worker_manager, "broadcast_drop_all_local_objects", AsyncMock()) as drop_all:
             result = _send(engine, ClearAllObjectStateRequest(i_know_what_im_doing=True), None)
@@ -1143,11 +1144,9 @@ class TestWorkerForTwoOrchestratorWorkflows:
         assert runtime_a is not None
         assert runtime_b is not None
         resources = worker_engine.resource_manager
-        # Held while each workflow's node runs, which is bound to its runtime.
-        with worker_engine.run_in_worker_workflow(runtime_a):
-            key_a = resources.put_local_object("A's model", owner="Lib", source="pa", key="a")
-        with worker_engine.run_in_worker_workflow(runtime_b):
-            key_b = resources.put_local_object("B's model", owner="Lib", source="pb", key="b")
+        # Held for the runtime each workflow's node belongs to.
+        key_a = resources.put_local_object("A's model", owner="Lib", source="pa", key="a", workflow=runtime_a)
+        key_b = resources.put_local_object("B's model", owner="Lib", source="pb", key="b", workflow=runtime_b)
 
         # The orchestrator closes A and tells its workers which workflow closed.
         await _handle_drop_all_local_objects(
@@ -1169,7 +1168,7 @@ class TestWorkerForTwoOrchestratorWorkflows:
 
 
 class TestRawThreadInNodeCode:
-    """Scenario (h): a plain thread does not carry the node's binding, so node code reaches its workflow through its files."""
+    """Scenario (h): a plain thread does not carry the node's binding, so node code reaches its workflow through its files or `self.workflow`."""
 
     @pytest.mark.asyncio
     async def test_files_node_code_builds_resolve_in_its_workflow_from_a_raw_thread(
@@ -1187,12 +1186,15 @@ class TestRawThreadInNodeCode:
         assert in_a != str(in_b.resolved_path)
         assert _RawThreadNode.seen["built_in_node_code"] == in_a
         assert _RawThreadNode.seen["built_for_the_node"] == in_a
-        # An ambient read can't tell which workflow the thread works for, so it is refused, not guessed.
-        assert isinstance(_RawThreadNode.seen["ambient"], WorkflowNotNamedError)
+        # An ambient read can't tell which workflow the thread works for, so it finds none, not a guess.
+        assert _RawThreadNode.seen["ambient"] is None
         assert _RawThreadNode.seen["ambient_resolve"].failed()
+        resolved = _RawThreadNode.seen["resolve_in_the_nodes_workflow"]
+        assert isinstance(resolved, ResolveMacroPathResultSuccess), resolved.result_details
+        assert str(resolved.resolved_path) == in_a
 
     @pytest.mark.asyncio
-    async def test_with_one_workflow_open_a_raw_thread_falls_back_to_it(
+    async def test_with_one_workflow_open_a_raw_threads_request_names_none(
         self,
         engine: Engine,
         spike_library: None,  # noqa: ARG002
@@ -1204,8 +1206,10 @@ class TestRawThreadInNodeCode:
         result = await _send_async(engine, StartFlowRequest(flow_name="canvas", flow_node_name="threaded"), only)
 
         assert isinstance(result, StartFlowResultSuccess), result.result_details
-        assert _RawThreadNode.seen["ambient"] is only
-        assert _RawThreadNode.seen["ambient_resolve"].succeeded()
+        assert _RawThreadNode.seen["ambient"] is None
+        # A request names the workflow it is sent through, never the only open one.
+        assert _RawThreadNode.seen["ambient_resolve"].failed()
+        assert _RawThreadNode.seen["resolve_in_the_nodes_workflow"].succeeded()
         assert _RawThreadNode.seen["built_in_node_code"] == _RawThreadNode.seen["in_node_code"]
 
 
@@ -1226,7 +1230,7 @@ def saved_workflow_name(engine: Engine, spike_library: None, tmp_path: Path) -> 
     _use_default_project(engine, workspace)
     opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="saved"))
     assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
-    saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+    saved = asyncio.run(the_open_workflow(engine).ahandle_request(SaveWorkflowRequest()))
     assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     assert engine.open_workflows.all_open() == []
@@ -1419,10 +1423,7 @@ class TestOtherSharedState:
         hook_ran = asyncio.Event()
 
         async def hook(_request: RequestPayload, _result: ResultPayload) -> None:
-            try:
-                seen.append(engine.current_workflow_or_none())
-            except WorkflowNotNamedError as err:
-                seen.append(err)
+            seen.append(engine.current_workflow_or_none())
             hook_ran.set()
 
         engine.event_manager.initialize_queue(asyncio.Queue())
@@ -1439,7 +1440,7 @@ class TestOtherSharedState:
         sent: list[Any] = []
 
         class _CapturingClient:
-            async def request_from_worker(self, *, event_request: Any, **_: Any) -> dict:
+            async def request_from_worker(self, event_request: Any) -> dict:
                 sent.append(event_request)
                 msg = "captured"
                 raise RuntimeError(msg)
@@ -1449,8 +1450,6 @@ class TestOtherSharedState:
         transport_thread.start()
         event_manager = worker_engine.event_manager
         event_manager._worker_request_client = cast("Any", _CapturingClient())
-        event_manager._orchestrator_request_topic = "orchestrator"
-        event_manager._worker_response_topic = "worker"
         event_manager._websocket_event_loop = transport_loop
         try:
             with worker_engine.run_in_worker_workflow(runtime), pytest.raises(RuntimeError, match="captured"):

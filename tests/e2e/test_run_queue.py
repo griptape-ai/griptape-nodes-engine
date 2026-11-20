@@ -139,7 +139,7 @@ async def test_a_run_started_while_another_is_in_progress_waits_for_it_to_end(
     assert isinstance(await _finish(holding), ResolveNodeResultSuccess)
     assert isinstance(await _finish(waiting), StartFlowFromNodeResultSuccess)
     assert _state(engine, "Next") is NodeResolutionState.RESOLVED
-    assert engine.flow_manager.check_for_existing_running_flow() is False, flow_name
+    assert engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()) is False, flow_name
 
 
 @pytest.mark.usefixtures("parallel_mode")
@@ -192,7 +192,7 @@ async def test_a_node_run_while_another_node_runs_joins_that_run(
     _open_gate(tmp_path)
     assert isinstance(await _finish(joined), ResolveNodeResultSuccess)
     assert isinstance(await _finish(holding), ResolveNodeResultSuccess)
-    assert engine.flow_manager.check_for_existing_running_flow() is False, flow_name
+    assert engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()) is False, flow_name
 
 
 @pytest.mark.usefixtures("parallel_mode")
@@ -220,7 +220,7 @@ async def test_a_node_that_joined_a_run_can_run_again_while_that_run_goes_on(
     _open_gate(tmp_path)
     assert isinstance(await _finish(holding), ResolveNodeResultSuccess)
     assert executed.count("Next") == runs_of_next, executed
-    assert engine.flow_manager.check_for_existing_running_flow() is False, flow_name
+    assert engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()) is False, flow_name
 
 
 def _record_executions(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -264,7 +264,9 @@ async def test_a_paused_debug_run_keeps_the_machine_until_it_ends(engine: Engine
     _set_parameter(engine, "Holder", "gate_file", "")
     paused = await engine.ahandle_request(StartFlowFromNodeRequest(node_name="Holder", debug_mode=True))
     assert isinstance(paused, StartFlowFromNodeResultSuccess), paused
-    assert engine.flow_manager.check_for_existing_running_flow() is True, "the debug run did not pause"
+    assert engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()) is True, (
+        "the debug run did not pause"
+    )
 
     waiting = asyncio.create_task(engine.ahandle_request(StartFlowFromNodeRequest(node_name="Next")))
     await asyncio.sleep(_WAITING_SECONDS)

@@ -64,6 +64,7 @@ from griptape_nodes.retained_mode.managers.workflow.running import WorkflowExecu
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 from griptape_nodes.servers.mcp import ToolCallSender, _handle_request_on_engine_loop
+from tests.workflow_context import the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -154,7 +155,7 @@ def saved_workflow_name(engine: Engine, tmp_path: Path) -> Iterator[str]:
     _use_default_project(engine, workspace)
     opened = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="saved"))
     assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened.result_details
-    saved = asyncio.run(engine.ahandle_request(SaveWorkflowRequest()))
+    saved = asyncio.run(the_open_workflow(engine).ahandle_request(SaveWorkflowRequest()))
     assert isinstance(saved, SaveWorkflowResultSuccess), saved.result_details
     engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     yield saved.workflow_name
@@ -462,7 +463,7 @@ class TestClosing:
 
         failure = asyncio.run(
             engine.project_manager._reload_after_project_switch(
-                "another-project", workspace_changed=True, library_config_changed=False
+                "another-project", close_workflows=True, workspace_changed=True, library_config_changed=False
             )
         )
 

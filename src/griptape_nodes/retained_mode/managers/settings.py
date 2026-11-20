@@ -20,8 +20,6 @@ PROJECTS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.projects_t
 REQUIRES_ENGINE_KEY = "app_events.on_app_initialization_complete.requires_engine"
 PROJECT_WORKSPACES_KEY = "project_workspaces"
 EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
-WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
-WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
@@ -383,26 +381,14 @@ class AppEvents(BaseModel):
 
 
 class WorkerSettings(BaseModel):
-    heartbeat_interval_s: float = Field(
-        default=5.0,
-        description="Interval in seconds between worker heartbeat challenges sent by the orchestrator.",
-    )
-    heartbeat_timeout_s: float = Field(
-        default=15.0,
-        description=(
-            "Seconds without a heartbeat response before a worker is evicted. A worker also shuts "
-            "itself down after this much orchestrator silence, but never sooner than 30 seconds, so "
-            "that an orchestrator too busy to challenge is not mistaken for one that exited."
-        ),
-    )
     library_load_timeout_s: float = Field(
         default=600.0,
         description=(
-            "Seconds a worker may take to load its library. Bounds how long running a node waits "
-            "for its library's worker to finish loading, and how long a project switch waits for "
-            "each worker to adopt it. "
+            "Seconds a worker may take to load its library. Bounds how long a worker this engine "
+            "starts may take to connect to it, how long running a node waits for its library's "
+            "worker to finish loading, and how long a project switch waits for each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
-            "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
+            "two minutes."
         ),
     )
     command_prefix: list[str] = Field(
@@ -696,7 +682,7 @@ class Settings(BaseModel):
     ffmpeg_directory: str = Field(
         category=FILE_SYSTEM,
         default="",
-        description="Absolute path to the directory holding the ffmpeg/ffprobe binaries the engine downloads on first use. Unlike the other directory settings, this is never interpreted relative to the workspace: the ffmpeg cache belongs to the machine, not to a workspace, so it is shared across every workspace and project. A relative value is ignored with a warning. Empty (the default) means the `ffmpeg` folder in the engine data directory: `<XDG_DATA_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_DATA_DIR` when that is set. To supply your own binaries instead of downloading, point this at a directory containing `bin/<platform>/` holding ffmpeg, ffprobe, and an empty `installed.crumb` file - static-ffmpeg treats that marker as proof of a completed install, and re-downloads over the binaries whenever it is missing.",
+        description="Absolute path to the directory holding the ffmpeg/ffprobe binaries the engine downloads on first use. Unlike the other directory settings, this is never interpreted relative to the workspace: the ffmpeg cache belongs to the machine, not to a workspace, so it is shared across every workspace and project. A relative value is ignored with a warning. Empty (the default) means the `ffmpeg` folder in the engine data directory: `<XDG_DATA_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_DATA_DIR` when that is set. Which ffmpeg runs: binaries you supplied here win, then ffmpeg and ffprobe on your `PATH`, and only then a download into this directory. Leaving it empty never overrides `PATH`. To supply your own binaries, set this and put ffmpeg, ffprobe, and an empty `installed.crumb` file in its `bin/<platform>/` folder; static-ffmpeg treats that marker as proof of a completed install.",
     )
     app_events: AppEvents = Field(
         category=APPLICATION_EVENTS,

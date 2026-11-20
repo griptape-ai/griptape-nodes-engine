@@ -575,14 +575,14 @@ class TestOnStartEntryResolution:
         _group(engine, ["Child1", "Child2"])
         _connect(engine, "G", "on_start", "Child2", "exec_in")
 
-        original = engine.flow_manager.on_start_local_subflow_request_in_workflow
+        original = engine.flow_manager.on_start_local_subflow_request
         captured_start_nodes: list[str | None] = []
 
         async def spy(request: StartLocalSubflowRequest, workflow: WorkflowRuntime) -> object:
             captured_start_nodes.append(request.start_node)
             return await original(request, workflow)
 
-        with patch.object(engine.flow_manager, "on_start_local_subflow_request_in_workflow", side_effect=spy):
+        with patch.object(engine.flow_manager, "on_start_local_subflow_request", side_effect=spy):
             run_result = await engine.ahandle_request(StartFlowRequest(flow_name=flow, flow_node_name="G"))
         assert isinstance(run_result, StartFlowResultSuccess), run_result
 

@@ -5,7 +5,7 @@ This is the mechanism behind the stale-library report. Three facts combine:
 1. `libraries_to_register` lives at
    `app_events.on_app_initialization_complete.libraries_to_register` -- a *nested*,
    *list-valued* key. `_load_config_from_env_vars` can reach a nested key via a `__`
-   path separator (e.g. `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S`), but a list-valued
+   path separator (e.g. `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`), but a list-valued
    setting has no string representation the `Settings` model accepts, so any value
    supplied for `libraries_to_register` is rejected and dropped. No `GTN_CONFIG_*`
    variable can set or shadow it.

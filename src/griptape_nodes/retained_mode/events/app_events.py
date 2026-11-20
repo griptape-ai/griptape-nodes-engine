@@ -36,6 +36,33 @@ class OrganizationInfo:
     name: str
 
 
+class WorkflowRunState(StrEnum):
+    """Whether an open workflow has a run in progress."""
+
+    IDLE = "idle"
+    # Includes a debug run paused at a breakpoint, which still holds the workflow's line.
+    RUNNING = "running"
+
+
+@dataclass(frozen=True)
+class OpenWorkflowState:
+    """What an open workflow is doing, as `OpenWorkflowInfo` reports it and `WorkflowStateChangedEvent` announces.
+
+    Args:
+        has_unsaved_changes: Whether a request changed the workflow since it opened or its own file
+            was last written. A Save As that leaves the workflow on its original file keeps it.
+        run_state: Whether a run of the workflow is in progress.
+        queued_run_count: Runs waiting for the run in progress to end.
+        last_run_error: Why the latest run failed, or None when none failed. Cleared when the next run
+            starts, and left None by a run that succeeded or was cancelled.
+    """
+
+    has_unsaved_changes: bool = False
+    run_state: WorkflowRunState = WorkflowRunState.IDLE
+    queued_run_count: int = 0
+    last_run_error: str | None = None
+
+
 @dataclass
 class OpenWorkflowInfo:
     """A workflow the engine has open, as the heartbeat reports it.
@@ -48,6 +75,7 @@ class OpenWorkflowInfo:
         workflow_file_path: Path to the workflow file. None exactly while the workflow is unsaved.
         is_saved: Whether the workflow has a file, for clients that are not sent its path.
         has_active_flow: Whether the workflow has a current flow.
+        state: Its unsaved changes and runs.
     """
 
     workflow_id: str
@@ -56,6 +84,7 @@ class OpenWorkflowInfo:
     workflow_file_path: str | None
     is_saved: bool
     has_active_flow: bool
+    state: OpenWorkflowState = field(default_factory=OpenWorkflowState)
 
 
 @runtime_checkable
@@ -130,13 +159,24 @@ class AppGetSessionRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class AppGetSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Session information retrieved successfully.
+    """Session information retrieved successfully, with the state of the engine holding it.
+
+    A client takes this as its snapshot of the engine when it connects to the session, and again
+    when the session heartbeat reports a new run id, since discovery may not list that engine.
 
     Args:
         session_id: Current session identifier (None if no active session)
+        engine_version: Current engine version string
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
     """
 
     session_id: str | None
+    engine_version: str
+    engine_run_id: str
+    engine_os: str
+    is_initializing: bool
 
 
 @dataclass
@@ -206,6 +246,22 @@ class WorkflowClosedEvent(AppPayload):
     """
 
     workflow_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowStateChangedEvent(AppPayload):
+    """An open workflow's unsaved changes or runs changed. Every client gets it, whichever client made the change.
+
+    Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries its state.
+
+    Args:
+        workflow_id: Id of the workflow, as `ListOpenWorkflowsRequest` lists it.
+        state: Its state now.
+    """
+
+    workflow_id: str
+    state: OpenWorkflowState
 
 
 @dataclass
@@ -298,7 +354,7 @@ class LibraryLoadedNotification(AppPayload):
 
     Raised by the process that owns the library's record, so listeners including the GUI can update
     their view of library health. For a library whose nodes execute in a worker that process is the
-    orchestrator, once it has accepted the worker's ``ReportLibraryLoadedRequest``.
+    orchestrator, once it has accepted the worker's load report.
 
     Args:
         library_name: Name of the library that was loaded.
@@ -313,29 +369,6 @@ class LibraryLoadedNotification(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
-class ReportLibraryLoadedRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by a worker to the orchestrator to report how a library loaded in the worker.
-
-    It is what releases anything waiting to route execution to that worker.
-
-    ``SkipTheLineMixin`` because the orchestrator may be executing a node when this arrives, and that
-    node can itself be waiting on this very report through ``WorkerManager.wait_until_executable``.
-    Queued behind execution, the report that ends the wait cannot be handled until the wait ends.
-
-    Args:
-        library_name: Name of the library that finished loading in the worker.
-        fitness: Final fitness value (LibraryManager.LibraryFitness string).
-        problem_details: Human-readable summary of problems, or None if there are none.
-    """
-
-    library_name: str
-    fitness: str
-    problem_details: str | None = None
-    broadcast_result: bool = field(default=False, kw_only=True)
-
-
-@dataclass
-@PayloadRegistry.register
 class ReportLibraryLoadedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The orchestrator recorded the worker's load outcome."""
 
@@ -344,23 +377,6 @@ class ReportLibraryLoadedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The orchestrator had no record of the library the worker reported on."""
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportGeneralPurposeWorkerReadyRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by a general-purpose worker to the orchestrator once it has loaded its libraries.
-
-    A worker registers before it loads anything, so registration alone does not mean it can create
-    the nodes routed to it. A library worker reports each library it serves through
-    ``ReportLibraryLoadedRequest``; a general-purpose worker serves none of them, so it reports
-    once, for itself.
-
-    ``SkipTheLineMixin`` for the same reason as ``ReportLibraryLoadedRequest``: a node already
-    executing on the orchestrator can be waiting on this report.
-    """
-
-    broadcast_result: bool = field(default=False, kw_only=True)
 
 
 @dataclass
@@ -554,7 +570,20 @@ class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 @dataclass
 @PayloadRegistry.register
 class SessionHeartbeatResultSuccess(ResultPayloadSuccess):
-    """Session heartbeat successful. Session is active and responsive."""
+    """Session heartbeat successful. Session is active and responsive.
+
+    Also carries the engine state that changes while a client stays connected. A new run id means
+    the engine restarted, and the client takes a fresh `AppGetSessionRequest` snapshot.
+
+    Args:
+        session_id: The engine's active session. A client that sees another one has lost its own.
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
+    """
+
+    session_id: str
+    engine_run_id: str
+    is_initializing: bool
 
 
 @dataclass
@@ -567,6 +596,9 @@ class SessionHeartbeatResultFailure(ResultPayloadFailure):
 @PayloadRegistry.register
 class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Request clients can use to discover active engines and their status.
+
+    A client connected to a session follows the engine with `AppGetSessionRequest` and
+    `SessionHeartbeatRequest` instead, since discovery may not list that engine.
 
     Attributes:
         heartbeat_id: Unique identifier for the heartbeat request, used to correlate requests and responses.

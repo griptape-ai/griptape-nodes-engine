@@ -228,9 +228,7 @@ class TestSecretsManager:
     def test_set_secret_broadcasts_secret_changed(self) -> None:
         """Setting a secret emits a SecretChanged app event carrying the normalized key.
 
-        Worker fan-out lives elsewhere (WorkerManager listens for SecretChanged
-        and schedules RefreshSecretsRequest); this manager only owns the
-        domain event.
+        This manager only owns the domain event.
         """
         from griptape_nodes.retained_mode.events.app_events import SecretChanged
         from griptape_nodes.retained_mode.events.secrets_events import SetSecretValueRequest

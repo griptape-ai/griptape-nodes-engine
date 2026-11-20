@@ -31,13 +31,14 @@ from griptape_nodes.retained_mode.events.context_events import (
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime import context as runtime_context
+from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.open_workflow_set import OpenWorkflowError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Iterator
+    from contextlib import AbstractContextManager
     from types import TracebackType
 
-    from griptape_nodes.exe_types.core_types import BaseNodeElement
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.workflow_registry import Workflow
     from griptape_nodes.retained_mode.engine import Engine, OpeningWorkflow
@@ -53,11 +54,13 @@ class ContextManager(EngineScoped):
     """Context manager for Workflow, Flow, Node, and Element contexts.
 
     Workflows own Flows, Flows own Nodes, and Nodes own Elements.
-    The Workflow context is the current workflow (`Engine.current_workflow_or_none`), whose Flow,
-    Node and Element contexts live on its runtime. A worker opens none: while it runs a node, the
+    The Workflow context is the workflow the work is bound to (`Engine.current_workflow_or_none`),
+    whose Flow, Node and Element contexts live on its runtime. Saved workflow files and node
+    libraries reach this manager through the facade and are not handed a workflow: a file opens
+    itself with `push_workflow`, which binds it, and a node runs bound to its own. A worker opens none: while it runs a node, the
     current workflow is the runtime it keeps for the node's orchestrator workflow
     (`adopt_orchestrator_workflow`). Workflows do not nest.
-    Clients can push/pop Workflow contexts, Flow contexts, Node contexts, and Element contexts.
+    Callers enter Flow and Node contexts with `with` blocks (see `WorkflowContextStack`).
     """
 
     WorkflowContextError = runtime_context.WorkflowContextError
@@ -107,69 +110,6 @@ class ContextManager(EngineScoped):
             exc_traceback: TracebackType | None,
         ) -> None:
             self._manager.pop_workflow()
-
-    # The admittedly-confusing term for using these as a Python context (e.g., the `with` keyword)
-    class FlowContext:
-        """A context manager for a Flow."""
-
-        _manager: ContextManager
-        _flow: ControlFlow
-        _exit_flow: Callable[[], None]
-
-        def __init__(self, manager: ContextManager, flow: ControlFlow):
-            self._manager = manager
-            self._flow = flow
-
-        def __enter__(self) -> ControlFlow:
-            self._exit_flow = self._manager.enter_flow(self._flow)
-            return self._flow
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            exc_traceback: TracebackType | None,
-        ) -> None:
-            self._exit_flow()
-
-    class NodeContext:
-        """A context manager for a Node within a Flow."""
-
-        _manager: ContextManager
-        _node: BaseNode
-
-        def __init__(self, manager: ContextManager, node: BaseNode):
-            self._manager = manager
-            self._node = node
-
-        def __enter__(self) -> BaseNode:
-            return self._manager.push_node(self._node)
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            exc_traceback: TracebackType | None,
-        ) -> None:
-            self._manager.pop_node()
-
-    class ElementContext:
-        """A context manager for an Element within a Node."""
-
-        def __init__(self, manager: ContextManager, element: BaseNodeElement):
-            self._manager = manager
-            self._element = element
-
-        def __enter__(self) -> BaseNodeElement:
-            return self._manager.push_element(self._element)
-
-        def __exit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc_value: BaseException | None,
-            exc_traceback: TracebackType | None,
-        ) -> None:
-            self._manager.pop_element()
 
     def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
@@ -380,64 +320,43 @@ class ContextManager(EngineScoped):
         """
         return self.WorkflowContext(self, workflow_name)
 
-    def flow(self, flow: ControlFlow | str) -> ContextManager.FlowContext:
-        """Create a context manager for a Flow context.
+    def flow(self, flow: ControlFlow | str) -> AbstractContextManager[ControlFlow]:
+        """Make a flow of the current workflow current for the length of a `with` block.
 
-        Args:
-            flow: The Flow object to enter.
+        Requests in the block that name no flow act on it. The block is the caller's own: other
+        callers' requests never see it (see `WorkflowContextStack`).
 
-        Returns:
-            A context manager for the Flow context.
+        Raises:
+            NoActiveWorkflowError: The caller is bound to no workflow.
+            ValueError: `flow` names no flow in the current workflow.
         """
+        context = self._current_context()
         if isinstance(flow, str):
-            try:
-                control_flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow, ControlFlow)
-                if control_flow is None:
-                    msg = f"Flow '{flow}' not found in current workflow."
-                    raise ValueError(msg)
-                flow = control_flow
-            except KeyError as e:
+            control_flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow, ControlFlow)
+            if control_flow is None:
                 msg = f"Flow '{flow}' not found in current workflow."
-                raise ValueError(msg) from e
-        return self.FlowContext(self, flow)
+                raise ValueError(msg)
+            flow = control_flow
+        return context.flow(flow)
 
-    def node(self, node: str | BaseNode) -> ContextManager.NodeContext:
-        """Create a context manager for a Node context.
+    def node(self, node: str | BaseNode) -> AbstractContextManager[BaseNode]:
+        """Make a node of the current flow current for the length of a `with` block.
 
-        Args:
-            node: The Node object to enter.
+        Requests in the block that name no node act on it.
 
-        Returns:
-            A context manager for the Node context.
+        Raises:
+            NoActiveWorkflowError: The caller is bound to no workflow.
+            EmptyStackError: No flow is current.
+            ValueError: `node` names no node in the current flow.
         """
+        context = self._current_context()
         if isinstance(node, str):
             try:
-                node = self.get_current_flow().nodes[node]
+                node = context.get_current_flow().nodes[node]
             except KeyError as e:
                 msg = f"Node '{node}' not found in current flow."
                 raise ValueError(msg) from e
-        return self.NodeContext(self, node)
-
-    def element(self, element: BaseNodeElement | str) -> ContextManager.ElementContext:
-        """Create a context manager for an Element context.
-
-        Args:
-            element: The Element object to enter.
-
-        Returns:
-            A context manager for the Element context.
-        """
-        if isinstance(element, str):
-            try:
-                node_element = self.get_current_node().root_ui_element.find_element_by_name(element)
-                if node_element is None:
-                    msg = f"Element '{element}' not found in current node."
-                    raise ValueError(msg)
-                element = node_element
-            except KeyError as e:
-                msg = f"Element '{element}' not found in current node."
-                raise ValueError(msg) from e
-        return self.ElementContext(self, element)
+        return context.node(node)
 
     def adopt_orchestrator_workflow(
         self,
@@ -608,31 +527,14 @@ class ContextManager(EngineScoped):
         return self._current_or_none() is not None
 
     def has_current_flow(self) -> bool:
-        """Check if there is an active Flow context within the current Workflow."""
-        if not self.has_current_workflow():
-            return False
-
-        current_workflow = self._current_context()
-        return current_workflow.has_current_flow()
+        """Whether the current workflow has a current flow (see `WorkflowContextStack.get_current_flow`)."""
+        current = self._current_or_none()
+        return current is not None and current.context.has_current_flow()
 
     def has_current_node(self) -> bool:
-        """Check if there is an active Node within the current Flow."""
-        if not self.has_current_flow():
-            return False
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-        return current_flow.has_current_node()
-
-    def has_current_element(self) -> bool:
-        """Check if there is an active Element within the current Node."""
-        if not self.has_current_node():
-            return False
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-        current_node = current_flow._node_stack[-1]
-        return current_node.has_current_element()
+        """Whether the caller is inside a node block of the current workflow."""
+        current = self._current_or_none()
+        return current is not None and current.context.has_current_node()
 
     def get_current_workflow_id(self) -> str:
         """Get the id of the current Workflow context.
@@ -667,62 +569,22 @@ class ContextManager(EngineScoped):
         return self.get_current_workflow().name
 
     def get_current_flow(self) -> ControlFlow:
-        """Get the current Flow object.
-
-        Returns:
-            The current Flow object.
+        """The flow of the caller's innermost block, else the current workflow's top-level flow.
 
         Raises:
-            NoActiveFlowError: If no Flow context is active.
+            NoActiveWorkflowError: The caller is bound to no workflow.
+            EmptyStackError: No block is entered and the workflow has no top-level flow.
         """
-        if not self.has_current_flow():
-            msg = "No active Flow context"
-            raise self.NoActiveFlowError(msg)
-
-        current_workflow = self._current_context()
-        return current_workflow.get_current_flow()
+        return self._current_context().get_current_flow()
 
     def get_current_node(self) -> BaseNode:
-        """Get the name of the current Node within the current Flow.
-
-        Returns:
-            The name of the current Node.
+        """The node of the caller's innermost block.
 
         Raises:
-            NoActiveFlowError: If no Flow context is active.
-            EmptyStackError: If the current Flow has no active Nodes.
+            NoActiveWorkflowError: The caller is bound to no workflow.
+            EmptyStackError: The caller is not inside a node block.
         """
-        if not self.has_current_flow():
-            msg = "No active Flow context"
-            raise self.NoActiveFlowError(msg)
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-        return current_flow.get_current_node()
-
-    def get_current_element(self) -> BaseNodeElement:
-        """Get the name of the current element within the current node.
-
-        Returns:
-            The name of the current element.
-
-        Raises:
-            NoActiveFlowError: If no Flow context is active.
-            EmptyStackError: If the current Flow has no active Nodes or Elements.
-        """
-        if not self.has_current_flow():
-            msg = "No active Flow context"
-            raise self.NoActiveFlowError(msg)
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-
-        if not current_flow.has_current_node():
-            msg = "No active Node context"
-            raise self.EmptyStackError(msg)
-
-        current_node = current_flow._node_stack[-1]
-        return current_node.get_current_element()
+        return self._current_context().get_current_node()
 
     def push_workflow(
         self,
@@ -746,8 +608,13 @@ class ContextManager(EngineScoped):
 
         The context holds only the workflow's id; its name, file and folder are read from its
         registry entry. Workflows do not nest: a push while the current work is bound to a live
-        workflow is refused. Opening binds nothing: work that builds into the opened workflow binds
-        it (`Engine.bind_workflow`).
+        workflow is refused.
+
+        Binds the opened workflow in the caller's context, with no block to end it, so a saved
+        workflow file run standalone, which pushes itself and then calls the `GriptapeNodes` facade,
+        acts on the workflow it opened. This is the compatibility path for saved files, which have
+        no handle to their workflow. `pop_workflow` ends the binding, and a request handler that
+        calls this has its caller's binding restored when dispatch returns.
 
         A library-provided workflow opens as a new unsaved copy of itself
         (`register_unsaved_copy`), so every open, a script's own included, leaves the library's
@@ -775,7 +642,9 @@ class ContextManager(EngineScoped):
             WorkflowAlreadyOpenError: If the current work is bound to a live workflow.
         """
         entry = self._entry_to_open(workflow_name, file_path=file_path, working_directory=working_directory)
-        return self.engine.open_workflow(entry.workflow_id)
+        workflow = self.engine.open_workflow(entry.workflow_id)
+        bound_workflow.set(workflow)
+        return workflow
 
     def _entry_to_open(
         self, workflow_name: str | None, *, file_path: str | None, working_directory: str | None
@@ -839,6 +708,8 @@ class ContextManager(EngineScoped):
     def pop_workflow(self) -> str:
         """Close the current workflow through `Engine.close_workflow`, which tears down what it holds.
 
+        Also unbinds it, if the current work is bound to it.
+
         Returns:
             The name of the Workflow that was closed. `get_current_workflow_id` gives its id
             beforehand.
@@ -861,145 +732,9 @@ class ContextManager(EngineScoped):
             raise self.WorkerWorkflowNotClosableError(msg)
 
         self.engine.close_workflow(workflow)
+        if bound_workflow.get() is workflow:
+            bound_workflow.set(None)
         return name
-
-    def enter_flow(self, flow: ControlFlow) -> Callable[[], None]:
-        """Push a Flow context for a `with` block and return the action that exits it.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        if not self.has_current_workflow():
-            msg = f"Cannot enter a Flow context '{flow.name}' without an active Workflow context"
-            raise self.NoActiveWorkflowError(msg)
-
-        return self._current_context().enter_flow(flow)
-
-    def push_flow(self, flow: ControlFlow) -> ControlFlow:
-        """Push a new Flow context onto the stack for the current Workflow.
-
-        Args:
-            flow: The Flow object to enter.
-
-        Returns:
-            The Flow object that was entered.
-
-        Raises:
-            NoActiveWorkflowError: If no Workflow context is active.
-        """
-        if not self.has_current_workflow():
-            msg = f"Cannot enter a Flow context '{flow.name}' without an active Workflow context"
-            raise self.NoActiveWorkflowError(msg)
-
-        current_workflow = self._current_context()
-        return current_workflow.push_flow(flow)
-
-    def pop_flow(self) -> ControlFlow:
-        """Pop the current Flow context from the stack.
-
-        Returns:
-            The Flow object that was popped.
-
-        Raises:
-            EmptyStackError: If no Flow is active.
-        """
-        if not self.has_current_workflow():
-            msg = "Cannot pop Flow: stack is empty"
-            raise self.EmptyStackError(msg)
-
-        current_workflow = self._current_context()
-        return current_workflow.pop_flow()
-
-    def push_node(self, node: BaseNode) -> BaseNode:
-        """Push a new Node context onto the stack for the current Flow.
-
-        Args:
-            node: The Node object to enter.
-
-        Returns:
-            The Node object that was entered.
-
-        Raises:
-            NoActiveFlowError: If no Flow context is active.
-        """
-        if not self.has_current_flow():
-            msg = f"Cannot enter a Node context '{node.name}' without an active Flow context"
-            raise self.NoActiveFlowError(msg)
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-        result = current_flow.push_node(node)
-        return result
-
-    def pop_node(self) -> BaseNode:
-        """Pop the current Node context from the stack for the current Flow.
-
-        Returns:
-            The name of the Node that was popped.
-
-        Raises:
-            NoActiveFlowError: If no Flow context is active.
-            EmptyStackError: If the current Flow has no active Nodes.
-        """
-        if not self.has_current_flow():
-            msg = "Cannot pop Node: no active Flow context"
-            raise self.NoActiveFlowError(msg)
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-        result = current_flow.pop_node()
-        return result
-
-    def push_element(self, element: BaseNodeElement) -> BaseNodeElement:
-        """Push a new element onto the stack for the current node.
-
-        Args:
-            element: The Element object to enter.
-
-        Returns:
-            The Element object that was entered.
-
-        Raises:
-            NoActiveFlowError: If no Flow context is active.
-            EmptyStackError: If the current Flow has no active Nodes or the current Node has no active Elements.
-        """
-        if not self.has_current_flow():
-            msg = f"Cannot enter an Element context '{element.name}' without an active Flow context"
-            raise self.NoActiveFlowError(msg)
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-
-        if not current_flow.has_current_node():
-            msg = "Cannot enter an Element context without an active Node context"
-            raise self.EmptyStackError(msg)
-
-        current_node = current_flow._node_stack[-1]
-        return current_node.push_element(element)
-
-    def pop_element(self) -> BaseNodeElement:
-        """Pop the current element from the stack for the current node.
-
-        Returns:
-            The Element object that was popped.
-
-        Raises:
-            NoActiveFlowError: If no Flow context is active.
-            EmptyStackError: If the current Flow has no active Nodes or Elements.
-        """
-        if not self.has_current_flow():
-            msg = "Cannot pop Element: no active Flow context"
-            raise self.NoActiveFlowError(msg)
-
-        current_workflow = self._current_context()
-        current_flow = current_workflow.current_flow_state()
-
-        if not current_flow.has_current_node():
-            msg = "Cannot pop Element: no active Node context"
-            raise self.EmptyStackError(msg)
-
-        current_node = current_flow._node_stack[-1]
-        return current_node.pop_element()
 
     def _open_workflow_with_flow(self, request: EnsureWorkflowAndFlowRequest) -> ResultPayload:
         """Open the workflow an Ensure request names, or a new one, with its top-level flow.
@@ -1025,7 +760,7 @@ class ContextManager(EngineScoped):
 
         workflow = opened.workflow
         workflow_name = self.engine.workflow_registry.get(workflow.workflow_id).name
-        flow_name = workflow.context.get_current_flow().name
+        flow_name = self._top_level_flow_name(workflow)
         return EnsureWorkflowAndFlowResultSuccess(
             workflow_name=workflow_name,
             workflow_id=workflow.workflow_id,
@@ -1054,8 +789,9 @@ class ContextManager(EngineScoped):
                 )
             )
         created_flow = False
-        if workflow.context.has_current_flow():
-            flow_name = workflow.context.get_current_flow().name
+        top_level_flow = workflow.top_level_flow()
+        if top_level_flow is not None:
+            flow_name = top_level_flow.name
         else:
             create_flow_result = self._create_top_level_flow(workflow, request.flow_name)
             if create_flow_result.failed():
@@ -1065,7 +801,7 @@ class ContextManager(EngineScoped):
                         f"{create_flow_result.result_details}"
                     )
                 )
-            flow_name = workflow.context.get_current_flow().name
+            flow_name = self._top_level_flow_name(workflow)
             created_flow = True
 
         return EnsureWorkflowAndFlowResultSuccess(
@@ -1075,6 +811,7 @@ class ContextManager(EngineScoped):
             created_workflow=False,
             created_flow=created_flow,
             open_workflow=self.engine.open_workflow_info(workflow),
+            altered_workflow_state=created_flow,
             result_details=(
                 f"Workflow '{workflow_name}' and Flow '{flow_name}' are ready "
                 f"(created_workflow=False, created_flow={created_flow})."
@@ -1155,16 +892,26 @@ class ContextManager(EngineScoped):
         return None
 
     def _create_top_level_flow(self, workflow: WorkflowRuntime, flow_name: str | None) -> ResultPayload:
-        """Create `workflow`'s top-level flow, named `flow_name` or by the engine, and make it the current flow."""
+        """Create `workflow`'s top-level flow, named `flow_name` or by the engine."""
         # Lazy import required: context_manager is imported by griptape_nodes, creating a circular dependency.
         from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest
 
-        return workflow.handle_request(
-            CreateFlowRequest(parent_flow_name=None, flow_name=flow_name, set_as_new_context=True)
-        )
+        return workflow.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name=flow_name))
+
+    def _top_level_flow_name(self, workflow: WorkflowRuntime) -> str:
+        """The name of the top-level flow `workflow` was just given.
+
+        Raises:
+            NoActiveFlowError: The workflow has no top-level flow.
+        """
+        flow = workflow.top_level_flow()
+        if flow is None:
+            msg = "Attempted to read the workflow's top-level flow. Failed because it has none."
+            raise self.NoActiveFlowError(msg)
+        return flow.name
 
     def _current_context(self) -> WorkflowContextStack:
-        """The Flow, Node and Element stacks of the Workflow context.
+        """The flow and node blocks the caller entered in the Workflow context.
 
         Raises:
             NoActiveWorkflowError: If no Workflow context is active.

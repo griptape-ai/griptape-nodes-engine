@@ -65,7 +65,7 @@ class CreateNodeRequest(RequestPayload):
         metadata: Initial metadata for the node (position, display properties)
         resolution: Initial resolution state (defaults to UNRESOLVED)
         initial_setup: Skip setup work when loading from file (defaults to False)
-        set_as_new_context: Set this node as current context after creation (defaults to False)
+        set_as_new_context: Deprecated and ignored. Name the node on later requests instead.
         create_error_proxy_on_failure: Create Error Proxy node if creation fails (defaults to True)
         node_names_to_add: List of existing node names to add to this node after creation (used by SubflowNodeGroup, defaults to None)
         subflow_name: Subflow name for node groups (if None, a fresh one will be created; used by SubflowNodeGroup, defaults to None)
@@ -83,7 +83,6 @@ class CreateNodeRequest(RequestPayload):
     resolution: str = NodeResolutionState.UNRESOLVED.value
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
-    # When True, this Node will be pushed as the current Node within the Current Context.
     set_as_new_context: bool = False
     # When True, create an Error Proxy node if the requested node type fails to create
     create_error_proxy_on_failure: bool = True
@@ -298,8 +297,12 @@ class SetNodeMetadataRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetNodeMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Node metadata updated successfully. New metadata stored and available for future requests."""
+class SetNodeMetadataResultSuccess(ResultPayloadSuccess):
+    """Node metadata updated successfully. New metadata stored and available for future requests.
+
+    `altered_workflow_state` is False when the request changed no value, or only recorded the size of a
+    node that had none, as the editor does the first time it draws a node.
+    """
 
 
 @dataclass
@@ -330,8 +333,10 @@ class BatchSetNodeMetadataRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class BatchSetNodeMetadataResultSuccess(ResultPayloadSuccess):
     """Batch node metadata update completed successfully.
+
+    `altered_workflow_state` is True when any node's update altered it, as `SetNodeMetadataResultSuccess` decides.
 
     Args:
         updated_nodes: List of node names that were successfully updated

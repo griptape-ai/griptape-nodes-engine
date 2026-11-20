@@ -1,5 +1,48 @@
 # Unreleased
 
+## Flow and node context belongs to the caller
+
+A request that names no flow acts on the workflow's top-level flow. It no longer acts on a flow an
+earlier request made current, because requests can't make a flow or node current anymore.
+
+**Request API clients.** `set_as_new_context` on `CreateFlowRequest` and `CreateNodeRequest` is
+ignored. Name the flow or node on the requests that follow:
+
+```python
+# Before
+handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="inner", set_as_new_context=True))
+handle_request(CreateNodeRequest(node_type="Agent"))
+
+# After
+handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="inner"))
+handle_request(CreateNodeRequest(node_type="Agent", override_parent_flow_name="inner"))
+```
+
+`DeserializeFlowFromCommandsRequest` no longer takes `pop_flow_context_after`. Drop the argument;
+the request leaves the current flow as it found it.
+
+**Library authors and scripts.** `ContextManager` keeps its `with` blocks and drops the calls that
+push and pop by hand. A block applies to the code inside it and to tasks started there, not to other
+requests running at the same time:
+
+```python
+# Before
+context_manager.push_flow(flow)
+GriptapeNodes.handle_request(CreateNodeRequest(node_type="Agent"))
+context_manager.pop_flow()
+
+# After
+with GriptapeNodes.ContextManager().flow(flow):
+    GriptapeNodes.handle_request(CreateNodeRequest(node_type="Agent"))
+```
+
+`push_flow`, `pop_flow`, `push_node`, `pop_node`, `push_element`, `pop_element`, `element()`,
+`has_current_element` and `get_current_element` are gone. Nothing in the engine read the element
+context.
+
+**Saved workflow files.** No change needed. Files saved by earlier versions still open and run.
+Newly saved files no longer include the `_ensure_workflow_context` function.
+
 ## Execution events name their workflow in `open_workflow_id`
 
 **Request API clients.** `ExecutionEvent` and streamed `ProgressEvent` carried the open workflow
@@ -58,6 +101,67 @@ They have no effect. While a library still asks for a worker and declares no
     `LOAD_PROBE` scope kind. `parameter-mutation-during-aprocess` is the only rule left.
 - The fitness problems reporting that request handlers and post-dispatch hooks are unsupported in an
     isolated library. Both now work in every library.
+
+## Managers no longer have ambient-workflow request methods
+
+**Library authors.** `NodeManager.on_get_parameter_value_request`, `on_set_parameter_value_request`
+and `on_remove_parameter_from_node_request`, and `FlowManager.on_get_top_level_flow_request`,
+`on_list_nodes_in_flow_request`, `on_create_connection_request`, `on_delete_connection_request` and
+`on_start_local_subflow_request`, used to take only a request and act on the open workflow. Those
+names now belong to the handlers the engine dispatches requests to, which require the workflow as a
+second argument. Don't call them, even with a workflow: calling a handler directly skips dispatch,
+including its hooks and result broadcast. Send the request instead:
+
+```python
+# Before
+result = GriptapeNodes.NodeManager().on_get_parameter_value_request(request)
+
+# After
+result = GriptapeNodes.handle_request(request)
+```
+
+From a node's `process()` or `aprocess()`, or a thread they start, send it through the node's
+workflow with `self.workflow.handle_request(request)`, or `await self.workflow.ahandle_request(request)`
+in async code. `self.workflow` is `None` until the node is added to a workflow, so don't send
+requests from a node's `__init__`.
+
+The two-argument `on_<name>_request_in_workflow` names are gone, renamed to the bare
+`on_<name>_request` names with the same arguments. For example,
+`on_set_parameter_value_request_in_workflow(request, workflow)` is now
+`on_set_parameter_value_request(request, workflow)`. They are dispatch handlers too, so send the
+request rather than call them.
+
+## Requests that act on a workflow must name it
+
+**Everyone sending requests.** A request that acts on a workflow, such as `CreateNodeRequest` or
+`SaveWorkflowRequest`, used to act on the only open workflow when it named none. It now fails with
+`WorkflowNotNamedResultFailure`, even with one workflow open. Send `open_workflow_id` on the request
+envelope, or the `X-Griptape-Workflow-Id` header from an MCP client.
+
+**Library authors.** `GriptapeNodes.handle_request(...)` from `process()`, `aprocess()` and the code
+they call acts on the node's workflow, as before. From a thread or thread pool you start yourself,
+it acts on no workflow. Send through the node's workflow, or start the thread in a copy of the
+node's context:
+
+```python
+# Before
+result = GriptapeNodes.handle_request(request)
+
+# After
+result = self.workflow.handle_request(request)
+```
+
+The `GriptapeNodes` manager methods that read the current workflow, such as `ContextManager`,
+`ObjectManager` lookups, `FlowManager.get_flow_by_name`, `NodeManager.get_node_by_name`,
+`StaticFilesManager.save_static_file` and `WorkflowManager.extract_workflow_shape`, find the
+workflow the same way. On such a thread they find none.
+
+**Saved workflow files.** `python workflow.py` and the files `ContextManager.push_workflow` opens
+need no change: `push_workflow` now binds the workflow it opens, so the calls after it act on that
+workflow, and `pop_workflow` ends the binding.
+
+**Library authors.** `WorkflowNotNamedError` is removed from `griptape_nodes.retained_mode.runtime.binding`.
+Drop any import or `except` that names it.
 
 ## Parameter values keep their type
 

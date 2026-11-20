@@ -81,13 +81,13 @@ class TestConnectControlWireThroughGroupRaisesOnFailure:
         )
 
         mock_create_connection = create_autospec(
-            engine.flow_manager.on_create_connection_request_in_workflow,
+            engine.flow_manager.on_create_connection_request,
             side_effect=[
                 CreateConnectionResultSuccess(result_details="outer leg created"),
                 CreateConnectionResultFailure(result_details="no such parameter 'exec_in' on 'Member'"),
             ],
         )
-        monkeypatch.setattr(engine.flow_manager, "on_create_connection_request_in_workflow", mock_create_connection)
+        monkeypatch.setattr(engine.flow_manager, "on_create_connection_request", mock_create_connection)
 
         with pytest.raises(RuntimeError):
             group._connect_control_wire_through_group(old_connection, is_incoming=True)

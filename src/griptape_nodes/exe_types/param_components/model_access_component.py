@@ -96,6 +96,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.exe_types.elements import parameter_messages
 from griptape_nodes.exe_types.param_components.model_policy import (
     ModelPolicySnapshot,
     apply_denial_badge,
@@ -201,6 +202,10 @@ class ModelAccessComponent:
         self._model_choices = list(model_choices)
         self._default_model = default_model
         self._deprecated_values = dict(deprecated_values or {})
+        # The node's callout about a repaired dropdown. Named per parameter so a node with two
+        # model parameters can hold two components.
+        self._repair_message_name = f"{parameter.name}_model_list_updated"
+        self._repair_message_shown = False
 
         # Fail-fast preconditions -- see docstring.
         self._raise_if_misconfigured()
@@ -224,7 +229,17 @@ class ModelAccessComponent:
             )
         )
         parameter.update_ui_options(self._build_ui_options())
-        parameter.add_converter(self._convert_legacy_value)
+        parameter.add_converter(self._convert_stored_value)
+        node.add_node_element(
+            parameter_messages.ParameterMessage(
+                name=self._repair_message_name,
+                variant="warning",
+                title="Model list updated",
+                value="",
+                markdown=True,
+                hide=True,
+            )
+        )
 
         # Migrate a legacy stored value to its canonical choice before
         # considering whether that choice is currently permitted.
@@ -285,9 +300,13 @@ class ModelAccessComponent:
         Nodes that remove and later re-add ``Options`` on the model parameter
         (e.g. after a driver connection is dropped) call this to put the
         component's state back. Idempotent: safe to call when ``Options`` is
-        already present -- ``add_trait`` will replace the existing instance.
+        already present -- the existing trait is removed first, because
+        ``add_trait`` appends rather than replaces and a second ``Options``
+        would leave two dropdowns' worth of converters and validators active.
         """
         parameter = self._parameter
+        for existing in parameter.find_elements_by_type(Options):
+            parameter.remove_trait(existing)
         parameter.add_trait(Options(choices=self._dropdown_choices()))
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
@@ -462,8 +481,8 @@ class ModelAccessComponent:
             return None
         return self._deprecated_values.get(value)
 
-    def _convert_legacy_value(self, value: Any) -> Any:
-        """Migrate a legacy stored value to its canonical choice; everything else passes through.
+    def _convert_stored_value(self, value: Any) -> Any:
+        """Repair a stale saved dropdown, then migrate a legacy stored value to its canonical choice.
 
         Installed as a directly-attached converter (``Parameter.add_converter``)
         rather than hooked into ``before_value_set`` / ``after_value_set``,
@@ -474,11 +493,94 @@ class ModelAccessComponent:
         ``before_value_set`` at all. A converter is the only hook a saved
         workflow's stored value is guaranteed to pass through, so it is the
         only place this migration can live.
+
+        The same property makes it the place to repair the dropdown itself. A
+        saved workflow replays the dropdown it was saved with
+        (``AlterParameterDetailsRequest``) after the node is built and before it
+        sets the stored value, so the value's assignment is the first moment the
+        node can see what the replay left behind.
         """
+        retired = self._repair_stale_dropdown()
+        selected = value
         migrated = self.migrate_value(value)
         if migrated is not None:
-            return migrated
+            value = migrated
+        if retired and isinstance(value, str):
+            # The trait converters that ran before this one belonged to the stale
+            # ``Options``, so a retired value with no migration passed them. Run the
+            # repaired trait's own, so it lands on ``choices[0]`` like any other
+            # assignment outside the list.
+            for options in self._parameter.find_elements_by_type(Options):
+                for converter in options.converters_for_trait():
+                    value = converter(value)
+        if retired:
+            self._show_repair_message(retired, selected=selected, current=value)
+        else:
+            self._hide_repair_message()
         return value
+
+    def _repair_stale_dropdown(self) -> list[str]:
+        """Rebuild the ``Options`` trait and rows if a replayed workflow left retired models in them.
+
+        Returns the retired models the saved rows named, or an empty list when it left the dropdown
+        alone. A dropdown is stale when its saved rows name at least one
+        ``deprecated_values`` key (a key is accepted but never offered, so such a row can only
+        predate that model's retirement) and name nothing outside this node's own vocabulary of
+        current choices plus deprecated keys.
+
+        Deliberately not "the saved list differs from ``model_choices``". A node may repopulate
+        this parameter on purpose -- an Agent pointing the same dropdown at a third-party
+        provider's models, then assigning one of them -- and this runs on every assignment, so a
+        difference test would revert that on the spot. The vocabulary condition keeps a provider's
+        list safe even when it happens to include an id this node has retired, because the list
+        also names models this node has never offered.
+
+        A parameter with no ``Options`` trait is left alone. A node strips it
+        deliberately while a driver is connected and puts it back through
+        ``reinstall_options``.
+        """
+        parameter = self._parameter
+        if not parameter.find_elements_by_type(Options):
+            return []
+        row_names = self._row_names(parameter.ui_options.get("data"))
+        retired = [name for name in row_names if name in self._deprecated_values]
+        if not retired:
+            return []
+        vocabulary = {*self._model_choices, *self._deprecated_values}
+        if any(name not in vocabulary for name in row_names):
+            return []
+
+        self.reinstall_options()
+        logger.warning(
+            "Attempted to open the model list for parameter '%s' on node '%s'. The saved workflow listed %s, "
+            "which this node no longer offers, so the list was replaced with the current models. "
+            "Save the workflow to keep the update.",
+            parameter.name,
+            self._node.name,
+            ", ".join(repr(model) for model in dict.fromkeys(retired)),
+        )
+        return list(dict.fromkeys(retired))
+
+    def _show_repair_message(self, retired: list[str], *, selected: Any, current: Any) -> None:
+        """Tell the artist, on the node, that its model list was updated and the file needs saving."""
+        message = self._node.get_message_by_name_or_element_id(self._repair_message_name)
+        if message is None:
+            return
+        models = ", ".join(f"`{model}`" for model in retired)
+        text = f"These models are no longer available: {models}. This node's model list was updated."
+        if isinstance(selected, str) and isinstance(current, str) and selected != current:
+            text += f" The selected model changed from `{selected}` to `{current}`."
+        text += " Save the workflow to keep the update."
+        message.value = text
+        self._node.show_message_by_name(self._repair_message_name)
+        self._repair_message_shown = True
+
+    def _hide_repair_message(self) -> None:
+        """Hide the callout once the model is assigned again. Quiet when it is not showing."""
+        if not self._repair_message_shown:
+            return
+        self._node.hide_message_by_name(self._repair_message_name)
+        self._repair_message_shown = False
 
     def _raise_if_misconfigured(self) -> None:
         """Raise on any constructor misuse, before the component touches the parameter.
@@ -615,3 +717,10 @@ class ModelAccessComponent:
     ) -> None:
         """Handler for the inline refresh button. Delegates to ``refresh()``."""
         self.refresh()
+
+    @staticmethod
+    def _row_names(rows: Any) -> list[Any]:
+        """The ``name`` of each dropdown row in ``rows``, or an empty list if ``rows`` is not a list of rows."""
+        if not isinstance(rows, list):
+            return []
+        return [row.get("name") for row in rows if isinstance(row, dict)]

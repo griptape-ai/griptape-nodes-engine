@@ -561,3 +561,21 @@ class TestGriptapeCloudStorageDriverBaseUrlPath:
 
         args, _ = mock_request.call_args
         assert args[1] == "https://example.com/prefix/api/buckets"
+
+
+class TestGriptapeCloudStorageDriverCredentialPerRequest:
+    """A session credential renews, so each request sends the credential the driver's owner last set."""
+
+    def test_the_next_request_sends_the_credential_its_owner_set(self) -> None:
+        driver = GriptapeCloudStorageDriver(
+            Mock(workspace_path=Path("/workspace")), bucket_id=TEST_BUCKET_ID, api_key="the first session token"
+        )
+
+        with patch("griptape_nodes.drivers.storage.griptape_cloud_storage_driver.httpx2.request") as mock_request:
+            mock_request.return_value = Mock(raise_for_status=Mock(return_value=None))
+            driver._request("GET", "https://cloud.example.com/one")
+            driver.api_key = "the renewed session token"
+            driver._request("GET", "https://cloud.example.com/two")
+
+        sent = [call.kwargs["headers"]["Authorization"] for call in mock_request.call_args_list]
+        assert sent == ["Bearer the first session token", "Bearer the renewed session token"]

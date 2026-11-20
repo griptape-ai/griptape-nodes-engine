@@ -378,6 +378,19 @@ class TestALibraryKeyedResource:
 
         assert released == ["first"]
 
+    def test_an_object_put_from_init_is_released_when_the_node_joins_and_the_workflow_closes(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        """`__init__` runs before the node joins a workflow, so the entry is tagged when it joins."""
+        producer = _Producer(name="Producer")
+        released: list[str] = []
+        producer.local_objects.put(Held("early"), key="cfg-hash", on_drop=lambda value: released.append(value.label))
+        _add(engine, producer, flow_name)
+
+        engine.resource_manager.drop_objects_for_workflow(engine.current_workflow().workflow_id)
+
+        assert released == ["early"]
+
 
 class TestSaving:
     def test_a_handle_key_is_never_written_into_a_saved_workflow(self, engine: Engine) -> None:

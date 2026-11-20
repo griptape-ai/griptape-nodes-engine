@@ -35,7 +35,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
-from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
@@ -93,6 +92,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowWithCurrentStateRequest,
     SaveSubflowToWorkflowRequest,
     SaveSubflowToWorkflowResultSuccess,
+    SaveWorkflowFileFromSerializedFlowRequest,
     SaveWorkflowFileFromSerializedFlowResultSuccess,
     SaveWorkflowRequest,
     SaveWorkflowResultFailure,
@@ -155,6 +155,7 @@ _OPTIONAL_WORKFLOW_REQUESTS = {
     GetWorkflowRunCommandRequest,
     GetWorkflowContextRequest,
     RunWorkflowWithCurrentStateRequest,
+    SaveWorkflowFileFromSerializedFlowRequest,
 }
 
 
@@ -871,7 +872,7 @@ def _publisher(handler: Any, get_publish_options: Any = None) -> RegisteredEvent
 
 
 class TestPublishOptions:
-    def test_the_callback_reads_the_only_open_workflow_when_the_request_names_none(self, engine: Engine) -> None:
+    def test_the_callback_reads_the_workflow_the_request_names(self, engine: Engine) -> None:
         """Publishers read the open graph for their saved settings."""
         workflow = _open(engine, "open")
         seen: list[WorkflowRuntime | None] = []
@@ -885,7 +886,7 @@ class TestPublishOptions:
             "get_registered_event_handlers",
             return_value={"lib": _publisher(MagicMock(), get_publish_options)},
         ):
-            result = engine.handle_request(GetPublishOptionsRequest(workflow_name="open", publisher_name="lib"))
+            result = _send(engine, GetPublishOptionsRequest(workflow_name="open", publisher_name="lib"), workflow)
 
         assert isinstance(result, GetPublishOptionsResultSuccess), result.result_details
         assert seen == [workflow]
@@ -1042,12 +1043,14 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         source = _open(engine, "subflow source")
         saved_target = _write_saved_workflow(engine, tmp_path.resolve() / "target.py")
         recorded = _RecordedRequests(flow_name="unused")
-        written_paths: list[str | None] = []
+        written_paths: list[str] = []
+        generated_for: list[WorkflowRuntime | None] = []
 
-        async def save_file(request: Any) -> SaveWorkflowFileFromSerializedFlowResultSuccess:
-            written_paths.append(request.file_path)
+        def save_file(*, destination: Any, workflow: WorkflowRuntime | None, **_kwargs: Any) -> Any:
+            written_paths.append(destination.location)
+            generated_for.append(workflow)
             return SaveWorkflowFileFromSerializedFlowResultSuccess(
-                file_path=str(request.file_path), workflow_metadata=saved_target.metadata, result_details="ok"
+                file_path=destination.location, workflow_metadata=saved_target.metadata, result_details="ok"
             )
 
         with (
@@ -1055,7 +1058,7 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
             patch.object(engine.workflow_manager, "extract_workflow_shape_in", side_effect=ValueError("no shape")),
             patch.object(
                 engine.workflow_manager.saver,
-                "on_save_workflow_file_from_serialized_flow_request",
+                "_save_workflow_file_inline",
                 side_effect=save_file,
             ),
         ):
@@ -1068,6 +1071,8 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert isinstance(result, SaveSubflowToWorkflowResultSuccess), result.result_details
         assert recorded.bound == [(SerializeFlowToCommandsRequest, source)]
         assert written_paths == [str(saved_target.absolute_path)]
+        # The file's code is generated against the workflow being saved, so its substitution flag is kept.
+        assert generated_for == [source]
 
     def test_referenced_import_creates_its_flow_in_the_workflow_it_is_handed(
         self, engine: Engine, tmp_path: Path
@@ -1118,24 +1123,16 @@ class TestWorkflowRequestsActOnTheWorkflowTheyAreHanded:
         assert target.context.get_current_flow().name == result.flow_name
         assert tab.flows.name_to_parent_name == {}
 
-    def test_ensure_naming_no_workflow_reuses_the_only_open_one(self, engine: Engine) -> None:
-        tab = _open(engine, "tab")
+    @pytest.mark.parametrize("open_count", [1, 2])
+    def test_ensure_naming_no_workflow_opens_one_beside_the_open_ones(self, engine: Engine, open_count: int) -> None:
+        tabs = [_open(engine, f"tab_{index}") for index in range(open_count)]
 
         result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), None)
 
         assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
-        assert result.workflow_id == tab.workflow_id
-        assert result.created_workflow is False
-
-    def test_ensure_naming_no_workflow_while_several_are_open_fails(self, engine: Engine) -> None:
-        tab = _open(engine, "tab")
-        beside = _open(engine, "beside")
-
-        result = _send(engine, EnsureWorkflowAndFlowRequest(flow_name="canvas"), None)
-
-        assert isinstance(result, WorkflowNotNamedResultFailure)
-        assert "did not name one" in str(result.result_details)
-        assert engine.open_workflows.all_open() == [tab, beside]
+        assert result.created_workflow is True
+        assert result.workflow_id not in {tab.workflow_id for tab in tabs}
+        assert len(engine.open_workflows.all_open()) == open_count + 1
 
     def test_run_command_naming_nothing_answers_for_the_workflow_it_is_handed(
         self, engine: Engine, tmp_path: Path

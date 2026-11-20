@@ -34,7 +34,10 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
     NodeMetadata,
 )
-from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+from griptape_nodes.retained_mode.events.context_events import (
+    EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
@@ -57,6 +60,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
+from tests.workflow_context import bind, the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -290,7 +294,11 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
     )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
     library.register_new_node_type(_ListNode, NodeMetadata(category="test", description="d", display_name="List"))
-    engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow"))
+    opened = engine.handle_request(
+        EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow")
+    )
+    assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened
+    bind(the_open_workflow(engine))
     try:
         yield _LIBRARY_NAME
     finally:

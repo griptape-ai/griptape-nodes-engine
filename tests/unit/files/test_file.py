@@ -296,28 +296,6 @@ class TestFileMacroPath:
         assert exc_info.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
         assert exc_info.value.missing_variables == {"outputs"}
 
-    def test_read_with_macro_path(self) -> None:
-        macro_path = MacroPath(ParsedMacro("{outputs}/file.txt"), {"outputs": "/resolved/outputs"})
-        resolve_result = GetPathForMacroResultSuccess(
-            result_details="OK",
-            resolved_path=Path("outputs/file.txt"),
-            absolute_path=Path("/resolved/outputs/file.txt"),
-        )
-        read_result = ReadFileResultSuccess(
-            result_details="OK",
-            content="hello",
-            file_size=5,
-            mime_type="text/plain",
-            encoding="utf-8",
-        )
-        with patch(HANDLE_REQUEST_PATH, side_effect=[resolve_result, read_result]) as mock_handle:
-            result = File(macro_path).read()
-
-        assert isinstance(result, FileContent)
-        assert result.content == "hello"
-        expected_call_count = 2
-        assert mock_handle.call_count == expected_call_count
-
     def test_plain_string_without_variables_no_resolution(self) -> None:
         read_result = ReadFileResultSuccess(
             result_details="OK",

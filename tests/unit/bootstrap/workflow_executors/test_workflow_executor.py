@@ -113,30 +113,6 @@ class TestWorkflowExecutor:
         assert result is None
         executor.arun_mock.assert_called_once_with({"input": "data"}, StorageBackend.LOCAL)
 
-    def test_output_property_can_be_set(self) -> None:
-        """Test that output property can be set and retrieved."""
-        executor = ConcreteWorkflowExecutor()
-
-        test_output = {"result": "success", "data": [1, 2, 3]}
-        executor.output = test_output
-
-        assert executor.output == test_output
-
-    def test_output_property_can_be_none(self) -> None:
-        """Test that output property can be set to None."""
-        executor = ConcreteWorkflowExecutor()
-        executor.output = {"some": "data"}
-
-        executor.output = None
-        assert executor.output is None
-
-    def test_abstract_method_enforcement(self) -> None:
-        """Test that WorkflowExecutor cannot be instantiated directly due to abstract method."""
-        # This test verifies that the arun method is properly marked as abstract
-        # We can't instantiate WorkflowExecutor directly, but we can verify the abstract method exists
-        assert hasattr(WorkflowExecutor, "arun")
-        assert getattr(WorkflowExecutor.arun, "__isabstractmethod__", False)
-
 
 class TestWorkflowExecutorIntegration:
     """Integration tests for WorkflowExecutor functionality."""

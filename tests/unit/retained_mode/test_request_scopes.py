@@ -44,7 +44,6 @@ from griptape_nodes.retained_mode.events.generic_events import (
 from griptape_nodes.retained_mode.events.library_events import ListRegisteredLibrariesRequest
 from griptape_nodes.retained_mode.events.model_events import DeclareModelInvocationRequest
 from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest
-from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import GetCurrentProjectRequest, ListProjectTemplatesRequest
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
@@ -71,11 +70,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ListCallableWorkflowsRequest,
     SetVariableSubstitutionEnabledRequest,
 )
-from griptape_nodes.retained_mode.managers import event_manager as event_manager_module
 from griptape_nodes.retained_mode.managers.event_manager import EventManager, ResultContext
 from griptape_nodes.retained_mode.request_handlers import RequestScope
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
-from griptape_nodes.retained_mode.unmigrated_requests import ONLY_OPEN_UNTIL_CLIENTS_NAME
 from tests.unit.host_workflow_reads import HostWorkflowRead
 
 if TYPE_CHECKING:
@@ -155,8 +152,9 @@ def _register(engine: Engine, calls: _Calls, scope: RequestScope, request_type: 
 
 
 def _open_workflow(engine: Engine, display_name: str = "open") -> WorkflowRuntime:
-    engine.context_manager.push_workflow(workflow_name=display_name)
-    return engine.open_workflows.get(engine.context_manager.get_current_workflow_id())
+    """Open a workflow and bind nothing, as an engine-side open does."""
+    entry = engine.workflow_registry.register_unsaved(display_name, listed=False)
+    return engine.open_workflow(entry.workflow_id)
 
 
 def _open_two(engine: Engine) -> list[WorkflowRuntime]:
@@ -252,14 +250,25 @@ class TestScopesThatTakeAWorkflow:
 
 
 class TestWorkflowScope:
-    def test_no_envelope_id_and_unbound_gets_the_only_open_workflow(self, engine: Engine, calls: _Calls) -> None:
-        workflow = _open_workflow(engine)
+    def test_no_envelope_id_and_unbound_fails_even_with_one_open(self, engine: Engine, calls: _Calls) -> None:
+        _open_workflow(engine)
         _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
 
         result = engine.handle_request(_ScopeProbeRequest())
 
+        assert isinstance(result, WorkflowNotNamedResultFailure)
+        assert "Name the open workflow on the request envelope" in str(result.result_details)
+        assert calls.workflows == []
+
+    def test_no_envelope_id_and_a_caller_bound_to_a_workflow_acts_on_it(self, engine: Engine, calls: _Calls) -> None:
+        _a, b = _open_two(engine)
+        _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
+
+        with engine.bind_workflow(b):
+            result = engine.handle_request(_ScopeProbeRequest())
+
         assert result.succeeded()
-        assert calls.workflows == [workflow]
+        assert calls.workflows == [b]
 
     def test_no_envelope_id_and_none_open_fails(self, engine: Engine, calls: _Calls) -> None:
         _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
@@ -308,6 +317,15 @@ class TestOptionalWorkflowScope:
         assert calls.current == [None]
         assert result_event.open_workflow_id is None
 
+    def test_no_envelope_id_while_several_are_open_gets_none(self, engine: Engine, calls: _Calls) -> None:
+        _open_two(engine)
+        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
+
+        result = engine.handle_request(_ScopeProbeRequest())
+
+        assert result.succeeded()
+        assert calls.workflows == [None]
+
     def test_no_envelope_id_and_none_open_gets_none(self, engine: Engine, calls: _Calls) -> None:
         _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
 
@@ -325,89 +343,6 @@ class TestOptionalWorkflowScope:
 
         assert result.succeeded()
         assert calls.workflows == [None]
-
-
-@pytest.fixture
-def probe_falls_back_to_the_only_open_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
-    """List `_ScopeProbeRequest` in `ONLY_OPEN_UNTIL_CLIENTS_NAME`."""
-    monkeypatch.setattr(event_manager_module, "ONLY_OPEN_UNTIL_CLIENTS_NAME", frozenset({"_ScopeProbeRequest"}))
-
-
-@pytest.mark.usefixtures("probe_falls_back_to_the_only_open_workflow")
-class TestOnlyOpenUntilClientsName:
-    """A listed OPTIONAL_WORKFLOW request that names nothing gets the only open workflow, None with none open."""
-
-    @pytest.mark.asyncio
-    async def test_no_envelope_id_while_one_is_open_gets_it(self, engine: Engine, calls: _Calls) -> None:
-        workflow = _open_workflow(engine)
-        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
-
-        result_event = await engine.event_manager.ahandle_request(_ScopeProbeRequest())
-
-        assert result_event.succeeded()
-        assert calls.workflows == [workflow]
-        assert calls.current == [workflow]
-
-    def test_no_envelope_id_while_none_is_open_gets_none(self, engine: Engine, calls: _Calls) -> None:
-        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
-
-        result = engine.handle_request(_ScopeProbeRequest())
-
-        assert result.succeeded()
-        assert calls.workflows == [None]
-
-    def test_no_envelope_id_while_several_are_open_fails(self, engine: Engine, calls: _Calls) -> None:
-        """Its client means the open one, and which that is can't be told."""
-        _open_two(engine)
-        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
-
-        result = engine.handle_request(_ScopeProbeRequest())
-
-        assert isinstance(result, WorkflowNotNamedResultFailure)
-        assert "2 workflows are open" in str(result.result_details)
-        assert calls.workflows == []
-
-    def test_the_envelope_id_wins_over_the_only_open_workflow(self, engine: Engine, calls: _Calls) -> None:
-        a, b = _open_two(engine)
-        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
-
-        result_event = engine.event_manager.handle_request(
-            _ScopeProbeRequest(), result_context=ResultContext(open_workflow_id=b.workflow_id)
-        )
-
-        assert result_event.succeeded()
-        assert calls.workflows == [b]
-        assert a not in calls.workflows
-
-    def test_a_caller_bound_to_no_workflow_gets_none_while_one_is_open(self, engine: Engine, calls: _Calls) -> None:
-        """Naming no workflow is naming something: only a request that names nothing falls back."""
-        _open_workflow(engine)
-        _register(engine, calls, RequestScope.OPTIONAL_WORKFLOW, _ScopeProbeRequest)
-
-        with engine.bind_workflow(NO_WORKFLOW):
-            result = engine.handle_request(_ScopeProbeRequest())
-
-        assert result.succeeded()
-        assert calls.workflows == [None]
-
-    @pytest.mark.parametrize("scope", [RequestScope.WORKFLOW, RequestScope.HOST])
-    def test_a_handler_that_is_not_optional_workflow_cannot_register(
-        self, engine: Engine, calls: _Calls, scope: RequestScope
-    ) -> None:
-        with pytest.raises(TypeError, match="ONLY_OPEN_UNTIL_CLIENTS_NAME"):
-            _register(engine, calls, scope, _ScopeProbeRequest)
-
-
-class TestOnlyOpenUntilClientsNameEntries:
-    """Each entry is a request type whose OPTIONAL_WORKFLOW handler's clients don't name a workflow yet."""
-
-    @pytest.mark.parametrize("name", sorted(ONLY_OPEN_UNTIL_CLIENTS_NAME))
-    def test_its_handler_is_optional_workflow(self, engine: Engine, name: str) -> None:
-        request_type = PayloadRegistry.get_type(name)
-        assert request_type is not None
-        assert issubclass(request_type, RequestPayload)
-
-        assert engine.event_manager.get_scope_for_request_type(request_type) is RequestScope.OPTIONAL_WORKFLOW
 
 
 class TestHostScope:
@@ -736,9 +671,24 @@ class TestResultLabels:
         workflow = _open_workflow(engine)
         _register(engine, calls, RequestScope.WORKFLOW, _ScopeProbeRequest)
 
-        result_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+        with engine.bind_workflow(workflow):
+            result_event = engine.event_manager.handle_request(_ScopeProbeRequest())
 
         assert result_event.open_workflow_id == workflow.workflow_id
+
+    def test_an_unscoped_handler_with_one_open_is_bound_to_no_workflow_when_its_caller_is_bound_to_none(
+        self, engine: Engine, calls: _Calls
+    ) -> None:
+        _open_workflow(engine)
+        engine.event_manager.assign_manager_to_request_type(
+            _ScopeProbeRequest, calls.host_handler, without_workflow=None
+        )
+
+        result_event = engine.event_manager.handle_request(_ScopeProbeRequest())
+
+        assert result_event.result.succeeded()
+        assert calls.current == [None]
+        assert result_event.open_workflow_id is None
 
     def test_an_unscoped_result_names_the_workflow_its_caller_bound(self, engine: Engine, calls: _Calls) -> None:
         _a, b = _open_two(engine)
@@ -914,9 +864,7 @@ class TestEveryEngineHandlerDeclaresAScope:
 
     def test_every_broadcast_handler_a_worker_registers_declares_host_scope(self) -> None:
         event_manager = EventManager()
-        register_broadcast_handlers(
-            event_manager, config_manager=MagicMock(), secrets_manager=MagicMock(), project_manager=MagicMock()
-        )
+        register_broadcast_handlers(event_manager, config_manager=MagicMock(), project_manager=MagicMock())
 
         scopes = {
             request_type.__name__: event_manager.get_scope_for_request_type(request_type)
@@ -947,15 +895,37 @@ class TestHostStateRequestsThatTakeAWorkflow:
 
 
 class TestArbitraryPython:
-    def test_its_requests_act_on_the_only_open_workflow_when_it_names_none(self, engine: Engine) -> None:
-        workflow = _open_workflow(engine)
-        code = (
-            "from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest\n"
-            "from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes\n"
-            "GriptapeNodes.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name='scripted'))\n"
-        )
+    CODE = (
+        "from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest\n"
+        "from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes\n"
+        "GriptapeNodes.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name='scripted'))\n"
+    )
 
-        result = engine.event_manager.handle_request(RunArbitraryPythonStringRequest(python_string=code)).result
+    def test_its_requests_act_on_the_workflow_its_caller_bound(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+
+        with engine.bind_workflow(workflow):
+            result = engine.event_manager.handle_request(
+                RunArbitraryPythonStringRequest(python_string=self.CODE)
+            ).result
 
         assert isinstance(result, RunArbitraryPythonStringResultSuccess), result.result_details
         assert "scripted" in workflow.flows.name_to_parent_name
+
+    def test_its_requests_act_on_the_workflow_the_envelope_names(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+
+        result = engine.event_manager.handle_request(
+            RunArbitraryPythonStringRequest(python_string=self.CODE),
+            result_context=ResultContext(open_workflow_id=workflow.workflow_id),
+        ).result
+
+        assert isinstance(result, RunArbitraryPythonStringResultSuccess), result.result_details
+        assert "scripted" in workflow.flows.name_to_parent_name
+
+    def test_its_requests_act_on_no_workflow_when_it_names_none_even_with_one_open(self, engine: Engine) -> None:
+        workflow = _open_workflow(engine)
+
+        engine.event_manager.handle_request(RunArbitraryPythonStringRequest(python_string=self.CODE))
+
+        assert "scripted" not in workflow.flows.name_to_parent_name

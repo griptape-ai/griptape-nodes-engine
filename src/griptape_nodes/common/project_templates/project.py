@@ -9,6 +9,7 @@ import semver
 from pydantic import BaseModel, Field, ValidationError
 from ruamel.yaml import YAML
 
+from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.directory import DirectoryDefinition
 from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
 from griptape_nodes.common.project_templates.situation import SituationTemplate
@@ -18,6 +19,7 @@ from griptape_nodes.common.project_templates.validation import (
     ProjectValidationInfo,
 )
 from griptape_nodes.common.project_templates.variable import ProjectVariableDef
+from griptape_nodes.files.media_variables import MEDIA_VARIABLE_NAMES, unknown_media_variables
 
 if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
@@ -423,6 +425,8 @@ class ProjectTemplate(BaseModel):
                             line_number=line_number,
                         )
 
+        ProjectTemplate._warn_about_unknown_media_variables(merged_situations, overlay, validation_info)
+
         # Merge directories
         merged_directories: dict[str, DirectoryDefinition] = {}
 
@@ -622,3 +626,32 @@ class ProjectTemplate(BaseModel):
             file_extension_directories=merged_file_extension_directories,
             description=merged_description,
         )
+
+    @staticmethod
+    def _warn_about_unknown_media_variables(
+        situations: dict[str, SituationTemplate],
+        overlay: ProjectOverlayData,
+        validation_info: ProjectValidationInfo,
+    ) -> None:
+        """Warn about `media.*` names in the overlay's situations that the engine never fills in.
+
+        A warning, not an error: the project stays usable, and a project written for a newer engine
+        that knows more names still loads here. At save time an unknown name behaves like any unset
+        variable.
+        """
+        for situation_name in overlay.situations:
+            situation = situations.get(situation_name)
+            if situation is None:
+                continue
+            unknown = unknown_media_variables(ParsedMacro(situation.macro))
+            if not unknown:
+                continue
+            field_path = f"situations.{situation_name}.macro"
+            validation_info.add_warning(
+                field_path=field_path,
+                message=(
+                    f"The media variables {', '.join(unknown)} are never filled in, so they have no "
+                    f"value when files are saved. Valid names are: {', '.join(sorted(MEDIA_VARIABLE_NAMES))}."
+                ),
+                line_number=overlay.line_info.get_line(field_path),
+            )

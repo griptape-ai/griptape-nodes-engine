@@ -1,0 +1,11 @@
+{
+ "name": "Rerun Upstream Library",
+ "library_schema_version": "0.7.0",
+ "metadata": {"author": "Test Fixture", "description": "Load -> Generate -> Compare shape", "library_version": "0.1.0", "engine_version": "0.0.0", "tags": ["test"], "dependencies": {"pip_dependencies": []}},
+ "categories": [{"test": {"title": "test", "description": "Test nodes", "color": "border-gray-500", "icon": "Folder"}}],
+ "nodes": [
+  {"class_name": "FakeLoadImage", "file_path": "rerun_upstream_nodes.py", "metadata": {"category": "test", "description": "load", "display_name": "Load Image"}},
+  {"class_name": "FakeGenerate", "file_path": "rerun_upstream_nodes.py", "metadata": {"category": "test", "description": "generate", "display_name": "Generate"}},
+  {"class_name": "FakeCompareImages", "file_path": "rerun_upstream_nodes.py", "metadata": {"category": "test", "description": "compare", "display_name": "Compare Images"}}
+ ]
+}

@@ -405,3 +405,44 @@ class TestProviderRegistry:
         assert "artifacts.image.preview_generation.preview_generator" in config_schema
         assert config_schema["artifacts.image.preview_generation.preview_format"] == "webp"
         assert config_schema["artifacts.image.preview_generation.preview_generator"] == "Standard Thumbnail Generation"
+
+    def test_unregister_provider_not_registered_is_ignored(self) -> None:
+        """Test that unregistering a provider class that was never registered leaves the registry unchanged."""
+        registry = ProviderRegistry()
+        registry.register_provider(ImageArtifactProvider)
+
+        registry.unregister_provider(BaseArtifactProvider)
+
+        assert registry.get_all_provider_classes() == [ImageArtifactProvider]
+        assert registry.get_provider_classes_by_format("png") == [ImageArtifactProvider]
+        assert registry.get_provider_class_by_friendly_name("Image") is ImageArtifactProvider
+
+    def test_unregister_provider_keeps_other_providers_for_shared_format(self) -> None:
+        """Test that unregistering a provider keeps other providers registered for the same format."""
+
+        class AlternateImageProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "AlternateImage"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"png"}
+
+            @classmethod
+            def get_preview_formats(cls) -> set[str]:
+                return set()
+
+            @classmethod
+            def get_artifact_metadata(cls, _source_path: str) -> None:
+                return None
+
+        registry = ProviderRegistry()
+        registry.register_provider(ImageArtifactProvider)
+        registry.register_provider(AlternateImageProvider)
+
+        registry.unregister_provider(AlternateImageProvider)
+
+        assert registry.get_all_provider_classes() == [ImageArtifactProvider]
+        assert registry.get_provider_classes_by_format("png") == [ImageArtifactProvider]
+        assert registry.get_provider_class_by_friendly_name("AlternateImage") is None

@@ -258,6 +258,7 @@ def _save_flow_to_disk(engine: Engine, flow_name: str, tmp_path: Path, file_stem
 
     destination = ProjectFileDestination(str(tmp_path / f"{file_stem}.py"))
     save_result = engine.workflow_manager.saver._save_workflow_file_inline(
+        workflow=None,
         destination=destination,
         serialized_flow_commands=serialize_result.serialized_flow_commands,
         file_name=file_stem,

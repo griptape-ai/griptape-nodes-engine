@@ -47,10 +47,11 @@ from griptape_nodes.retained_mode.managers.resource_types.compute_resource impor
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType, detect_cpu_capabilities
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import OSResourceType, detect_os_capabilities
 from griptape_nodes.retained_mode.request_handlers import handles
-from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
+from griptape_nodes.retained_mode.runtime.binding import WorkflowNotOpenError
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.resource_components.resource_instance import ResourceInstance
+    from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -436,6 +437,7 @@ class ResourceManager(EngineScoped):
         slot: str | None = None,
         group: str | None = None,
         on_drop: Callable[[Any], None] | None = None,
+        workflow: "WorkflowRuntime | None" = None,
     ) -> str:
         """Hold `value` in this process and return the key that refers to it.
 
@@ -448,7 +450,22 @@ class ResourceManager(EngineScoped):
         holds it. That displacement lives here rather than on the parameter write, because the engine
         clears parameter values through several paths and none of them can be trusted to still hold the
         old key by the time the new one is written.
+
+        `workflow` is the workflow the entry belongs to, so `drop_objects_for_workflow` releases it when that
+        workflow closes. Leave it None for an entry that belongs to no workflow.
+
+        Raises:
+            WorkflowNotOpenError: `workflow` has closed, so nothing would ever release the entry.
         """
+        workflow_id = None
+        if workflow is not None:
+            if workflow.closed:
+                msg = (
+                    f"Attempted to hold an object for workflow '{workflow.workflow_id}'. "
+                    "Failed because the workflow was closed. Reopen the workflow and try again."
+                )
+                raise WorkflowNotOpenError(msg)
+            workflow_id = workflow.workflow_id
         full_key = self.local_object_key(key, owner=owner)
         entry = LocalObjectEntry(
             value=value,
@@ -457,7 +474,7 @@ class ResourceManager(EngineScoped):
             slot=slot,
             group=group,
             on_drop=on_drop,
-            workflow_id=self._current_workflow_id(),
+            workflow_id=workflow_id,
         )
         with self._local_objects_lock:
             displaced = self._local_objects.get(full_key)
@@ -706,6 +723,17 @@ class ResourceManager(EngineScoped):
         self._invoke_hooks_once_per_object(to_release)
         return len(doomed)
 
+    def tag_untagged_objects_for_workflow(self, *, owner: str, source: str, workflow: "WorkflowRuntime") -> None:
+        """Hold what `source` put before it joined `workflow` for that workflow, so closing it releases them.
+
+        A node's `__init__` runs before the node joins a workflow, so an object it puts there has no workflow
+        to be tagged with. The node joining is the first moment its workflow is known.
+        """
+        with self._local_objects_lock:
+            for entry in self._local_objects.values():
+                if entry.owner == owner and entry.source == source and entry.workflow_id is None:
+                    entry.workflow_id = workflow.workflow_id
+
     def drop_objects_for_workflow(self, workflow_id: str) -> int:
         """Release everything held in this process for one workflow, returning how many went.
 
@@ -737,16 +765,6 @@ class ResourceManager(EngineScoped):
 
         self._invoke_hooks_once_per_object(to_release, defer_during_execution=defer_during_execution)
         return len(doomed)
-
-    def _current_workflow_id(self) -> str | None:
-        """The id of the workflow the current work acts on, or None when it acts on none or cannot tell which."""
-        try:
-            workflow = self.engine.current_workflow_or_none()
-        except WorkflowNotNamedError:
-            return None
-        if workflow is None:
-            return None
-        return workflow.workflow_id
 
     def _value_still_held_locked(self, value: Any) -> bool:
         """`_value_still_held` for callers already holding the lock.
