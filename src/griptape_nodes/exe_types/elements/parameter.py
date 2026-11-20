@@ -36,6 +36,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 
+class InvalidParameterValueError(ValueError):
+    """A converter or validator rejected a value, with a message written for the person who entered it."""
+
+
 class ParameterBase(BaseNodeElement, ABC):
     @property
     @abstractmethod
