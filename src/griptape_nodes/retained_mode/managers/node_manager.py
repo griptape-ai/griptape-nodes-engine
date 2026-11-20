@@ -4717,6 +4717,7 @@ class NodeManager(EngineScoped):
             node_dependencies=node_dependencies,
             lock_node_command=lock_command,
             is_node_group=isinstance(node, SubflowNodeGroup),
+            node_uuid=SerializedNodeCommands.NodeUUID(node_name),
         )
         details = f"Successfully serialized node '{node_name}' into commands."
         result = SerializeNodeToCommandsResultSuccess(
