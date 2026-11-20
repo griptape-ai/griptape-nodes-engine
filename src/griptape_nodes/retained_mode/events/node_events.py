@@ -425,8 +425,8 @@ class SetLockNodeStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetLockNodeStateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Node locked successfully."""
+class SetLockNodeStateResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Node locked successfully. A saved workflow keeps its lock, so this changes the workflow."""
 
     node_name: str
     locked: bool
@@ -458,7 +458,7 @@ class BatchSetNodeLockStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeLockStateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+class BatchSetNodeLockStateResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     """Batch node lock state update completed successfully."""
 
     updated_nodes: list[str]
