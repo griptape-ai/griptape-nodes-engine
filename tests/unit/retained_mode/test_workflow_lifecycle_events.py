@@ -463,7 +463,7 @@ class TestClosing:
 
         failure = asyncio.run(
             engine.project_manager._reload_after_project_switch(
-                "another-project", workspace_changed=True, library_config_changed=False
+                "another-project", close_workflows=True, workspace_changed=True, library_config_changed=False
             )
         )
 

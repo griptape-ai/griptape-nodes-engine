@@ -484,7 +484,7 @@ class TestIdsAcrossRescans:
         engine.config_manager.workspace_path = workspace / "shots"
         failure = asyncio.run(
             engine.project_manager._reload_after_project_switch(
-                "shots", workspace_changed=True, library_config_changed=False
+                "shots", close_workflows=True, workspace_changed=True, library_config_changed=False
             )
         )
 
