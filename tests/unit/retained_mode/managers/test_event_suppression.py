@@ -307,6 +307,34 @@ class TestSuppressionIsScopedToItsCaller:
         with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
             assert await nested_handler() is True
 
+    @pytest.mark.asyncio
+    async def test_a_task_started_inside_the_window_is_suppressed_while_it_is_open(self) -> None:
+        """A handler that runs its nested requests as tasks, and awaits them, hides them too."""
+        event_manager = EventManager()
+
+        async def nested_request() -> bool:
+            await asyncio.sleep(0)
+            return event_manager.should_suppress_event(_create_node_result_event())
+
+        with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
+            assert await asyncio.create_task(nested_request()) is True
+
+    @pytest.mark.asyncio
+    async def test_a_task_that_outlives_the_window_broadcasts_again(self) -> None:
+        """A task a node starts while it is being built, such as one that fetches what it shows."""
+        event_manager = EventManager()
+        window_closed = asyncio.Event()
+
+        async def background_task() -> bool:
+            await window_closed.wait()
+            return event_manager.should_suppress_event(_create_node_result_event())
+
+        with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
+            task = asyncio.create_task(background_task())
+        window_closed.set()
+
+        assert await task is False
+
 
 class TestSuppressionSetReachability:
     """The executor's suppression sets stay split by transport: execution payloads vs request results."""

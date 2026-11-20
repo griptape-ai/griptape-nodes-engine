@@ -172,11 +172,27 @@ _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], 
 # It fails open: work handed to a thread the engine does not control (a library-internal
 # ThreadPoolExecutor) starts from a fresh context and loses the flag, so its results are
 # broadcast as they are today. Over-broadcasting is a cosmetic event; over-suppressing desyncs
-# the editor. Frozensets are replaced, never mutated, because the value object itself is shared
-# with every context that copied it.
-_suppressed_event_types: ContextVar[frozenset[type]] = ContextVar(
-    "_event_manager_suppressed_event_types", default=frozenset()
+# the editor. A task started inside the window copies the context and with it the window, so the
+# window closes itself on exit: a task that outlives it, such as one a node starts while it is
+# being built, broadcasts again from then on. Tuples are replaced, never mutated, because the value
+# object itself is shared with every context that copied it.
+_suppression_windows: ContextVar[tuple[_SuppressionWindow, ...]] = ContextVar(
+    "_event_manager_suppression_windows", default=()
 )
+
+
+@dataclass(eq=False)
+class _SuppressionWindow:
+    """One ``EventSuppressionContext`` block: the types it hides, while it is open."""
+
+    event_types: frozenset[type]
+    is_open: bool = True
+
+
+def _suppressed_event_types() -> frozenset[type]:
+    """The types the open windows of the current context hide."""
+    return frozenset().union(*(window.event_types for window in _suppression_windows.get() if window.is_open))
+
 
 # Post-dispatch hooks are deliberately unbounded -- every result gets its own task so a
 # notification hook never misses a request. This is purely a "something is wrong" signal
@@ -519,9 +535,9 @@ class EventManager(EngineScoped):
 
         Matching is by ``isinstance``, so a set may name a base class such as ``ResultPayload``.
 
-        Suppression is scoped to the current context; see ``_suppressed_event_types``.
+        Suppression is scoped to the current context; see ``_suppression_windows``.
         """
-        suppressed_types = _suppressed_event_types.get()
+        suppressed_types = _suppressed_event_types()
         if not suppressed_types:
             return False
 
@@ -538,7 +554,7 @@ class EventManager(EngineScoped):
         that opened it (``EventSuppressionContext`` restores the previous value on exit) and is
         invisible to other contexts, so this is a no-op in the normal case.
         """
-        _suppressed_event_types.set(frozenset())
+        _suppression_windows.set(())
 
     def initialize_queue(self, queue: asyncio.Queue | None = None) -> None:
         """Set the event queue for this manager.
@@ -2374,9 +2390,9 @@ class EventSuppressionContext:
     The operations themselves complete normally: suppression only skips queueing the broadcast,
     and in-process callers still receive every result in full.
 
-    Suppression applies to the current context and to any nested request dispatched from inside
-    the block, not to the manager as a whole -- see ``_suppressed_event_types`` for why that
-    distinction is load-bearing. Nesting composes: the previous value is restored on exit, so an
+    Suppression applies to the current context and to any nested request dispatched or task started
+    from inside the block, until the block ends, not to the manager as a whole -- see
+    ``_suppression_windows`` for why that distinction is load-bearing. Nesting composes: the previous value is restored on exit, so an
     inner block adding a type does not unsuppress what an outer block was already hiding.
 
     One instance may be entered more than once, whether nested in itself or reused for a later
@@ -2392,11 +2408,11 @@ class EventSuppressionContext:
     def __init__(self, manager: EventManager, events_to_suppress: AbstractSet[type]):
         self.manager = manager
         self.events_to_suppress = events_to_suppress
-        self._tokens: list[contextvars.Token[frozenset[type]]] = []
+        self._entered: list[tuple[contextvars.Token[tuple[_SuppressionWindow, ...]], _SuppressionWindow]] = []
 
     def __enter__(self) -> None:
-        currently_suppressed = _suppressed_event_types.get()
-        self._tokens.append(_suppressed_event_types.set(currently_suppressed | frozenset(self.events_to_suppress)))
+        window = _SuppressionWindow(event_types=frozenset(self.events_to_suppress))
+        self._entered.append((_suppression_windows.set((*_suppression_windows.get(), window)), window))
 
     def __exit__(
         self,
@@ -2404,10 +2420,12 @@ class EventSuppressionContext:
         exc_value: BaseException | None,
         exc_traceback: types.TracebackType | None,
     ) -> None:
-        if not self._tokens:
+        if not self._entered:
             return
 
-        _suppressed_event_types.reset(self._tokens.pop())
+        token, window = self._entered.pop()
+        window.is_open = False
+        _suppression_windows.reset(token)
 
 
 class EventTranslationContext:
