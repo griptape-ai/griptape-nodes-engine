@@ -9,13 +9,13 @@ This skill covers the full cold-start cycle (build → wire → run → read) ag
 
 ## Mental Model
 
-- **Workflow**: Top-level namespace. Several can be open at once. `ClearAllObjectStateRequest` closes them all.
+- **Workflow**: Top-level namespace. The engine can have several open at once, such as one per editor tab.
 - **Flow**: The canvas inside a workflow. A workflow has exactly one top-level "canvas" flow. Sub-flows are possible but rarely needed for scratch work.
 - **Node**: A unit of work with parameters (inputs, outputs, properties).
 - **Connection**: An edge between two parameters. Two kinds:
     - **Data flow**: A typed parameter on one node → a typed parameter on another. The engine derives execution order from data dependencies, so data connections alone are usually sufficient.
     - **Control flow**: `exec_out` → `exec_in`. Only needed when two nodes must run in a specific order but don't share data (e.g. side-effecting steps, branching). Skip these by default.
-- **Current Context**: A stack (workflow → flow → node). Most requests default to "current" when a name is omitted.
+- **Your workflow**: Every tool call that builds, changes, or runs a graph acts on one open workflow. With no `X-Griptape-Workflow-Id` header, that is the workflow your MCP session opened most recently. With the header, it is the workflow the header names. Within that workflow, requests that omit `flow_name` use its top-level flow. See "Choose the Workflow" below.
 
 ## What the MCP server actually exposes
 
@@ -44,31 +44,38 @@ registered libraries and the node types they expose is the catalog every later s
 draws from, so spend the round trips up front instead of guessing names that may not
 exist (or that exist in a different library than you expect).
 
-### Find the workspace directory on disk
+### Find the workspace directory
 
-The MCP surface does not expose `GetConfigValueRequest`, so resolve the workspace
-path by reading the user config file directly. On macOS / Linux it lives at:
+Ask the running engine, do not read config files on disk. The engine is the only
+authority on its own workspace, and the config file's location varies by packaging
+(the CLI uses `~/.config/griptape_nodes/...`, the macOS desktop app uses an XDG
+override under `~/Library/Application Support/Griptape Nodes/xdg_config_home/...`).
 
 ```
-~/.config/griptape_nodes/griptape_nodes_config.json
+A. griptape_nodes_GetWorkspaceRequest()
+   → returns `workspace_path`: the absolute workspace root with `~` expanded and
+     symlinks resolved. Safe to feed straight into `Path` / `os.path` operations.
+
+B. griptape_nodes_GetConfigValueRequest(category_and_key="sandbox_library_directory")
+   → returns the subdirectory as the engine has it. Subdirectory keys
+     (`sandbox_library_directory`, `static_files_directory`, `libraries_directory`)
+     come back **relative to the workspace** (e.g. `"sandbox_library"`). Defaults are
+     merged in, so a key that isn't in the user config still returns its default
+     rather than null. Nested keys use dot syntax (`category.key`).
+
+C. (optional) griptape_nodes_GetConfigValueRequest(
+       category_and_key="app_events.on_app_initialization_complete.libraries_to_register")
+   → list of locally registered `griptape_nodes_library.json` paths. Entries can
+     be either a string or `{"path": "...", "enabled": true}`. Useful when you
+     want to look at an existing node's Python module before writing a similar
+     sandbox node.
 ```
 
-The keys you care about are:
-
-- `workspace_directory`: absolute (or `~`-prefixed) workspace root. The sandbox
-    library lives inside this directory.
-- `app_events.on_app_initialization_complete.libraries_to_register`: list of locally
-    registered `griptape_nodes_library.json` paths. Entries can be either a string or
-    an object `{"path": "...", "enabled": true}`. Reading these tells you where each
-    library's source lives if you need to look at an existing node's Python module
-    before writing a similar sandbox node.
-
-The sandbox subdirectory key (`sandbox_library_directory`) is optional and defaults
-to `sandbox_library`. The absolute sandbox path is therefore
-`<workspace_directory>/<sandbox_library_directory>` (e.g.
-`~/Projects/.../GriptapeNodes/sandbox_library`).
-
-Do this once per session and remember the paths; they don't change mid-run.
+The absolute sandbox library path is therefore
+`Path(workspace_path) / sandbox_library_directory` (`Path` correctly drops the
+workspace half if the subdir setting is itself absolute, which is allowed). Re-fetch
+`GetWorkspaceRequest` at the top of any build phase that touches the filesystem,
+because the workspace can change while the engine runs.
 
 ### Survey the registered libraries via MCP
 
@@ -194,31 +201,45 @@ batched recipe below uses.
 
 ## Choose the Workflow
 
-Calls act on the workflow your client's `X-Griptape-Workflow-Id` header names. With
-no header, pick one before building:
+The user may have other workflows open in the editor. Your session builds into one
+of them and leaves the rest alone:
 
-```
-A. griptape_nodes_ListOpenWorkflowsRequest()
-   → each open workflow's workflow_id and name.
-B. griptape_nodes_OpenWorkflowRequest(workflow_id="<id>") → work in that open workflow,
-   or griptape_nodes_OpenWorkflowRequest(create_flow=True) → start a new one.
-```
+- **Start fresh:** `EnsureWorkflowAndFlowRequest()` as the first call of a session
+    opens a new workflow. To start another one later in the same session, call
+    `OpenWorkflowRequest(create_flow=True)` with no `workflow_id`. The session
+    switches to the workflow it opens.
+- **Work in a workflow that's already open,** such as the user's tab:
+    `ListOpenWorkflowsRequest()` lists every open workflow with its `workflow_id`.
+    `OpenWorkflowRequest(workflow_id=...)` returns it with `already_open` set,
+    changes nothing about it, and makes it your session's workflow.
+- **Pin one workflow:** an `X-Griptape-Workflow-Id` header in the client's MCP
+    configuration makes every call act on that workflow, including each request
+    inside `EventRequestBatch`.
+- **Close it:** `CloseWorkflowRequest(workflow_id=...)` closes that one workflow
+    and leaves the others open.
 
-Later calls in the MCP session act on that workflow. If another client closes it,
-calls fail with `WorkflowNotOpenResultFailure`, which lists the open workflows, until
-you repeat step B.
+If your workflow is closed by someone else, such as the user closing its tab,
+every call that acts on it fails with `WorkflowNotOpenResultFailure`, including
+`EnsureWorkflowAndFlowRequest`. Its `open_workflows` lists what is still open.
+Recover with `OpenWorkflowRequest`: `workflow_id=...` for one of those, or
+`create_flow=True` for a new one.
+
+Do not reach for `ClearAllObjectStateRequest` to reset. It closes every open
+workflow, including the ones in the user's editor tabs.
 
 ## Canonical Cold-Start Recipe
 
 For a typical 3-node linear pipeline (`TextInput → Agent → DisplayText`), once the
 workspace survey above has confirmed the relevant library exposes those node types.
-On an empty engine, step 1 opens a new workflow with its flow. With one open, choose
-it first (see Choose the Workflow); step 1 then gives it a flow if it has none.
+To build into a workflow that's already open, choose it first (see Choose the
+Workflow).
 
 ```
 1. griptape_nodes_EnsureWorkflowAndFlowRequest()
-   → returns workflow_name, flow_name, created_workflow, created_flow.
-     Idempotent: if both pieces are already in context, reuses them.
+   → returns workflow_id, workflow_name, flow_name, created_workflow, created_flow.
+     If your session has no workflow yet, opens a new one and makes it the
+     session's workflow. Once it has one, reuses it and only creates the flow if
+     it is missing, so calling it again is safe.
 
 2. griptape_nodes_DescribeNodeTypeRequest(node_type="TextInput")
 3. griptape_nodes_DescribeNodeTypeRequest(node_type="Agent")
@@ -254,10 +275,10 @@ it first (see Choose the Workflow); step 1 then gives it a flow if it has none.
     → required after any multi-node build. Without it, every node lands at (0, 0)
       and the canvas shows them stacked on top of each other. Topologically sorts
       the graph and assigns column-and-row positions. Omit `flow_name` to lay out
-      the current-context flow.
+      your workflow's top-level flow.
 
 12. griptape_nodes_StartFlowRequest()
-    → omit flow_name; the handler uses the current-context flow.
+    → omit flow_name; the handler uses your workflow's top-level flow.
       Returns once the run ends.
 
 13. griptape_nodes_GetParameterValueRequest(node_name="DisplayText_1", parameter_name="text")
@@ -336,7 +357,7 @@ against stale state.
 - **`StartFlowRequest` returns when the run ends.** Read outputs straight after it;
     no polling needed.
 - **Omit `flow_name` on `StartFlowRequest`** when you just finished building a
-    single flow. The handler defaults to the current-context flow.
+    single flow. The handler defaults to your workflow's top-level flow.
 - **A data input takes one connection.** Connecting a second source to it (or a
     control output to a second target) replaces the existing connection.
     `CreateConnectionResultSuccess.replaced_connection` names the one removed.
@@ -366,8 +387,8 @@ in `_trim_response`):
 `ok` reflects whether the engine produced a `*ResultSuccess` payload. The remaining
 fields are flattened from the inner result class, so for example
 `CreateNodeResultSuccess.node_name` is reachable as `response["node_name"]`,
-`EnsureWorkflowAndFlowResultSuccess` exposes `workflow_name`, `flow_name`,
-`created_workflow`, `created_flow` at the top level, and `AutoLayoutFlowResultSuccess`
+`EnsureWorkflowAndFlowResultSuccess` exposes `workflow_id`, `workflow_name`,
+`flow_name`, `created_workflow`, `created_flow` at the top level, and `AutoLayoutFlowResultSuccess`
 exposes `flow_name` and `positioned_nodes`. Failures surface as MCP tool errors with
 the engine's `result_details` message attached.
 
@@ -449,13 +470,6 @@ The slot name is engine-generated and only known after the add returns, so the
 an `EventRequestBatch`. Batch all the adds in one round trip, read each slot's
 `parameter_name`, then batch the connects/sets in the next.
 
-### Several workflows can be open
-
-`OpenWorkflowRequest` and `SetWorkflowContextRequest` open a workflow beside the ones
-already open. Close yours with `CloseWorkflowRequest(workflow_id=...)` when you're done.
-`ClearAllObjectStateRequest(i_know_what_im_doing=True)` closes every workflow, other
-clients' included.
-
 ### Agents cannot be interrupted mid-run
 
 `StartFlowRequest` holds the call until the run finishes or errors. A subsequent
@@ -467,7 +481,9 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 
 | Goal                                                                                | Tool                                                                                                                                                      |
 | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bootstrap a workflow + flow on an empty engine                                      | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
+| Get the absolute workspace directory                                                | `GetWorkspaceRequest` (subdirectory config keys are workspace-relative)                                                                                   |
+| Read a configuration value                                                          | `GetConfigValueRequest` (e.g. `sandbox_library_directory`, nested keys via dot syntax)                                                                    |
+| Get a workflow + flow to build into                                                 | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
 | Fan N requests out in one round trip                                                | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
 | Discover libraries / node types                                                     | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest` (`include_metadata` for descriptions), `ListCategoriesInLibraryRequest`                 |
 | Inspect a node type's parameters                                                    | `DescribeNodeTypeRequest`                                                                                                                                 |
@@ -490,7 +506,7 @@ and `CancelAllRunsRequest` cancels everything. A run request's result carries it
 | Find nodes by Python class (e.g. StartFlow, Agent)                                  | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
 | Register a sandbox node type from Python source or a saved workflow already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
 | List, work in, start or close workflows                                             | `ListOpenWorkflowsRequest()`, `OpenWorkflowRequest(workflow_id=...)`, `OpenWorkflowRequest(create_flow=True)`, `CloseWorkflowRequest(workflow_id=...)`    |
-| Reset everything                                                                    | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
+| Close every open workflow, including the user's tabs                                | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
 
 ## Custom nodes
 
