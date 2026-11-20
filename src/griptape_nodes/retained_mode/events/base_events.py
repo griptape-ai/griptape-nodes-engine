@@ -135,8 +135,9 @@ class RequestPayload(Payload, ABC):
         undo_group: Names the user action a request belongs to, making what it changes undoable.
                 Requests that share a group undo as one step, so a client starts a new group for
                 each user input, such as one drag. A request without one is not an undo step: what
-                it changes is taken back along with the undo step before it. Neither is a request in
-                the group of the latest UndoRequest or RedoRequest, which is the client reacting to it.
+                it changes is taken back along with the undo step before it. A client reacting to an
+                UndoRequest or RedoRequest, such as by writing back what it measured, sends its
+                requests without a group.
         undo_label: Names the action in the undo history, such as "Move 3 nodes". The last label
                 sent in a group wins. Without one, the action is named after its first request.
     """
