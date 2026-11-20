@@ -127,6 +127,27 @@ class TestProjectSwitchWithOpenWorkflows:
         assert not result.altered_workflow_state
         assert engine.open_workflows.all_open() == [workflow]
 
+    def test_a_switch_that_fails_and_rolls_back_leaves_them_open(
+        self, engine: Engine, projects: _Projects, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workflow = _open(engine, "tab")
+        manager = engine.project_manager
+        apply_layers = manager._apply_workspace_and_libraries_layers
+
+        async def refuse_second(project_info: Any, project_file_path: Path) -> SetCurrentProjectResultFailure | None:
+            if manager._current_project_id == projects.second:
+                return SetCurrentProjectResultFailure(result_details="parent chain cannot be resolved")
+            return await apply_layers(project_info, project_file_path)
+
+        monkeypatch.setattr(manager, "_apply_workspace_and_libraries_layers", refuse_second)
+
+        result = asyncio.run(engine.ahandle_request(SetCurrentProjectRequest(project_id=projects.second)))
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert not result.altered_workflow_state
+        assert manager._current_project_id == projects.first
+        assert engine.open_workflows.all_open() == [workflow]
+
     @pytest.mark.asyncio
     async def test_a_switch_while_a_workflow_runs_fails_and_changes_nothing(
         self, engine: Engine, projects: _Projects

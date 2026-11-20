@@ -6235,7 +6235,7 @@ class TestProjectManagerProjectWorkspaces:
         failure = SetCurrentProjectResultFailure(result_details="engine_version mismatch")
         calls: list[str] = []
 
-        async def fake_activate(project_id: str) -> _ProjectActivationOutcome:
+        async def fake_activate(project_id: str, *, restoring_previous: bool = False) -> _ProjectActivationOutcome:  # noqa: ARG001
             calls.append(project_id)
             # First call (the requested target) fails; the rollback to previous succeeds.
             if len(calls) == 1:
@@ -6287,7 +6287,7 @@ class TestProjectManagerProjectWorkspaces:
         failure = SetCurrentProjectResultFailure(result_details="boot failure")
         calls: list[str] = []
 
-        async def fake_activate(project_id: str) -> _ProjectActivationOutcome:
+        async def fake_activate(project_id: str, *, restoring_previous: bool = False) -> _ProjectActivationOutcome:  # noqa: ARG001
             calls.append(project_id)
             # First call (the requested target) fails; the rollback to the rest state succeeds.
             if len(calls) == 1:
