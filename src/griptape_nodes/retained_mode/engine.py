@@ -45,6 +45,7 @@ from griptape_nodes.retained_mode.events.app_events import (
     SessionHeartbeatResultSuccess,
     WorkflowClosedEvent,
     WorkflowOpenedEvent,
+    WorkflowStateChangedEvent,
 )
 from griptape_nodes.retained_mode.events.base_events import (
     AppEvent,
@@ -873,6 +874,23 @@ class Engine:
             workflow_file_path=file_path,
             is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),
+            state=workflow.state(),
+        )
+
+    def report_workflow_state(self, workflow: WorkflowRuntime) -> None:
+        """Tell every client of `workflow`'s state if it changed since they were last told.
+
+        Call after anything that can change it. Says nothing of a workflow that is closed or still
+        building, which its `WorkflowOpenedEvent` will report.
+        """
+        if self._open_workflows.find(workflow.workflow_id) is not workflow or self.is_opening(workflow):
+            return
+        state = workflow.state()
+        if state == workflow.reported_state:
+            return
+        workflow.reported_state = state
+        self._event_manager.put_event(
+            AppEvent(payload=WorkflowStateChangedEvent(workflow_id=workflow.workflow_id, state=state))
         )
 
     def close_workflow(self, workflow: WorkflowRuntime) -> None:
@@ -1013,7 +1031,10 @@ class Engine:
         finally:
             build_ended = self._opening_workflows.pop(workflow)
             if not workflow.closed:
+                # What the block built, its file's graph or a new workflow's flow, is where its changes start.
+                workflow.has_unsaved_changes = False
                 opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
+                workflow.reported_state = opened_event.open_workflow.state
                 self._event_manager.put_event(AppEvent(payload=opened_event))
             build_ended.set()
 

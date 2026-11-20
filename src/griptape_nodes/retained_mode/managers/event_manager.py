@@ -1619,6 +1619,7 @@ class EventManager(EngineScoped):
             # from coming in and immediately being flagged as being dirty.
             if workflow_mgr.should_squelch_workflow_altered():
                 callback_result.altered_workflow_state = False
+            self._record_workflow_altered(callback_result, request_workflow)
 
             # Override failure log level if requested, except for a crash: `failure_log_level`
             # silences failures its caller EXPECTS, so honoring it for an exception a handler or
@@ -1669,6 +1670,14 @@ class EventManager(EngineScoped):
         self._fire_post_dispatch_hooks(request, callback_result)
 
         return result_event
+
+    def _record_workflow_altered(self, result: ResultPayload, request_workflow: _RequestWorkflow | None) -> None:
+        """Mark the workflow a request acted on as having unsaved changes when its result says it changed it."""
+        if not result.altered_workflow_state or request_workflow is None or request_workflow.workflow is None:
+            return
+        workflow = request_workflow.workflow
+        workflow.has_unsaved_changes = True
+        self.engine.report_workflow_state(workflow)
 
     def _result_for_handler_exception(
         self, request: RP, exception: Exception, *, context: ResultContext, request_workflow: _RequestWorkflow

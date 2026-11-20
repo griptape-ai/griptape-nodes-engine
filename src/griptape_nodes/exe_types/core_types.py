@@ -24,7 +24,7 @@ from griptape_nodes.exe_types.elements.node_messages import (
     NodeMessagePayload,
     NodeMessageResult,
 )
-from griptape_nodes.exe_types.elements.parameter import Parameter, ParameterBase
+from griptape_nodes.exe_types.elements.parameter import InvalidParameterValueError, Parameter, ParameterBase
 from griptape_nodes.exe_types.elements.parameter_messages import DeprecationMessage, ParameterMessage
 from griptape_nodes.exe_types.elements.parameter_types import (
     VALID_PARAMETER_RENDER_LOCATIONS,
@@ -49,6 +49,7 @@ __all__ = [
     "ControlParameterOutput",
     "DeprecationMessage",
     "ElementMessageCallback",
+    "InvalidParameterValueError",
     "NodeError",
     "NodeErrorLink",
     "NodeMessagePayload",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowState, WorkflowRunState
 from griptape_nodes.retained_mode.events.base_events import build_execution_event
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
@@ -49,6 +50,24 @@ class WorkflowRuntime:
         self.nodes = WorkflowNodes()
         self.flows = WorkflowFlows(self)
         self.variables = WorkflowVariables()
+        # Set by a request that changes the workflow, cleared when the workflow's own file is written.
+        self.has_unsaved_changes = False
+        # Why the latest run failed, cleared when the next starts.
+        self.last_run_error: str | None = None
+        # The state clients were last told of, so `Engine.report_workflow_state` tells them only of a change.
+        self.reported_state: OpenWorkflowState | None = None
+
+    def state(self) -> OpenWorkflowState:
+        """Its unsaved changes and runs, as clients are told of them."""
+        run_state = WorkflowRunState.IDLE
+        if self.flows.run_in_progress is not None:
+            run_state = WorkflowRunState.RUNNING
+        return OpenWorkflowState(
+            has_unsaved_changes=self.has_unsaved_changes,
+            run_state=run_state,
+            queued_run_count=len(self.flows.run_queue.snapshot()),
+            last_run_error=self.last_run_error,
+        )
 
     def top_level_flow(self) -> ControlFlow | None:
         """The workflow's top-level flow, the one with no parent, if it has one."""
