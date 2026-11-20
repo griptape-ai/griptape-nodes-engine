@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 import warnings
@@ -265,10 +266,12 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
             },
         )
         if traits:
-            # A set holds no order, so traits go in by kind, which shows them the same way every time.
-            for trait in sorted(traits, key=_trait_kind):
+            # A set holds no order, so traits go in by kind and then by state, which shows them
+            # the same way every time.
+            instances = [instantiate_trait(trait) for trait in traits]
+            for trait in sorted(instances, key=_trait_order):
                 # UI options are now traits! sorry!
-                self.add_child(instantiate_trait(trait))
+                self.add_child(trait)
         if badge is not None:
             set_initial_badge(self, badge)
         self.type = type
@@ -877,7 +880,7 @@ def diff_list_values(self_value: Any, other_value: Any, differences: dict, key: 
         differences[key] = other_value
 
 
-def _trait_kind(trait: type[Trait] | Trait) -> str:
-    if isinstance(trait, type):
-        return trait.__name__
-    return type(trait).__name__
+def _trait_order(trait: Trait) -> tuple[str, str, str]:
+    """Order traits by name, then module, then saved state, so no two different traits tie."""
+    saved_state = {key: as_saved_state_value(value).value for key, value in trait.to_state().items()}
+    return (type(trait).__name__, type(trait).__module__, json.dumps(saved_state, sort_keys=True))
