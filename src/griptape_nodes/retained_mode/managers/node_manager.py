@@ -3137,7 +3137,8 @@ class NodeManager(EngineScoped):
         # When after_value_set modifies output parameters, those
         # changes must reach downstream nodes.
         if output_snapshot is not None and modified:
-            for output_param_name, new_value in node.parameter_output_values.items():
+            # A copy: if the node is running, its own thread may be adding outputs.
+            for output_param_name, new_value in list(node.parameter_output_values.items()):
                 old_value = output_snapshot.get(output_param_name)
                 if old_value is new_value or old_value == new_value:
                     continue

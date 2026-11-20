@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import Mock, patch
 
 import pytest
@@ -43,6 +44,37 @@ class TestNodeTypes:
 
         # Verify all yields were processed
         assert results == ["result1", "result2"]
+
+    @pytest.mark.asyncio
+    async def test_aprocess_runs_a_generators_body_and_steps_off_the_loop(self) -> None:
+        threads = []
+
+        def generator() -> AsyncResult:
+            threads.append(threading.get_ident())
+            yield lambda: threads.append(threading.get_ident())
+            threads.append(threading.get_ident())
+
+        node = MockNode(process_result=generator())
+
+        await node.aprocess()
+
+        before_yield, step, after_yield = threads
+        loop_thread = threading.get_ident()
+        assert loop_thread not in {before_yield, step, after_yield}
+
+    @pytest.mark.asyncio
+    async def test_aprocess_raises_what_a_yielded_callable_raises(self) -> None:
+        def fail() -> None:
+            msg = "step failed"
+            raise ValueError(msg)
+
+        def generator() -> AsyncResult:
+            yield fail
+
+        node = MockNode(process_result=generator())
+
+        with pytest.raises(ValueError, match="step failed"):
+            await node.aprocess()
 
 
 class TestConnectionRemovedHooks:

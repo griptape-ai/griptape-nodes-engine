@@ -201,6 +201,32 @@ class _ParkNode(ControlNode):
         self.parameter_output_values["result"] = f"done:{self.get_parameter_value('value')}"
 
 
+class _SyncParkNode(ControlNode):
+    """A sync process() that waits on its gate, then sends a request that sets its own `seen`."""
+
+    gate: ClassVar[threading.Event] = threading.Event()
+    started: ClassVar[threading.Event] = threading.Event()
+    process_threads: ClassVar[list[int]] = []
+    released: ClassVar[list[bool]] = []
+    seen_set_on_threads: ClassVar[list[int]] = []
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(name="seen", tooltip="Seen", type="str", default_value="", allowed_modes={ParameterMode.PROPERTY})
+        )
+
+    def process(self) -> None:
+        _SyncParkNode.process_threads.append(threading.get_ident())
+        _SyncParkNode.started.set()
+        _SyncParkNode.released.append(_SyncParkNode.gate.wait(5))
+        self.engine.handle_request(SetParameterValueRequest(node_name=self.name, parameter_name="seen", value="yes"))
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:
+        if parameter.name == "seen" and value == "yes":
+            _SyncParkNode.seen_set_on_threads.append(threading.get_ident())
+
+
 _RAW_THREAD_FILE = "{workflow_dir}/{workflow_name}.png"
 
 
@@ -245,7 +271,7 @@ def spike_library() -> Iterator[None]:
         nodes=[],
     )
     library = LibraryRegistry.generate_new_library(schema)
-    for node_class in (_ValueNode, _ParkNode, _RawThreadNode):
+    for node_class in (_ValueNode, _ParkNode, _RawThreadNode, _SyncParkNode):
         library.register_new_node_type(
             node_class, NodeMetadata(category="test", description="d", display_name=node_class.__name__)
         )
@@ -254,6 +280,11 @@ def spike_library() -> Iterator[None]:
     _ParkNode.ran_in = {}
     _ParkNode.node_workflow = {}
     _RawThreadNode.seen = {}
+    _SyncParkNode.gate = threading.Event()
+    _SyncParkNode.started = threading.Event()
+    _SyncParkNode.process_threads = []
+    _SyncParkNode.released = []
+    _SyncParkNode.seen_set_on_threads = []
     try:
         yield
     finally:
@@ -513,6 +544,43 @@ class TestRunInOneEditTheOther:
         assert _ParkNode.ran_in == {"park_a": a, "park_b": b}
         assert _get(engine, a, "park_a", "result") == "done:a"
         assert _get(engine, b, "park_b", "result") == "done:b"
+
+    @pytest.mark.asyncio
+    async def test_b_answers_while_a_runs_a_sync_node(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, b = two_open
+        engine.event_manager.initialize_queue(asyncio.Queue())
+        _make_node(engine, a, "_SyncParkNode", "sync")
+        run = asyncio.create_task(_send_async(engine, StartFlowRequest(flow_name="canvas", flow_node_name="sync"), a))
+        assert await asyncio.to_thread(_SyncParkNode.started.wait, 5)
+
+        created = await _send_async(engine, CreateNodeRequest(node_type="_ValueNode", node_name="added"), b)
+        _SyncParkNode.gate.set()
+        result = await asyncio.wait_for(run, 5)
+
+        assert isinstance(created, CreateNodeResultSuccess), created.result_details
+        # Released by this test rather than timed out: the loop kept running while the node waited.
+        assert _SyncParkNode.released == [True]
+        assert isinstance(result, StartFlowResultSuccess), result.result_details
+
+    @pytest.mark.asyncio
+    async def test_a_sync_nodes_requests_are_handled_on_the_engine_loop(
+        self, engine: Engine, two_open: tuple[WorkflowRuntime, WorkflowRuntime]
+    ) -> None:
+        a, _ = two_open
+        engine.event_manager.initialize_queue(asyncio.Queue())
+        _make_node(engine, a, "_SyncParkNode", "sync")
+        _SyncParkNode.gate.set()
+
+        result = await _send_async(engine, StartFlowRequest(flow_name="canvas", flow_node_name="sync"), a)
+
+        assert isinstance(result, StartFlowResultSuccess), result.result_details
+        loop_thread = threading.get_ident()
+        assert len(_SyncParkNode.process_threads) == 1
+        assert _SyncParkNode.process_threads[0] != loop_thread
+        assert _SyncParkNode.seen_set_on_threads == [loop_thread]
+        assert _get(engine, a, "sync", "seen") == "yes"
 
     @pytest.mark.asyncio
     async def test_a_run_started_with_nothing_bound_runs_in_the_workflow_it_is_handed(

@@ -227,6 +227,22 @@ def aprocess_scope(
         VariableResolver.reset_cache(cache_token)
 
 
+_PROCESS_FINISHED = object()
+
+
+def _run_process_step(process: Generator[Any, Any, Any], previous_result: Any) -> Any:
+    """Run a generator process() up to its next yield, then the callable it yielded.
+
+    Returns the callable's result, or `_PROCESS_FINISHED` once the generator returns. A thread can't
+    hand back StopIteration: asyncio refuses it as a future's exception.
+    """
+    try:
+        func = process.send(previous_result)
+    except StopIteration:
+        return _PROCESS_FINISHED
+    return func()
+
+
 class ImportDependency(NamedTuple):
     """Import dependency specification for a node.
 
@@ -655,10 +671,14 @@ class BaseNode(ABC):
             self._on_change_queued(self)
 
     def emit_parameter_changes(self) -> None:
-        if self._tracked_parameters:
-            for parameter in self._tracked_parameters:
-                parameter._emit_alter_element_event_if_possible()
-            self._tracked_parameters.clear()
+        # One atomic pop at a time: a running node queues changes from its own thread mid-drain, and
+        # iterating then clearing would drop them.
+        while True:
+            try:
+                parameter = self._tracked_parameters.pop(0)
+            except IndexError:
+                return
+            parameter._emit_alter_element_event_if_possible()
 
     def allow_incoming_connection(
         self,
@@ -1464,29 +1484,25 @@ class BaseNode(ABC):
 
         Default implementation wraps the existing process() method to maintain backwards compatibility.
         Subclasses can override this method to provide direct async implementation.
+
+        process() runs off the engine loop, so a slow node doesn't stall every open workflow. A
+        generator's body runs off it too, one step at a time: up to a yield, then the callable it
+        yielded.
         """
-        result = self.process()
+        result = await async_utils.to_node_code_thread(self.process)
 
         if result is None:
-            # Simple synchronous node - nothing to do
             return
 
-        if isinstance(result, Generator):
-            try:
-                # Start the generator
-                func = next(result)
-
-                while True:
-                    # Send result back and get next callable
-                    func_result = await async_utils.to_thread(func)
-                    func = result.send(func_result)
-
-            except StopIteration:
-                # Generator is done
-                return
-        else:
-            # Some other return type - log warning but continue
+        if not isinstance(result, Generator):
             logger.warning("Node %s process() returned unexpected type: %s", self.name, type(result))
+            return
+
+        step_result = None
+        while True:
+            step_result = await async_utils.to_node_code_thread(_run_process_step, result, step_result)
+            if step_result is _PROCESS_FINISHED:
+                return
 
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:

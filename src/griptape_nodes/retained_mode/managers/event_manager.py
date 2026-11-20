@@ -66,7 +66,7 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
-from griptape_nodes.utils.async_utils import call_function, to_thread
+from griptape_nodes.utils.async_utils import call_function, in_node_code_thread, to_thread
 
 if TYPE_CHECKING:
     import types
@@ -2019,6 +2019,9 @@ class EventManager(EngineScoped):
     ) -> EventResultSuccess | EventResultFailure:
         """Publish an event to the manager assigned to its type (sync version).
 
+        Called from a node running off the engine loop (`in_node_code_thread`), the request is handled
+        on the loop, which owns the engine's state, while the node waits.
+
         Args:
             request: The request to handle
             result_context: The request envelope's fields: response_topic, request_id, sender, and
@@ -2027,6 +2030,20 @@ class EventManager(EngineScoped):
                 handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
                 the workflow the request ran in (see `_result_workflow_id`).
         """
+        # The loop is free to handle it: it is awaiting the node. The coroutine runs in the node's context.
+        if in_node_code_thread() and self._event_loop is not None and self._event_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                self.ahandle_request(request, result_context=result_context), self._event_loop
+            )
+            return future.result()
+        return self._handle_request_on_this_thread(request, result_context=result_context)
+
+    def _handle_request_on_this_thread(
+        self,
+        request: RP,
+        *,
+        result_context: ResultContext | None,
+    ) -> EventResultSuccess | EventResultFailure:
         operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()

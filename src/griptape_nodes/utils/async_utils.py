@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import subprocess
+import threading
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -13,6 +14,11 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Marks the pool thread running node code. Thread-local rather than a context variable, because a
+# context variable would follow the code's requests onto the engine loop, and from there into any
+# side thread the loop blocks on, which must not send requests back to the loop it is blocking.
+_node_code_thread = threading.local()
 
 
 async def call_function(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -73,6 +79,28 @@ async def to_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         raise
 
     return task_result
+
+
+async def to_node_code_thread(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run a node's code in a thread pool, so a slow node doesn't stall the engine loop.
+
+    The engine's state belongs to the engine loop. The thread is marked, and the event manager sends
+    the requests the code makes back to that loop (see `in_node_code_thread`).
+    """
+    return await to_thread(_run_as_node_code, func, *args, **kwargs)
+
+
+def in_node_code_thread() -> bool:
+    """Whether the calling thread is running node code for `to_node_code_thread`."""
+    return getattr(_node_code_thread, "active", False)
+
+
+def _run_as_node_code(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    _node_code_thread.active = True
+    try:
+        return func(*args, **kwargs)
+    finally:
+        _node_code_thread.active = False
 
 
 async def subprocess_run(
