@@ -52,8 +52,8 @@ class RedoRequest(RequestPayload):
 
     Use when: A user presses Redo.
 
-    Making a new undoable change drops what could be redone. Unavailable while the workflow is
-    running.
+    Changing the workflow drops what could be redone, except by running it. Unavailable while the
+    workflow is running.
 
     Results: RedoResultSuccess (with the change's label) | RedoResultFailure (nothing to redo, a run
         or another change is in progress, or the workflow could not be put back)

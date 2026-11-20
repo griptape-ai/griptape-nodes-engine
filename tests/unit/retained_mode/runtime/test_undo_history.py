@@ -100,6 +100,15 @@ class TestChangesOutsideAStep:
         assert current.commands == b"Move, then a run"
         assert current.label == "Move"
 
+    def test_can_drop_what_could_be_redone(self) -> None:
+        history = _with_steps("Move", "Rename")
+        history.step_back()
+
+        history.drop_redo()
+
+        assert history.undo_label == "Move"
+        assert history.redo_label is None
+
     def test_keep_what_could_be_redone(self) -> None:
         history = _with_steps("Move", "Rename")
         history.step_back()

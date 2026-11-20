@@ -457,18 +457,47 @@ class TestWhatIsNotAStep:
 
 
 class TestAClientCatchingUpAfterAnUndo:
-    def test_keeps_what_could_be_redone(self, engine: Engine, workflow: WorkflowRuntime) -> None:
-        """An editor that writes back what it measures after an undo sends it without a group."""
+    def test_a_change_that_leaves_the_workflow_as_it_was_keeps_what_could_be_redone(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        """An editor that writes back what it shows after an undo sends it without a group."""
         _add(engine, workflow, "a")
         _set(engine, workflow, "a", "first", group="type")
-        undone = _send(engine, workflow, UndoRequest(), group="press undo")
-        assert isinstance(undone, UndoResultSuccess)
+        _undo(engine, workflow)
 
-        _ok(engine, workflow, SetNodeMetadataRequest(node_name="a", metadata={"size": 1}))
+        written_back = _ok(engine, workflow, SetParameterValueRequest(node_name="a", parameter_name="value", value=""))
 
+        assert written_back.altered_workflow_state
         assert workflow.undo.redo_label == "Set Parameter Value"
         _redo(engine, workflow)
         assert _value(workflow, "a") == "first"
+
+    def test_a_run_since_the_undo_is_not_a_change(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """A rebuild carries over the latest results, so a redo loses nothing a run changed."""
+        _add(engine, workflow, "a")
+        _set(engine, workflow, "a", "first", group="type")
+        _undo(engine, workflow)
+        _ran(workflow, "a")
+
+        _ok(engine, workflow, SetParameterValueRequest(node_name="a", parameter_name="value", value=""))
+
+        assert workflow.undo.redo_label == "Set Parameter Value"
+
+    def test_a_change_drops_what_could_be_redone(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """A redo would rebuild the workflow without the change, so it is the redo that goes."""
+        _add(engine, workflow, "a")
+        _set(engine, workflow, "a", "first", group="type")
+        _undo(engine, workflow)
+
+        _ok(engine, workflow, SetNodeMetadataRequest(node_name="a", metadata={"size": 1}))
+        _add(engine, workflow, "b")
+
+        assert workflow.undo.redo_label is None
+        assert isinstance(_send(engine, workflow, RedoRequest()), RedoResultFailure)
+        a = _node(workflow, "a")
+        assert a is not None
+        assert a.metadata["size"] == 1
+        assert _node(workflow, "b") is not None
 
     def test_the_next_input_is_a_step_again(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         _add(engine, workflow, "a")

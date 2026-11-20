@@ -36,6 +36,9 @@ class UndoHistory:
         self.pending_label: str | None = None
         # Whether anything changed the workflow since the current checkpoint was taken.
         self.stale = False
+        # Whether a client, rather than a run, changed the workflow outside any step since the current
+        # checkpoint was taken.
+        self.edited = False
         # The undo group whose step is being recorded. Its next request continues that step.
         self.open_group: str | None = None
         # Requests of the step being recorded that have not finished.
@@ -91,6 +94,7 @@ class UndoHistory:
             self._checkpoints[self._current] = Checkpoint(commands=commands, label=label)
         self.pending_label = None
         self.stale = False
+        self.edited = False
 
     def previous(self) -> Checkpoint | None:
         """The checkpoint an undo goes back to. Take a checkpoint first, so the current one is up to date."""
@@ -109,6 +113,10 @@ class UndoHistory:
             return None
         return self._checkpoints[self._current]
 
+    def drop_redo(self) -> None:
+        """Forget the checkpoints a redo would go forward to, such as when a client changed the workflow since."""
+        del self._checkpoints[self._current + 1 :]
+
     def step_back(self) -> None:
         """Make the previous checkpoint current, once an undo rebuilt the workflow from it."""
         self._current -= 1
@@ -125,4 +133,5 @@ class UndoHistory:
         self._current = -1
         self.pending_label = None
         self.stale = False
+        self.edited = False
         self.open_group = None
