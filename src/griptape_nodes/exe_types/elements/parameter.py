@@ -25,7 +25,12 @@ from griptape_nodes.exe_types.elements.parameter_types import (
 from griptape_nodes.exe_types.elements.tooltips import default_parameter_tooltip
 from griptape_nodes.exe_types.elements.trait import Trait, instantiate_trait
 from griptape_nodes.exe_types.elements.ui_options import UIOptionsMixin, seed_ui_options
-from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value, changed_trait_states
+from griptape_nodes.exe_types.trait_state import (
+    TraitStateEntry,
+    as_saved_state_value,
+    changed_trait_states,
+    same_trait_states,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -826,7 +831,7 @@ def diff_parameters(parameter: Parameter, other: Parameter) -> dict:
     for key, self_value in self_dict.items():
         other_value = other_dict.get(key, None)
         if key == "traits":
-            if self_value != other_value:
+            if not same_trait_states(self_value, other_dict["traits"]):
                 differences[key] = changed_trait_states(self_value, other_dict["traits"])
         # handle children here
         elif isinstance(self_value, BaseNodeElement) and isinstance(other_value, BaseNodeElement):

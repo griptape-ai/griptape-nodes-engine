@@ -15,6 +15,9 @@ from griptape_nodes.exe_types.core_types import (
     ParameterType,
     Trait,
 )
+from griptape_nodes.exe_types.elements.parameter import diff_parameters
+from griptape_nodes.traits.options import Options
+from griptape_nodes.traits.slider import Slider
 
 # No badge by default; elements send badge: null until set_badge() is called.
 NO_BADGE = None
@@ -517,6 +520,34 @@ class TestParameter:
         param_false_dict = param_false.to_dict()
         assert "settable" in param_false_dict
         assert param_false_dict["settable"] is False
+
+
+class TestDiffParameters:
+    def test_traits_in_another_order_are_no_difference(self) -> None:
+        """A parameter's traits are a set, so two builds of one node can list them in either order."""
+        built = _make_param()
+        built.add_trait(Slider(min_val=0, max_val=10))
+        built.add_trait(Options(choices=["a"]))
+        current = _make_param()
+        current.add_trait(Options(choices=["a"]))
+        current.add_trait(Slider(min_val=0, max_val=10))
+
+        assert "traits" not in diff_parameters(built, current)
+
+    def test_a_changed_trait_in_another_order_is_still_a_difference(self) -> None:
+        built = _make_param()
+        built.add_trait(Slider(min_val=0, max_val=10))
+        built.add_trait(Options(choices=["a"]))
+        current = _make_param()
+        current.add_trait(Options(choices=["a"]))
+        current.add_trait(Slider(min_val=0, max_val=5))
+
+        diff = diff_parameters(built, current)
+
+        assert diff["traits"] == [
+            {"trait_name": "Options", "trait_module": "griptape_nodes.traits.options", "trait_state": {}},
+            {"trait_name": "Slider", "trait_module": "griptape_nodes.traits.slider", "trait_state": {"max_val": 5}},
+        ]
 
 
 def _make_param(name: str = "test_param", **kwargs) -> Parameter:

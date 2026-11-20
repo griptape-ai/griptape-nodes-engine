@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value
+from griptape_nodes.exe_types.trait_state import TraitStateEntry, as_saved_state_value, same_trait_states
 
 
 class TestValuesASavedArtifactCanHold:
@@ -92,3 +92,21 @@ class TestTheSavedShape:
 
         assert entry is not None
         assert entry.trait_state == {}
+
+
+_SLIDER = {"trait_name": "Slider", "trait_module": "m", "trait_state": {"max_val": 10}}
+_OPTIONS = {"trait_name": "Options", "trait_module": "m", "trait_state": {"choices": ["a"]}}
+
+
+class TestSameTraitStates:
+    def test_order_does_not_matter(self) -> None:
+        assert same_trait_states([_SLIDER, _OPTIONS], [_OPTIONS, _SLIDER])
+
+    def test_a_changed_state_does(self) -> None:
+        moved = {**_SLIDER, "trait_state": {"max_val": 5}}
+
+        assert not same_trait_states([_SLIDER, _OPTIONS], [_OPTIONS, moved])
+
+    def test_a_repeated_trait_must_appear_as_often(self) -> None:
+        assert not same_trait_states([_SLIDER, _SLIDER], [_SLIDER, _OPTIONS])
+        assert not same_trait_states([_SLIDER], [_SLIDER, _SLIDER])

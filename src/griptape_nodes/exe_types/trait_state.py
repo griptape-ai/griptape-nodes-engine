@@ -59,6 +59,21 @@ def state_from_rendered_keys(written: Any, renames: dict[str, str]) -> dict[str,
     return {state_key: written[ui_key] for ui_key, state_key in renames.items() if ui_key in written}
 
 
+def same_trait_states(built: list[dict[str, Any]], current: list[dict[str, Any]]) -> bool:
+    """Whether both hold the same traits in the same states, in any order.
+
+    A parameter's traits are a set, so two builds of the same node can list them in different orders.
+    """
+    if len(built) != len(current):
+        return False
+    unmatched = list(built)
+    for entry in current:
+        if entry not in unmatched:
+            return False
+        unmatched.remove(entry)
+    return True
+
+
 def changed_trait_states(built: list[dict[str, Any]], current: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop each state key that still matches the same trait in ``built``.
 
