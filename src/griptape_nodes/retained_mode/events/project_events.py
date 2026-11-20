@@ -443,9 +443,10 @@ class SetCurrentProjectRequest(RequestPayload):
 
     Use when: User switches between projects, opens a new workspace.
 
-    If the workspace directory changes as a result of setting the project,
-    and startup is complete, this handler automatically reloads all libraries
-    and re-registers workflows from config and the new workspace.
+    The project applies to the whole engine, so once startup is complete, switching to another
+    project closes every open workflow. It fails without changing anything while a workflow runs
+    or has runs waiting. If the workspace directory changes, it also re-registers workflows from
+    the new workspace, and if the project's library config changes, it reloads all libraries.
 
     Args:
         project_id: Opaque id of the project to set as current (matched verbatim
