@@ -1751,11 +1751,19 @@ class NodeManager(EngineScoped):
                 result = SetNodeMetadataResultFailure(result_details=details)
                 return result
 
+        changed_keys = {
+            key for key, value in request.metadata.items() if key not in node.metadata or node.metadata[key] != value
+        }
+        # The editor writes a node's size the first time it draws a node that has none. It would draw
+        # the node at that size anyway, so recording it is not a change to the workflow.
+        records_first_size = changed_keys == {"size"} and "size" not in node.metadata
+        altered = bool(changed_keys) and not records_first_size
+
         # We can't completely overwrite metadata.
         for key, value in request.metadata.items():
             node.metadata[key] = value
         details = f"Successfully set metadata for a Node '{node_name}'."
-        result = SetNodeMetadataResultSuccess(result_details=details)
+        result = SetNodeMetadataResultSuccess(result_details=details, altered_workflow_state=altered)
         return result
 
     @handles(BatchSetNodeMetadataRequest)
@@ -1764,6 +1772,7 @@ class NodeManager(EngineScoped):
     ) -> ResultPayload:
         updated_nodes = []
         failed_nodes = {}
+        altered = False
 
         for node_name, metadata_update in request.node_metadata_updates.items():
             # Resolve node name and get node object
@@ -1790,6 +1799,7 @@ class NodeManager(EngineScoped):
 
             if isinstance(result, SetNodeMetadataResultSuccess):
                 updated_nodes.append(actual_node_name)
+                altered = altered or result.altered_workflow_state
             else:
                 failed_nodes[actual_node_name] = result.result_details
 
@@ -1802,6 +1812,7 @@ class NodeManager(EngineScoped):
             updated_nodes=updated_nodes,
             failed_nodes=failed_nodes,
             result_details=f"Successfully updated metadata for {len(updated_nodes)} nodes.",
+            altered_workflow_state=altered,
         )
 
     @handles(ListConnectionsForNodeRequest)
