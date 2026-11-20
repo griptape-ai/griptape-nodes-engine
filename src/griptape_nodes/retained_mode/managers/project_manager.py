@@ -3336,11 +3336,15 @@ class ProjectManager(EngineScoped):
         if not busy_names:
             return None
         quoted_names = ", ".join(f"'{name}'" for name in busy_names)
+        if len(busy_names) == 1:
+            still_running = "is still running"
+        else:
+            still_running = "are still running"
         project_name = self._cached_project_name(resolved_project_id) or resolved_project_id
         return SetCurrentProjectResultFailure(
             result_details=f"Attempted to switch to project '{project_name}'. Failed because {quoted_names} "
-            "is still running, and switching projects closes every open workflow. Wait for the run to finish "
-            "or cancel it, then switch."
+            f"{still_running}, and switching projects closes every open workflow. Wait for the runs to finish "
+            "or cancel them, then switch."
         )
 
     def _refuse_unresolvable_declared_paths(
@@ -3413,7 +3417,7 @@ class ProjectManager(EngineScoped):
         the workspace switch is skipped.
 
         `resolved_project_id` is already canonicalized. Returns the reload failure
-        (None on success) and whether the workspace changed. This is the shared
+        (None on success) and whether the open workflows were closed. This is the shared
         body used both for the requested switch and for rolling back to the
         previously active project when a switch fails.
         """
