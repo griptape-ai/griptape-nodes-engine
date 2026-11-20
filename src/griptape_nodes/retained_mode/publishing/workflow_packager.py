@@ -1,9 +1,9 @@
 """Shared packaging utilities for workflow publishers.
 
-Extracted from the duplicated code across LocalPublisher, GriptapeCloudPublisher,
-and NukeGizmoPublisher. Any library-specific publisher can compose with this class
-to get standard bundling behavior (copy libraries, write .env, write config, etc.)
-without reimplementing these utilities.
+Extracted from the duplicated code across LocalPublisher and NukeGizmoPublisher.
+Any library-specific publisher can compose with this class to get standard bundling
+behavior (copy libraries, write .env, write config, etc.) without reimplementing
+these utilities.
 """
 
 from __future__ import annotations
