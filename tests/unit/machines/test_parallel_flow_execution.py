@@ -370,6 +370,7 @@ class TestCollectValuesFromUpstreamNodes:
         locked_node = MagicMock(spec=BaseNode)
         locked_node.name = "locked_node"
         locked_node.lock = True
+        locked_node.is_frozen = True
         # Guard against the method touching parameters before checking the lock.
         locked_node.parameters = MagicMock(side_effect=AssertionError("parameters accessed on locked node"))
 
@@ -405,6 +406,7 @@ class TestCollectValuesFromUpstreamNodes:
         target_node = MagicMock(spec=BaseNode)
         target_node.name = "target_node"
         target_node.lock = False
+        target_node.is_frozen = False
         target_node.parameters = [target_parameter]
 
         node_reference = MagicMock()
@@ -448,6 +450,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         node = MagicMock(spec=BaseNode)
         node.name = "n"
         node.lock = False
+        node.is_frozen = False
         node.state = NodeResolutionState.RESOLVING
 
         graph = DirectedGraph()
@@ -641,6 +644,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         node = MagicMock(spec=BaseNode)
         node.name = "n"
         node.lock = False
+        node.is_frozen = False
         node.state = NodeResolutionState.RESOLVING
         graph = DirectedGraph()
         graph.add_node("n")
@@ -699,6 +703,7 @@ class TestLockedNodeIsNeverQueuedOrExecuted:
         node = MagicMock(spec=BaseNode)
         node.name = "locked"
         node.lock = True
+        node.is_frozen = True
         node.state = NodeResolutionState.RESOLVED
 
         graph = DirectedGraph()
@@ -785,6 +790,7 @@ class TestLockedNodeRecordsResolvingWithoutExecuting:
         node = MagicMock(spec=spec)
         node.name = "node"
         node.lock = lock
+        node.is_frozen = lock
         node.state = state
         node.resolved_while_locked = resolved_while_locked
         node.parameter_values = {}
