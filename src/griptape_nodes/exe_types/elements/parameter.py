@@ -265,8 +265,8 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
             },
         )
         if traits:
-            for trait in traits:
-                # Add a trait as a child
+            # A set holds no order, so traits go in by kind, which shows them the same way every time.
+            for trait in sorted(traits, key=_trait_kind):
                 # UI options are now traits! sorry!
                 self.add_child(instantiate_trait(trait))
         if badge is not None:
@@ -875,3 +875,9 @@ def diff_list_values(self_value: Any, other_value: Any, differences: dict, key: 
             break
     if list_differences:
         differences[key] = other_value
+
+
+def _trait_kind(trait: type[Trait] | Trait) -> str:
+    if isinstance(trait, type):
+        return trait.__name__
+    return type(trait).__name__
