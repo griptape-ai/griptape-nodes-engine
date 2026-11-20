@@ -32,7 +32,9 @@ class WorkflowFlows:
         self.global_flow_queue: Queue[QueueItem] = Queue()
         self.global_control_flow_machine: ControlFlowMachine | None = None
         self.global_single_node_resolution = False
-        self.global_dag_builder = DagBuilder(self.connections)
+        self.global_dag_builder = DagBuilder(
+            self.connections, run_advances_control=lambda: not self.global_single_node_resolution
+        )
 
         # The runs waiting for this workflow's machine and the one that has it. Read and written without a
         # lock, so only the engine loop may touch them. A run request sent synchronously from another

@@ -14,6 +14,7 @@ from griptape_nodes.exe_types.node_types import NodeResolutionState
 
 if TYPE_CHECKING:
     import asyncio
+    from collections.abc import Callable
 
     from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.exe_types.node_types import BaseNode
@@ -80,8 +81,17 @@ class DagBuilder:
     graph_to_nodes: dict[str, set[str]]  # Track which nodes belong to which graph
     start_node_candidates: dict[str, dict[str, set[str]]]  # {data_node: {graph: {boundary_nodes}}}
 
-    def __init__(self, connections: Connections) -> None:
+    def __init__(self, connections: Connections, run_advances_control: Callable[[], bool] | None = None) -> None:
+        """Build an empty DAG over `connections`.
+
+        Args:
+            connections: The connections the DAG's edges come from.
+            run_advances_control: Whether the run this builder serves hands control on from node to
+                node. A single-node run does not. Defaults to always, which is true of a loop or group
+                body run on a builder of its own.
+        """
         self.connections = connections
+        self._run_advances_control = run_advances_control
         self.graphs = {}
         self.node_to_reference: dict[str, DagNode] = {}
         self.graph_to_nodes = {}
@@ -191,14 +201,14 @@ class DagBuilder:
 
         return added_nodes
 
-    @staticmethod
     def _upstream_dependency(
-        node: BaseNode, param: Parameter, nodes_to_exclude: set[str], connections: Connections
+        self, node: BaseNode, param: Parameter, nodes_to_exclude: set[str], connections: Connections
     ) -> BaseNode | None:
-        """Return the unresolved node feeding `param` by data that this DAG must run first, if any.
+        """Return the node feeding `param` by data that this DAG must run first, if any.
 
         Control parameters carry no data. A node in `nodes_to_exclude` (a loop End's body) runs
-        inside the packaged loop, not here. A RESOLVED node already holds its value.
+        inside the packaged loop, not here. A RESOLVED node holds a current value, unless this run can
+        still produce a new one for it (see `_can_change_this_run`).
         """
         if param.type == ParameterTypeBuiltin.CONTROL_TYPE:
             return None
@@ -212,9 +222,47 @@ class DagBuilder:
             return None
         if upstream_node.name in nodes_to_exclude:
             return None
-        if upstream_node.state == NodeResolutionState.RESOLVED:
+        if upstream_node.state == NodeResolutionState.RESOLVED and not self._can_change_this_run(
+            upstream_node, connections
+        ):
             return None
         return upstream_node
+
+    def _can_change_this_run(self, node: BaseNode, connections: Connections) -> bool:
+        """Whether this run can still give `node` a new value: by running it, or anything it reads, by control.
+
+        Only a node wired into a control flow is run by control, and only in a run that hands control
+        on. A node that already finished in this run holds this run's value. A plain data node gets a
+        new value only when something it reads does, so the walk goes on upstream through its inputs.
+        """
+        if self._run_advances_control is not None and not self._run_advances_control():
+            return False
+        pending = [node]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current.name in seen or self._finished_this_run(current):
+                continue
+            seen.add(current.name)
+            if connections.has_control_connection(current):
+                return True
+            for param in current.parameters:
+                if param.type == ParameterTypeBuiltin.CONTROL_TYPE:
+                    continue
+                upstream_connection = connections.get_connected_node(current, param, include_internal=False)
+                if upstream_connection is not None and upstream_connection[0] is not current:
+                    pending.append(upstream_connection[0])
+        return False
+
+    def _finished_this_run(self, node: BaseNode) -> bool:
+        """Whether `node` already finished in this run.
+
+        `clear` empties `node_to_reference` when a run ends, so a DONE entry is this run's. The one path
+        that drops finished entries mid-run, `cleanup_empty_graph_nodes`, belongs to single-node runs,
+        which `_can_change_this_run` turns away before asking.
+        """
+        reference = self.node_to_reference.get(node.name)
+        return reference is not None and reference.node_state == NodeState.DONE
 
     def add_node(self, node: BaseNode, graph_name: str = "default") -> DagNode:
         """Add just one node to DAG without dependencies (assumes dependencies already exist)."""

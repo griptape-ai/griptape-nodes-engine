@@ -12,18 +12,23 @@ These shapes are exercised:
   the loop hands that same end node the control token on its way out.
 - Two independent control entry points where one feeds the other's data, so seeding the first
   adopts the second as a data dependency before the second is seeded as an entry of its own.
+- The same flows run a second time. Every node is still RESOLVED from the first run when seeding
+  starts, so the upstream data walk has to tell a feeder that already holds this run's value from one
+  control is about to run again: a node wired into a control flow, or a data node reading one.
+- Running a single node, which never hands control on, so a resolved feeder's value is reused.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.node_types import NodeResolutionState
-from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest
+from griptape_nodes.retained_mode.events.execution_events import ResolveNodeRequest, StartFlowRequest
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
@@ -268,3 +273,164 @@ async def test_entry_point_feeding_another_entry_point(
     assert states["E2"] == NodeResolutionState.RESOLVED
     assert states["S1"] == NodeResolutionState.RESOLVED
     assert states["S2"] == NodeResolutionState.RESOLVED, "control advance out of the adopted entry point was dropped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("feeder_first", [False, True])
+async def test_rerun_waits_for_entry_point_feeder(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+    feeder_first: bool,  # noqa: FBT001
+) -> None:
+    """On a re-run, a reader still waits for the entry point that feeds it.
+
+    Same shape as ``test_entry_point_feeding_another_entry_point``, run twice. On the second run
+    ``E2`` is still RESOLVED from the first when ``E1`` is seeded, so the upstream walk would skip
+    it and ``E1`` would run beside it on the previous run's value. ``E2`` then finishing unresolves
+    ``E1`` again, which is how the defect shows in the final states.
+    """
+    flow = loose_sink_flow
+    names = ("E2", "S2", "E1", "S1") if feeder_first else ("E1", "S1", "E2", "S2")
+    for name in names:
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "S1", "exec_in")
+    connect("E2", "exec_out", "S2", "exec_in")
+    connect("E2", "result", "E1", "text")
+
+    await _run(engine, flow)
+    states = await _run(engine, flow)
+
+    assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), (
+        "the reader ran before its feeder on the second run"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rerun_waits_for_mid_chain_feeder(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+) -> None:
+    """On a re-run, a reader waits for a feeder in the middle of another control chain.
+
+    ``E2 -> C -> S2`` and ``E1 -> S1``, with ``C`` feeding ``E1``. ``C`` is not an entry point, so
+    only the forward control walk from ``E2`` knows it will run again this time.
+    """
+    flow = loose_sink_flow
+    for name in ("E1", "S1", "E2", "C", "S2"):
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "S1", "exec_in")
+    connect("E2", "exec_out", "C", "exec_in")
+    connect("C", "exec_out", "S2", "exec_in")
+    connect("C", "result", "E1", "text")
+
+    await _run(engine, flow)
+    states = await _run(engine, flow)
+
+    assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), (
+        "the reader ran before its mid-chain feeder on the second run"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rerun_waits_for_feeder_behind_a_data_node(
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+) -> None:
+    """On a re-run, a reader waits for a feeder that reaches it through a plain data node.
+
+    ``E1 -> S1`` and ``E2 -> S2``, with ``E2`` feeding ``D`` and ``D`` feeding ``E1``. ``D`` has no
+    control wires, so it is only current if what it reads is, and ``E2`` is about to run again.
+    """
+    flow = loose_sink_flow
+    for name in ("E1", "S1", "E2", "S2", "D"):
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E1", "exec_out", "S1", "exec_in")
+    connect("E2", "exec_out", "S2", "exec_in")
+    connect("E2", "result", "D", "text")
+    connect("D", "result", "E1", "text")
+
+    await _run(engine, flow)
+    states = await _run(engine, flow)
+
+    assert states == dict.fromkeys(states, NodeResolutionState.RESOLVED), (
+        "the reader ran before the data node between it and its feeder on the second run"
+    )
+    assert engine.node_manager.get_node_by_name("E1").get_parameter_value("text") == ">E2>D"
+
+
+@pytest.mark.asyncio
+async def test_a_node_reading_its_control_predecessor_runs_once_per_run(  # noqa: PLR0913, PLR0917 (fixtures, plus the execution recorder)
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``E -> A -> B`` with ``B`` reading ``A``: ``A`` has already run when ``B`` is added, so it is current."""
+    flow = loose_sink_flow
+    for name in ("E", "A", "B"):
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E", "exec_out", "A", "exec_in")
+    connect("A", "exec_out", "B", "exec_in")
+    connect("A", "result", "B", "text")
+    executed = _record_executions(engine, monkeypatch)
+
+    with caplog.at_level(logging.ERROR, logger="griptape_nodes"):
+        for _ in range(2):
+            before = len(executed)
+            await _run(engine, flow)
+            assert executed[before:] == ["E", "A", "B"]
+
+    assert not [record for record in caplog.records if "DUPLICATE COMPLETION" in record.getMessage()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("follows_by_control", [False, True])
+async def test_playing_a_node_reuses_a_resolved_control_wired_feeder(  # noqa: PLR0913, PLR0917 (fixtures, plus the execution recorder)
+    engine: Engine,
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+    loose_sink_flow: str,
+    monkeypatch: pytest.MonkeyPatch,
+    follows_by_control: bool,  # noqa: FBT001
+) -> None:
+    """Running one node reads a resolved feeder's value instead of running the feeder again.
+
+    A single-node run never hands control on, so control cannot run ``C`` again there, however it is
+    wired. ``C`` may be a paid model call.
+    """
+    flow = loose_sink_flow
+    for name in ("E", "C", "B"):
+        create_node("ChainNode", name, flow, library_name=LIBRARY_NAME)
+    connect("E", "exec_out", "C", "exec_in")
+    if follows_by_control:
+        connect("C", "exec_out", "B", "exec_in")
+    connect("C", "result", "B", "text")
+    await _run(engine, flow)
+    executed = _record_executions(engine, monkeypatch)
+
+    for _ in range(2):
+        await engine.ahandle_request(ResolveNodeRequest(node_name="B"))
+
+    assert executed == ["B", "B"]
+
+
+def _record_executions(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the name of every node the engine executes, in order."""
+    executed: list[str] = []
+    node_executor = engine.flow_manager.node_executor
+    real_execute = node_executor.execute
+
+    async def _record(node: Any, *args: Any, **kwargs: Any) -> Any:
+        executed.append(node.name)
+        return await real_execute(node, *args, **kwargs)
+
+    monkeypatch.setattr(node_executor, "execute", _record)
+    return executed

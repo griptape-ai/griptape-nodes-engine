@@ -492,6 +492,18 @@ class Connections:
 
         return False
 
+    def has_control_connection(self, node: BaseNode) -> bool:
+        """Whether any control wire goes into or out of ``node``."""
+        for index in (self.incoming_index, self.outgoing_index):
+            for connection_ids in index.get(node.name, {}).values():
+                for connection_id in connection_ids:
+                    connection = self.connections.get(connection_id)
+                    if connection is None:
+                        continue
+                    if connection.source_parameter.output_type == ParameterTypeBuiltin.CONTROL_TYPE.value:
+                        return True
+        return False
+
     @staticmethod
     def _carries_data(connection: Connection) -> bool:
         """Whether a connection passes a value downstream, rather than control."""
