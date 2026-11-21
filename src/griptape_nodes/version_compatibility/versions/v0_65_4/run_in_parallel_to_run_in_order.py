@@ -69,17 +69,21 @@ class RunInParallelToRunInOrderCheck(SetParameterVersionCompatibilityCheck):
             value: The value being set (boolean)
 
         Returns:
-            SetParameterValueResultSuccess indicating the migration was successful
+            SetParameterValueResultSuccess indicating the migration was successful. It reports the
+            workflow as altered only when `run_in_order` ended up with a different value.
         """
         if value is None:
             inverted_value = True
         else:
             inverted_value = not bool(value)
 
+        old_value = node._get_raw_parameter_value("run_in_order")
         node.set_parameter_value("run_in_order", inverted_value)
+        new_value = node._get_raw_parameter_value("run_in_order")
 
         return SetParameterValueResultSuccess(
             finalized_value=inverted_value,
             data_type="bool",
             result_details=f"Migrated deprecated '{parameter_name}' parameter to 'run_in_order' with inverted value",
+            altered_workflow_state=old_value != new_value,
         )
