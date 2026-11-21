@@ -687,6 +687,24 @@ class TestClientsAreTold:
                 broadcast.append(type(result).__name__)
         assert broadcast == []
 
+    def test_only_the_workflow_after_the_undo(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """Not the workflow partway through the rebuild, such as marked unsaved but not yet undone."""
+        _add(engine, workflow, "a")
+        _set(engine, workflow, "a", "first", group="type")
+        workflow.has_unsaved_changes = False
+        engine.report_workflow_state(workflow)
+        events: asyncio.Queue = asyncio.Queue()
+        engine.event_manager.initialize_queue(events)
+
+        _undo(engine, workflow)
+
+        states = []
+        while not events.empty():
+            event = events.get_nowait()
+            if isinstance(event, AppEvent) and isinstance(event.payload, WorkflowStateChangedEvent):
+                states.append((event.payload.state.undo_label, event.payload.state.redo_label))
+        assert states == [(None, "Set Parameter Value")]
+
     def test_what_undo_and_redo_would_do(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         events: asyncio.Queue = asyncio.Queue()
         engine.event_manager.initialize_queue(events)
