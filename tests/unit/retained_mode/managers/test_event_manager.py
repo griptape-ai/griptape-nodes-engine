@@ -1,6 +1,7 @@
 """Test EventManager functionality including sync/async event broadcasting."""
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import threading
@@ -301,6 +302,43 @@ class TestCoalescedEventsAcrossThreads:
         await asyncio.sleep(0)
 
         assert self._drain(event_manager) == [1, 2, "failure"]
+
+    @pytest.mark.asyncio
+    async def test_an_event_from_a_thread_the_loop_waits_on_is_not_overtaken(self) -> None:
+        """Such as a sync request handled on another thread while the loop thread blocks on it."""
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        worker = threading.Thread(target=event_manager.put_event, args=("from the thread",))
+        worker.start()
+        worker.join()
+        event_manager.put_event("from the loop after")
+        await asyncio.sleep(0)
+
+        assert self._drain(event_manager) == ["from the thread", "from the loop after"]
+
+    def test_an_event_a_finished_run_never_took_does_not_reach_the_next_run(self) -> None:
+        event_manager = EventManager()
+
+        async def start_run() -> None:
+            event_manager.initialize_queue(asyncio.Queue())
+
+        def put_after_the_run_finished() -> None:
+            # The run's loop is closed, so scheduling the event on it raises.
+            with contextlib.suppress(RuntimeError):
+                event_manager.put_event("from the finished run")
+
+        async def next_run() -> list:
+            event_manager.initialize_queue(asyncio.Queue())
+            event_manager.put_event("from the next run")
+            return self._drain(event_manager)
+
+        asyncio.run(start_run())
+        worker = threading.Thread(target=put_after_the_run_finished)
+        worker.start()
+        worker.join()
+
+        assert asyncio.run(next_run()) == ["from the next run"]
 
     @pytest.mark.asyncio
     async def test_keyed_events_from_another_thread_are_throttled(self) -> None:
