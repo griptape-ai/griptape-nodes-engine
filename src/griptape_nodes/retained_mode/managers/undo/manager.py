@@ -182,6 +182,8 @@ class UndoManager(EngineScoped):
 
         failure = await self._restore(workflow, previous, current, live)
         if failure is not None:
+            # A failed rebuild forgets the history.
+            self.engine.report_workflow_state(workflow)
             return UndoResultFailure(result_details=f"Attempted to undo '{current.label}'. {failure}")
         history.step_back()
         self.engine.report_workflow_state(workflow)
@@ -210,6 +212,8 @@ class UndoManager(EngineScoped):
 
         failure = await self._restore(workflow, following, current, live)
         if failure is not None:
+            # A failed rebuild forgets the history.
+            self.engine.report_workflow_state(workflow)
             return RedoResultFailure(result_details=f"Attempted to redo '{following.label}'. {failure}")
         workflow.undo.step_forward()
         self.engine.report_workflow_state(workflow)

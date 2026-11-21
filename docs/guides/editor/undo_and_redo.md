@@ -32,7 +32,7 @@ downstream of it, the same as if you had changed it by hand.
 - **Running a workflow.** Undo and Redo are unavailable while a workflow is running.
 - **Saving.** Undo changes the workflow you're editing, not the saved file. Save again to keep the
     result.
-- **Workflow variables.**
+- **Workflow variables.** They keep their current values when you undo or redo.
 
 Each workflow keeps its own history of the last 100 steps, so with several workflows open, Undo
 only changes the one you're looking at. Closing a workflow or restarting Griptape Nodes clears its
