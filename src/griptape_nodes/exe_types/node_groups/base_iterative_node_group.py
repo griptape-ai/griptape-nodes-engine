@@ -91,6 +91,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
                 tooltip="Fires once after every iteration has finished. Wire the next node's control input here.",
                 display_name="On Complete",
             ),
+            inner_control_ports=False,
         )
         self.exec_in = self.control_in
         self.exec_out = self.control_out
@@ -187,6 +188,9 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
             name=IterationControlParam.BREAK_LOOP.value,
         )
         self.break_loop.ui_options = {"display_name": "Break Out of Loop"}
+        # A member's control wire crossing the loop's boundary is carried inside by On Each / Loop Complete.
+        self.inner_entry = self.on_each
+        self.inner_exit = self.loop_complete
         self.add_parameter(self.break_loop)
 
         self.results = Parameter(

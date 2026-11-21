@@ -15,6 +15,10 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     SubflowNodeGroup,
 )
 from griptape_nodes.exe_types.node_types import ISOLATED_EXECUTION, LEGACY_PRIVATE_EXECUTION, LOCAL_EXECUTION
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionResultFailure,
+    CreateConnectionResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
@@ -55,6 +59,47 @@ class TestSubflowNodeGroupCreateSubflow:
         )
         # ...but the group must record the flow it ACTUALLY got back, not the requested name.
         assert group.metadata["subflow_name"] == "G_subflow_1"
+
+
+class TestConnectControlWireThroughGroupRaisesOnFailure:
+    """A connection that fails to create must not leave an owner recorded for a wire never drawn."""
+
+    def test_a_failed_inner_leg_raises_and_records_no_ownership(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The outer leg (control_in) succeeds; the inner leg (on_start) is the one that fails."""
+        group = _MiniSubflowGroup(name="G")
+        group._set_workflow(WorkflowRuntime("wf", engine))
+
+        caller = MockNode("Caller")
+        member = MockNode("Member")
+        old_connection = Mock(
+            source_node=caller,
+            source_parameter=Parameter(name="exec_out", tooltip=""),
+            target_node=member,
+            target_parameter=Parameter(name="exec_in", tooltip=""),
+        )
+
+        # _create_connection dispatches through _handle_request_in_workflow -> Engine.handle_request,
+        # not a direct call to the manager's handler method, so that is the point to intercept: a
+        # request type's handler is resolved once at registration time (register_request_handlers),
+        # so patching engine.flow_manager.on_create_connection_request afterwards would not be seen
+        # by this dispatch at all.
+        mock_handle = create_autospec(
+            engine.handle_request,
+            side_effect=[
+                CreateConnectionResultSuccess(result_details="outer leg created"),
+                CreateConnectionResultFailure(result_details="no such parameter 'exec_in' on 'Member'"),
+            ],
+        )
+        monkeypatch.setattr(engine, "handle_request", mock_handle)
+
+        with pytest.raises(RuntimeError):
+            group._connect_control_wire_through_group(old_connection, is_incoming=True)
+
+        assert group._entry_wire_owner is None
+        expected_attempts = 2  # the outer leg (succeeds) and the inner leg (fails)
+        assert mock_handle.call_count == expected_attempts
 
 
 class TestGetAllNodes:
@@ -105,8 +150,8 @@ class TestRegisterSideParameter:
         """A group built from nothing names its own control ports, once each."""
         group = _MiniSubflowGroup(name="fresh")
 
-        expected_left = {"group_exec_in"}
-        expected_right = {"group_exec_out"}
+        expected_left = {"group_exec_in", "on_start"}
+        expected_right = {"group_exec_out", "group_complete"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -136,8 +181,8 @@ class TestRegisterSideParameter:
 
         group = _MiniSubflowGroup(name="restored", metadata=saved_metadata)
 
-        expected_left = {"group_exec_in", "prompt", "seed"}
-        expected_right = {"group_exec_out", "image"}
+        expected_left = {"group_exec_in", "on_start", "prompt", "seed"}
+        expected_right = {"group_exec_out", "group_complete", "image"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -178,8 +223,8 @@ class TestDedupeSideParameters:
 
         group = _MiniSubflowGroup(name="restored", metadata=saved_metadata)
 
-        expected_left = {"group_exec_in", "prompt", "seed"}
-        expected_right = {"group_exec_out", "image"}
+        expected_left = {"group_exec_in", "on_start", "prompt", "seed"}
+        expected_right = {"group_exec_out", "group_complete", "image"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -203,9 +248,9 @@ class TestDedupeSideParameters:
         right_rails = [generation.metadata[RIGHT_PARAMETERS_KEY] for generation in generations]
 
         # Generation 1 is built from nothing, so the subclass's names appear exactly once.
-        assert right_rails[0] == ["group_exec_out", "old_a", "old_b"]
+        assert right_rails[0] == ["group_exec_out", "group_complete", "old_a", "old_b"]
         # Generation 2 normalises what it was given, then the subclass appends its names again.
-        assert right_rails[1] == ["group_exec_out", "old_a", "old_b", "old_a", "old_b"]
+        assert right_rails[1] == ["group_exec_out", "group_complete", "old_a", "old_b", "old_a", "old_b"]
         # From there it is stable: no further copies accumulate.
         assert right_rails[2] == right_rails[1]
         assert right_rails[3] == right_rails[1]
@@ -256,8 +301,8 @@ class TestCreateProxyParameterForConnection:
         )
 
         assert proxy.name == self.PROXY_NAME
-        expected_left = {"group_exec_in", self.PROXY_NAME}
-        expected_right = {"group_exec_out"}
+        expected_left = {"group_exec_in", "on_start", self.PROXY_NAME}
+        expected_right = {"group_exec_out", "group_complete"}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
@@ -274,8 +319,8 @@ class TestCreateProxyParameterForConnection:
         )
 
         assert proxy.name == self.PROXY_NAME
-        expected_left = {"group_exec_in"}
-        expected_right = {"group_exec_out", self.PROXY_NAME}
+        expected_left = {"group_exec_in", "on_start"}
+        expected_right = {"group_exec_out", "group_complete", self.PROXY_NAME}
         assert set(group.metadata[LEFT_PARAMETERS_KEY]) == expected_left
         assert len(group.metadata[LEFT_PARAMETERS_KEY]) == len(expected_left)
         assert set(group.metadata[RIGHT_PARAMETERS_KEY]) == expected_right
