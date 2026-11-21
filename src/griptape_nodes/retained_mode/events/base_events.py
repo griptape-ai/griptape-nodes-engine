@@ -132,12 +132,23 @@ class RequestPayload(Payload, ABC):
                 Framework fields (result_details, altered_workflow_state) are always
                 included regardless of what fields specifies. Filtering is skipped
                 entirely on failure results.
+        undo_group: Names the user action a request belongs to, making what it changes undoable.
+                Requests that share a group undo as one step, so a client starts a new group for
+                each user input, such as one drag. A request without one is not an undo step: what
+                it changes is taken back along with the undo step before it, and drops what could be
+                redone. A client reacting to an UndoRequest or RedoRequest, such as by writing back
+                what it measured, sends its requests without a group, and only when they change
+                something.
+        undo_label: Names the action in the undo history, such as "Move 3 nodes". The last label
+                sent in a group wins. Without one, the action is named after its first request.
     """
 
     broadcast_result: bool = True
     request_id: str | None = None
     failure_log_level: int | None = None
     fields: list[str] | None = None
+    undo_group: str | None = None
+    undo_label: str | None = None
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.
@@ -182,6 +193,14 @@ class GraphAccessMixin:
     A node must not send one while it is being created or having its saved state applied (strict-mode
     rule ``graph-access-while-loading``): the graph around a loading node is incomplete, so the answer
     would depend on how the node was loaded.
+    """
+
+
+class RunControlMixin:
+    """Marks a request that runs a workflow, stops a run, or resets what a run produced.
+
+    What it changes, and what the nodes it runs change, is the outcome of a run rather than an edit,
+    so it is never an undo step, nor part of the step that started it.
     """
 
 

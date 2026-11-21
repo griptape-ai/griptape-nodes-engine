@@ -705,7 +705,8 @@ class TestLibraryTools:
             )
 
         assert result.is_error is False
-        assert seen["payload"] == ProbeStartRenderRequest(frame=7)
+        payload = cast("ProbeStartRenderRequest", seen["payload"])
+        assert payload == ProbeStartRenderRequest(frame=7, undo_group=payload.undo_group)
 
     @pytest.mark.asyncio
     async def test_library_endpoint_rejects_engine_tools(self) -> None:
@@ -1204,3 +1205,60 @@ class TestToolCallWorkflow:
         assert _payload(result)["ok"], result
         assert "canvas" in first.flows.name_to_parent_name
         assert "canvas" not in third.flows.name_to_parent_name
+
+
+class TestUndoGroups:
+    """What an agent changes can be undone, one tool call at a time."""
+
+    def test_undo_and_redo_are_tools(self) -> None:
+        assert "UndoRequest" in ENGINE_TOOLS
+        assert "RedoRequest" in ENGINE_TOOLS
+
+    @pytest.mark.asyncio
+    async def test_each_tool_call_is_a_step_of_its_own(self) -> None:
+        seen: list[RequestPayload] = []
+
+        async def fake_dispatch(payload: RequestPayload, _sender: object, timeout_ms: int | None = None) -> dict:  # noqa: ARG001
+            seen.append(payload)
+            return {"result_type": "SetNodeMetadataResultSuccess", "result": {}}
+
+        params = CallToolRequestParams(name="SetNodeMetadataRequest", arguments={"node_name": "a", "metadata": {}})
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            await call_tool(_NO_CONTEXT, params)
+            await call_tool(_NO_CONTEXT, params)
+
+        first, second = seen
+        assert first.undo_group is not None
+        assert second.undo_group is not None
+        assert first.undo_group != second.undo_group
+
+    @pytest.mark.asyncio
+    async def test_a_batch_is_one_step(self) -> None:
+        seen: list[RequestPayload] = []
+
+        async def fake_dispatch(payload: RequestPayload, _sender: object, timeout_ms: int | None = None) -> dict:  # noqa: ARG001
+            seen.append(payload)
+            return {"result_type": "SetNodeMetadataResultSuccess", "result": {}}
+
+        inner = {"request_type": "SetNodeMetadataRequest", "request": {"node_name": "a", "metadata": {}}}
+        params = CallToolRequestParams(name=EVENT_REQUEST_BATCH_TOOL_NAME, arguments={"requests": [inner, inner]})
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            await call_tool(_NO_CONTEXT, params)
+
+        first, second = seen
+        assert first.undo_group is not None
+        assert first.undo_group == second.undo_group
+
+    @pytest.mark.asyncio
+    async def test_a_group_the_agent_names_is_kept(self) -> None:
+        seen: list[RequestPayload] = []
+
+        async def fake_dispatch(payload: RequestPayload, _sender: object, timeout_ms: int | None = None) -> dict:  # noqa: ARG001
+            seen.append(payload)
+            return {"result_type": "SetNodeMetadataResultSuccess", "result": {}}
+
+        arguments = {"node_name": "a", "metadata": {}, "undo_group": "layout"}
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            await call_tool(_NO_CONTEXT, CallToolRequestParams(name="SetNodeMetadataRequest", arguments=arguments))
+
+        assert seen[0].undo_group == "layout"

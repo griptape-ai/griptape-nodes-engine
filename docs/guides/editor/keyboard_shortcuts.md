@@ -79,6 +79,8 @@ how auto-arrange lays out your graph.
 
 | Action                            | macOS           | Windows / Linux  |
 | --------------------------------- | --------------- | ---------------- |
+| Undo                              | Cmd+Z           | Ctrl+Z           |
+| Redo                              | Shift+Cmd+Z     | Shift+Ctrl+Z     |
 | Save                              | Cmd+S           | Ctrl+S           |
 | Save As                           | Shift+Cmd+S     | Shift+Ctrl+S     |
 | Save As New Version               | Option+Shift+S  | Alt+Shift+S      |

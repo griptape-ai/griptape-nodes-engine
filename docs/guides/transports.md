@@ -134,6 +134,7 @@ A client with a tab for each workflow uses three requests and the two events abo
     - `run_state` is `running` while a run of the workflow is in progress, including one paused at a breakpoint, and `idle` otherwise.
     - `queued_run_count` is how many runs wait for the run in progress to end.
     - `last_run_error` says why the latest run failed. It is `null` when that run succeeded or was cancelled, and clears when the next run starts.
+    - `undo_label` and `redo_label` name what `UndoRequest` and `RedoRequest` would take back or put back, such as "Set Parameter Value". Each is `null` when there is nothing to undo or redo. See [Undo and redo](#undo-and-redo).
 - `OpenWorkflowRequest` opens a workflow by `workflow_id` or `workflow_name`, or a new unsaved one when you name neither. `create_flow` gives a new workflow the top-level flow it needs to be saved, and `working_directory` sets where it writes until then. An open workflow comes back with `already_open` set, once built if another request is still opening it. The request opens it beside the open ones and never closes one. It fails with:
     - `WorkflowNotFoundResultFailure` for an unknown id or name, which an unsaved workflow becomes once closed or after a restart.
     - `OpenWorkflowResultFailure` when its file fails to build.
@@ -156,6 +157,21 @@ Older requests open and close workflows too:
 `RenameWorkflowRequest`, `MoveWorkflowRequest`, `DeleteWorkflowRequest`, `BranchWorkflowRequest`, `MergeWorkflowBranchRequest`, `ResetWorkflowBranchRequest`, `CompareWorkflowsRequest`, `GetWorkflowMetadataRequest`, `SetWorkflowMetadataRequest` and `GetWorkflowInfoRequest` act on the saved workflow they name, not the one `open_workflow_id` names, so a tab can rename or delete a workflow that isn't open. Name it by its `workflow_id`, which stays the same through a rename or a move, or by its `workflow_name`, which changes with them. A request that gives both fails unless they name the same workflow. `CompareWorkflowsRequest` names the second workflow by `compare_workflow_id` or `compare_workflow_name` the same way. `ImportWorkflowAsReferencedSubFlowRequest`, `SaveSubflowToWorkflowRequest`, `GetWorkflowShapeRequest`, `GetWorkflowRunCommandRequest` and `GetPublishOptionsRequest` name a saved or imported workflow while acting on your open one, and take a `workflow_id` the same way. `PublishWorkflowRequest` publishes the workflow `open_workflow_id` names, so a `workflow_id` it gives must be that one. A `workflow_id` inside a request or result names the workflow that request or result is about, which may not be open, such as the copy a Save As creates. Renaming an open workflow saves it to the new file. Renaming one that isn't open moves its file. Either way, a rename never replaces another workflow's file. Results of `EnsureWorkflowAndFlowRequest` and of requests that open, load or save a workflow carry `open_workflow`, the workflow open afterwards, in the form `ListOpenWorkflowsRequest` lists it. After a save, compare its `workflow_id` to the result's own: when they match, the open workflow is the saved file, and when they differ, the save wrote a copy and the original stays open. A Save As or a versioned save with `continue_in_copy` set keeps the open workflow, its `workflow_id` and everything in it, on the new file instead, and registers the original file as a separate workflow with a new id. The result's `open_workflow` then reports the new name and file. A save never writes over the file of another open workflow.
 
 If your organization uses license keys, the engine checks each request against your license. A request your license doesn't permit is refused rather than run.
+
+### Undo and redo
+
+A request becomes undoable when it carries an `undo_group`, any string you choose. Requests that share a group undo as one step, so start a new group for each thing the user does, such as one drag of several nodes. `undo_label` names the step, such as "Move 3 nodes". Without one, the step is named after its first request.
+
+`UndoRequest` takes back the last step in the workflow `open_workflow_id` names, and `RedoRequest` puts it back. Starting a new step drops what could be redone, and so does any other request that changes the workflow, since a redo would rebuild it without that change. A run doesn't, and neither does a request that leaves the workflow as it was. Both fail while the workflow is running or while a request of the step is still running.
+
+An undo puts the workflow back the way a save made before the step would reopen it:
+
+- Nodes the step didn't change keep their latest results. A node it did change is marked to run again, with every node downstream of it.
+- A change made by a request without an `undo_group`, or by a run, is taken back along with the step before it. Running, stepping through, cancelling and resetting a run are never steps.
+- Workflow variables are left as they are.
+- Each workflow keeps its last 100 steps. Closing it, or restarting the engine, clears them.
+
+An undo rebuilds the workflow's nodes without sending the results of the requests that rebuild it. When an `UndoResultSuccess` or `RedoResultSuccess` arrives for a workflow you show, whichever client sent it, read the workflow again. Nodes keep their names and parameters keep their element ids, so you can keep what reads the same as before. A change you send only to keep the engine in step with what you show, such as a size you measured, belongs in no `undo_group`. Send it only when it differs from what the engine holds, as one that changes the workflow drops what could be redone.
 
 ### Following a workflow
 

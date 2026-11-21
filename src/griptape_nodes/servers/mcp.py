@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import socket
+import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -108,6 +109,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
     SetParameterValueRequest,
 )
+from griptape_nodes.retained_mode.events.undo_events import RedoRequest, UndoRequest
 from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesRequest
 from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowsRequest,
@@ -186,6 +188,9 @@ SUPPORTED_REQUEST_EVENTS: dict[str, type[RequestPayload]] = {
     "GetAllNodeInfoRequest": GetAllNodeInfoRequest,
     # Workflow persistence
     "SaveWorkflowRequest": SaveWorkflowRequest,
+    # Undo history
+    "UndoRequest": UndoRequest,
+    "RedoRequest": RedoRequest,
     # Library / engine source discovery (read-only)
     "GetLibrarySourceInfoRequest": GetLibrarySourceInfoRequest,
     "GetEngineSourceInfoRequest": GetEngineSourceInfoRequest,
@@ -633,6 +638,8 @@ async def _call_tool_payload(
         raise ValueError(msg)
 
     request_payload = _with_agent_limits(tools[name].request_type(**arguments))
+    # Each tool call is an action of its own, so what an agent changes can be undone.
+    request_payload.undo_group = request_payload.undo_group or uuid.uuid4().hex
     result = await _dispatch_to_engine(request_payload, sender, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
     mcp_server_logger.debug("Got result: %s", result)
     return json.dumps(_trim_response(result))
@@ -648,6 +655,10 @@ async def _dispatch_batch_to_engine(
     semantics) so one bad inner request does not abort the rest; _trim_batch_results maps those
     exceptions to ok=false responses.
     """
+    # A batch is one action, so it undoes as one step.
+    undo_group = uuid.uuid4().hex
+    for request in requests:
+        request.undo_group = request.undo_group or undo_group
     coros = [_dispatch_to_engine(request, sender) for request in requests]
     gather = asyncio.gather(*coros, return_exceptions=True)
     return await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
