@@ -303,6 +303,20 @@ class TestCoalescedEventsAcrossThreads:
         assert self._drain(event_manager) == [1, 2, "failure"]
 
     @pytest.mark.asyncio
+    async def test_an_event_from_a_thread_the_loop_waits_on_is_not_overtaken(self) -> None:
+        """Such as a sync request handled on another thread while the loop thread blocks on it."""
+        event_manager = EventManager()
+        event_manager.initialize_queue(asyncio.Queue())
+
+        worker = threading.Thread(target=event_manager.put_event, args=("from the thread",))
+        worker.start()
+        worker.join()
+        event_manager.put_event("from the loop after")
+        await asyncio.sleep(0)
+
+        assert self._drain(event_manager) == ["from the thread", "from the loop after"]
+
+    @pytest.mark.asyncio
     async def test_keyed_events_from_another_thread_are_throttled(self) -> None:
         event_manager = EventManager()
         event_manager.initialize_queue(asyncio.Queue())

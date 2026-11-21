@@ -8,7 +8,7 @@ import inspect
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields
@@ -439,6 +439,9 @@ class EventManager(EngineScoped):
         self._coalesce_last_sent_at: dict[Hashable, float] = {}
         self._coalesce_pending_event: dict[Hashable, Any] = {}
         self._coalesce_timers: dict[Hashable, asyncio.TimerHandle] = {}
+        # Events put from other threads, in the order they were put, until the loop thread takes them.
+        self._cross_thread_events: deque[tuple[Any, Hashable | None]] = deque()
+        self._cross_thread_events_lock = threading.Lock()
         # Worker-to-orchestrator forwarding state. Inert until
         # configure_worker_forwarding() is called at worker startup.
         self._worker_forwarding_enabled: bool = False
@@ -643,11 +646,24 @@ class EventManager(EngineScoped):
 
     def _submit_to_loop(self, event: Any, coalesce_key: Hashable | None) -> None:
         if self._is_cross_thread_call() and self._event_loop is not None:
-            self._event_loop.call_soon_threadsafe(self._enqueue, event, coalesce_key)
+            # The loop thread may be blocked waiting on this thread, and would queue an event it puts
+            # meanwhile before a callback scheduled from here could run. So events from other threads
+            # wait in order, and the loop thread takes them before queuing one of its own.
+            with self._cross_thread_events_lock:
+                self._cross_thread_events.append((event, coalesce_key))
+            self._event_loop.call_soon_threadsafe(self._take_cross_thread_events)
         else:
+            self._take_cross_thread_events()
             self._enqueue(event, coalesce_key)
 
     # Everything below runs on the event loop thread, one call at a time, so no two of them overlap.
+    def _take_cross_thread_events(self) -> None:
+        with self._cross_thread_events_lock:
+            waiting = list(self._cross_thread_events)
+            self._cross_thread_events.clear()
+        for event, coalesce_key in waiting:
+            self._enqueue(event, coalesce_key)
+
     def _enqueue(self, event: Any, coalesce_key: Hashable | None) -> None:
         if coalesce_key is None:
             # Anything held goes out first, so a newer event never overtakes an older one.
