@@ -955,7 +955,7 @@ class NodeExecutor(EngineScoped):
         entry_control_parameter_name: str | None = None
         if isinstance(node, SubflowNodeGroup):
             node_names = list(node.get_all_nodes().keys())
-            entry_control_node_name, entry_control_parameter_name = self.resolve_inner_entry_node(node)
+            entry_control_node_name, entry_control_parameter_name = node.resolve_inner_entry_node()
         else:
             # Otherwise, it's a list of one node!
             node_names = [node.name]
@@ -2525,42 +2525,6 @@ class NodeExecutor(EngineScoped):
 
         return sources
 
-    def resolve_inner_entry_node(self, node: SubflowNodeGroup) -> tuple[str | None, str | None]:
-        """Return (entry_node_name, entry_param_name) from the inner entry's connection, or (None, None).
-
-        The inner entry is On Each on a loop, On Start on a plain group, or nothing at all on a
-        group whose inner control inputs mean something else (a while-group's Done / Continue):
-        node.inner_entry is None there, and this falls back to implicit child-discovery the same way
-        an unconnected inner entry does.
-
-        Public (not an underscored helper) because SubflowNodeGroup.execute_subflow calls it too, to
-        resolve the same entry node for the local execution path -- the proxy-hop-walking below is
-        not something a second call site should re-derive.
-        """
-        workflow = node._require_workflow()
-        if node.inner_entry is None:
-            return None, None
-        connections = workflow.flows.connections
-        # Use node.inner_entry.name instead of a literal so renames stay in sync.
-        # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
-        on_each_conns = connections.outgoing_index.get(node.name, {}).get(node.inner_entry.name, [])
-        if not on_each_conns:
-            return None, None
-        first_conn = connections.connections[on_each_conns[0]]
-        if first_conn.target_node.name == node.name:
-            # on_each is a proxy port on the group boundary. When the user wires on_each → a child node,
-            # two hops are stored: group→proxy (boundary edge) then proxy→child (internal edge).
-            # Follow both to find the actual entry node inside the group.
-            proxy_param = first_conn.target_parameter
-            proxy_conns = connections.outgoing_index.get(node.name, {}).get(proxy_param.name, [])
-            if proxy_conns:
-                # Control outputs are single-target, so index 0 is the only connection.
-                internal_conn = connections.connections[proxy_conns[0]]
-                if internal_conn.is_node_group_internal:
-                    return internal_conn.target_node.name, internal_conn.target_parameter.name
-            return None, None
-        return first_conn.target_node.name, first_conn.target_parameter.name
-
     async def _package_subflow_group_body(
         self, node: SubflowNodeGroup, label: str
     ) -> PackageNodesAsSerializedFlowResultSuccess | None:
@@ -2595,7 +2559,7 @@ class NodeExecutor(EngineScoped):
         sanitized_node_name = node.name.replace(" ", "_")
         output_parameter_prefix = f"{sanitized_node_name}_{label}_"
 
-        entry_control_node_name, entry_control_parameter_name = self.resolve_inner_entry_node(node)
+        entry_control_node_name, entry_control_parameter_name = node.resolve_inner_entry_node()
 
         request = PackageNodesAsSerializedFlowRequest(
             node_names=node_names,

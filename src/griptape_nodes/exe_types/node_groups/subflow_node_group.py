@@ -524,6 +524,42 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         # first-control-output scan would depend on the order the ports were added in.
         return self.control_out
 
+    def resolve_inner_entry_node(self) -> tuple[str | None, str | None]:
+        """Return (entry_node_name, entry_param_name) from the inner entry's connection, or (None, None).
+
+        The inner entry is On Each on a loop, On Start on a plain group, or nothing at all on a
+        group whose inner control inputs mean something else (a while-group's Done / Continue):
+        self.inner_entry is None there, and this falls back to implicit child-discovery the same way
+        an unconnected inner entry does.
+
+        Public (not an underscored helper) because NodeExecutor calls it too, to resolve the entry
+        node when publishing or packaging this group's subflow -- the proxy-hop-walking below is
+        not something a second call site should re-derive.
+        """
+        workflow = self._require_workflow()
+        if self.inner_entry is None:
+            return None, None
+        connections = workflow.flows.connections
+        # Use self.inner_entry.name instead of a literal so renames stay in sync.
+        # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
+        on_each_conns = connections.outgoing_index.get(self.name, {}).get(self.inner_entry.name, [])
+        if not on_each_conns:
+            return None, None
+        first_conn = connections.connections[on_each_conns[0]]
+        if first_conn.target_node.name == self.name:
+            # on_each is a proxy port on the group boundary. When the user wires on_each → a child node,
+            # two hops are stored: group→proxy (boundary edge) then proxy→child (internal edge).
+            # Follow both to find the actual entry node inside the group.
+            proxy_param = first_conn.target_parameter
+            proxy_conns = connections.outgoing_index.get(self.name, {}).get(proxy_param.name, [])
+            if proxy_conns:
+                # Control outputs are single-target, so index 0 is the only connection.
+                internal_conn = connections.connections[proxy_conns[0]]
+                if internal_conn.is_node_group_internal:
+                    return internal_conn.target_node.name, internal_conn.target_parameter.name
+            return None, None
+        return first_conn.target_node.name, first_conn.target_parameter.name
+
     def _connect_control_wire_through_group(self, old_connection: Connection, *, is_incoming: bool) -> None:
         """Re-draw a member's control wire that crosses the boundary as an outer leg and an inner leg.
 
@@ -1702,7 +1738,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         subflow = self.metadata.get("subflow_name")
         if subflow is not None and isinstance(subflow, str):
-            entry_node_name, _entry_param_name = self.engine.flow_manager.node_executor.resolve_inner_entry_node(self)
+            entry_node_name, _entry_param_name = self.resolve_inner_entry_node()
             result = await self.engine.flow_manager.on_start_local_subflow_request(
                 StartLocalSubflowRequest(flow_name=subflow, start_node=entry_node_name), self._require_workflow()
             )

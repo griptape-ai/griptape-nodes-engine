@@ -599,7 +599,7 @@ class TestLoopGroup:
 class TestOnStartEntryResolution:
     """On Start now actually controls a plain group's entry, for every execution path that packages one.
 
-    NodeExecutor.resolve_inner_entry_node reads the inner entry's wiring on any SubflowNodeGroup,
+    SubflowNodeGroup.resolve_inner_entry_node reads the inner entry's wiring on any SubflowNodeGroup,
     not just a loop's On Each; it used to answer (None, None) for anything that was not a
     BaseIterativeNodeGroup. SubflowNodeGroup.execute_subflow (local execution) and
     NodeExecutor._publish_local_workflow (isolated/library execution) both now call it and act on
@@ -622,7 +622,7 @@ class TestOnStartEntryResolution:
         _connect(engine, "G", "on_start", "Child2", "exec_in")
 
         group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
-        entry = engine.flow_manager.node_executor.resolve_inner_entry_node(group)
+        entry = group.resolve_inner_entry_node()
 
         assert entry == ("Child2", "exec_in")
 
@@ -636,7 +636,7 @@ class TestOnStartEntryResolution:
         _group(engine, ["Child"])
 
         group = cast("SubflowNodeGroup", engine.node_manager.get_node_by_name("G"))
-        entry = engine.flow_manager.node_executor.resolve_inner_entry_node(group)
+        entry = group.resolve_inner_entry_node()
 
         assert entry == (None, None)
 
