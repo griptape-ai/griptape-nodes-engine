@@ -649,6 +649,24 @@ class TestAFailedRebuild:
         assert _value(workflow, "a") == "first"
         assert workflow.undo.undo_label is None
 
+    def test_tells_clients_the_history_is_gone(
+        self, engine: Engine, workflow: WorkflowRuntime, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """So they stop offering an undo there is no history for, even when the rebuild changed nothing."""
+        _add(engine, workflow, "a")
+        _set(engine, workflow, "a", "first", group="type")
+
+        async def failing_rebuild(_self: Any, _workflow: WorkflowRuntime, _commands: SerializedFlowCommands) -> str:
+            return "it broke"
+
+        monkeypatch.setattr(manager_module.UndoManager, "_rebuild", failing_rebuild)
+
+        result = _send(engine, workflow, UndoRequest())
+
+        assert isinstance(result, UndoResultFailure)
+        assert workflow.reported_state is not None
+        assert workflow.reported_state.undo_label is None
+
 
 class TestClientsAreTold:
     def test_nothing_of_the_rebuild(self, engine: Engine, workflow: WorkflowRuntime) -> None:
