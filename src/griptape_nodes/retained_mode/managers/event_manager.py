@@ -549,6 +549,10 @@ class EventManager(EngineScoped):
         Args:
             queue: The asyncio.Queue to use for events, or None to clear
         """
+        # A new queue starts a new run. An event another thread put for the previous run, whose loop
+        # finished before it took the event, belongs to that run and must not reach this one.
+        with self._cross_thread_events_lock:
+            self._cross_thread_events.clear()
         if queue is not None:
             self._event_queue = queue
             # Track which thread the event loop is running on and store loop reference
