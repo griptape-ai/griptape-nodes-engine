@@ -889,9 +889,12 @@ class Engine:
         """Tell every client of `workflow`'s state if it changed since they were last told.
 
         Call after anything that can change it. Says nothing of a workflow that is closed or still
-        building, which its `WorkflowOpenedEvent` will report.
+        building, which its `WorkflowOpenedEvent` will report, or that an undo or redo is rebuilding,
+        which reports the workflow once it is done.
         """
         if self._open_workflows.find(workflow.workflow_id) is not workflow or self.is_opening(workflow):
+            return
+        if workflow.undo.restoring:
             return
         state = workflow.state()
         if state == workflow.reported_state:
