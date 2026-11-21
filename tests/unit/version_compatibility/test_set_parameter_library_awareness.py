@@ -8,6 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueResultSuccess
 from griptape_nodes.version_compatibility.versions.v0_65_4.run_in_parallel_to_run_in_order import (
     RunInParallelToRunInOrderCheck,
@@ -18,6 +20,19 @@ from griptape_nodes.version_compatibility.versions.v0_65_5.flux_2_removed_parame
 
 STANDARD_LIBRARY = "griptape_nodes_library"
 EXTENSION_LIBRARY = "blackforestlabs_library"
+
+
+class ForLoopStartNode(BaseNode):
+    """A real node named like the standard library's loop start, carrying the `run_in_order` parameter."""
+
+    def __init__(self, name: str, *, run_in_order: bool) -> None:
+        super().__init__(name=name, metadata={"library": STANDARD_LIBRARY})
+        self.add_parameter(
+            Parameter(name="run_in_order", type="bool", default_value=run_in_order, tooltip="Run in order")
+        )
+
+    def process(self) -> None:
+        pass
 
 
 def _make_node(class_name: str, library_name: str) -> MagicMock:
@@ -112,3 +127,23 @@ class TestRunInParallelToRunInOrderCheckLibraryAwareness:
         node = _make_node("SomeOtherNode", STANDARD_LIBRARY)
 
         assert check.applies_to_set_parameter(node, "run_in_parallel", True) is False
+
+    def test_migrating_to_a_different_run_in_order_alters_the_workflow(
+        self, check: RunInParallelToRunInOrderCheck
+    ) -> None:
+        node = ForLoopStartNode("loop", run_in_order=True)
+
+        result = check.set_parameter_value(node, "run_in_parallel", True)
+
+        assert node.get_parameter_value("run_in_order") is False
+        assert result.altered_workflow_state
+
+    def test_migrating_to_the_run_in_order_it_has_leaves_the_workflow_as_it_was(
+        self, check: RunInParallelToRunInOrderCheck
+    ) -> None:
+        node = ForLoopStartNode("loop", run_in_order=False)
+
+        result = check.set_parameter_value(node, "run_in_parallel", True)
+
+        assert node.get_parameter_value("run_in_order") is False
+        assert not result.altered_workflow_state

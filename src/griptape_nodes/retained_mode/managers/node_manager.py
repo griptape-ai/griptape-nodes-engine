@@ -3176,7 +3176,10 @@ class NodeManager(EngineScoped):
         # Cool.
         details = f"Successfully set value on Node '{node_name}' Parameter '{request.parameter_name}'."
         result = SetParameterValueResultSuccess(
-            finalized_value=finalized_value, data_type=parameter.type, result_details=details
+            finalized_value=finalized_value,
+            data_type=parameter.type,
+            result_details=details,
+            altered_workflow_state=modified,
         )
         return result
 
