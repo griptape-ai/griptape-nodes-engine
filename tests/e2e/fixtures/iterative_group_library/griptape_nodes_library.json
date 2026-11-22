@@ -50,6 +50,15 @@
       }
     },
     {
+      "class_name": "SkipIndexOneControlNode",
+      "file_path": "iterative_group_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "Loop filter that exits through drop on index 1",
+        "display_name": "Skip Index One"
+      }
+    },
+    {
       "class_name": "CounterControlNode",
       "file_path": "iterative_group_nodes.py",
       "metadata": {
