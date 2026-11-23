@@ -3,7 +3,9 @@ from pydantic_ai.settings import ModelSettings
 
 from griptape_nodes.drivers.cloud_models import (
     _PRESET_KEY_KINDS,
+    CUSTOM_ENDPOINT_PROVIDER_ID,
     DEPRECATED_MODELS,
+    ENGINE_MODEL_CATALOG,
     IMAGE_DEPRECATED_MODELS,
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
@@ -11,9 +13,11 @@ from griptape_nodes.drivers.cloud_models import (
     MODEL_SETTINGS,
     O_SERIES_MODELS,
     VISION_MODEL_CHOICES,
+    ProviderID,
     _PresetKeyKind,
     model_settings_for,
 )
+from griptape_nodes.node_library.library_declarations import ResolvedModel, iter_catalog_models
 
 
 class TestDeprecatedModels:
@@ -129,3 +133,48 @@ class TestModelSettings:
         assert settings is not None
         settings["max_tokens"] = 1
         assert MODEL_SETTINGS["claude-opus-5"]["max_tokens"] == 64000  # noqa: PLR2004
+
+
+class TestEngineModelCatalog:
+    """`ENGINE_MODEL_CATALOG`: the engine's own catalog of chat/image models plus local/custom providers.
+
+    Admin policy gates every model on `provider_id` and `model_families`, so a
+    catalog entry missing either would silently escape a provider- or
+    family-scoped rule.
+    """
+
+    def _resolved_by_provider_model_id(self) -> dict[str, ResolvedModel]:
+        return {
+            resolved.model.provider_model_id: resolved
+            for resolved in iter_catalog_models(ENGINE_MODEL_CATALOG)
+            if resolved.model.provider_model_id is not None
+        }
+
+    def test_every_chat_model_is_in_the_catalog(self) -> None:
+        """MODEL_CHOICES and the catalog table are two lists in one file; nothing keeps them in sync but this."""
+        resolved = self._resolved_by_provider_model_id()
+        missing = [name for name in MODEL_CHOICES if name not in resolved]
+        assert not missing, f"Add {missing} to _CHAT_MODEL_CATALOG in cloud_models.py."
+
+    def test_every_image_model_is_in_the_catalog(self) -> None:
+        """IMAGE_MODEL_CHOICES and the catalog table are two lists in one file; nothing keeps them in sync but this."""
+        resolved = self._resolved_by_provider_model_id()
+        missing = [name for name in IMAGE_MODEL_CHOICES if name not in resolved]
+        assert not missing, f"Add {missing} to _IMAGE_MODEL_CATALOG in cloud_models.py."
+
+    def test_every_catalog_model_has_a_provider_and_family(self) -> None:
+        for resolved in iter_catalog_models(ENGINE_MODEL_CATALOG):
+            assert resolved.provider_id
+            assert resolved.model.family, f"'{resolved.model_id}' declares no family."
+
+    def test_local_and_custom_providers_declare_no_fixed_models(self) -> None:
+        for provider_id in (ProviderID.OLLAMA, ProviderID.LMSTUDIO, CUSTOM_ENDPOINT_PROVIDER_ID):
+            assert ENGINE_MODEL_CATALOG.providers[provider_id].models == {}
+
+    def test_no_provider_is_the_griptape_cloud_transport_id(self) -> None:
+        """`provider_id` is always the API serving the call, never the proxy that routed it."""
+        assert ProviderID.GRIPTAPE_CLOUD not in ENGINE_MODEL_CATALOG.providers
+
+    def test_custom_connection_maps_to_custom_endpoint_provider(self) -> None:
+        assert CUSTOM_ENDPOINT_PROVIDER_ID == "custom_endpoint"
+        assert CUSTOM_ENDPOINT_PROVIDER_ID in ENGINE_MODEL_CATALOG.providers

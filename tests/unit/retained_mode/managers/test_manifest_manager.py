@@ -266,7 +266,7 @@ class TestManifestManager:
 
     @pytest.mark.asyncio
     async def test_generate_manifest_aggregates_model_catalog(self, manifest_manager: ManifestManager) -> None:
-        """The model catalog is aggregated from loaded libraries' declarations."""
+        """The model catalog aggregates the engine's own catalog with the loaded libraries' declarations."""
         from griptape_nodes.node_library.library_declarations import (
             KeySupport,
             Model,
@@ -283,15 +283,15 @@ class TestManifestManager:
             declarations=[
                 ModelCatalogLibraryProperty(
                     providers={
-                        "anthropic": ModelProvider(
-                            display_name="Anthropic",
-                            terms_url="https://anthropic.com/terms",
+                        "some_vendor": ModelProvider(
+                            display_name="Some Vendor",
+                            terms_url="https://some-vendor.example/terms",
                             models={
-                                "claude-opus-4": Model(
-                                    display_name="Claude Opus 4",
-                                    family="Claude 4",
+                                "some-model": Model(
+                                    display_name="Some Model",
+                                    family="Some Family",
                                     key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
-                                    terms_url="https://anthropic.com/model-terms",
+                                    terms_url="https://some-vendor.example/model-terms",
                                 )
                             },
                         )
@@ -315,8 +315,74 @@ class TestManifestManager:
         )
 
         assert isinstance(result, GenerateManifestResultSuccess)
-        assert [provider.provider_id for provider in result.manifest.model_providers] == ["anthropic"]
-        assert result.manifest.model_providers[0].display_name == "Anthropic"
+        provider_ids = {provider.provider_id for provider in result.manifest.model_providers}
+        # The library's own provider is present alongside the engine catalog's.
+        assert "some_vendor" in provider_ids
+        assert "anthropic" in provider_ids
+        assert "ollama" in provider_ids
+        model_ids = {model.model_id for model in result.manifest.models}
+        assert "some-model" in model_ids
+        assert "gtc_claude_sonnet_5" in model_ids
+
+    @pytest.mark.asyncio
+    async def test_generate_manifest_engine_catalog_wins_first_declaration(
+        self, manifest_manager: ManifestManager
+    ) -> None:
+        """The engine catalog is seeded first, so it wins the first-declaration-wins dedup."""
+        from griptape_nodes.node_library.library_declarations import (
+            KeySupport,
+            Model,
+            ModelCatalogLibraryProperty,
+            ModelProvider,
+        )
+
+        metadata = LibraryMetadata(
+            author="a",
+            description="d",
+            library_version="1.0.0",
+            engine_version="0.86.0",
+            tags=[],
+            declarations=[
+                ModelCatalogLibraryProperty(
+                    providers={
+                        "anthropic": ModelProvider(
+                            display_name="A Library's Own Name For Anthropic",
+                            models={
+                                "gtc_claude_sonnet_5": Model(
+                                    display_name="A Library's Own Name For Claude Sonnet 5",
+                                    family="Some Other Family",
+                                    key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+                                )
+                            },
+                        )
+                    }
+                )
+            ],
+        )
+
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.engine_identity_manager.engine_id = "engine-uuid-1"
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[
+                ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
+                GetLibraryMetadataResultSuccess(metadata=metadata, result_details="ok"),
+                GetEngineVersionResultSuccess(major=1, minor=0, patch=0, result_details="ok"),
+            ]
+        )
+
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(include_libraries=False, include_project_templates=False)
+        )
+
+        assert isinstance(result, GenerateManifestResultSuccess)
+        provider = next(p for p in result.manifest.model_providers if p.provider_id == "anthropic")
+        assert provider.display_name == "Anthropic"
+        model = next(m for m in result.manifest.models if m.model_id == "gtc_claude_sonnet_5")
+        assert model.display_name == "Claude Sonnet 5"
+        assert model.family == "Claude 5"
+        # Each provider/model id appears exactly once even though both catalogs declare it.
+        assert [p.provider_id for p in result.manifest.model_providers].count("anthropic") == 1
+        assert [m.model_id for m in result.manifest.models].count("gtc_claude_sonnet_5") == 1
         assert result.manifest.model_providers[0].terms_url == "https://anthropic.com/terms"
         assert [model.model_id for model in result.manifest.models] == ["claude-opus-4"]
         model = result.manifest.models[0]
