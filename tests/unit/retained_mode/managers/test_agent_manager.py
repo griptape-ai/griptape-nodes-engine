@@ -1591,6 +1591,80 @@ class TestConfigureAgentActiveProvider:
         assert isinstance(result, ConfigureAgentResultSuccess)
         assert providers_manager._image_model_name == "gpt-image-1-mini"
 
+    def test_configure_fails_when_new_image_model_is_denied(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Configure refuses a denied image model up front, rather than only failing on first use."""
+
+        def deny_image(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_gpt_image_1_mini":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Image generation is off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_image)
+        original_image_model = providers_manager._image_model_name
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(image_generation_driver={"model": "gpt-image-1-mini"})
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Image generation is off." in str(result.result_details)
+        assert providers_manager._image_model_name == original_image_model  # unchanged
+
+    def test_configure_combined_request_checks_the_pre_switch_prompt_provider_not_the_switched_to_one(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Setting `prompt_driver.model` together with `active_provider` checks the pair each field writes.
+
+        `_apply_prompt_driver_config` writes the new model onto the provider
+        active *before* the switch (a pre-existing mutation-order quirk, left as
+        is) -- so the offer check for `prompt_driver.model` must target that
+        provider (`griptape_cloud`), not the one `active_provider` switches to
+        (`my-ollama`). A hook that only denies the Anthropic provider would
+        incorrectly allow this request if the check targeted `my-ollama` instead.
+        """
+
+        def deny_anthropic(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "anthropic":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic models are off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_anthropic)
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(
+                active_provider="my-ollama", prompt_driver=PromptDriverConfig(model="claude-sonnet-5")
+            )
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Anthropic models are off." in str(result.result_details)
+        # Neither write happened: the request is refused as a whole.
+        assert providers_manager._active_provider_name == "griptape_cloud"
+        gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
+        assert gc.model == "gpt-4o"
+
+    def test_configure_combined_request_also_checks_the_switched_to_providers_own_model(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """The switched-to provider's own stored model is checked independently of the prompt-model check."""
+
+        def deny_ollama(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "ollama":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_ollama)
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(active_provider="my-ollama", prompt_driver=PromptDriverConfig(model="gpt-5"))
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Local models are off." in str(result.result_details)
+        assert providers_manager._active_provider_name == "griptape_cloud"
+
 
 class TestEngineMcpToolset:
     """Each run reaches the engine's MCP server addressed to the workflow the run was sent from."""

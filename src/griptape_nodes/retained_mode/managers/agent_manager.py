@@ -753,6 +753,35 @@ class AgentManager(EngineScoped):
             return None
         return f"model '{effective_model}' is not permitted: {denial_message}"
 
+    def _configure_request_denial_message(self, request: ConfigureAgentRequest) -> str | None:
+        """The offer-denial sentence for every provider+model pair this `ConfigureAgentRequest` writes.
+
+        See `on_handle_configure_agent_request` for which pair each field maps
+        to. Checks in field order and returns the first denial found.
+        """
+        pd = request.prompt_driver
+        if "model" in pd.model_fields_set and pd.model:
+            prompt_provider = self._get_provider(None)
+            denial_message = self._model_offer_denial_message(connection_id=prompt_provider.type, model_name=pd.model)
+            if denial_message is not None:
+                return f"model '{pd.model}' is not permitted: {denial_message}"
+        if request.active_provider:
+            switched_provider = self._get_provider(request.active_provider)
+            denial_message = self._model_offer_denial_message(
+                connection_id=switched_provider.type, model_name=switched_provider.model
+            )
+            if denial_message is not None:
+                return f"model '{switched_provider.model}' is not permitted: {denial_message}"
+        if "model" in request.image_generation_driver:
+            new_image_model = str(request.image_generation_driver["model"])
+            if new_image_model:
+                denial_message = self._model_offer_denial_message(
+                    connection_id=ProviderID.GRIPTAPE_CLOUD, model_name=new_image_model
+                )
+                if denial_message is not None:
+                    return f"image model '{new_image_model}' is not permitted: {denial_message}"
+        return None
+
     def _offer_split(
         self, model_names: Sequence[str], *, connection_id: str = ProviderID.GRIPTAPE_CLOUD
     ) -> _ModelOfferSplit:
@@ -1371,12 +1400,17 @@ class AgentManager(EngineScoped):
         keys are accepted but ignored. Any change that affects the runner
         flushes the runner cache so the next run picks up the new settings.
 
-        A request that sets ``prompt_driver.model`` or switches
-        ``active_provider`` is refused when the resulting provider+model pair
-        is denied by license policy -- the same `OfferModel` check a provider
-        create/update runs. A request that touches neither is not re-checked,
-        so tightening policy never blocks an unrelated edit (base URL, icon,
-        API key) to an already-configured, already-denied provider.
+        Refused when any pair the request actually writes is denied by license
+        policy -- the same `OfferModel` check a provider create/update runs:
+        ``prompt_driver.model`` against the provider active *before* this
+        request (where `_apply_prompt_driver_config` writes it -- switching
+        ``active_provider`` does not change which provider that write lands on),
+        ``active_provider``'s own stored model against the provider being
+        switched to, and ``image_generation_driver.model`` against Griptape
+        Cloud (the only provider the image tool uses). A request that touches
+        none of these is not re-checked, so tightening policy never blocks an
+        unrelated edit (base URL, icon, API key) to an already-configured,
+        already-denied provider.
         """
         if request.active_provider:
             provider_names = {p.name for p in self._providers}
@@ -1385,18 +1419,13 @@ class AgentManager(EngineScoped):
                     result_details=f"Attempted to set active provider '{request.active_provider}'. Failed because it does not exist."
                 )
 
-        pd = request.prompt_driver
-        if request.active_provider or "model" in pd.model_fields_set:
-            target_provider = self._get_provider(request.active_provider or None)
-            target_model = pd.model if "model" in pd.model_fields_set and pd.model else target_provider.model
-            denial_message = self._model_offer_denial_message(
-                connection_id=target_provider.type, model_name=target_model
+        denial_message = self._configure_request_denial_message(request)
+        if denial_message is not None:
+            return ConfigureAgentResultFailure(
+                result_details=f"Attempted to configure agent. Failed because {denial_message}"
             )
-            if denial_message is not None:
-                return ConfigureAgentResultFailure(
-                    result_details=f"Attempted to configure agent. Failed because model '{target_model}' is not permitted: {denial_message}"
-                )
 
+        pd = request.prompt_driver
         try:
             changed = self._apply_prompt_driver_config(pd)
             if "model" in request.image_generation_driver:
