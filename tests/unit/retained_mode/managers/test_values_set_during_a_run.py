@@ -7,6 +7,7 @@ cleared before each run, so what makes that work is the authored copy the setter
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.node_types import BaseNode, aprocess_scope
@@ -20,6 +21,8 @@ from tests.unit.retained_mode.managers.test_workflow_save_load_roundtrip import 
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
     from griptape_nodes.retained_mode.engine import Engine
 
@@ -122,14 +125,18 @@ class TestWhatAWorkerSendsBack:
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert result.parameter_values_set_by_run == {"value": _SEED}
 
-    def test_not_a_value_with_no_plain_data_form(self, engine: Engine, tmp_path: Path) -> None:
-        """Inputs are not cached for egress, so such a value stays in the worker, as it always has."""
+    def test_not_a_value_with_no_plain_data_form(
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Inputs are not cached for egress, so such a value stays in the worker, with a warning."""
         node = _node_running_its_body(engine, tmp_path, "worker_keeps")
         with aprocess_scope(None, node):
             node.set_parameter_value("value2", Handle())
             node.parameter_output_values.silent_clear()
 
-        result = engine.node_manager._worker_execution_result(node)
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = engine.node_manager._worker_execution_result(node)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert result.parameter_values_set_by_run == {}
+        assert "parameter 'value2'" in caplog.text

@@ -4273,17 +4273,33 @@ class NodeManager(EngineScoped):
                 f"stays in that process and the next node receives a reference to it."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        # Inputs are not cached for egress (see cache_outputs_for_egress), so only plain data travels.
-        values_set_by_run = {
-            name: value
-            for name, value in node.values_set_by_run.items()
-            if not isinstance(try_encode(value), Unencodable)
-        }
         return ExecuteNodeResultSuccess(
             parameter_output_values=output_values,
-            parameter_values_set_by_run=values_set_by_run,
+            parameter_values_set_by_run=self._sendable_values_set_by_run(node),
             result_details=f"Node '{node.name}' executed successfully.",
         )
+
+    @staticmethod
+    def _sendable_values_set_by_run(node: BaseNode) -> dict[str, Any]:
+        """The values the node's run set on itself that can leave the worker, warning of the others.
+
+        Inputs are not cached for egress (see cache_outputs_for_egress), so only plain data travels.
+        """
+        sendable: dict[str, Any] = {}
+        for name, value in node.values_set_by_run.items():
+            encoded = try_encode(value)
+            if not isinstance(encoded, Unencodable):
+                sendable[name] = value
+                continue
+            logger.warning(
+                "Attempted to send the value node '%s' set on parameter '%s' while running out of %s's isolated "
+                "process. Failed because %s The node keeps the value it had before the run.",
+                node.name,
+                name,
+                node.metadata.get("library", "its library"),
+                encoded.reason,
+            )
+        return sendable
 
     def execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
         """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
