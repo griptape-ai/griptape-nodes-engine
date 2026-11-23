@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -613,6 +614,77 @@ class TestWhatAnUndoLeavesAlone:
         assert not workflow.undo.needs_checkpoint
         _redo(engine, workflow)
         assert _value(workflow, "a") == "first"
+
+
+class TestTwoClientsAtOnce:
+    def test_a_step_waits_for_the_step_before_to_finish(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """An agent's request can be partway through when the user's next input arrives."""
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        original = engine.event_manager.get_manager_for_request_type(SetParameterValueRequest)
+        assert callable(original)
+
+        async def scenario() -> None:
+            gate = asyncio.Event()
+            halfway = asyncio.Event()
+
+            async def pauses_partway(request: SetParameterValueRequest, workflow: WorkflowRuntime) -> Any:
+                if request.value == "slow":
+                    await workflow.ahandle_request(
+                        SetParameterValueRequest(node_name=request.node_name, parameter_name="value", value="half")
+                    )
+                    halfway.set()
+                    await gate.wait()
+                    request.value = "whole"
+                result = original(request, workflow=workflow)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+
+            engine.event_manager.replace_manager_for_request_type(SetParameterValueRequest, pauses_partway)
+            try:
+                agent = asyncio.create_task(_send_async(engine, workflow, _setting("a", "slow"), "agent"))
+                await halfway.wait()
+                user = asyncio.create_task(_send_async(engine, workflow, _setting("b", "typed"), "user"))
+                await asyncio.sleep(0.01)
+                assert not user.done()
+                gate.set()
+                await agent
+                await user
+            finally:
+                engine.event_manager.replace_manager_for_request_type(SetParameterValueRequest, original)
+
+        asyncio.run(scenario())
+
+        _undo(engine, workflow)
+        assert _value(workflow, "b") == ""
+        assert _value(workflow, "a") == "whole"
+        _undo(engine, workflow)
+        assert _value(workflow, "a") == ""
+
+    def test_a_synchronous_request_that_cannot_wait_is_refused(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _set(engine, workflow, "a", "first", group="agent")
+        workflow.undo.request_started()
+        try:
+            result = _send(engine, workflow, _setting("a", "second"), "user")
+        finally:
+            workflow.undo.request_finished()
+
+        assert result.failed()
+        assert _value(workflow, "a") == "first"
+
+
+def _setting(name: str, value: str) -> SetParameterValueRequest:
+    return SetParameterValueRequest(node_name=name, parameter_name="value", value=value)
+
+
+async def _send_async(engine: Engine, workflow: WorkflowRuntime, request: RequestPayload, group: str) -> Any:
+    request.undo_group = group
+    context = ResultContext(open_workflow_id=workflow.workflow_id)
+    result = (await engine.event_manager.ahandle_request(request, result_context=context)).result
+    assert result.succeeded(), result.result_details
+    return result
 
 
 class TestValuesACheckpointCannotHold:

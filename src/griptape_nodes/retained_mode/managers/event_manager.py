@@ -730,6 +730,23 @@ class EventManager(EngineScoped):
             except ValueError:
                 return
 
+    def _refusal_to_start_step(
+        self, request: RequestPayload, workflow: WorkflowRuntime | None
+    ) -> GenericResultFailure | None:
+        """The failure for a synchronous request that would start an undo step while the step before is still running.
+
+        A request dispatched asynchronously waits for that step to finish instead (`UndoManager.wait_for_open_step`).
+        """
+        if workflow is None or not self.engine.undo_manager.starts_step_while_another_runs(
+            request, workflow, outermost=_active_request_type.get() is None
+        ):
+            return None
+        details = (
+            f"Attempted to handle a {type(request).__name__}. Failed because another change to the workflow "
+            "is still being made. Send it again once that change finishes."
+        )
+        return GenericResultFailure(result_details=details)
+
     def _run_pre_dispatch_hooks(
         self,
         request: RequestPayload,
@@ -1932,6 +1949,10 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         is_outermost_request = _active_request_type.get() is None
+        # Nothing awaits between this and begin_dispatch, so no other request can start a step in between.
+        await self.engine.undo_manager.wait_for_open_step(
+            request, handler_call.request_workflow.workflow, outermost=is_outermost_request
+        )
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
@@ -2073,7 +2094,9 @@ class EventManager(EngineScoped):
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
-        short_circuit = self._run_pre_dispatch_hooks(request, result_context)
+        short_circuit = self._run_pre_dispatch_hooks(request, result_context) or self._refusal_to_start_step(
+            request, handler_call.request_workflow.workflow
+        )
         if short_circuit is not None:
             return self._handle_request_core(
                 request,
@@ -2084,6 +2107,7 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         is_outermost_request = _active_request_type.get() is None
+        request_workflow = handler_call.request_workflow.workflow
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
@@ -2094,7 +2118,7 @@ class EventManager(EngineScoped):
             try:
                 # Before the handler, so a request that starts an undo step finds the step before checkpointed.
                 undo_scope = self.engine.undo_manager.begin_dispatch(
-                    request, handler_call.request_workflow.workflow, outermost=is_outermost_request
+                    request, request_workflow, outermost=is_outermost_request
                 )
                 with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
                     result_payload = self._invoke_handler_from_sync(callback, handler_call.function, request)
