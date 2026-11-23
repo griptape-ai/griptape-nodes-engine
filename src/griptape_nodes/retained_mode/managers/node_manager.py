@@ -4256,6 +4256,7 @@ class NodeManager(EngineScoped):
             return self._worker_execution_result(node)
         return ExecuteNodeResultSuccess(
             parameter_output_values=dict(node.parameter_output_values),
+            parameter_values_set_by_run=node.values_set_by_run,
             result_details=f"Node '{node_name}' executed successfully.",
         )
 
@@ -4272,8 +4273,15 @@ class NodeManager(EngineScoped):
                 f"stays in that process and the next node receives a reference to it."
             )
             return ExecuteNodeResultFailure(result_details=details)
+        # Inputs are not cached for egress (see cache_outputs_for_egress), so only plain data travels.
+        values_set_by_run = {
+            name: value
+            for name, value in node.values_set_by_run.items()
+            if not isinstance(try_encode(value), Unencodable)
+        }
         return ExecuteNodeResultSuccess(
             parameter_output_values=output_values,
+            parameter_values_set_by_run=values_set_by_run,
             result_details=f"Node '{node.name}' executed successfully.",
         )
 

@@ -829,9 +829,13 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
 
     Args:
         parameter_output_values: Output parameter values from the node.
+        parameter_values_set_by_run: Values the node's run gave its own parameters, such as a seed it
+            rolled, so that the engine's copy of a node that ran in a worker holds them too. A value
+            with no plain-data form stays in the worker.
     """
 
     parameter_output_values: dict[str, Value] = field(default_factory=dict)
+    parameter_values_set_by_run: dict[str, Value] = field(default_factory=dict)
 
 
 @dataclass
