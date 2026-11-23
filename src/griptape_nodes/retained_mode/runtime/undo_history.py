@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 MAX_STEPS = 100
@@ -42,7 +43,10 @@ class UndoHistory:
         # The undo group whose step is being recorded. Its next request continues that step.
         self.open_group: str | None = None
         # Requests of the step being recorded that have not finished.
-        self.in_flight = 0
+        self._in_flight = 0
+        # Set while no request of the step being recorded is running.
+        self._idle = asyncio.Event()
+        self._idle.set()
         # Set while an undo or redo rebuilds the workflow, whose changes are not steps.
         self.restoring = False
 
@@ -63,6 +67,11 @@ class UndoHistory:
         return self._checkpoints[self._current + 1].label
 
     @property
+    def in_flight(self) -> int:
+        """How many requests of the step being recorded have not finished."""
+        return self._in_flight
+
+    @property
     def has_checkpoint(self) -> bool:
         return self._current >= 0
 
@@ -70,6 +79,21 @@ class UndoHistory:
     def needs_checkpoint(self) -> bool:
         """Whether the workflow may differ from the current checkpoint, or there is none yet."""
         return self._current < 0 or self.pending_label is not None or self.stale
+
+    def request_started(self) -> None:
+        """Note that a request of the step being recorded started."""
+        self._in_flight += 1
+        self._idle.clear()
+
+    def request_finished(self) -> None:
+        """Note that a request of the step being recorded finished."""
+        self._in_flight -= 1
+        if self._in_flight == 0:
+            self._idle.set()
+
+    async def wait_until_idle(self) -> None:
+        """Wait until no request of the step being recorded is running."""
+        await self._idle.wait()
 
     def record(self, commands: bytes) -> None:
         """Take a checkpoint of the workflow as it is now.

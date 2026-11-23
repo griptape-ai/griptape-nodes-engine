@@ -112,6 +112,32 @@ class UndoManager(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
+    async def wait_for_open_step(
+        self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
+    ) -> None:
+        """Wait until ``request`` can start a new step, if it starts one. Call right before `begin_dispatch`.
+
+        A new step starts with a checkpoint of the workflow, which has to show the step before it
+        whole. So a request that starts one waits for the requests of the step before to finish,
+        such as an agent's, rather than checkpoint them halfway and take the rest into its own step.
+        """
+        while workflow is not None and self.starts_step_while_another_runs(request, workflow, outermost=outermost):
+            await workflow.undo.wait_until_idle()
+
+    def starts_step_while_another_runs(
+        self, request: RequestPayload, workflow: WorkflowRuntime, *, outermost: bool
+    ) -> bool:
+        """Whether ``request`` would start a new step while a request of the step before is still running."""
+        history = workflow.undo
+        return (
+            outermost
+            and not isinstance(request, (RunControlMixin, UndoRequest, RedoRequest))
+            and not history.restoring
+            and request.undo_group is not None
+            and request.undo_group != history.open_group
+            and history.in_flight > 0
+        )
+
     def begin_dispatch(
         self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
     ) -> DispatchScope | None:
@@ -139,7 +165,7 @@ class UndoManager(EngineScoped):
             history.open_group = request.undo_group
         label = request.undo_label or _label_for(request)
         token = _recording.set(_Recording(workflow=workflow, label=label))
-        history.in_flight += 1
+        history.request_started()
         return DispatchScope(token=token, workflow=workflow)
 
     def end_dispatch(self, scope: DispatchScope | None) -> None:
@@ -149,7 +175,7 @@ class UndoManager(EngineScoped):
         if scope.workflow is None:
             return
         if scope.in_step:
-            scope.workflow.undo.in_flight -= 1
+            scope.workflow.undo.request_finished()
             return
         # Checkpointed now rather than at the next step, so that a change that drops what could be
         # redone stops clients offering it at once.
