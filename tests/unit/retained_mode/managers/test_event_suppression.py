@@ -164,6 +164,7 @@ class TestSuppressionWindowLifetime:
                 finalized_value=1,
                 data_type="int",
                 result_details="Set parameter value.",
+                altered_workflow_state=True,
             ),
         )
 

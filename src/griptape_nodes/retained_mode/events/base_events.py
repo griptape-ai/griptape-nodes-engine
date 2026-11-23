@@ -176,6 +176,18 @@ class WorkflowNotAlteredMixin:
     altered_workflow_state: bool = field(default=False, init=False)
 
 
+@dataclass
+class WorkflowAlteredReportedMixin:
+    """Mixin for a ResultPayload whose handler decides whether the workflow was altered.
+
+    The field has no default, so a handler that forgets to decide fails to build the result rather
+    than reporting no change, which would hide the change from whatever tracks edits, such as the
+    unsaved marker.
+    """
+
+    altered_workflow_state: bool = field(kw_only=True)
+
+
 class GraphAccessMixin:
     """Marks a request that reads or changes connections, flows, flow variables, or node group membership.
 

@@ -824,7 +824,7 @@ class ExecuteNodeRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class ExecuteNodeResultSuccess(ResultPayloadSuccess):
+class ExecuteNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Successful result from executing a node directly.
 
     Args:

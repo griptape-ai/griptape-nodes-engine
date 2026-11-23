@@ -128,7 +128,7 @@ class AppStartSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppStartSessionResultSuccess(ResultPayloadSuccess):
+class AppStartSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session started successfully.
 
     Args:
@@ -464,7 +464,7 @@ class GetEngineVersionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class GetEngineVersionResultSuccess(ResultPayloadSuccess):
+class GetEngineVersionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Engine version retrieved successfully.
 
     Args:
@@ -498,7 +498,7 @@ class AppEndSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppEndSessionResultSuccess(ResultPayloadSuccess):
+class AppEndSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session ended successfully.
 
     Args:
@@ -531,7 +531,7 @@ class AppJoinSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppJoinSessionResultSuccess(ResultPayloadSuccess):
+class AppJoinSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     session_id: str
 
 
@@ -551,7 +551,7 @@ class AppLeaveSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppLeaveSessionResultSuccess(ResultPayloadSuccess):
+class AppLeaveSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The client is no longer listed; leaving when never listed succeeds too."""
 
 
@@ -569,7 +569,7 @@ class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 
 @dataclass
 @PayloadRegistry.register
-class SessionHeartbeatResultSuccess(ResultPayloadSuccess):
+class SessionHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session heartbeat successful. Session is active and responsive.
 
     Also carries the engine state that changes while a client stays connected. A new run id means
@@ -620,7 +620,7 @@ class SessionClient:
 
 @dataclass
 @PayloadRegistry.register
-class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
+class EngineHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Engine heartbeat successful with comprehensive status information.
 
     Args:

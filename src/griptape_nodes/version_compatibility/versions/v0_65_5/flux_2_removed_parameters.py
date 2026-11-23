@@ -86,5 +86,7 @@ class Flux2RemovedParametersCheck(SetParameterVersionCompatibilityCheck):
         return SetParameterValueResultSuccess(
             finalized_value=None,
             data_type="any",
+            # The parameter no longer exists, so nothing was set.
+            altered_workflow_state=False,
             result_details=f"Parameter '{parameter_name}' was removed in v0.65.5. Please resave this workflow.",
         )
