@@ -197,8 +197,8 @@ class TestNodeManagerResolutionStateSerialization:
         assert not any("Attempted to serialize" in msg for msg in warning_messages)
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
-    def test_serializable_true_param_with_encode_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Genuine serialization failures (serializable=True) must still emit the warning."""
+    def test_serializable_true_param_with_encode_failure_is_recorded(self) -> None:
+        """Genuine serialization failures (serializable=True) are recorded for a save to warn of."""
         from unittest.mock import MagicMock
 
         from griptape_nodes.exe_types.core_types import Parameter
@@ -224,9 +224,7 @@ class TestNodeManagerResolutionStateSerialization:
 
         mock_tracker = MagicMock()
         mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
-
-        caplog.clear()
-        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+        mock_tracker.values_left_out = []
 
         NodeManager.handle_parameter_value_saving(
             parameter=mock_parameter,
@@ -236,8 +234,8 @@ class TestNodeManagerResolutionStateSerialization:
             create_node_request=create_node_request,
         )
 
-        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("Attempted to save the set value of parameter 'test_param'" in msg for msg in warning_messages)
+        warnings = [value.save_warning() for value in mock_tracker.values_left_out]
+        assert any("Attempted to save the set value of parameter 'test_param'" in warning for warning in warnings)
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
 

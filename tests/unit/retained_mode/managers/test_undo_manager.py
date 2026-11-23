@@ -20,7 +20,11 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.execution_events import ResolveNodeRequest
-from griptape_nodes.retained_mode.events.flow_events import SetFlowMetadataRequest
+from griptape_nodes.retained_mode.events.flow_events import (
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
+    SetFlowMetadataRequest,
+)
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     DeleteNodeRequest,
@@ -609,6 +613,41 @@ class TestWhatAnUndoLeavesAlone:
         assert not workflow.undo.needs_checkpoint
         _redo(engine, workflow)
         assert _value(workflow, "a") == "first"
+
+
+class TestValuesACheckpointCannotHold:
+    def test_are_reported_by_a_serialization_of_the_flow(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """So that a save can warn of them."""
+        _add(engine, workflow, "a")
+        a = _node(workflow, "a")
+        assert a is not None
+        a.parameter_values["value"] = object()
+        flow = workflow.top_level_flow()
+        assert flow is not None
+
+        result = workflow.handle_request(SerializeFlowToCommandsRequest(flow_name=flow.name))
+
+        assert isinstance(result, SerializeFlowToCommandsResultSuccess)
+        assert [(left_out.node_name, left_out.parameter_name) for left_out in result.values_left_out] == [
+            ("a", "value")
+        ]
+
+    def test_are_not_warned_of_on_each_step(
+        self, engine: Engine, workflow: WorkflowRuntime, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The warning is about reopening a saved workflow, which a checkpoint is not."""
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        a = _node(workflow, "a")
+        assert a is not None
+        a.parameter_values["value"] = object()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        _set(engine, workflow, "b", "one", group="one")
+        _set(engine, workflow, "b", "two", group="two")
+        _undo(engine, workflow)
+
+        assert not [record for record in caplog.records if "plain-data form" in record.message]
 
 
 class TestAStepThatChangesNothing:
