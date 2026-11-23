@@ -734,18 +734,10 @@ class AgentManager(EngineScoped):
         )
 
     def _configure_request_denial_message(self, request: ConfigureAgentRequest) -> str | None:
-        """The `OfferModel` refusal for every provider+model pair this `ConfigureAgentRequest` writes.
+        """The first `OfferModel` refusal among the provider+model pairs this request writes, or `None`.
 
-        `prompt_driver.model` is checked against the provider active *before*
-        this request (where `_apply_prompt_driver_config` writes it; switching
-        `active_provider` in the same request does not change which provider
-        that write lands on). `active_provider`'s own stored model is checked
-        against the provider being switched to. `image_generation_driver.model`
-        is checked against Griptape Cloud (the only provider the image tool
-        uses). A request that touches none of these is not re-checked, so
-        tightening policy never blocks an unrelated edit (base URL, icon, API
-        key) to an already-configured, already-denied provider. Checks in field
-        order and returns the first denial found.
+        `prompt_driver.model` lands on the provider active before any
+        `active_provider` switch in the same request, so it is checked there.
         """
         access_manager = self.engine.access_manager
         pd = request.prompt_driver

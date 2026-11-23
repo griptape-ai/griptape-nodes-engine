@@ -274,16 +274,10 @@ class AccessManager(EngineScoped):
         )
 
     def chat_model_denial(self, *, action: CheckpointAction, connection_id: str, model_name: str) -> str | None:
-        """One formatted refusal for a chat/image model, or `None` when it's permitted.
+        """One formatted refusal for a chat/image model under `action`, or `None` when it's permitted.
 
-        `AgentManager` calls this in-process (not through an event), passing
-        `OFFER_MODEL` for a sidebar listing or a provider create/update/configure,
-        and `INVOKE_MODEL` for the gate that matters: before `_build_runner`
-        builds or reuses a runner, and before each image-generation call --
-        because `agent.providers` can be edited in the config file directly,
-        bypassing every offer check. See `resolve_chat_model` for how
-        `connection_id` and `model_name` resolve to a checkpoint's id, provider,
-        and family.
+        `INVOKE_MODEL` runs before every agent run and image call because
+        `agent.providers` can be edited in the config file, skipping every offer check.
         """
         resolved = self.resolve_chat_model(connection_id=connection_id, model_name=model_name)
         if resolved is None:
