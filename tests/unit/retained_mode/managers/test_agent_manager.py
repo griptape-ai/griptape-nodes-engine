@@ -100,6 +100,7 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     ListLibraryMCPServersResultSuccess,
     MCPServerConfig,
 )
+from griptape_nodes.retained_mode.managers.access_manager import UnknownGriptapeCloudModelError
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
     _SKILLS_README,
@@ -1935,6 +1936,118 @@ class TestAttributionHeaders:
         assert asked == []
 
 
+class TestRunAgentInvokeGate:
+    """`InvokeModel` gates every `RunAgentRequest`, before `_build_runner` builds or reuses a runner.
+
+    This is the gate that matters: `agent.providers` can be edited in the
+    config file directly, skipping every offer check made when the provider
+    was created or last updated.
+    """
+
+    @staticmethod
+    def _manager(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        denial: CheckpointDenial | None,
+        raises: Exception | None = None,
+    ) -> tuple[AgentManager, MagicMock]:
+        """A manager whose `InvokeModel` check answers with `denial` (or raises `raises`), and a spy on `_build_runner`."""
+        manager = AgentManager.__new__(AgentManager)
+        manager._active_runs = {}
+        manager._mcp_toolsets = MCPToolsetCache()
+        manager._mcp_server_port = 1234
+        manager._active_provider_name = "griptape_cloud"
+        manager._providers = [ProviderConfig(name="griptape_cloud", type="griptape_cloud", model="gpt-4o")]
+        # Non-empty history keeps `is_first_run` False, so the title update is skipped.
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            load_history=lambda _t: [object()],
+            get_thread_metadata=lambda _t: SimpleNamespace(tool_grants=[]),
+            update_thread_metadata=lambda _t, **_kw: {},
+            append_run_record=lambda thread_id, record: None,  # noqa: ARG005
+        )
+        monkeypatch.setattr(manager, "_validate_thread_for_run", lambda _thread_id: "t1")
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + "._compose_prompt", _stub_compose_prompt)
+
+        build_runner_mock = MagicMock(side_effect=AssertionError("_build_runner must not be reached when denied"))
+        monkeypatch.setattr(manager, "_build_runner", build_runner_mock)
+
+        def evaluate_chat_model_invocation(**_kwargs: object) -> CheckpointDenial | None:
+            if raises is not None:
+                raise raises
+            return denial
+
+        manager._engine = SimpleNamespace(  # type: ignore[assignment]
+            event_manager=SimpleNamespace(put_event=lambda _e: None),
+            handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
+            ahandle_request=_no_attribution,
+            library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
+            only_open_workflow_or_none=lambda: None,
+            access_manager=SimpleNamespace(evaluate_chat_model_invocation=evaluate_chat_model_invocation),
+        )
+        return manager, build_runner_mock
+
+    @pytest.mark.asyncio
+    async def test_denied_model_refuses_the_run_before_building_a_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        denial = CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+        manager, build_runner_mock = self._manager(monkeypatch, denial=denial)
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "Sonnet is not in your plan." in str(result.result_details)
+        build_runner_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_hook_proceeds_to_build_the_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No hook registered: everything is allowed, as today."""
+        manager, build_runner_mock = self._manager(monkeypatch, denial=None)
+
+        async def fake_run(*_a: object, **_k: object) -> AgentRunResult:
+            return AgentRunResult(thread_id="t1", output="done", message_count=2)
+
+        build_runner_mock.side_effect = None
+        build_runner_mock.return_value = SimpleNamespace(run=fake_run)
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultSuccess)
+        build_runner_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_griptape_cloud_default_model_refuses_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A denied default model (never chosen by the user) is refused on the first run; nothing picks another."""
+        manager, build_runner_mock = self._manager(
+            monkeypatch,
+            denial=None,
+            raises=UnknownGriptapeCloudModelError("'not-a-real-model' is not a Griptape Cloud catalog model."),
+        )
+        # As if `agent.providers` was edited in the config file directly, bypassing every offer check.
+        manager._providers = [ProviderConfig(name="griptape_cloud", type="griptape_cloud", model="not-a-real-model")]
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "not a Griptape Cloud catalog model" in str(result.result_details)
+        build_runner_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_provider_rule_refuses_running_on_a_denied_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Provider rules: denying `ModelProvider::"ollama"` refuses running on one, not just creating one."""
+        denial = CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
+        manager, build_runner_mock = self._manager(monkeypatch, denial=denial)
+        # As if `agent.providers` was edited in the config file directly, bypassing every offer check.
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3.2")]
+        manager._active_provider_name = "my-ollama"
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "Local models are off." in str(result.result_details)
+        build_runner_mock.assert_not_called()
+
+
 class TestRunAgentResultPayloadContract:
     """`_run_agent`'s three success branches must agree on the payload's keys.
 
@@ -1985,6 +2098,8 @@ class TestRunAgentResultPayloadContract:
             # neither the node types nor a flow.
             library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
             only_open_workflow_or_none=lambda: None,
+            # These tests are about the payload shape, not policy: always allow.
+            access_manager=SimpleNamespace(evaluate_chat_model_invocation=lambda **_kw: None),
         )
         return manager
 

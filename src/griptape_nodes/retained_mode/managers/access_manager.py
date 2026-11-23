@@ -29,13 +29,15 @@ authorization hook chain once per id. The chain's recursion guard
 (`EventManager._hook_evaluation.authorizing`) is reset after each evaluation, so
 N sequential calls from one handler produce N independent verdicts.
 
-`resolve_chat_model` and `evaluate_chat_model_access` are the same per-candidate
-`OfferModel` ask for the chat sidebar, called in-process by `AgentManager` rather
-than through an event: a Griptape Cloud model name resolves against the engine's
-own catalog (`ENGINE_MODEL_CATALOG`), and a local or custom one gets a derived
-`<provider>/<model>` id. Both paths build the checkpoint's attributes with
-`_checkpoint_attributes`, the same code `_evaluate` uses, so a provider- or
-family-scoped rule gates a node's dropdown and the chat sidebar identically.
+`resolve_chat_model` resolves one sidebar model name to a checkpoint's id,
+provider and family -- a Griptape Cloud model name against the engine's own
+catalog (`ENGINE_MODEL_CATALOG`), a local or custom one to a derived
+`<provider>/<model>` id. `evaluate_chat_model_access` (`OfferModel`) and
+`evaluate_chat_model_invocation` (`InvokeModel`) are both called in-process by
+`AgentManager` rather than through an event, and both build the checkpoint's
+attributes with `_checkpoint_attributes`, the same code `_evaluate` uses, so a
+provider- or family-scoped rule gates a node's dropdown, the chat sidebar's
+offer, and the chat sidebar's invocation identically.
 
 This manager depends on the event bus (for the hook chain), the `LibraryRegistry`
 (for library catalog resolution), and the engine's own model catalog in
@@ -82,6 +84,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
     CheckpointAttribute,
+    CheckpointDenial,
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -324,6 +327,37 @@ class AccessManager(EngineScoped):
             )
         )
         return ModelAccessVerdict(model_id=resolved.model_id, provider_model_id=model_name, denial=denial)
+
+    def evaluate_chat_model_invocation(self, *, connection_id: str, model_name: str) -> CheckpointDenial | None:
+        """`InvokeModel` for one chat/image model about to be used.
+
+        `AgentManager` calls this in-process before `_build_runner` builds or
+        reuses a runner, and the image-generation tool calls it before each
+        call -- the gate that matters, because `agent.providers` can be edited
+        in the config file directly, bypassing every `OfferModel` check.
+        Resolution is identical to `evaluate_chat_model_access`; see
+        `resolve_chat_model`.
+
+        Raises:
+            UnknownGriptapeCloudModelError: `connection_id` is `griptape_cloud`
+                and `model_name` is not in the engine catalog. The caller must
+                refuse the run; this is never invoked and never asked of policy.
+        """
+        resolved = self.resolve_chat_model(connection_id=connection_id, model_name=model_name)
+        attributes = self._checkpoint_attributes(
+            resolved.model_id,
+            node_type=None,
+            provider_id=resolved.provider_id,
+            model_families=resolved.model_families,
+        )
+        return self.engine.event_manager.evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.INVOKE_MODEL,
+                subject_type=CheckpointSubjectType.MODEL,
+                subject_id=resolved.model_id,
+                attributes=attributes,
+            )
+        )
 
     def _resolve_node_library(self, node_type: str, specific_library_name: str | None) -> _NodeResolution:
         """Look up the node's library and return its declarations plus a model-id index.

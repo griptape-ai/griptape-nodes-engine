@@ -737,6 +737,24 @@ class AgentManager(EngineScoped):
             return None
         return verdict.denial.reason()
 
+    def _model_invoke_denial_message(self, *, connection_id: str, model_name: str) -> str | None:
+        """The `InvokeModel` denial reason for one provider+model pair about to be used, or `None` if permitted.
+
+        Mirrors `_model_offer_denial_message` but for the gate that matters: a
+        provider edited into the config file directly skips every offer check,
+        so this runs again right before a runner is built or reused, and before
+        each image-generation call.
+        """
+        try:
+            denial = self.engine.access_manager.evaluate_chat_model_invocation(
+                connection_id=connection_id, model_name=model_name
+            )
+        except UnknownGriptapeCloudModelError as e:
+            return str(e)
+        if denial is None:
+            return None
+        return denial.reason()
+
     def _update_provider_denial_message(self, existing: ProviderConfig, pd: UpdateProviderPayload) -> str | None:
         """The offer-denial sentence for an update's resulting type+model pair, or `None` when it's permitted.
 
@@ -1011,7 +1029,19 @@ class AgentManager(EngineScoped):
 
         ``active`` is the thread's claim from :meth:`_claim_thread`; its cancel event
         is what ``CancelAgentRequest`` sets. The instructions describe ``workflow``'s current flow.
+
+        The `InvokeModel` gate runs here, before `_build_runner`, on the exact
+        provider+model it is about to build or reuse a runner for -- the check
+        that matters, since a provider edited into the config file directly
+        skips every offer check made when it was created or last updated.
         """
+        provider = self._get_provider(provider_name)
+        effective_model_name = model_name or provider.model
+        denial_message = self._model_invoke_denial_message(connection_id=provider.type, model_name=effective_model_name)
+        if denial_message is not None:
+            msg = f"Attempted to run the agent. Failed because {denial_message}"
+            raise PermissionError(msg)
+
         runner = self._build_runner(
             provider_name=provider_name,
             model_name=model_name,

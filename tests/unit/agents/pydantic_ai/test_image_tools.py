@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from pydantic_ai import RunContext
     from pydantic_ai.messages import ModelMessage
 
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
 
@@ -315,3 +316,44 @@ class TestGenerateImage:
         with pytest.raises(ModelRetry):
             await toolset.generate_image(_ctx(), "a cat")
         assert static_files.saved == []
+
+
+@pytest.mark.asyncio
+class TestGenerateImageInvokeGate:
+    """`InvokeModel` gates the image tool before each call, against Griptape Cloud (the only provider it uses)."""
+
+    async def test_denied_model_refuses_before_any_request(
+        self,
+        static_files: _FakeStaticFilesManager,
+        patch_transport: _TransportRecorder,
+        engine: Engine,
+    ) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        def deny_image(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_gpt_image_1_mini":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Image generation is off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_image)
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        with pytest.raises(PermissionError, match="Image generation is off"):
+            await toolset.generate_image(_ctx(), "a red bird")
+
+        assert patch_transport.requests == []
+        assert static_files.saved == []
+
+    async def test_no_hook_proceeds_to_the_request(
+        self, static_files: _FakeStaticFilesManager, patch_transport: _TransportRecorder
+    ) -> None:
+        """No hook registered: everything is allowed, as today."""
+        toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
+
+        await toolset.generate_image(_ctx(), "a red bird")
+
+        assert len(patch_transport.requests) == 1
