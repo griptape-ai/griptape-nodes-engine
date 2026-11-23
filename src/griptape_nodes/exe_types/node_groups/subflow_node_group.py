@@ -84,7 +84,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
     the group, allowing it to seamlessly integrate into the DAG structure.
     """
 
-    _proxy_param_to_connections: dict[str, int]
+    # The proxy parameters this group made for connections into and out of it, which it removes once
+    # no connection runs through them.
+    _proxy_parameter_names: set[str]
 
     def __init__(
         self,
@@ -155,8 +157,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             traits={Options(choices=get_library_names_with_publish_handlers(self.engine))},
         )
         self.add_parameter(self.execution_environment)
-        # Track mapping from proxy parameter name to (original_node, original_param_name)
-        self._proxy_param_to_connections = {}
+        self._proxy_parameter_names = set()
         if "execution_environment" not in self.metadata:
             self.metadata["execution_environment"] = {}
         self.metadata["execution_environment"]["Griptape Nodes Library"] = {
@@ -826,18 +827,13 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             is_node_group_internal=is_incoming,
         )
         # _create_proxy_parameter_for_connection returns the group's own control_in / control_out for
-        # a control wire, not a disposable proxy: a future caller that skips this check would count
+        # a control wire, not a disposable proxy: a future caller that skips this check would track
         # the port as a proxy below, and _cleanup_proxy_parameter would delete it off the node once
-        # the count it never really had hit zero.
+        # no connection ran through it.
         if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
             self._connect_control_wire_through_group(old_connection, is_incoming=is_incoming)
             return
-        # Store the mapping from proxy parameter to original node/parameter
-        # only increment by 1, even though we're making two connections.
-        if proxy_parameter.name not in self._proxy_param_to_connections:
-            self._proxy_param_to_connections[proxy_parameter.name] = 2
-        else:
-            self._proxy_param_to_connections[proxy_parameter.name] += 2
+        self._proxy_parameter_names.add(proxy_parameter.name)
         self._handle_request_in_workflow(create_first_connection)
         self._handle_request_in_workflow(create_second_connection)
 
@@ -932,24 +928,29 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                         raise RuntimeError(msg)
 
     def _cleanup_proxy_parameter(self, proxy_parameter: Parameter, metadata_key: str) -> None:
-        """Clean up proxy parameter if it has no more connections.
+        """Remove a proxy parameter this group made once no connection runs through it.
+
+        Asks the connections that remain rather than counting them, so a connection made straight to
+        the proxy keeps it as well as one the group made.
 
         Args:
             proxy_parameter: The proxy parameter to potentially clean up
             metadata_key: The metadata key ('left_parameters' or 'right_parameters')
         """
-        if proxy_parameter.name not in self._proxy_param_to_connections:
+        if proxy_parameter.name not in self._proxy_parameter_names:
             return
-
-        self._proxy_param_to_connections[proxy_parameter.name] -= 1
-        if self._proxy_param_to_connections[proxy_parameter.name] == 0:
-            self.engine.node_manager.on_remove_parameter_from_node_request(
-                RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name),
-                self._require_workflow(),
-            )
-            del self._proxy_param_to_connections[proxy_parameter.name]
-            if metadata_key in self.metadata and proxy_parameter.name in self.metadata[metadata_key]:
-                self.metadata[metadata_key].remove(proxy_parameter.name)
+        connections = self._require_workflow().flows.connections
+        if connections.get_incoming_connections_to_parameter(
+            self, proxy_parameter
+        ) or connections.get_outgoing_connections_from_parameter(self, proxy_parameter):
+            return
+        self.engine.node_manager.on_remove_parameter_from_node_request(
+            RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name),
+            self._require_workflow(),
+        )
+        self._proxy_parameter_names.discard(proxy_parameter.name)
+        if metadata_key in self.metadata and proxy_parameter.name in self.metadata[metadata_key]:
+            self.metadata[metadata_key].remove(proxy_parameter.name)
 
     def _refresh_proxy_serializable(self, proxy_parameter: Parameter) -> None:
         """Save a proxy's value only if every inner parameter connected to it saves its own.
@@ -1655,11 +1656,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
             self._connect_control_wire_through_group(old_connection, is_incoming=is_incoming)
             return
-        # Track connections for cleanup
-        if proxy_parameter.name not in self._proxy_param_to_connections:
-            self._proxy_param_to_connections[proxy_parameter.name] = 2
-        else:
-            self._proxy_param_to_connections[proxy_parameter.name] += 2
+        self._proxy_parameter_names.add(proxy_parameter.name)
 
         self._handle_request_in_workflow(create_first_connection)
         self._handle_request_in_workflow(create_second_connection)
