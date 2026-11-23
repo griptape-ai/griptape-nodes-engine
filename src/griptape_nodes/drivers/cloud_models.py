@@ -13,7 +13,7 @@ every consumer picks up the change.
 """
 
 from enum import StrEnum
-from typing import Any, NamedTuple
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -44,51 +44,459 @@ _GEMINI_ARGS = {"stream": True}
 _OPENAI_ARGS = {"stream": True}
 
 
+# `key`, `provider`, `display_name`, `family`, and `key_support` are the
+# engine's own model-catalog placement for this entry (see
+# `_build_engine_model_catalog`), matched to the key `griptape-nodes-library-standard`
+# declares for the same `provider_model_id` (`name`, below) so one admin rule
+# gates both the node dropdown and the chat sidebar. `provider` is the vendor
+# that serves the call (`anthropic`, `openai`, ...), never `griptape_cloud` --
+# see "One model, several providers" in the design doc. Only `name`, `icon`,
+# `args`, and `vision` are read by griptape-nodes-library-standard.
 MODEL_CHOICES_ARGS = [
     # Anthropic
-    {"name": "claude-sonnet-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
-    {"name": "claude-sonnet-5-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
-    {"name": "claude-opus-5-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
-    {"name": "claude-opus-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
-    {"name": "claude-haiku-5-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
-    {"name": "claude-haiku-4-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": False},
+    {
+        "name": "claude-sonnet-5",
+        "icon": "logos/anthropic.svg",
+        "args": _CLAUDE_ARGS,
+        "vision": True,
+        "key": "gtc_claude_sonnet_5",
+        "provider": "anthropic",
+        "display_name": "Claude Sonnet 5",
+        "family": "Claude 5",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "claude-sonnet-5-5",
+        "icon": "logos/anthropic.svg",
+        "args": _CLAUDE_ARGS,
+        "vision": True,
+        "key": "gtc_claude_sonnet_5_5",
+        "provider": "anthropic",
+        "display_name": "Claude Sonnet 5.5",
+        "family": "Claude 5",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "claude-opus-5-5",
+        "icon": "logos/anthropic.svg",
+        "args": _CLAUDE_ARGS,
+        "vision": True,
+        "key": "gtc_claude_opus_5_5",
+        "provider": "anthropic",
+        "display_name": "Claude Opus 5.5",
+        "family": "Claude 5",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "claude-opus-5",
+        "icon": "logos/anthropic.svg",
+        "args": _CLAUDE_ARGS,
+        "vision": True,
+        "key": "gtc_claude_opus_5",
+        "provider": "anthropic",
+        "display_name": "Claude Opus 5",
+        "family": "Claude 5",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "claude-haiku-5-5",
+        "icon": "logos/anthropic.svg",
+        "args": _CLAUDE_ARGS,
+        "vision": True,
+        "key": "gtc_claude_haiku_5_5",
+        "provider": "anthropic",
+        "display_name": "Claude Haiku 5.5",
+        "family": "Claude 5",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "claude-haiku-4-5",
+        "icon": "logos/anthropic.svg",
+        "args": _CLAUDE_ARGS,
+        "vision": False,
+        "key": "gtc_claude_haiku_4_5",
+        "provider": "anthropic",
+        "display_name": "Claude Haiku 4.5",
+        "family": "Claude 4",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
     # Google
-    {"name": "gemini-3.6-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-3.5-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-3.5-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-3.1-pro", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-3.1-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-3-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-2.5-pro", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-2.5-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-2.5-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
+    {
+        "name": "gemini-3.6-flash",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_3_6_flash",
+        "provider": "google",
+        "display_name": "Gemini 3.6 Flash",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-3.5-flash",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_3_5_flash",
+        "provider": "google",
+        "display_name": "Gemini 3.5 Flash",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-3.5-flash-lite",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_3_5_flash_lite",
+        "provider": "google",
+        "display_name": "Gemini 3.5 Flash-Lite",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-3.1-pro",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_3_1_pro",
+        "provider": "google",
+        "display_name": "Gemini 3.1 Pro",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-3.1-flash-lite",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_3_1_flash_lite",
+        "provider": "google",
+        "display_name": "Gemini 3.1 Flash-Lite",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-3-flash",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_3_flash",
+        "provider": "google",
+        "display_name": "Gemini 3 Flash",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-2.5-pro",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_2_5_pro",
+        "provider": "google",
+        "display_name": "Gemini 2.5 Pro",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-2.5-flash",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_2_5_flash",
+        "provider": "google",
+        "display_name": "Gemini 2.5 Flash",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gemini-2.5-flash-lite",
+        "icon": "logos/google.svg",
+        "args": _GEMINI_ARGS,
+        "vision": True,
+        "key": "gtc_gemini_2_5_flash_lite",
+        "provider": "google",
+        "display_name": "Gemini 2.5 Flash-Lite",
+        "family": "Gemini",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
     # OpenAI
-    {"name": "gpt-6-sol", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-6-luna", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5.6-sol", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5.6-terra", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5.6-luna", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5.5", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5.4", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5.2", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5.2-chat", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": False},
-    {"name": "gpt-5.1", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5-mini", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-5-nano", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": False},
-    {"name": "gpt-4.1", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-4.1-mini", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-4.1-nano", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "gpt-4o", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "o4-mini", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "o3", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
-    {"name": "o3-mini", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": False},
-    {"name": "o1", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": False},
+    {
+        "name": "gpt-6-sol",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_6_sol",
+        "provider": "openai",
+        "display_name": "GPT-6 Sol",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-6-luna",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_6_luna",
+        "provider": "openai",
+        "display_name": "GPT-6 Luna",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.6-sol",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_6_sol",
+        "provider": "openai",
+        "display_name": "GPT-5.6 Sol",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.6-terra",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_6_terra",
+        "provider": "openai",
+        "display_name": "GPT-5.6 Terra",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.6-luna",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_6_luna",
+        "provider": "openai",
+        "display_name": "GPT-5.6 Luna",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.5",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_5",
+        "provider": "openai",
+        "display_name": "GPT-5.5",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.4",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_4",
+        "provider": "openai",
+        "display_name": "GPT-5.4",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.2",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_2",
+        "provider": "openai",
+        "display_name": "GPT-5.2",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.2-chat",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": False,
+        "key": "gtc_gpt_5_2_chat",
+        "provider": "openai",
+        "display_name": "GPT-5.2 Chat",
+        "family": "GPT",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5.1",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_1",
+        "provider": "openai",
+        "display_name": "GPT-5.1",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5",
+        "provider": "openai",
+        "display_name": "GPT-5",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5-mini",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_5_mini",
+        "provider": "openai",
+        "display_name": "GPT-5 mini",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-5-nano",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": False,
+        "key": "gtc_gpt_5_nano",
+        "provider": "openai",
+        "display_name": "GPT-5 nano",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-4.1",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_4_1",
+        "provider": "openai",
+        "display_name": "GPT-4.1",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-4.1-mini",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_4_1_mini",
+        "provider": "openai",
+        "display_name": "GPT-4.1 mini",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-4.1-nano",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_4_1_nano",
+        "provider": "openai",
+        "display_name": "GPT-4.1 nano",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-4o",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_gpt_4o",
+        "provider": "openai",
+        "display_name": "GPT-4o",
+        "family": "GPT",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "o4-mini",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_o4_mini",
+        "provider": "openai",
+        "display_name": "o4 mini",
+        "family": "o-series",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "o3",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": True,
+        "key": "gtc_o3",
+        "provider": "openai",
+        "display_name": "o3",
+        "family": "o-series",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "o3-mini",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": False,
+        "key": "gtc_o3_mini",
+        "provider": "openai",
+        "display_name": "o3 mini",
+        "family": "o-series",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "o1",
+        "icon": "logos/openai.svg",
+        "args": _OPENAI_ARGS,
+        "vision": False,
+        "key": "gtc_o1",
+        "provider": "openai",
+        "display_name": "o1",
+        "family": "o-series",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
     # Other
-    {"name": "deepseek-v3", "icon": "logos/deepseek.svg", "args": _DEEPSEEK_V3_ARGS, "vision": False},
-    {"name": "deepseek.r1-v1", "icon": "logos/deepseek.svg", "args": _DEEPSEEK_R1_ARGS, "vision": False},
-    {"name": "llama3-3-70b-instruct-v1", "icon": "logos/meta.svg", "args": _LLAMA_ARGS, "vision": False},
-    {"name": "llama3-1-70b-instruct-v1", "icon": "logos/meta.svg", "args": _LLAMA_ARGS, "vision": False},
+    {
+        "name": "deepseek-v3",
+        "icon": "logos/deepseek.svg",
+        "args": _DEEPSEEK_V3_ARGS,
+        "vision": False,
+        "key": "gtc_deepseek_v3",
+        "provider": "deepseek",
+        "display_name": "DeepSeek V3",
+        "family": "DeepSeek V3",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "deepseek.r1-v1",
+        "icon": "logos/deepseek.svg",
+        "args": _DEEPSEEK_R1_ARGS,
+        "vision": False,
+        "key": "gtc_deepseek_r1",
+        "provider": "deepseek",
+        "display_name": "DeepSeek R1",
+        "family": "DeepSeek R1",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "llama3-3-70b-instruct-v1",
+        "icon": "logos/meta.svg",
+        "args": _LLAMA_ARGS,
+        "vision": False,
+        "key": "gtc_llama_3_3_70b",
+        "provider": "meta",
+        "display_name": "Llama 3.3 70B Instruct",
+        "family": "Llama 3",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "llama3-1-70b-instruct-v1",
+        "icon": "logos/meta.svg",
+        "args": _LLAMA_ARGS,
+        "vision": False,
+        "key": "gtc_llama_3_1_70b",
+        "provider": "meta",
+        "display_name": "Llama 3.1 70B Instruct",
+        "family": "Llama 3",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
 ]
 
 MODEL_CHOICES: list[str] = [str(model["name"]) for model in MODEL_CHOICES_ARGS]
@@ -164,242 +572,31 @@ def model_settings_for(model_name: str) -> dict[str, Any] | None:
     return dict(settings)
 
 
+# See the comment above MODEL_CHOICES_ARGS: `key`, `provider`, `display_name`,
+# `family`, and `key_support` are the engine catalog's placement for this entry.
 IMAGE_MODEL_CHOICES_ARGS = [
     # OpenAI
-    {"name": "gpt-image-1.5", "icon": "logos/openai.svg"},
-    {"name": "gpt-image-1-mini", "icon": "logos/openai.svg"},
+    {
+        "name": "gpt-image-1.5",
+        "icon": "logos/openai.svg",
+        "key": "gtc_gpt_image_1_5",
+        "provider": "openai",
+        "display_name": "GPT Image 1.5",
+        "family": "GPT Image",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "gpt-image-1-mini",
+        "icon": "logos/openai.svg",
+        "key": "gtc_gpt_image_1_mini",
+        "provider": "openai",
+        "display_name": "GPT Image 1 Mini",
+        "family": "GPT Image",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
 ]
 
 IMAGE_MODEL_CHOICES: list[str] = [str(model["name"]) for model in IMAGE_MODEL_CHOICES_ARGS]
-
-
-# --- Engine model catalog (admin policy) ---
-
-
-class _EngineCatalogModel(NamedTuple):
-    """One Griptape Cloud model's placement in the engine's own model catalog.
-
-    `key` matches the catalog key `griptape-nodes-library-standard` declares for the
-    same `provider_model_id` (e.g. ``gtc_claude_sonnet_5``), so one admin rule gates
-    both the node dropdown and the chat sidebar. `provider_id` is the vendor that
-    serves the call (``anthropic``, ``openai``, ...), never ``griptape_cloud`` --
-    see "One model, several providers" in the design doc.
-    """
-
-    key: str
-    provider_id: str
-    display_name: str
-    family: str
-    key_support: KeySupport
-
-
-# Keyed by `provider_model_id` (the chat/image model's wire name) so
-# `_build_engine_model_catalog` and `AccessManager`'s chat resolution can both look
-# a model up by the name the sidebar actually sends.
-_CHAT_MODEL_CATALOG: dict[str, _EngineCatalogModel] = {
-    # Anthropic
-    "claude-sonnet-5": _EngineCatalogModel(
-        "gtc_claude_sonnet_5",
-        "anthropic",
-        "Claude Sonnet 5",
-        "Claude 5",
-        KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    ),
-    "claude-sonnet-5-5": _EngineCatalogModel(
-        "gtc_claude_sonnet_5_5",
-        "anthropic",
-        "Claude Sonnet 5.5",
-        "Claude 5",
-        KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    ),
-    "claude-opus-5-5": _EngineCatalogModel(
-        "gtc_claude_opus_5_5",
-        "anthropic",
-        "Claude Opus 5.5",
-        "Claude 5",
-        KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    ),
-    "claude-opus-5": _EngineCatalogModel(
-        "gtc_claude_opus_5", "anthropic", "Claude Opus 5", "Claude 5", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "claude-haiku-5-5": _EngineCatalogModel(
-        "gtc_claude_haiku_5_5",
-        "anthropic",
-        "Claude Haiku 5.5",
-        "Claude 5",
-        KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    ),
-    "claude-haiku-4-5": _EngineCatalogModel(
-        "gtc_claude_haiku_4_5",
-        "anthropic",
-        "Claude Haiku 4.5",
-        "Claude 4",
-        KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    ),
-    # Google
-    "gemini-3.6-flash": _EngineCatalogModel(
-        "gtc_gemini_3_6_flash", "google", "Gemini 3.6 Flash", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-3.5-flash": _EngineCatalogModel(
-        "gtc_gemini_3_5_flash", "google", "Gemini 3.5 Flash", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-3.5-flash-lite": _EngineCatalogModel(
-        "gtc_gemini_3_5_flash_lite", "google", "Gemini 3.5 Flash-Lite", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-3.1-pro": _EngineCatalogModel(
-        "gtc_gemini_3_1_pro", "google", "Gemini 3.1 Pro", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-3.1-flash-lite": _EngineCatalogModel(
-        "gtc_gemini_3_1_flash_lite", "google", "Gemini 3.1 Flash-Lite", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-3-flash": _EngineCatalogModel(
-        "gtc_gemini_3_flash", "google", "Gemini 3 Flash", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-2.5-pro": _EngineCatalogModel(
-        "gtc_gemini_2_5_pro", "google", "Gemini 2.5 Pro", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-2.5-flash": _EngineCatalogModel(
-        "gtc_gemini_2_5_flash", "google", "Gemini 2.5 Flash", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gemini-2.5-flash-lite": _EngineCatalogModel(
-        "gtc_gemini_2_5_flash_lite", "google", "Gemini 2.5 Flash-Lite", "Gemini", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    # OpenAI
-    "gpt-6-sol": _EngineCatalogModel(
-        "gtc_gpt_6_sol", "openai", "GPT-6 Sol", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-6-luna": _EngineCatalogModel(
-        "gtc_gpt_6_luna", "openai", "GPT-6 Luna", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5.6-sol": _EngineCatalogModel(
-        "gtc_gpt_5_6_sol", "openai", "GPT-5.6 Sol", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5.6-terra": _EngineCatalogModel(
-        "gtc_gpt_5_6_terra", "openai", "GPT-5.6 Terra", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5.6-luna": _EngineCatalogModel(
-        "gtc_gpt_5_6_luna", "openai", "GPT-5.6 Luna", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5.5": _EngineCatalogModel(
-        "gtc_gpt_5_5", "openai", "GPT-5.5", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5.4": _EngineCatalogModel(
-        "gtc_gpt_5_4", "openai", "GPT-5.4", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5.2": _EngineCatalogModel(
-        "gtc_gpt_5_2", "openai", "GPT-5.2", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5.2-chat": _EngineCatalogModel(
-        "gtc_gpt_5_2_chat", "openai", "GPT-5.2 Chat", "GPT", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "gpt-5.1": _EngineCatalogModel(
-        "gtc_gpt_5_1", "openai", "GPT-5.1", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5": _EngineCatalogModel(
-        "gtc_gpt_5", "openai", "GPT-5", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5-mini": _EngineCatalogModel(
-        "gtc_gpt_5_mini", "openai", "GPT-5 mini", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-5-nano": _EngineCatalogModel(
-        "gtc_gpt_5_nano", "openai", "GPT-5 nano", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-4.1": _EngineCatalogModel(
-        "gtc_gpt_4_1", "openai", "GPT-4.1", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-4.1-mini": _EngineCatalogModel(
-        "gtc_gpt_4_1_mini", "openai", "GPT-4.1 mini", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-4.1-nano": _EngineCatalogModel(
-        "gtc_gpt_4_1_nano", "openai", "GPT-4.1 nano", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-4o": _EngineCatalogModel(
-        "gtc_gpt_4o", "openai", "GPT-4o", "GPT", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "o4-mini": _EngineCatalogModel(
-        "gtc_o4_mini", "openai", "o4 mini", "o-series", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "o3": _EngineCatalogModel("gtc_o3", "openai", "o3", "o-series", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY),
-    "o3-mini": _EngineCatalogModel(
-        "gtc_o3_mini", "openai", "o3 mini", "o-series", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "o1": _EngineCatalogModel("gtc_o1", "openai", "o1", "o-series", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY),
-    # DeepSeek
-    "deepseek-v3": _EngineCatalogModel(
-        "gtc_deepseek_v3", "deepseek", "DeepSeek V3", "DeepSeek V3", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "deepseek.r1-v1": _EngineCatalogModel(
-        "gtc_deepseek_r1", "deepseek", "DeepSeek R1", "DeepSeek R1", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    # Meta
-    "llama3-3-70b-instruct-v1": _EngineCatalogModel(
-        "gtc_llama_3_3_70b", "meta", "Llama 3.3 70B Instruct", "Llama 3", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-    "llama3-1-70b-instruct-v1": _EngineCatalogModel(
-        "gtc_llama_3_1_70b", "meta", "Llama 3.1 70B Instruct", "Llama 3", KeySupport.REQUIRES_GRIPTAPE_KEY
-    ),
-}
-
-_IMAGE_MODEL_CATALOG: dict[str, _EngineCatalogModel] = {
-    "gpt-image-1.5": _EngineCatalogModel(
-        "gtc_gpt_image_1_5", "openai", "GPT Image 1.5", "GPT Image", KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY
-    ),
-    "gpt-image-1-mini": _EngineCatalogModel(
-        "gtc_gpt_image_1_mini",
-        "openai",
-        "GPT Image 1 Mini",
-        "GPT Image",
-        KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    ),
-}
-
-_VENDOR_PROVIDER_DISPLAY_NAMES: dict[str, str] = {
-    "anthropic": "Anthropic",
-    "google": "Google",
-    "openai": "OpenAI",
-    "deepseek": "DeepSeek",
-    "meta": "Meta",
-}
-
-# The catalog provider a `custom` connection's models resolve under. `custom` stays
-# the sidebar's connection type (see `ProviderID`); `custom_endpoint` is what a
-# policy matches, since nothing verifies where the endpoint actually points.
-CUSTOM_ENDPOINT_PROVIDER_ID = "custom_endpoint"
-
-
-def _build_engine_model_catalog() -> ModelCatalogLibraryProperty:
-    """Build the engine's own model catalog: Griptape Cloud models under their vendor, plus local/custom providers.
-
-    Every Griptape Cloud chat and image model gets the same key, provider, and
-    family `griptape-nodes-library-standard` declares for the same
-    `provider_model_id`, so a rule written for a node also gates the same model in
-    chat. `ollama`, `lmstudio`, and `custom_endpoint` declare no fixed models --
-    their models are discovered at runtime and resolve to a derived id instead
-    (see `AccessManager.resolve_chat_model`).
-    """
-    providers: dict[str, ModelProvider] = {
-        provider_id: ModelProvider(display_name=display_name)
-        for provider_id, display_name in _VENDOR_PROVIDER_DISPLAY_NAMES.items()
-    }
-    for catalog in (_CHAT_MODEL_CATALOG, _IMAGE_MODEL_CATALOG):
-        for provider_model_id, entry in catalog.items():
-            providers[entry.provider_id].models[entry.key] = Model(
-                display_name=entry.display_name,
-                provider_model_id=provider_model_id,
-                family=entry.family,
-                key_support=entry.key_support,
-            )
-    providers[ProviderID.OLLAMA] = ModelProvider(display_name="Ollama (local)", key_support=KeySupport.NO_KEY_REQUIRED)
-    providers[ProviderID.LMSTUDIO] = ModelProvider(
-        display_name="LM Studio (local)", key_support=KeySupport.NO_KEY_REQUIRED
-    )
-    providers[CUSTOM_ENDPOINT_PROVIDER_ID] = ModelProvider(
-        display_name="Custom (OpenAI-compatible)", key_support=KeySupport.REQUIRES_CUSTOMER_KEY
-    )
-    return ModelCatalogLibraryProperty(providers=providers)
-
-
-ENGINE_MODEL_CATALOG = _build_engine_model_catalog()
 
 
 # Maps deprecated model IDs that may appear in saved workflows to their live
@@ -443,10 +640,11 @@ O_SERIES_MODELS = {"o1", "o3", "o3-mini", "o4-mini"}
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
 LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
 
-# Source of truth for the sidebar's provider catalog.
-# Provider IDs here must match the model_catalog declaration keys used in
-# griptape-nodes-library-standard so that admin enforcement applies uniformly
-# when the enforcement PR lands.
+# Source of truth for the sidebar's provider catalog. These ids are the
+# sidebar's connection types (how the chat UI talks to a provider), which is a
+# separate concern from the catalog providers license policy matches against
+# (`ENGINE_MODEL_CATALOG`, built below from these entries' `display_name` /
+# `key_support` for the local and custom ones).
 PROVIDER_CATALOG = ModelCatalogSidebarProperty(
     providers={
         ProviderID.GRIPTAPE_CLOUD: SidebarModelProvider(
@@ -522,3 +720,59 @@ def provider_catalog_entries() -> list[ProviderCatalogEntry]:
         )
         for provider_id, provider in PROVIDER_CATALOG.providers.items()
     ]
+
+
+# --- Engine model catalog (admin policy) ---
+
+_VENDOR_PROVIDER_DISPLAY_NAMES: dict[str, str] = {
+    "anthropic": "Anthropic",
+    "google": "Google",
+    "openai": "OpenAI",
+    "deepseek": "DeepSeek",
+    "meta": "Meta",
+}
+
+# The catalog provider a `custom` connection's models resolve under. `custom` stays
+# the sidebar's connection type (see `ProviderID`); `custom_endpoint` is what a
+# policy matches, since nothing verifies where the endpoint actually points.
+CUSTOM_ENDPOINT_PROVIDER_ID = "custom_endpoint"
+
+
+def _build_engine_model_catalog() -> ModelCatalogLibraryProperty:
+    """Build the engine's own model catalog: Griptape Cloud models under their vendor, plus local/custom providers.
+
+    Every Griptape Cloud chat and image model gets the key, provider, and
+    family carried on its `MODEL_CHOICES_ARGS` / `IMAGE_MODEL_CHOICES_ARGS`
+    entry, matching what `griptape-nodes-library-standard` declares for the
+    same `provider_model_id`, so a rule written for a node also gates the same
+    model in chat. `ollama`, `lmstudio`, and `custom_endpoint` declare no fixed
+    models -- their models are discovered at runtime and resolve to a derived
+    id instead (see `AccessManager.resolve_chat_model`) -- so they only need
+    the display name and key support `PROVIDER_CATALOG` already declares for
+    the sidebar.
+    """
+    providers: dict[str, ModelProvider] = {
+        provider_id: ModelProvider(display_name=display_name)
+        for provider_id, display_name in _VENDOR_PROVIDER_DISPLAY_NAMES.items()
+    }
+    for catalog in (MODEL_CHOICES_ARGS, IMAGE_MODEL_CHOICES_ARGS):
+        for entry in catalog:
+            providers[str(entry["provider"])].models[str(entry["key"])] = Model(
+                display_name=str(entry["display_name"]),
+                provider_model_id=str(entry["name"]),
+                family=str(entry["family"]),
+                key_support=entry["key_support"],  # type: ignore[arg-type]
+            )
+    for provider_id in (ProviderID.OLLAMA, ProviderID.LMSTUDIO):
+        sidebar_provider = PROVIDER_CATALOG.providers[provider_id]
+        providers[provider_id] = ModelProvider(
+            display_name=sidebar_provider.display_name, key_support=sidebar_provider.key_support
+        )
+    custom_sidebar_provider = PROVIDER_CATALOG.providers[ProviderID.CUSTOM]
+    providers[CUSTOM_ENDPOINT_PROVIDER_ID] = ModelProvider(
+        display_name=custom_sidebar_provider.display_name, key_support=custom_sidebar_provider.key_support
+    )
+    return ModelCatalogLibraryProperty(providers=providers)
+
+
+ENGINE_MODEL_CATALOG = _build_engine_model_catalog()

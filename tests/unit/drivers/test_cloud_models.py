@@ -17,7 +17,7 @@ from griptape_nodes.drivers.cloud_models import (
     _PresetKeyKind,
     model_settings_for,
 )
-from griptape_nodes.node_library.library_declarations import ResolvedModel, iter_catalog_models
+from griptape_nodes.node_library.library_declarations import iter_catalog_models
 
 
 class TestDeprecatedModels:
@@ -142,25 +142,6 @@ class TestEngineModelCatalog:
     catalog entry missing either would silently escape a provider- or
     family-scoped rule.
     """
-
-    def _resolved_by_provider_model_id(self) -> dict[str, ResolvedModel]:
-        return {
-            resolved.model.provider_model_id: resolved
-            for resolved in iter_catalog_models(ENGINE_MODEL_CATALOG)
-            if resolved.model.provider_model_id is not None
-        }
-
-    def test_every_chat_model_is_in_the_catalog(self) -> None:
-        """MODEL_CHOICES and the catalog table are two lists in one file; nothing keeps them in sync but this."""
-        resolved = self._resolved_by_provider_model_id()
-        missing = [name for name in MODEL_CHOICES if name not in resolved]
-        assert not missing, f"Add {missing} to _CHAT_MODEL_CATALOG in cloud_models.py."
-
-    def test_every_image_model_is_in_the_catalog(self) -> None:
-        """IMAGE_MODEL_CHOICES and the catalog table are two lists in one file; nothing keeps them in sync but this."""
-        resolved = self._resolved_by_provider_model_id()
-        missing = [name for name in IMAGE_MODEL_CHOICES if name not in resolved]
-        assert not missing, f"Add {missing} to _IMAGE_MODEL_CATALOG in cloud_models.py."
 
     def test_every_catalog_model_has_a_provider_and_family(self) -> None:
         for resolved in iter_catalog_models(ENGINE_MODEL_CATALOG):
