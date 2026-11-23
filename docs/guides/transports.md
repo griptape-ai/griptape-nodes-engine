@@ -164,14 +164,14 @@ A request becomes undoable when it carries an `undo_group`, any string you choos
 
 `UndoRequest` takes back the last step in the workflow `open_workflow_id` names, and `RedoRequest` puts it back. Starting a new step drops what could be redone, and so does any other request that changes the workflow, since a redo would rebuild it without that change. A run doesn't, and neither does a request that leaves the workflow as it was. Both fail while the workflow is running or while a request of the step is still running.
 
-An undo puts the workflow back the way a save made before the step would reopen it:
+An undo changes only the nodes the step changed, and brings each back the way a save made before the step would reopen it:
 
-- Nodes the step didn't change keep their latest results. A node it did change is marked to run again, with every node downstream of it.
+- Nodes the step didn't change are left as they are, with their latest results and anything they hold in memory, such as a loaded model. A node whose position, size or lock the step changed is changed back in place. Any other node the step changed is rebuilt and marked to run again, with every node downstream of it.
 - A change made by a request without an `undo_group`, or by a run, is taken back along with the step before it. Running, stepping through, cancelling and resetting a run are never steps.
 - Workflow variables are left as they are.
 - Each workflow keeps its last 100 steps. Closing it, or restarting the engine, clears them.
 
-An undo rebuilds the workflow's nodes without sending the results of the requests that rebuild it. When an `UndoResultSuccess` or `RedoResultSuccess` arrives for a workflow you show, whichever client sent it, read the workflow again. Nodes keep their names and parameters keep their element ids, so you can keep what reads the same as before. A change you send only to keep the engine in step with what you show, such as a size you measured, belongs in no `undo_group`. Send it only when it differs from what the engine holds, as one that changes the workflow drops what could be redone.
+An undo changes the workflow without sending the results of the requests that change it. When an `UndoResultSuccess` or `RedoResultSuccess` arrives for a workflow you show, whichever client sent it, read the workflow again. Do the same for an `UndoResultFailure` or `RedoResultFailure` with `workflow_rebuilt` set: the undo could not finish, so the engine rebuilt the workflow as it was before, and its nodes lost their results. Nodes keep their names and parameters keep their element ids, so you can keep what reads the same as before. A change you send only to keep the engine in step with what you show, such as a size you measured, belongs in no `undo_group`. Send it only when it differs from what the engine holds, as one that changes the workflow drops what could be redone.
 
 ### Following a workflow
 

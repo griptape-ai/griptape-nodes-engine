@@ -23,8 +23,8 @@ one request at a time.
 
 ## Results
 
-Undo keeps the results of every node the change didn't touch, so a node you moved back doesn't need
-to run again. A node whose settings or connections changed is marked to run again, with every node
+Undo leaves every node the change didn't touch as it is, so it keeps its results and anything it
+has loaded, such as a model, and a node you moved back doesn't need to run again. A node whose settings or connections changed is marked to run again, with every node
 downstream of it, the same as if you had changed it by hand.
 
 ## What isn't undone
