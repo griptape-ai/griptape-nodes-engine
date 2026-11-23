@@ -207,6 +207,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeRequest,
     UnresolveNodeResultFailure,
     UnresolveNodeResultSuccess,
+    ValueLeftOut,
 )
 from griptape_nodes.retained_mode.events.object_events import (
     RenameObjectRequest,
@@ -5781,9 +5782,10 @@ class NodeManager(EngineScoped):
         genuinely failed. Whenever a value was present but could not be recorded (opt-out OR
         genuine failure) the node is marked UNRESOLVED so it re-runs on load and recomputes the
         missing value; downstream consumers would otherwise see None (issue #4994). Only the
-        genuine-failure branch also emits a warning — opt-outs are silent.
+        genuine-failure branch is recorded in the tracker's values_left_out, for a save to warn of.
+        Opt-outs are silent.
 
-        value_kind is "set" or "output" and is used only in the warning text.
+        value_kind is "set" or "output".
         """
         # No value of this kind was set on the node.
         if value is None:
@@ -5815,9 +5817,14 @@ class NodeManager(EngineScoped):
         # Author opted out via serializable=False — silently skip; not a failure.
         if not parameter.serializable:
             return None
-        # Genuine serialization failure — warn and mark unresolved.
-        details = f"Attempted to save the {value_kind} value of parameter '{parameter.name}' on node '{node.name}'. Failed because a '{type(value).__name__}' value has no plain-data form, so the node will run again when the workflow is reopened. To keep the value, register its class with register_value_codec, or set serializable=False on the parameter to stop this warning."
-        logger.warning(details)
+        serialized_parameter_value_tracker.values_left_out.append(
+            ValueLeftOut(
+                node_name=node.name,
+                parameter_name=parameter.name,
+                value_kind=value_kind,
+                type_name=type(value).__name__,
+            )
+        )
         return None
 
     @staticmethod

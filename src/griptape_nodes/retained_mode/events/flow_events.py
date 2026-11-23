@@ -15,7 +15,11 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredReportedMixin,
     WorkflowNotAlteredMixin,
 )
-from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
+from griptape_nodes.retained_mode.events.node_events import (
+    SerializedNodeCommands,
+    SetLockNodeStateRequest,
+    ValueLeftOut,
+)
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.variable_events import CreateVariableRequest
 
@@ -508,7 +512,16 @@ class SerializeFlowToCommandsRequest(RequestPayload, GraphAccessMixin):
 @dataclass
 @PayloadRegistry.register
 class SerializeFlowToCommandsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The flow's commands.
+
+    Args:
+        serialized_flow_commands: The commands that build the flow.
+        values_left_out: Parameter values the commands could not hold, because they have no plain-data
+            form. A caller that writes the commands to a file warns of each.
+    """
+
     serialized_flow_commands: SerializedFlowCommands
+    values_left_out: list[ValueLeftOut] = field(default_factory=list)
 
 
 @dataclass

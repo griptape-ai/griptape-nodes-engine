@@ -371,6 +371,8 @@ class WorkflowSaver(EngineScoped):
             details = f"Attempted to save workflow '{relative_file_path}'. Failed when serializing flow."
             return SaveWorkflowResultFailure(result_details=details)
         commands = serialized_flow_result.serialized_flow_commands
+        for value_left_out in serialized_flow_result.values_left_out:
+            logger.warning(value_left_out.save_warning())
 
         # Extract workflow shape if available; ignore failures
         try:
@@ -697,6 +699,8 @@ class WorkflowSaver(EngineScoped):
             details = f"Attempted to save subflow '{request.flow_name}' to '{file_path}'. Failed when serializing flow."
             return SaveSubflowToWorkflowResultFailure(result_details=details)
         commands = serialized_flow_result.serialized_flow_commands
+        for value_left_out in serialized_flow_result.values_left_out:
+            logger.warning(value_left_out.save_warning())
 
         # Strip parent_flow_name so the saved file stands alone as a top-level workflow.
         # If the subflow is tracked as a referenced workflow, replace the self-referential

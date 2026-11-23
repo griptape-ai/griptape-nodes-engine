@@ -555,6 +555,7 @@ class FlowSerialization(EngineScoped):
                 return SerializeFlowToCommandsResultFailure(result_details=details)
 
             sub_flow_commands = []
+            values_left_out = serialized_parameter_value_tracker.values_left_out
             for child_flow in flows_in_flow_result.flow_names:
                 child_flow_obj = workflow.objects.get_as_type(child_flow, ControlFlow)
                 if child_flow_obj is None:
@@ -607,6 +608,7 @@ class FlowSerialization(EngineScoped):
                             return SerializeFlowToCommandsResultFailure(result_details=details)
                         serialized_flow = child_flow_result.serialized_flow_commands
                         sub_flow_commands.append(serialized_flow)
+                        values_left_out.extend(child_flow_result.values_left_out)
 
         # Append NodeGroup commands AFTER regular node commands
         # This ensures child nodes exist before their parent NodeGroups are created during deserialization
@@ -714,7 +716,9 @@ class FlowSerialization(EngineScoped):
             serialized_variable_commands=serialized_variable_commands,
         )
         details = f"Successfully serialized Flow '{flow_name}' into commands."
-        result = SerializeFlowToCommandsResultSuccess(serialized_flow_commands=serialized_flow, result_details=details)
+        result = SerializeFlowToCommandsResultSuccess(
+            serialized_flow_commands=serialized_flow, values_left_out=values_left_out, result_details=details
+        )
         return result
 
     @handles(DeserializeFlowFromCommandsRequest)

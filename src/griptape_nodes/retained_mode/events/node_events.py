@@ -522,6 +522,32 @@ class SerializedNodeCommands:
     node_uuid: NodeUUID = field(default_factory=lambda: SerializedNodeCommands.NodeUUID(str(uuid4())))
 
 
+@dataclass(frozen=True)
+class ValueLeftOut:
+    """A parameter value a serialization could not write down, because it has no plain-data form.
+
+    Args:
+        node_name: The node holding the value.
+        parameter_name: The parameter holding the value.
+        value_kind: "set" for a value the parameter was given, "output" for one its node produced.
+        type_name: The name of the value's type.
+    """
+
+    node_name: str
+    parameter_name: str
+    value_kind: str
+    type_name: str
+
+    def save_warning(self) -> str:
+        """What to tell the user when a saved workflow leaves this value out."""
+        return (
+            f"Attempted to save the {self.value_kind} value of parameter '{self.parameter_name}' on node "
+            f"'{self.node_name}'. Failed because a '{self.type_name}' value has no plain-data form, so the node "
+            f"will run again when the workflow is reopened. To keep the value, register its class with "
+            f"register_value_codec, or set serializable=False on the parameter to stop this warning."
+        )
+
+
 @dataclass
 class SerializedParameterValueTracker:
     """Remembers how each value met while serializing was saved, so a value several parameters share is encoded once.
@@ -529,6 +555,9 @@ class SerializedParameterValueTracker:
     Values are told apart by identity, and the tracker holds every value it has seen. A value read
     from a node can be built on each read, such as a list parameter's items, and without the hold it
     could be freed and its identity reused by another value, which would then be saved as the first.
+
+    It also records each parameter value that could not be written down, for a caller that writes a
+    workflow to a file to warn of.
     """
 
     class TrackerState(Enum):
@@ -541,6 +570,7 @@ class SerializedParameterValueTracker:
     # Keyed by id(value). Each entry holds the value, so the id stays its own.
     _serializable: dict[int, tuple[Any, SerializedNodeCommands.UniqueParameterValueUUID]] = field(default_factory=dict)
     _non_serializable: dict[int, Any] = field(default_factory=dict)
+    values_left_out: list[ValueLeftOut] = field(default_factory=list)
 
     def get_tracker_state(self, value: Any) -> TrackerState:
         if id(value) in self._non_serializable:
