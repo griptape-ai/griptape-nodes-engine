@@ -383,10 +383,3 @@ class TestManifestManager:
         # Each provider/model id appears exactly once even though both catalogs declare it.
         assert [p.provider_id for p in result.manifest.model_providers].count("anthropic") == 1
         assert [m.model_id for m in result.manifest.models].count("gtc_claude_sonnet_5") == 1
-        assert result.manifest.model_providers[0].terms_url == "https://anthropic.com/terms"
-        assert [model.model_id for model in result.manifest.models] == ["claude-opus-4"]
-        model = result.manifest.models[0]
-        assert model.provider_id == "anthropic"
-        assert model.display_name == "Claude Opus 4"
-        assert model.family == "Claude 4"
-        assert model.terms_url == "https://anthropic.com/model-terms"

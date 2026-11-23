@@ -47,11 +47,10 @@ _OPENAI_ARGS = {"stream": True}
 # `key`, `provider`, `display_name`, `family`, and `key_support` are the
 # engine's own model-catalog placement for this entry (see
 # `_build_engine_model_catalog`), matched to the key `griptape-nodes-library-standard`
-# declares for the same `provider_model_id` (`name`, below) so one admin rule
-# gates both the node dropdown and the chat sidebar. `provider` is the vendor
-# that serves the call (`anthropic`, `openai`, ...), never `griptape_cloud` --
-# see "One model, several providers" in the design doc. Only `name`, `icon`,
-# `args`, and `vision` are read by griptape-nodes-library-standard.
+# declares for the same `provider_model_id` (`name`, below). `provider` is the
+# vendor that serves the call (`anthropic`, `openai`, ...), never
+# `griptape_cloud`. Only `name`, `icon`, `args`, and `vision` are read by
+# griptape-nodes-library-standard.
 MODEL_CHOICES_ARGS = [
     # Anthropic
     {

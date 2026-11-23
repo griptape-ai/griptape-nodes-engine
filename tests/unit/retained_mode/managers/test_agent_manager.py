@@ -396,10 +396,18 @@ class TestOnHandleListAgentModelsRequest:
     def test_denied_image_model_is_missing_from_allowed_list_and_reports_its_denial(
         self, agent_manager: AgentManager, engine: Engine
     ) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
         denied_image_model = IMAGE_MODEL_CHOICES[0]
+        denied_image_model_key = AccessManager.resolve_chat_model(
+            connection_id="griptape_cloud", model_name=denied_image_model
+        )
+        assert denied_image_model_key is not None
 
         def deny_image(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            if checkpoint.attributes.get("id") == denied_image_model:
+            # The checkpoint's `id` is the catalog key (e.g. `gtc_gpt_image_1_5`), not the wire
+            # name the sidebar sent (`gpt-image-1.5`).
+            if checkpoint.attributes.get("id") == denied_image_model_key.model_id:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Image generation is off."),))
             return None
 
@@ -1413,7 +1421,7 @@ class TestListProviderModels:
 
         assert isinstance(result, ListProviderModelsResultSuccess)
         assert "claude-sonnet-5" not in result.models
-        assert result.models == ["some-model"]
+        assert result.models == [m for m in MODEL_CHOICES if m != "claude-sonnet-5"]
 
     @pytest.mark.asyncio
     async def test_entries_without_id_are_excluded(

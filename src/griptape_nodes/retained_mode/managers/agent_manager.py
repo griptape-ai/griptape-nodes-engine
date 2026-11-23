@@ -736,8 +736,16 @@ class AgentManager(EngineScoped):
     def _configure_request_denial_message(self, request: ConfigureAgentRequest) -> str | None:
         """The `OfferModel` refusal for every provider+model pair this `ConfigureAgentRequest` writes.
 
-        See `on_handle_configure_agent_request` for which pair each field maps
-        to. Checks in field order and returns the first denial found.
+        `prompt_driver.model` is checked against the provider active *before*
+        this request (where `_apply_prompt_driver_config` writes it; switching
+        `active_provider` in the same request does not change which provider
+        that write lands on). `active_provider`'s own stored model is checked
+        against the provider being switched to. `image_generation_driver.model`
+        is checked against Griptape Cloud (the only provider the image tool
+        uses). A request that touches none of these is not re-checked, so
+        tightening policy never blocks an unrelated edit (base URL, icon, API
+        key) to an already-configured, already-denied provider. Checks in field
+        order and returns the first denial found.
         """
         access_manager = self.engine.access_manager
         pd = request.prompt_driver
@@ -999,10 +1007,7 @@ class AgentManager(EngineScoped):
         ``active`` is the thread's claim from :meth:`_claim_thread`; its cancel event
         is what ``CancelAgentRequest`` sets. The instructions describe ``workflow``'s current flow.
 
-        The `InvokeModel` gate runs here, before `_build_runner`, on the exact
-        provider+model it is about to build or reuse a runner for -- the check
-        that matters, since a provider edited into the config file directly
-        skips every offer check made when it was created or last updated.
+        The `InvokeModel` gate runs here, before `_build_runner`.
         """
         provider = self._get_provider(provider_name)
         effective_model_name = model_name or provider.model
@@ -1402,16 +1407,7 @@ class AgentManager(EngineScoped):
         flushes the runner cache so the next run picks up the new settings.
 
         Refused when any pair the request actually writes is denied by license
-        policy -- the same `OfferModel` check a provider create/update runs:
-        ``prompt_driver.model`` against the provider active *before* this
-        request (where `_apply_prompt_driver_config` writes it -- switching
-        ``active_provider`` does not change which provider that write lands on),
-        ``active_provider``'s own stored model against the provider being
-        switched to, and ``image_generation_driver.model`` against Griptape
-        Cloud (the only provider the image tool uses). A request that touches
-        none of these is not re-checked, so tightening policy never blocks an
-        unrelated edit (base URL, icon, API key) to an already-configured,
-        already-denied provider.
+        policy; see `_configure_request_denial_message`.
         """
         if request.active_provider:
             provider_names = {p.name for p in self._providers}

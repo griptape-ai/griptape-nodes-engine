@@ -29,15 +29,8 @@ authorization hook chain once per id. The chain's recursion guard
 (`EventManager._hook_evaluation.authorizing`) is reset after each evaluation, so
 N sequential calls from one handler produce N independent verdicts.
 
-`resolve_chat_model` resolves one sidebar model name to a checkpoint's id,
-provider and family -- a Griptape Cloud model name against the engine's own
-catalog (`ENGINE_MODEL_CATALOG`), a local or custom one to a derived
-`<provider>/<model>` id. `chat_model_denial` asks either checkpoint
-(`OfferModel` or `InvokeModel`) for one such model, called in-process by
-`AgentManager` rather than through an event, and builds the checkpoint's
-attributes with `_checkpoint_attributes`, the same code `_evaluate` uses, so a
-provider- or family-scoped rule gates a node's dropdown and the chat sidebar
-identically.
+`resolve_chat_model` and `chat_model_denial` do the same for the chat sidebar,
+called in-process by `AgentManager` rather than through an event.
 
 This manager depends on the event bus (for the hook chain), the `LibraryRegistry`
 (for library catalog resolution), and the engine's own model catalog in
@@ -54,7 +47,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from griptape_nodes.drivers.cloud_models import CUSTOM_ENDPOINT_PROVIDER_ID, ENGINE_MODEL_CATALOG, ProviderID
+from griptape_nodes.drivers.cloud_models import (
+    CUSTOM_ENDPOINT_PROVIDER_ID,
+    DEPRECATED_MODELS,
+    ENGINE_MODEL_CATALOG,
+    IMAGE_DEPRECATED_MODELS,
+    ProviderID,
+)
 from griptape_nodes.node_library.library_declarations import (
     ModelProviderUsageNodeProperty,
     ModelUsageNodeProperty,
@@ -399,15 +398,19 @@ class AccessManager(EngineScoped):
         through the engine catalog's `provider_model_id` index to its vendor
         provider and family -- the same catalog key a node's own dropdown would
         resolve to, so a rule written for nodes also gates the same model in
-        chat. Every other connection has no fixed catalog entries, so its model
-        gets a derived id under its own provider (`custom` maps to
-        `custom_endpoint`), with no family.
+        chat. A name retired from the catalog but still saved in a provider's
+        config resolves through `DEPRECATED_MODELS` / `IMAGE_DEPRECATED_MODELS`
+        to its replacement's entry instead: only the policy identity changes,
+        never the name actually sent. Every other connection has no fixed
+        catalog entries, so its model gets a derived id under its own provider
+        (`custom` maps to `custom_endpoint`), with no family.
 
         Returns:
             `None` when `connection_id` is `griptape_cloud` and `model_name` is
-                not in the engine catalog. There is no bare-id fallback for this
-                provider: an unresolved id would carry no provider or family and
-                so escape every provider- and family-scoped deny rule.
+                in neither the engine catalog nor the deprecation maps. There is
+                no bare-id fallback for this provider: an unresolved id would
+                carry no provider or family and so escape every provider- and
+                family-scoped deny rule.
         """
         if connection_id != ProviderID.GRIPTAPE_CLOUD:
             provider_id = CUSTOM_ENDPOINT_PROVIDER_ID if connection_id == ProviderID.CUSTOM else connection_id
@@ -417,6 +420,10 @@ class AccessManager(EngineScoped):
                 model_families=None,
             )
         resolved = _ENGINE_CATALOG_BY_PROVIDER_MODEL_ID.get(model_name)
+        if resolved is None:
+            replacement_name = DEPRECATED_MODELS.get(model_name) or IMAGE_DEPRECATED_MODELS.get(model_name)
+            if replacement_name is not None:
+                resolved = _ENGINE_CATALOG_BY_PROVIDER_MODEL_ID.get(replacement_name)
         if resolved is None:
             return None
         families = [resolved.model.family] if resolved.model.family else None
