@@ -1,10 +1,15 @@
-"""Undo and redo, by checkpointing each workflow the way a save writes it and rebuilding from a checkpoint.
+"""Undo and redo, by checkpointing what the user edited in each workflow and restoring a checkpoint.
 
 A step is the changes made by requests that share an `undo_group`. The checkpoint at the end of a
 step is taken when the next step starts, or when an undo or redo needs it, so a step of many requests
-costs one serialization. An undo deletes the workflow's flow and rebuilds it from the checkpoint before,
-the same way opening a saved workflow builds it, so every node and connection comes back through the
-code that makes them, with no hooks running twice.
+costs one serialization. A checkpoint is the workflow the way a save writes it, without what runs
+produced and without workflow variables, neither of which an undo changes.
+
+An undo brings the workflow to the checkpoint before by changing only the nodes that differ from it
+(see `plan`). A node it rebuilds comes back through the code that opens a saved workflow, and a node
+it keeps keeps its results and whatever it holds in memory. A kept node can still end up changed, by
+what its rebuilt neighbors do as they connect to it, so the workflow is checked against the checkpoint
+afterwards and any kept node that differs is rebuilt too.
 """
 
 from __future__ import annotations
@@ -30,6 +35,14 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
+    SetFlowMetadataRequest,
+)
+from griptape_nodes.retained_mode.events.node_events import (
+    DeleteNodeRequest,
+    SerializedNodeCommands,
+    SetLockNodeStateRequest,
+    SetNodeMetadataRequest,
+    UnresolveNodeRequest,
 )
 from griptape_nodes.retained_mode.events.undo_events import (
     RedoRequest,
@@ -41,7 +54,12 @@ from griptape_nodes.retained_mode.events.undo_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
 from griptape_nodes.retained_mode.managers.undo.element_ids import element_ids, restore_element_ids
-from griptape_nodes.retained_mode.managers.undo.run_state import carry_over_run_state, same_edits
+from griptape_nodes.retained_mode.managers.undo.plan import (
+    RestorePlan,
+    commands_to_build,
+    plan_rebuild,
+    plan_restore,
+)
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.serialization.commands import decode_commands, encode_commands
 from griptape_nodes.serialization.values import ValueEncodeError, dump_json
@@ -184,7 +202,9 @@ class UndoManager(EngineScoped):
         if failure is not None:
             # A failed rebuild forgets the history.
             self.engine.report_workflow_state(workflow)
-            return UndoResultFailure(result_details=f"Attempted to undo '{current.label}'. {failure}")
+            return UndoResultFailure(
+                result_details=f"Attempted to undo '{current.label}'. {failure}", workflow_rebuilt=True
+            )
         history.step_back()
         self.engine.report_workflow_state(workflow)
         return UndoResultSuccess(label=current.label or "", result_details=f"Undid '{current.label}'.")
@@ -214,7 +234,9 @@ class UndoManager(EngineScoped):
         if failure is not None:
             # A failed rebuild forgets the history.
             self.engine.report_workflow_state(workflow)
-            return RedoResultFailure(result_details=f"Attempted to redo '{following.label}'. {failure}")
+            return RedoResultFailure(
+                result_details=f"Attempted to redo '{following.label}'. {failure}", workflow_rebuilt=True
+            )
         workflow.undo.step_forward()
         self.engine.report_workflow_state(workflow)
         return RedoResultSuccess(label=following.label or "", result_details=f"Redid '{following.label}'.")
@@ -252,17 +274,13 @@ class UndoManager(EngineScoped):
             history.clear()
             self.engine.report_workflow_state(workflow)
             return False
+        compressed = zlib.compress(text.encode(), _COMPRESSION_LEVEL)
         current = history.current()
-        # A redo would rebuild the workflow without what a client changed since, so it is dropped.
-        # Run results are carried into any rebuild, so a run changes nothing a redo would lose.
-        if (
-            history.edited
-            and history.redo_label is not None
-            and current is not None
-            and not same_edits(_decode(current.commands), decode_commands(json.loads(text), SerializedFlowCommands))
-        ):
+        # A redo would bring the workflow back without what a client changed since, so it is dropped.
+        # A checkpoint holds no run results, so a run changes nothing a redo would lose.
+        if history.edited and history.redo_label is not None and current is not None and current.commands != compressed:
             history.drop_redo()
-        history.record(zlib.compress(text.encode(), _COMPRESSION_LEVEL))
+        history.record(compressed)
         self.engine.report_workflow_state(workflow)
         return True
 
@@ -270,29 +288,39 @@ class UndoManager(EngineScoped):
         flow = workflow.top_level_flow()
         if flow is None:
             return None
-        # The requests a serialization makes along the way are of no interest to clients.
-        with EventSuppressionContext(self.engine.event_manager, _REBUILD_EVENTS):
-            result = workflow.handle_request(SerializeFlowToCommandsRequest(flow_name=flow.name))
-        if not isinstance(result, SerializeFlowToCommandsResultSuccess):
-            logger.warning("Undo could not checkpoint the workflow: %s", result.result_details)
+        commands = self._serialize_edits(workflow, flow.name)
+        if commands is None:
             workflow.undo.clear()
             self.engine.report_workflow_state(workflow)
+        return commands
+
+    def _serialize_edits(self, workflow: WorkflowRuntime, flow_name: str) -> SerializedFlowCommands | None:
+        """The workflow as a checkpoint holds it, or None when it could not be serialized."""
+        # The requests a serialization makes along the way are of no interest to clients.
+        with EventSuppressionContext(self.engine.event_manager, _REBUILD_EVENTS):
+            result = workflow.handle_request(
+                SerializeFlowToCommandsRequest(flow_name=flow_name, include_run_results=False)
+            )
+        if not isinstance(result, SerializeFlowToCommandsResultSuccess):
+            logger.warning("Undo could not checkpoint the workflow: %s", result.result_details)
             return None
-        return result.serialized_flow_commands
+        return _without_variables(result.serialized_flow_commands)
 
     async def _restore(
         self, workflow: WorkflowRuntime, checkpoint: Checkpoint, current: Checkpoint, live: SerializedFlowCommands
     ) -> str | None:
-        """Rebuild the workflow from ``checkpoint``, keeping ``live``'s results. Return why it failed, if it did.
+        """Bring the workflow, which ``live`` holds, to ``checkpoint``. Return why it failed, if it did.
 
-        A rebuild that fails puts the workflow back as the ``current`` checkpoint holds it, which is
-        ``live`` without its results, and forgets the history.
+        A restore that fails puts the workflow back as the ``current`` checkpoint holds it, which is
+        ``live``, rebuilt without its results, and forgets the history.
         """
-        target = carry_over_run_state(_decode(checkpoint.commands), live)
         history = workflow.undo
         history.restoring = True
         try:
-            failure = await self._rebuild(workflow, target)
+            # Clients see the undo's own result and read the workflow again. Every node coming down and
+            # back up along the way would only have them redraw it piece by piece, and react to it.
+            with EventSuppressionContext(self.engine.event_manager, _REBUILD_EVENTS):
+                failure = await self._bring_to(workflow, _decode(checkpoint.commands), live)
             if failure is None:
                 return None
             logger.error("Undo could not rebuild the workflow, so it is put back as it was: %s", failure)
@@ -305,9 +333,52 @@ class UndoManager(EngineScoped):
         finally:
             history.restoring = False
 
+    async def _bring_to(
+        self, workflow: WorkflowRuntime, target: SerializedFlowCommands, live: SerializedFlowCommands
+    ) -> str | None:
+        """Change the nodes that differ from ``target``, until the workflow matches it. Return why it failed, if it did."""
+        flow = workflow.top_level_flow()
+        if flow is None:
+            return "Failed because the workflow has no flow."
+        ids = element_ids(workflow)
+        plan = plan_restore(target, live)
+        built: set[str] = set()
+        # Each pass rebuilds at least one kept node, or ends, so there are at most as many passes as nodes.
+        while not plan.changes_nothing:
+            failure = await self._apply(workflow, flow.name, target, plan)
+            if failure is not None:
+                return failure
+            built |= plan.units_to_build
+            now = self._serialize_edits(workflow, flow.name)
+            if now is None:
+                return "Failed because the workflow could not be read back."
+            check = plan_restore(target, now)
+            # A rebuilt node is as close to the checkpoint as opening a saved workflow gets it.
+            drifted = (check.units_to_build | check.node_edits.keys()) - built
+            if not drifted:
+                break
+            plan = plan_rebuild(target, now, drifted)
+        # So that clients can tell what is unchanged, and their requests by element id still work.
+        restore_element_ids(workflow, ids)
+        return None
+
+    async def _apply(
+        self, workflow: WorkflowRuntime, flow_name: str, target: SerializedFlowCommands, plan: RestorePlan
+    ) -> str | None:
+        """Make the changes ``plan`` holds. Return why it failed, if it did."""
+        flow = workflow.top_level_flow()
+        if flow is None:
+            return "Failed because the workflow has no flow."
+        # The checkpoint's nodes are built into the flow in context.
+        with workflow.context.flow(flow):
+            for request in _requests_for(flow_name, target, plan):
+                result = await workflow.ahandle_request(request)
+                if result.failed():
+                    return str(result.result_details)
+        return None
+
     async def _rebuild(self, workflow: WorkflowRuntime, commands: SerializedFlowCommands) -> str | None:
-        # Clients see the undo's own result and read the workflow again. Every node coming down and
-        # back up along the way would only have them redraw it piece by piece, and react to it.
+        """Delete the workflow's flow and build it again from ``commands``. Return why it failed, if it did."""
         ids = element_ids(workflow)
         with EventSuppressionContext(self.engine.event_manager, _REBUILD_EVENTS):
             flow = workflow.top_level_flow()
@@ -325,6 +396,36 @@ class UndoManager(EngineScoped):
         return None
 
 
+def _requests_for(flow_name: str, target: SerializedFlowCommands, plan: RestorePlan) -> list[RequestPayload]:
+    """The requests that make the changes ``plan`` holds, in order."""
+    requests: list[RequestPayload] = [
+        DeleteNodeRequest(node_name=name) for unit in plan.units_to_delete for name in unit
+    ]
+    if plan.units_to_build:
+        requests.append(
+            DeserializeFlowFromCommandsRequest(
+                serialized_flow_commands=commands_to_build(target, plan),
+                existing_nodes={SerializedNodeCommands.NodeUUID(name): name for name in plan.kept},
+            )
+        )
+        # Built nodes start unresolved. What they feed has to run again too.
+        requests.extend(UnresolveNodeRequest(node_name=name) for name in sorted(plan.units_to_build))
+    for name, edit in sorted(plan.node_edits.items()):
+        if edit.metadata is not None:
+            requests.append(
+                SetNodeMetadataRequest(node_name=name, metadata=edit.metadata, remove_keys=edit.removed_metadata_keys)
+            )
+        if edit.lock is not None:
+            requests.append(SetLockNodeStateRequest(node_name=name, lock=edit.lock))
+    if plan.flow_metadata is not None:
+        requests.append(
+            SetFlowMetadataRequest(
+                flow_name=flow_name, metadata=plan.flow_metadata, remove_keys=plan.removed_flow_metadata_keys
+            )
+        )
+    return requests
+
+
 def _blocker(workflow: WorkflowRuntime, verb: str) -> str | None:
     """Why an undo or redo cannot run now, or None when it can."""
     if workflow.flows.run_in_progress is not None:
@@ -339,6 +440,35 @@ def _blocker(workflow: WorkflowRuntime, verb: str) -> str | None:
 def _routine(message: str) -> ResultDetails:
     """A failure the user only needs to be told of, such as pressing Undo with nothing to undo."""
     return ResultDetails(message=message, level=logging.INFO)
+
+
+def _without_variables(commands: SerializedFlowCommands) -> SerializedFlowCommands:
+    """``commands`` without the workflow variables, which belong to the workflow rather than its flow.
+
+    Changes ``commands`` in place.
+    """
+    levels = _levels(commands)
+    referenced = {
+        command.unique_value_uuid
+        for level in levels
+        for set_value_commands in level.set_parameter_value_commands.values()
+        for command in set_value_commands
+    }
+    for level in levels:
+        level.serialized_variable_commands = []
+        level.unique_parameter_uuid_to_values = {
+            value_uuid: value
+            for value_uuid, value in level.unique_parameter_uuid_to_values.items()
+            if value_uuid in referenced
+        }
+    return commands
+
+
+def _levels(commands: SerializedFlowCommands) -> list[SerializedFlowCommands]:
+    levels = [commands]
+    for sub_flow_commands in commands.sub_flows_commands:
+        levels.extend(_levels(sub_flow_commands))
+    return levels
 
 
 def _decode(commands: bytes) -> SerializedFlowCommands:

@@ -18,9 +18,9 @@ class UndoRequest(RequestPayload):
     Use when: A user presses Undo, or an agent reverses an edit it made.
 
     A change is undoable when the request that made it carries an `undo_group`. Undo puts the
-    workflow back the way it was before that change, as reopening it from a save made then would.
-    Nodes the change did not touch keep their latest results. Workflow variables are left as they are.
-    Unavailable while the workflow is running.
+    nodes the change touched back the way they were before it, as reopening a save made then would.
+    Nodes the change did not touch are left as they are, with their results and anything they hold
+    in memory. Workflow variables are left as they are. Unavailable while the workflow is running.
 
     Results: UndoResultSuccess (with the change's label) | UndoResultFailure (nothing to undo, a run
         or another change is in progress, or the workflow could not be put back)
@@ -42,7 +42,14 @@ class UndoResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class UndoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Nothing was undone, and the workflow is as it was."""
+    """Nothing was undone.
+
+    Args:
+        workflow_rebuilt: Whether the undo started and could not finish, so the workflow was rebuilt
+            as it was before it, without its results. A client showing the workflow reads it again.
+    """
+
+    workflow_rebuilt: bool = False
 
 
 @dataclass
@@ -75,4 +82,11 @@ class RedoResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class RedoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Nothing was redone, and the workflow is as it was."""
+    """Nothing was redone.
+
+    Args:
+        workflow_rebuilt: Whether the redo started and could not finish, so the workflow was rebuilt
+            as it was before it, without its results. A client showing the workflow reads it again.
+    """
+
+    workflow_rebuilt: bool = False

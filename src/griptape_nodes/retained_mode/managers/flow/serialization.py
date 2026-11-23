@@ -517,6 +517,7 @@ class FlowSerialization(EngineScoped):
                         unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,  # Unique values
                         serialized_parameter_value_tracker=serialized_parameter_value_tracker,  # Mapping values to UUIDs,
                         include_existing_subflow_in_group=True,
+                        include_run_results=request.include_run_results,
                     )
                     serialize_node_result = workflow.handle_request(serialize_node_request)
                     if not isinstance(serialize_node_result, SerializeNodeToCommandsResultSuccess):
@@ -597,7 +598,9 @@ class FlowSerialization(EngineScoped):
                 else:
                     # For standalone sub-flows, use the existing recursive serialization.
                     with workflow.context.flow(child_flow_obj):
-                        child_flow_request = SerializeFlowToCommandsRequest()
+                        child_flow_request = SerializeFlowToCommandsRequest(
+                            include_run_results=request.include_run_results
+                        )
                         child_flow_result = workflow.handle_request(child_flow_request)
                         if not isinstance(child_flow_result, SerializeFlowToCommandsResultSuccess):
                             details = f"Attempted to serialize parent flow '{flow_name}'. Failed while serializing child flow '{child_flow}'."
@@ -765,6 +768,9 @@ class FlowSerialization(EngineScoped):
                 deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
                     workflow, serialized_flow_commands=request.serialized_flow_commands
                 )
+                # The nodes the connections may name: those just built, and those already here.
+                connectable_nodes = DeserializedFlowNodes(node_uuid_to_node_name=dict(request.existing_nodes))
+                connectable_nodes.merge(deserialized_nodes)
 
                 # Now apply the connections, for this Flow and every Flow beneath it.
                 # We didn't know the exact name that would be used for the nodes, but we knew the node's
@@ -780,7 +786,7 @@ class FlowSerialization(EngineScoped):
                 self._deserialize_connections_for_flow_and_subflows(
                     workflow,
                     serialized_flow_commands=request.serialized_flow_commands,
-                    deserialized_nodes=deserialized_nodes,
+                    deserialized_nodes=connectable_nodes,
                     created_connection_keys=set(),
                 )
 

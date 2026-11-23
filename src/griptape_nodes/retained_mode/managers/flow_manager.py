@@ -551,12 +551,17 @@ class FlowManager(EngineScoped):
         changed_keys = {
             key for key, value in request.metadata.items() if key not in flow.metadata or flow.metadata[key] != value
         }
+        removed_keys = {key for key in request.remove_keys if key in flow.metadata}
         # We can't completely overwrite metadata.
         for key, value in request.metadata.items():
             flow.metadata[key] = value
+        for key in removed_keys:
+            del flow.metadata[key]
         details = f"Successfully set metadata for a Flow '{flow_name}'."
 
-        return SetFlowMetadataResultSuccess(result_details=details, altered_workflow_state=bool(changed_keys))
+        return SetFlowMetadataResultSuccess(
+            result_details=details, altered_workflow_state=bool(changed_keys) or bool(removed_keys)
+        )
 
     def does_canvas_exist(self, workflow: WorkflowRuntime) -> bool:
         """Determines if there is already an existing flow with no parent flow.Returns True if there is an existing flow with no parent flow.Return False if there is no existing flow with no parent flow."""

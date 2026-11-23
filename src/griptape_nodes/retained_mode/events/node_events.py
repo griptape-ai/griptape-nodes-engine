@@ -285,8 +285,10 @@ class SetNodeMetadataRequest(RequestPayload):
     saving user preferences. Metadata doesn't affect execution but provides workflow context.
 
     Args:
-        metadata: Dictionary of metadata to set (position, display properties, custom data)
+        metadata: Dictionary of metadata to set (position, display properties, custom data). Keys it
+            leaves out keep their values.
         node_name: Name of the node to update metadata for (None for current context node)
+        remove_keys: Keys to remove from the node's metadata
 
     Results: SetNodeMetadataResultSuccess | SetNodeMetadataResultFailure (node not found, update error)
     """
@@ -294,6 +296,7 @@ class SetNodeMetadataRequest(RequestPayload):
     metadata: dict
     # If None is passed, assumes we're using the Node in the Current Context
     node_name: str | None = None
+    remove_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -574,6 +577,8 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
         use_pickling: Deprecated and ignored. The value pool always holds encoded values.
+        include_run_results: If False, writes the node as unresolved, without its output values or the input
+            values its connections fed it.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """
@@ -590,6 +595,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
     serialize_all_parameter_values: bool = False
     # If True, keep subflow_name in group metadata for workflow file generation (defaults to False for copy/paste)
     include_existing_subflow_in_group: bool = False
+    include_run_results: bool = True
 
 
 @dataclass

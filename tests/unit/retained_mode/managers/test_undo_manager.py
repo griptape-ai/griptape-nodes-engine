@@ -44,6 +44,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.retained_mode.managers.undo import manager as manager_module
+from griptape_nodes.retained_mode.managers.undo.plan import RestorePlan, commands_to_build
 from griptape_nodes.serialization.commands import encode_commands
 from griptape_nodes.serialization.values import dump_json
 from griptape_nodes.traits.slider import Slider
@@ -83,6 +84,52 @@ class _PassThrough(DataNode):
         self.parameter_output_values["result"] = self.get_parameter_value("value")
 
 
+class _HoldsAnObject(_PassThrough):
+    """Outputs an object a save can't write down, as a node holding a loaded model does."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="model",
+                type="any",
+                default_value=None,
+                tooltip="",
+                allowed_modes={ParameterMode.OUTPUT},
+                serializable=False,
+            )
+        )
+
+
+class _ForgetsOnDisconnect(_PassThrough):
+    """Resets its volume when an input is disconnected, and doesn't put it back on reconnect."""
+
+    def after_incoming_connection_removed(
+        self, source_node: BaseNode, source_parameter: Parameter, target_parameter: Parameter
+    ) -> None:
+        super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
+        self.set_parameter_value("volume", 0)
+
+
+class _GrowsOnConnect(_PassThrough):
+    """Adds a parameter while its input is connected, and removes it again on disconnect."""
+
+    def after_incoming_connection(
+        self,
+        source_node: BaseNode,  # noqa: ARG002
+        source_parameter: Parameter,  # noqa: ARG002
+        target_parameter: Parameter,  # noqa: ARG002
+    ) -> None:
+        if self.get_parameter_by_name("extra") is None:
+            self.add_parameter(Parameter(name="extra", type="str", default_value="", tooltip=""))
+
+    def after_incoming_connection_removed(
+        self, source_node: BaseNode, source_parameter: Parameter, target_parameter: Parameter
+    ) -> None:
+        super().after_incoming_connection_removed(source_node, source_parameter, target_parameter)
+        self.remove_parameter_element_by_name("extra")
+
+
 class _Group(SubflowNodeGroup):
     """A group that keeps its members in a flow of their own."""
 
@@ -103,6 +150,8 @@ def _library() -> Iterator[None]:
     library = LibraryRegistry.generate_new_library(library_data=schema)
     library.register_new_node_type(_PassThrough, NodeMetadata(category="t", description="d", display_name="Pass"))
     library.register_new_node_type(_Group, NodeMetadata(category="t", description="d", display_name="Group"))
+    for node_type in (_HoldsAnObject, _ForgetsOnDisconnect, _GrowsOnConnect):
+        library.register_new_node_type(node_type, NodeMetadata(category="t", description="d", display_name="t"))
     yield
     LibraryRegistry._clear()
 
@@ -143,11 +192,27 @@ def _redo(engine: Engine, workflow: WorkflowRuntime) -> RedoResultSuccess:
     return result
 
 
-def _add(engine: Engine, workflow: WorkflowRuntime, name: str, group: str | None = None) -> None:
+def _add(
+    engine: Engine, workflow: WorkflowRuntime, name: str, group: str | None = None, node_type: str = "_PassThrough"
+) -> None:
     _ok(
         engine,
         workflow,
-        CreateNodeRequest(node_type="_PassThrough", specific_library_name=_LIBRARY, node_name=name),
+        CreateNodeRequest(node_type=node_type, specific_library_name=_LIBRARY, node_name=name),
+        group,
+    )
+
+
+def _connect(engine: Engine, workflow: WorkflowRuntime, source: str, target: str, group: str | None = None) -> None:
+    _ok(
+        engine,
+        workflow,
+        CreateConnectionRequest(
+            source_node_name=source,
+            source_parameter_name="result",
+            target_node_name=target,
+            target_parameter_name="value",
+        ),
         group,
     )
 
@@ -351,6 +416,199 @@ class TestGroups:
         assert a is not None
         assert a.state is NodeResolutionState.RESOLVED
         assert a.parameter_output_values["result"] == "a ran"
+
+
+class TestWhatAnUndoLeavesAlone:
+    def test_a_node_the_step_did_not_touch_is_left_in_place(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        before = _node(workflow, "b")
+        _set(engine, workflow, "a", "first", group="type")
+
+        _undo(engine, workflow)
+
+        assert _node(workflow, "b") is before
+
+    def test_an_object_a_save_cannot_hold_survives(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """A loaded model would otherwise be freed, and loaded again on the next run."""
+        _add(engine, workflow, "loader", node_type="_HoldsAnObject")
+        _add(engine, workflow, "other")
+        model = object()
+        loader = _node(workflow, "loader")
+        assert loader is not None
+        loader.parameter_output_values["model"] = model
+        loader.state = NodeResolutionState.RESOLVED
+        _set(engine, workflow, "other", "edited", group="type")
+
+        _undo(engine, workflow)
+
+        loader = _node(workflow, "loader")
+        assert loader is not None
+        assert loader.parameter_output_values["model"] is model
+        assert loader.state is NodeResolutionState.RESOLVED
+
+    def test_moving_a_node_back_moves_the_same_node(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        before = _node(workflow, "a")
+        _ok(engine, workflow, SetNodeMetadataRequest(node_name="a", metadata={"position": {"x": 9, "y": 9}}), "drag")
+
+        _undo(engine, workflow)
+
+        assert _node(workflow, "a") is before
+
+    def test_a_metadata_key_the_step_added_is_removed(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _ok(engine, workflow, SetNodeMetadataRequest(node_name="a", metadata={"note": "hi"}), "annotate")
+
+        _undo(engine, workflow)
+
+        a = _node(workflow, "a")
+        assert a is not None
+        assert "note" not in a.metadata
+
+    def test_a_flow_metadata_key_the_step_added_is_removed(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _ok(engine, workflow, SetFlowMetadataRequest(metadata={"note": 1}), "annotate")
+
+        _undo(engine, workflow)
+
+        flow = workflow.top_level_flow()
+        assert flow is not None
+        assert "note" not in flow.metadata
+
+    def test_unlocking_keeps_the_node(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        before = _node(workflow, "a")
+        _ok(engine, workflow, SetLockNodeStateRequest(node_name="a", lock=True), group="lock")
+
+        _undo(engine, workflow)
+
+        assert _node(workflow, "a") is before
+        assert before is not None
+        assert not before.lock
+
+    def test_a_node_downstream_of_a_rebuilt_one_is_kept_and_runs_again(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        _connect(engine, workflow, "a", "b")
+        before = _node(workflow, "b")
+        _set(engine, workflow, "a", "first", group="type")
+        _ran(workflow, "a", "b")
+
+        _undo(engine, workflow)
+
+        b = _node(workflow, "b")
+        assert b is before
+        assert b is not None
+        assert b.state is NodeResolutionState.UNRESOLVED
+        assert len(workflow.flows.connections.connections) == 1
+
+    def test_a_kept_node_a_rebuilt_neighbor_changes_is_rebuilt_too(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b", node_type="_ForgetsOnDisconnect")
+        volume = 5
+        _ok(engine, workflow, SetParameterValueRequest(node_name="b", parameter_name="volume", value=volume))
+        _connect(engine, workflow, "a", "b")
+        before = _node(workflow, "b")
+        _set(engine, workflow, "a", "first", group="type")
+
+        _undo(engine, workflow)
+
+        b = _node(workflow, "b")
+        assert b is not None
+        assert b is not before
+        assert b.get_parameter_value("volume") == volume
+        assert len(workflow.flows.connections.connections) == 1
+        assert not workflow.undo.needs_checkpoint
+
+    def test_a_node_that_changes_back_on_reconnect_is_kept(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b", node_type="_GrowsOnConnect")
+        _connect(engine, workflow, "a", "b")
+        before = _node(workflow, "b")
+        assert before is not None
+        assert before.get_parameter_by_name("extra") is not None
+        _set(engine, workflow, "a", "first", group="type")
+
+        _undo(engine, workflow)
+
+        assert _node(workflow, "b") is before
+        assert before.get_parameter_by_name("extra") is not None
+
+    def test_a_group_the_step_did_not_touch_is_left_in_place(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        _ok(
+            engine,
+            workflow,
+            CreateNodeRequest(
+                node_type="_Group", specific_library_name=_LIBRARY, node_name="group", node_names_to_add=["a"]
+            ),
+        )
+        group = _node(workflow, "group")
+        member = _node(workflow, "a")
+        _set(engine, workflow, "b", "outside", group="type")
+
+        _undo(engine, workflow)
+
+        assert _node(workflow, "group") is group
+        assert _node(workflow, "a") is member
+
+    def test_a_change_inside_a_group_rebuilds_the_group(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        _ok(
+            engine,
+            workflow,
+            CreateNodeRequest(
+                node_type="_Group", specific_library_name=_LIBRARY, node_name="group", node_names_to_add=["a"]
+            ),
+        )
+        outside = _node(workflow, "b")
+        _set(engine, workflow, "a", "inside", group="type")
+
+        _undo(engine, workflow)
+
+        a = _node(workflow, "a")
+        assert a is not None
+        assert a.parent_group is _node(workflow, "group")
+        assert _value(workflow, "a") == ""
+        assert _node(workflow, "b") is outside
+
+    def test_a_node_connected_into_a_group_is_rebuilt_and_reconnected(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        _connect(engine, workflow, "a", "b")
+        _ok(
+            engine,
+            workflow,
+            CreateNodeRequest(
+                node_type="_Group", specific_library_name=_LIBRARY, node_name="group", node_names_to_add=["b"]
+            ),
+        )
+        connections_before = sorted(
+            (c.source_node.name, c.source_parameter.name, c.target_node.name, c.target_parameter.name)
+            for c in workflow.flows.connections.connections.values()
+        )
+        _set(engine, workflow, "a", "first", group="type")
+
+        _undo(engine, workflow)
+
+        assert _value(workflow, "a") == ""
+        connections_after = sorted(
+            (c.source_node.name, c.source_parameter.name, c.target_node.name, c.target_parameter.name)
+            for c in workflow.flows.connections.connections.values()
+        )
+        assert connections_after == connections_before
+        assert not workflow.undo.needs_checkpoint
+        _redo(engine, workflow)
+        assert _value(workflow, "a") == "first"
 
 
 class TestAStepThatChangesNothing:
@@ -610,6 +868,7 @@ class TestWhenUndoIsUnavailable:
         result = _send(engine, workflow, UndoRequest())
 
         assert isinstance(result, UndoResultFailure)
+        assert not result.workflow_rebuilt
         assert isinstance(result.result_details, ResultDetails)
         assert result.result_details.result_details[0].level == logging.INFO
 
@@ -634,18 +893,19 @@ class TestAFailedRebuild:
         _add(engine, workflow, "a")
         _set(engine, workflow, "a", "first", group="type")
 
-        def unbuildable(target: SerializedFlowCommands, live: SerializedFlowCommands) -> SerializedFlowCommands:
-            del live
-            create_command = target.serialized_node_commands[0].create_node_command
+        def unbuildable(target: SerializedFlowCommands, plan: RestorePlan) -> SerializedFlowCommands:
+            commands = commands_to_build(target, plan)
+            create_command = commands.serialized_node_commands[0].create_node_command
             create_command.node_type = "NoSuchNode"
             create_command.create_error_proxy_on_failure = False
-            return target
+            return commands
 
-        monkeypatch.setattr(manager_module, "carry_over_run_state", unbuildable)
+        monkeypatch.setattr(manager_module, "commands_to_build", unbuildable)
 
         result = _send(engine, workflow, UndoRequest())
 
         assert isinstance(result, UndoResultFailure)
+        assert result.workflow_rebuilt
         assert _value(workflow, "a") == "first"
         assert workflow.undo.undo_label is None
 
@@ -656,10 +916,12 @@ class TestAFailedRebuild:
         _add(engine, workflow, "a")
         _set(engine, workflow, "a", "first", group="type")
 
-        async def failing_rebuild(_self: Any, _workflow: WorkflowRuntime, _commands: SerializedFlowCommands) -> str:
+        async def failing_restore(
+            _self: Any, _workflow: WorkflowRuntime, _target: SerializedFlowCommands, _live: SerializedFlowCommands
+        ) -> str:
             return "it broke"
 
-        monkeypatch.setattr(manager_module.UndoManager, "_rebuild", failing_rebuild)
+        monkeypatch.setattr(manager_module.UndoManager, "_bring_to", failing_restore)
 
         result = _send(engine, workflow, UndoRequest())
 
