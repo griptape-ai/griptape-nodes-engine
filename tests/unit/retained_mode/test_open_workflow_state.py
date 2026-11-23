@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
@@ -105,9 +106,12 @@ async def _send_async(engine: Engine, request: RequestPayload, workflow: Workflo
     return (await engine.event_manager.ahandle_request(request, result_context=context)).result
 
 
+_edits = itertools.count()
+
+
 def _edit(engine: Engine, workflow: WorkflowRuntime) -> None:
     """Change `workflow` the way a client's edit does."""
-    result = _send(engine, SetFlowMetadataRequest(metadata={"edited": True}), workflow)
+    result = _send(engine, SetFlowMetadataRequest(metadata={"edit": next(_edits)}), workflow)
     assert result.succeeded(), result.result_details
     assert result.altered_workflow_state
 
@@ -273,6 +277,28 @@ class TestNodeMetadataChanges:
 
         moved = BatchSetNodeMetadataRequest(node_metadata_updates={"node": {"position": {"x": 6, "y": 6}}})
         _send(engine, moved, workflow)
+        assert engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+
+class TestFlowMetadataChanges:
+    def test_writing_the_values_it_already_has_changes_nothing(self, engine: Engine) -> None:
+        workflow = _open(engine, "annotated")
+        flow = workflow.top_level_flow()
+        assert flow is not None
+        flow.metadata["note"] = "kept"
+
+        result = _send(engine, SetFlowMetadataRequest(metadata=dict(flow.metadata)), workflow)
+
+        assert result.succeeded(), result.result_details
+        assert not result.altered_workflow_state
+        assert not engine.open_workflow_info(workflow).state.has_unsaved_changes
+
+    def test_a_change_marks_it(self, engine: Engine) -> None:
+        workflow = _open(engine, "annotated")
+
+        result = _send(engine, SetFlowMetadataRequest(metadata={"note": "new"}), workflow)
+
+        assert result.altered_workflow_state
         assert engine.open_workflow_info(workflow).state.has_unsaved_changes
 
 

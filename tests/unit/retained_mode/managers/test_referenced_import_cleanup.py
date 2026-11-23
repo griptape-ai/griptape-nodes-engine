@@ -167,7 +167,7 @@ class TestExecuteWorkflowImportCleanup:
             self._remove_with_children(request.flow_name)
             return DeleteFlowResultSuccess(result_details="ok")
         if self._metadata_ok:
-            return SetFlowMetadataResultSuccess(result_details="ok")
+            return SetFlowMetadataResultSuccess(result_details="ok", altered_workflow_state=True)
         return SetFlowMetadataResultFailure(result_details="no")
 
     def _get_parent_flow(self, _workflow: object, name: str) -> str | None:

@@ -686,8 +686,11 @@ class SetFlowMetadataRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class SetFlowMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Flow metadata updated successfully."""
+class SetFlowMetadataResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
+    """Flow metadata updated successfully.
+
+    `altered_workflow_state` is False when the flow already had the metadata.
+    """
 
 
 @dataclass
