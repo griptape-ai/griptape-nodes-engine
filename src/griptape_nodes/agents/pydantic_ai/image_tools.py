@@ -30,7 +30,7 @@ from griptape_nodes.agents.pydantic_ai.tool_approval import needs_approval
 from griptape_nodes.drivers.cloud_credentials import DEFAULT_CLOUD_BASE_URL, join_cloud_url
 from griptape_nodes.drivers.cloud_models import ProviderID
 from griptape_nodes.retained_mode.engine import current_engine
-from griptape_nodes.retained_mode.managers.access_manager import UnknownGriptapeCloudModelError
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
 from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_exception
 from griptape_nodes.utils.budget_refusal import describe_reply as describe_budget_refusal
 from griptape_nodes.utils.budget_refusal import log_line as budget_log_line
@@ -129,9 +129,11 @@ class ImageGenerationToolset:
         if not ctx.tool_call_approved and needs_approval(ctx.deps, [IMAGE_TOOL_NAME]):
             raise ApprovalRequired
 
-        denial_message = self._invoke_denial_message()
+        denial_message = current_engine().access_manager.chat_model_denial(
+            action=CheckpointAction.INVOKE_MODEL, connection_id=ProviderID.GRIPTAPE_CLOUD, model_name=self._config.model
+        )
         if denial_message is not None:
-            msg = f"Attempted to generate an image with model '{self._config.model}'. Failed because {denial_message}"
+            msg = f"Attempted to generate an image. Failed because {denial_message}"
             raise PermissionError(msg)
 
         payload: dict[str, object] = {
@@ -185,22 +187,6 @@ class ImageGenerationToolset:
             "output_format": self._config.output_format,
         }
         return {key: value for key, value in config.items() if value is not None}
-
-    def _invoke_denial_message(self) -> str | None:
-        """The `InvokeModel` denial reason for this toolset's image model, or `None` if it's permitted.
-
-        Image generation is Griptape Cloud-specific (see `AgentManager._build_runner`),
-        so the model always resolves against that connection.
-        """
-        try:
-            denial = current_engine().access_manager.evaluate_chat_model_invocation(
-                connection_id=ProviderID.GRIPTAPE_CLOUD, model_name=self._config.model
-            )
-        except UnknownGriptapeCloudModelError as e:
-            return str(e)
-        if denial is None:
-            return None
-        return denial.reason()
 
 
 def _run_headers(ctx: RunContext[Any]) -> dict[str, str]:

@@ -32,12 +32,12 @@ N sequential calls from one handler produce N independent verdicts.
 `resolve_chat_model` resolves one sidebar model name to a checkpoint's id,
 provider and family -- a Griptape Cloud model name against the engine's own
 catalog (`ENGINE_MODEL_CATALOG`), a local or custom one to a derived
-`<provider>/<model>` id. `evaluate_chat_model_access` (`OfferModel`) and
-`evaluate_chat_model_invocation` (`InvokeModel`) are both called in-process by
-`AgentManager` rather than through an event, and both build the checkpoint's
+`<provider>/<model>` id. `chat_model_denial` asks either checkpoint
+(`OfferModel` or `InvokeModel`) for one such model, called in-process by
+`AgentManager` rather than through an event, and builds the checkpoint's
 attributes with `_checkpoint_attributes`, the same code `_evaluate` uses, so a
-provider- or family-scoped rule gates a node's dropdown, the chat sidebar's
-offer, and the chat sidebar's invocation identically.
+provider- or family-scoped rule gates a node's dropdown and the chat sidebar
+identically.
 
 This manager depends on the event bus (for the hook chain), the `LibraryRegistry`
 (for library catalog resolution), and the engine's own model catalog in
@@ -84,7 +84,6 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
     CheckpointAttribute,
-    CheckpointDenial,
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -123,26 +122,14 @@ class _NodeResolution:
 def build_derived_model_id(provider_id: str, model_name: str) -> str:
     """Join a provider and model into the `<provider>/<model>` id a local or custom model gates on.
 
-    `provider_id` must not itself contain `/`: `split_derived_model_id` recovers it
-    by splitting at the FIRST `/`, so a provider id that contained one would make
-    every derived id under it ambiguous to split back apart.
+    `provider_id` must not itself contain `/`, so the join stays unambiguous: a
+    provider id with one would make it impossible to tell where the provider
+    ends and the model begins.
     """
     if "/" in provider_id:
         msg = f"Attempted to build a derived model id. Failed because provider id '{provider_id}' contains '/'."
         raise ValueError(msg)
     return f"{provider_id}/{model_name}"
-
-
-def split_derived_model_id(derived_id: str) -> tuple[str, str]:
-    """Split a derived `<provider>/<model>` id into its provider and model, at the FIRST `/`.
-
-    The model half may itself contain `/` (e.g. an Ollama model pulled from the
-    Hugging Face Hub, ``ollama/hf.co/user/model:tag``), so only the first `/` is
-    the provider boundary -- splitting on the last or on every `/` would cut into
-    the model name instead.
-    """
-    provider_id, _, model_name = derived_id.partition("/")
-    return provider_id, model_name
 
 
 # Indexes ENGINE_MODEL_CATALOG's Griptape Cloud models by the wire name the sidebar sends.
@@ -151,17 +138,6 @@ _ENGINE_CATALOG_BY_PROVIDER_MODEL_ID: dict[str, ResolvedModel] = {
     for resolved in iter_catalog_models(ENGINE_MODEL_CATALOG)
     if resolved.model.provider_model_id is not None
 }
-
-
-class UnknownGriptapeCloudModelError(ValueError):
-    """A `griptape_cloud` model name is not in the engine catalog.
-
-    `ConfigureAgentRequest` and a hand-edited config file can name an arbitrary
-    string for this provider. Resolving it to a bare id with no provider or
-    family would let it escape every provider- and family-scoped deny rule --
-    exactly the hole this catalog closes -- so callers must refuse it directly
-    rather than ask policy.
-    """
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -298,20 +274,21 @@ class AccessManager(EngineScoped):
             result_details=f"Evaluated {len(verdicts)} candidate model(s) in catalog '{request.library_name}'.",
         )
 
-    def evaluate_chat_model_access(self, *, connection_id: str, model_name: str) -> ModelAccessVerdict:
-        """`OfferModel` for one chat/image model named by the sidebar.
+    def chat_model_denial(self, *, action: CheckpointAction, connection_id: str, model_name: str) -> str | None:
+        """One formatted refusal for a chat/image model, or `None` when it's permitted.
 
-        `AgentManager` calls this in-process (not through an event) once per
-        candidate the sidebar would list -- the same per-candidate ask a node's
-        model dropdown makes. See `resolve_chat_model` for how `connection_id`
-        and `model_name` become the checkpoint's id, provider, and family.
-
-        Raises:
-            UnknownGriptapeCloudModelError: `connection_id` is `griptape_cloud`
-                and `model_name` is not in the engine catalog. The caller must
-                refuse the request; this is never offered and never asked of policy.
+        `AgentManager` calls this in-process (not through an event), passing
+        `OFFER_MODEL` for a sidebar listing or a provider create/update/configure,
+        and `INVOKE_MODEL` for the gate that matters: before `_build_runner`
+        builds or reuses a runner, and before each image-generation call --
+        because `agent.providers` can be edited in the config file directly,
+        bypassing every offer check. See `resolve_chat_model` for how
+        `connection_id` and `model_name` resolve to a checkpoint's id, provider,
+        and family.
         """
         resolved = self.resolve_chat_model(connection_id=connection_id, model_name=model_name)
+        if resolved is None:
+            return f"'{model_name}' is not a Griptape Cloud catalog model."
         attributes = self._checkpoint_attributes(
             resolved.model_id,
             node_type=None,
@@ -320,44 +297,15 @@ class AccessManager(EngineScoped):
         )
         denial = self.engine.event_manager.evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
-                action=CheckpointAction.OFFER_MODEL,
+                action=action,
                 subject_type=CheckpointSubjectType.MODEL,
                 subject_id=resolved.model_id,
                 attributes=attributes,
             )
         )
-        return ModelAccessVerdict(model_id=resolved.model_id, provider_model_id=model_name, denial=denial)
-
-    def evaluate_chat_model_invocation(self, *, connection_id: str, model_name: str) -> CheckpointDenial | None:
-        """`InvokeModel` for one chat/image model about to be used.
-
-        `AgentManager` calls this in-process before `_build_runner` builds or
-        reuses a runner, and the image-generation tool calls it before each
-        call -- the gate that matters, because `agent.providers` can be edited
-        in the config file directly, bypassing every `OfferModel` check.
-        Resolution is identical to `evaluate_chat_model_access`; see
-        `resolve_chat_model`.
-
-        Raises:
-            UnknownGriptapeCloudModelError: `connection_id` is `griptape_cloud`
-                and `model_name` is not in the engine catalog. The caller must
-                refuse the run; this is never invoked and never asked of policy.
-        """
-        resolved = self.resolve_chat_model(connection_id=connection_id, model_name=model_name)
-        attributes = self._checkpoint_attributes(
-            resolved.model_id,
-            node_type=None,
-            provider_id=resolved.provider_id,
-            model_families=resolved.model_families,
-        )
-        return self.engine.event_manager.evaluate_authorization_checkpoint(
-            AuthorizationCheckpoint(
-                action=CheckpointAction.INVOKE_MODEL,
-                subject_type=CheckpointSubjectType.MODEL,
-                subject_id=resolved.model_id,
-                attributes=attributes,
-            )
-        )
+        if denial is None:
+            return None
+        return f"model '{model_name}' is not permitted: {denial.reason()}"
 
     def _resolve_node_library(self, node_type: str, specific_library_name: str | None) -> _NodeResolution:
         """Look up the node's library and return its declarations plus a model-id index.
@@ -443,7 +391,7 @@ class AccessManager(EngineScoped):
         return ordered
 
     @staticmethod
-    def resolve_chat_model(*, connection_id: str, model_name: str) -> ChatModelResolution:
+    def resolve_chat_model(*, connection_id: str, model_name: str) -> ChatModelResolution | None:
         """Resolve one sidebar model name to the id/provider/family an `OfferModel` checkpoint gates on.
 
         `connection_id` is the sidebar's connection type (`griptape_cloud`,
@@ -455,12 +403,11 @@ class AccessManager(EngineScoped):
         gets a derived id under its own provider (`custom` maps to
         `custom_endpoint`), with no family.
 
-        Raises:
-            UnknownGriptapeCloudModelError: `connection_id` is `griptape_cloud`
-                and `model_name` is not in the engine catalog. There is no bare-id
-                fallback for this provider: an unresolved id would carry no
-                provider or family and so escape every provider- and
-                family-scoped deny rule.
+        Returns:
+            `None` when `connection_id` is `griptape_cloud` and `model_name` is
+                not in the engine catalog. There is no bare-id fallback for this
+                provider: an unresolved id would carry no provider or family and
+                so escape every provider- and family-scoped deny rule.
         """
         if connection_id != ProviderID.GRIPTAPE_CLOUD:
             provider_id = CUSTOM_ENDPOINT_PROVIDER_ID if connection_id == ProviderID.CUSTOM else connection_id
@@ -471,8 +418,7 @@ class AccessManager(EngineScoped):
             )
         resolved = _ENGINE_CATALOG_BY_PROVIDER_MODEL_ID.get(model_name)
         if resolved is None:
-            msg = f"'{model_name}' is not a Griptape Cloud catalog model."
-            raise UnknownGriptapeCloudModelError(msg)
+            return None
         families = [resolved.model.family] if resolved.model.family else None
         return ChatModelResolution(
             model_id=resolved.model_id, provider_id=resolved.provider_id, model_families=families

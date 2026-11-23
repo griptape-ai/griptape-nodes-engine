@@ -177,7 +177,7 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     ListLibraryMCPServersRequest,
     ListLibraryMCPServersResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.access_manager import UnknownGriptapeCloudModelError
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -718,45 +718,8 @@ class AgentManager(EngineScoped):
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         return ProviderConfig(name=_PROTECTED_PROVIDER_NAME, type=_PROTECTED_PROVIDER_NAME, model=default_model)
 
-    def _model_offer_denial_message(self, *, connection_id: str, model_name: str) -> str | None:
-        """The `OfferModel` denial reason for one provider+model pair, or `None` when it's permitted.
-
-        Treats an unrecognized Griptape Cloud model name the same as a denial: a
-        free-form `model` field (`ConfigureAgentRequest`, a provider create/edit)
-        can name one that was never in the engine catalog, which is refused
-        rather than resolved to a bare id that would escape every provider- and
-        family-scoped rule.
-        """
-        try:
-            verdict = self.engine.access_manager.evaluate_chat_model_access(
-                connection_id=connection_id, model_name=model_name
-            )
-        except UnknownGriptapeCloudModelError as e:
-            return str(e)
-        if verdict.denial is None:
-            return None
-        return verdict.denial.reason()
-
-    def _model_invoke_denial_message(self, *, connection_id: str, model_name: str) -> str | None:
-        """The `InvokeModel` denial reason for one provider+model pair about to be used, or `None` if permitted.
-
-        Mirrors `_model_offer_denial_message` but for the gate that matters: a
-        provider edited into the config file directly skips every offer check,
-        so this runs again right before a runner is built or reused, and before
-        each image-generation call.
-        """
-        try:
-            denial = self.engine.access_manager.evaluate_chat_model_invocation(
-                connection_id=connection_id, model_name=model_name
-            )
-        except UnknownGriptapeCloudModelError as e:
-            return str(e)
-        if denial is None:
-            return None
-        return denial.reason()
-
     def _update_provider_denial_message(self, existing: ProviderConfig, pd: UpdateProviderPayload) -> str | None:
-        """The offer-denial sentence for an update's resulting type+model pair, or `None` when it's permitted.
+        """The `OfferModel` refusal for an update's resulting type+model pair, or `None` when it's permitted.
 
         Only re-checks when the update actually sets `type` or `model`: tightening
         policy against an already-configured provider must not retroactively
@@ -766,38 +729,44 @@ class AgentManager(EngineScoped):
             return None
         effective_type = pd.type if pd.type is not None else existing.type
         effective_model = pd.model if pd.model is not None else existing.model
-        denial_message = self._model_offer_denial_message(connection_id=effective_type, model_name=effective_model)
-        if denial_message is None:
-            return None
-        return f"model '{effective_model}' is not permitted: {denial_message}"
+        return self.engine.access_manager.chat_model_denial(
+            action=CheckpointAction.OFFER_MODEL, connection_id=effective_type, model_name=effective_model
+        )
 
     def _configure_request_denial_message(self, request: ConfigureAgentRequest) -> str | None:
-        """The offer-denial sentence for every provider+model pair this `ConfigureAgentRequest` writes.
+        """The `OfferModel` refusal for every provider+model pair this `ConfigureAgentRequest` writes.
 
         See `on_handle_configure_agent_request` for which pair each field maps
         to. Checks in field order and returns the first denial found.
         """
+        access_manager = self.engine.access_manager
         pd = request.prompt_driver
         if "model" in pd.model_fields_set and pd.model:
             prompt_provider = self._get_provider(None)
-            denial_message = self._model_offer_denial_message(connection_id=prompt_provider.type, model_name=pd.model)
-            if denial_message is not None:
-                return f"model '{pd.model}' is not permitted: {denial_message}"
-        if request.active_provider:
-            switched_provider = self._get_provider(request.active_provider)
-            denial_message = self._model_offer_denial_message(
-                connection_id=switched_provider.type, model_name=switched_provider.model
+            denial_message = access_manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id=prompt_provider.type, model_name=pd.model
             )
             if denial_message is not None:
-                return f"model '{switched_provider.model}' is not permitted: {denial_message}"
+                return denial_message
+        if request.active_provider:
+            switched_provider = self._get_provider(request.active_provider)
+            denial_message = access_manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL,
+                connection_id=switched_provider.type,
+                model_name=switched_provider.model,
+            )
+            if denial_message is not None:
+                return denial_message
         if "model" in request.image_generation_driver:
             new_image_model = str(request.image_generation_driver["model"])
             if new_image_model:
-                denial_message = self._model_offer_denial_message(
-                    connection_id=ProviderID.GRIPTAPE_CLOUD, model_name=new_image_model
+                denial_message = access_manager.chat_model_denial(
+                    action=CheckpointAction.OFFER_MODEL,
+                    connection_id=ProviderID.GRIPTAPE_CLOUD,
+                    model_name=new_image_model,
                 )
                 if denial_message is not None:
-                    return f"image model '{new_image_model}' is not permitted: {denial_message}"
+                    return denial_message
         return None
 
     def _offer_split(
@@ -807,13 +776,13 @@ class AgentManager(EngineScoped):
         allowed: list[str] = []
         denied: dict[str, str] = {}
         for name in model_names:
-            verdict = self.engine.access_manager.evaluate_chat_model_access(
-                connection_id=connection_id, model_name=name
+            denial_message = self.engine.access_manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id=connection_id, model_name=name
             )
-            if verdict.denial is None:
+            if denial_message is None:
                 allowed.append(name)
             else:
-                denied[name] = verdict.denial.reason()
+                denied[name] = denial_message
         return _ModelOfferSplit(allowed=allowed, denied=denied)
 
     def _on_config_changed(self, event: ConfigChanged) -> None:
@@ -1037,7 +1006,9 @@ class AgentManager(EngineScoped):
         """
         provider = self._get_provider(provider_name)
         effective_model_name = model_name or provider.model
-        denial_message = self._model_invoke_denial_message(connection_id=provider.type, model_name=effective_model_name)
+        denial_message = self.engine.access_manager.chat_model_denial(
+            action=CheckpointAction.INVOKE_MODEL, connection_id=provider.type, model_name=effective_model_name
+        )
         if denial_message is not None:
             msg = f"Attempted to run the agent. Failed because {denial_message}"
             raise PermissionError(msg)
@@ -1711,10 +1682,12 @@ class AgentManager(EngineScoped):
                 result_details=f"Attempted to create provider. Failed because a provider named '{name}' already exists."
             )
         model = pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o")
-        denial_message = self._model_offer_denial_message(connection_id=pd.type, model_name=model)
+        denial_message = self.engine.access_manager.chat_model_denial(
+            action=CheckpointAction.OFFER_MODEL, connection_id=pd.type, model_name=model
+        )
         if denial_message is not None:
             return CreateAgentProviderResultFailure(
-                result_details=f"Attempted to create provider '{name}'. Failed because model '{model}' is not permitted: {denial_message}"
+                result_details=f"Attempted to create provider '{name}'. Failed because {denial_message}"
             )
         raw_secret_name = pd.api_key_secret_name or ""
         api_key_secret_name = None

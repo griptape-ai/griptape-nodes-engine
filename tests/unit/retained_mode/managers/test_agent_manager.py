@@ -100,7 +100,6 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     ListLibraryMCPServersResultSuccess,
     MCPServerConfig,
 )
-from griptape_nodes.retained_mode.managers.access_manager import UnknownGriptapeCloudModelError
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
     _SKILLS_README,
@@ -386,7 +385,10 @@ class TestOnHandleListAgentModelsRequest:
 
         assert isinstance(result, ListAgentModelsResultSuccess)
         assert "claude-sonnet-5" not in result.prompt_models
-        assert result.denied_prompt_models["claude-sonnet-5"] == "Sonnet is not in your plan."
+        assert (
+            result.denied_prompt_models["claude-sonnet-5"]
+            == "model 'claude-sonnet-5' is not permitted: Sonnet is not in your plan."
+        )
         # Every other model stays allowed.
         assert len(result.prompt_models) == len(MODEL_CHOICES) - 1
         assert result.denied_image_models == {}
@@ -407,7 +409,10 @@ class TestOnHandleListAgentModelsRequest:
 
         assert isinstance(result, ListAgentModelsResultSuccess)
         assert denied_image_model not in result.image_models
-        assert result.denied_image_models[denied_image_model] == "Image generation is off."
+        assert (
+            result.denied_image_models[denied_image_model]
+            == f"model '{denied_image_model}' is not permitted: Image generation is off."
+        )
         assert result.denied_prompt_models == {}
 
     def test_every_model_denied_returns_an_empty_allowed_list(
@@ -1948,10 +1953,9 @@ class TestRunAgentInvokeGate:
     def _manager(
         monkeypatch: pytest.MonkeyPatch,
         *,
-        denial: CheckpointDenial | None,
-        raises: Exception | None = None,
+        denial_message: str | None,
     ) -> tuple[AgentManager, MagicMock]:
-        """A manager whose `InvokeModel` check answers with `denial` (or raises `raises`), and a spy on `_build_runner`."""
+        """A manager whose `InvokeModel` check answers with `denial_message`, and a spy on `_build_runner`."""
         manager = AgentManager.__new__(AgentManager)
         manager._active_runs = {}
         manager._mcp_toolsets = MCPToolsetCache()
@@ -1971,25 +1975,21 @@ class TestRunAgentInvokeGate:
         build_runner_mock = MagicMock(side_effect=AssertionError("_build_runner must not be reached when denied"))
         monkeypatch.setattr(manager, "_build_runner", build_runner_mock)
 
-        def evaluate_chat_model_invocation(**_kwargs: object) -> CheckpointDenial | None:
-            if raises is not None:
-                raise raises
-            return denial
-
         manager._engine = SimpleNamespace(  # type: ignore[assignment]
             event_manager=SimpleNamespace(put_event=lambda _e: None),
             handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
             ahandle_request=_no_attribution,
             library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
             only_open_workflow_or_none=lambda: None,
-            access_manager=SimpleNamespace(evaluate_chat_model_invocation=evaluate_chat_model_invocation),
+            access_manager=SimpleNamespace(chat_model_denial=lambda **_kw: denial_message),
         )
         return manager, build_runner_mock
 
     @pytest.mark.asyncio
     async def test_denied_model_refuses_the_run_before_building_a_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        denial = CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
-        manager, build_runner_mock = self._manager(monkeypatch, denial=denial)
+        manager, build_runner_mock = self._manager(
+            monkeypatch, denial_message="model 'gpt-4o' is not permitted: Sonnet is not in your plan."
+        )
 
         result = await manager.on_handle_run_agent_request(_run_request())
 
@@ -2000,7 +2000,7 @@ class TestRunAgentInvokeGate:
     @pytest.mark.asyncio
     async def test_no_hook_proceeds_to_build_the_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No hook registered: everything is allowed, as today."""
-        manager, build_runner_mock = self._manager(monkeypatch, denial=None)
+        manager, build_runner_mock = self._manager(monkeypatch, denial_message=None)
 
         async def fake_run(*_a: object, **_k: object) -> AgentRunResult:
             return AgentRunResult(thread_id="t1", output="done", message_count=2)
@@ -2019,9 +2019,7 @@ class TestRunAgentInvokeGate:
     ) -> None:
         """A denied default model (never chosen by the user) is refused on the first run; nothing picks another."""
         manager, build_runner_mock = self._manager(
-            monkeypatch,
-            denial=None,
-            raises=UnknownGriptapeCloudModelError("'not-a-real-model' is not a Griptape Cloud catalog model."),
+            monkeypatch, denial_message="'not-a-real-model' is not a Griptape Cloud catalog model."
         )
         # As if `agent.providers` was edited in the config file directly, bypassing every offer check.
         manager._providers = [ProviderConfig(name="griptape_cloud", type="griptape_cloud", model="not-a-real-model")]
@@ -2035,8 +2033,9 @@ class TestRunAgentInvokeGate:
     @pytest.mark.asyncio
     async def test_provider_rule_refuses_running_on_a_denied_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Provider rules: denying `ModelProvider::"ollama"` refuses running on one, not just creating one."""
-        denial = CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
-        manager, build_runner_mock = self._manager(monkeypatch, denial=denial)
+        manager, build_runner_mock = self._manager(
+            monkeypatch, denial_message="model 'llama3.2' is not permitted: Local models are off."
+        )
         # As if `agent.providers` was edited in the config file directly, bypassing every offer check.
         manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3.2")]
         manager._active_provider_name = "my-ollama"
@@ -2099,7 +2098,7 @@ class TestRunAgentResultPayloadContract:
             library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
             only_open_workflow_or_none=lambda: None,
             # These tests are about the payload shape, not policy: always allow.
-            access_manager=SimpleNamespace(evaluate_chat_model_invocation=lambda **_kw: None),
+            access_manager=SimpleNamespace(chat_model_denial=lambda **_kw: None),
         )
         return manager
 
