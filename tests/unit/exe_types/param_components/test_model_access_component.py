@@ -135,6 +135,7 @@ def _build_probe_node_with_component(
     default_model: str,
     initial_stored_value: str | None = None,
     deprecated_values: dict[str, str] | None = None,
+    keep_unlisted_values: bool = False,
 ) -> tuple[_AccessProbeNode, ModelAccessComponent, Parameter]:
     """Build node + parameter + component (fully installed) and return all three.
 
@@ -172,6 +173,7 @@ def _build_probe_node_with_component(
         model_choices=model_choices,
         default_model=default_model,
         deprecated_values=deprecated_values,
+        keep_unlisted_values=keep_unlisted_values,
     )
     return node, component, param
 
@@ -1106,6 +1108,92 @@ class TestDeprecatedValuesMigration:
         )
 
         assert node.get_parameter_value(param.name) == "beta"
+
+
+class TestKeepUnlistedValues:
+    """A saved model the list does not offer stays as saved, and is reported by name.
+
+    The kept value is deliberately not ``choices[0]``, so a test cannot pass
+    because ``Options`` snapped it there.
+    """
+
+    def test_an_unlisted_value_is_snapped_to_the_first_choice_by_default(self) -> None:
+        node, helper, param = _build_probe_node_with_component(model_choices=["alpha", "beta"], default_model="beta")
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True, skip_before_value_set=True)
+
+        assert node.get_parameter_value(param.name) == "alpha"
+        assert helper.unlisted_selection_error() is None
+
+    def test_an_unlisted_value_is_kept_on_the_workflow_load_path(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True, skip_before_value_set=True)
+
+        assert node.get_parameter_value(param.name) == "gamma"
+
+    def test_the_error_names_the_unlisted_model(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        error = helper.unlisted_selection_error()
+
+        assert isinstance(error, ValueError)
+        assert "'gamma'" in str(error)
+
+    def test_a_listed_value_has_no_error(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "alpha")
+
+        assert helper.unlisted_selection_error() is None
+
+    def test_a_legacy_value_still_migrates(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+            keep_unlisted_values=True,
+        )
+
+        node.set_parameter_value(param.name, "Beta", initial_setup=True)
+
+        assert node.get_parameter_value(param.name) == "beta"
+        assert helper.unlisted_selection_error() is None
+
+    def test_the_unlisted_value_is_not_offered(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        assert [row["name"] for row in param.ui_options["data"]] == ["alpha", "beta"]
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert "gamma" not in options_trait.choices
+
+    def test_reinstalled_options_still_keep_unlisted_values(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        helper.reinstall_options()
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        assert node.get_parameter_value(param.name) == "gamma"
+
+    def test_a_connected_driver_has_no_error(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, object(), initial_setup=True)
+
+        assert helper.unlisted_selection_error() is None
 
 
 class TestMigrateValue:

@@ -70,6 +70,13 @@ never restates its own parameter's name. ``query_for_denial(value)`` and
 ``raise_if_denied(value)`` remain for the rare caller holding a model id from
 somewhere other than the dropdown.
 
+A saved value outside ``model_choices`` that no ``deprecated_values`` key
+covers is replaced with ``choices[0]`` by default. A node whose list used to be
+open-ended (fetched from the provider, say) passes ``keep_unlisted_values=True``
+instead: the value is stored as saved, and the node reports
+``unlisted_selection_error()`` from its validation and execute paths so the run
+fails naming that model rather than quietly using another.
+
 Nodes that reinstall the ``Options`` trait themselves (e.g. after a driver
 disconnect) call ``reinstall_options()`` to put the component's trait +
 decoration + badge back in place.
@@ -157,7 +164,7 @@ class ModelAccessComponent:
     -- gate the node's execute path against the current policy.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         node: BaseNode,
@@ -165,6 +172,7 @@ class ModelAccessComponent:
         model_choices: list[str],
         default_model: str,
         deprecated_values: dict[str, str] | None = None,
+        keep_unlisted_values: bool = False,
     ) -> None:
         """Attach the component to an already-added Parameter and decorate it.
 
@@ -180,6 +188,13 @@ class ModelAccessComponent:
         parameter's current stored value is migrated the same way at
         construction, before the denied-default relocation described in the
         class docstring.
+
+        ``keep_unlisted_values`` stores a value outside both ``model_choices``
+        and ``deprecated_values`` as it is, rather than replacing it with
+        ``choices[0]``. That holds on every assignment, not only workflow load,
+        so a script or an upstream string is not rejected when it is set either.
+        The dropdown still offers only ``model_choices``. A node that sets it
+        must report ``unlisted_selection_error()``.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -202,6 +217,7 @@ class ModelAccessComponent:
         self._model_choices = list(model_choices)
         self._default_model = default_model
         self._deprecated_values = dict(deprecated_values or {})
+        self._keep_unlisted_values = keep_unlisted_values
         # The node's callout about a repaired dropdown. Named per parameter so a node with two
         # model parameters can hold two components.
         self._repair_message_name = f"{parameter.name}_model_list_updated"
@@ -218,7 +234,7 @@ class ModelAccessComponent:
         # Install decoration + traits. Options accepts legacy values too, so an
         # assignment carrying one is never snapped to choices[0] before the
         # migration converter (added below) gets a chance to run.
-        parameter.add_trait(Options(choices=self._dropdown_choices()))
+        parameter.add_trait(self._build_options())
         parameter.add_trait(
             Button(
                 icon=_REFRESH_ICON,
@@ -307,7 +323,7 @@ class ModelAccessComponent:
         parameter = self._parameter
         for existing in parameter.find_elements_by_type(Options):
             parameter.remove_trait(existing)
-        parameter.add_trait(Options(choices=self._dropdown_choices()))
+        parameter.add_trait(self._build_options())
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
@@ -447,6 +463,25 @@ class ModelAccessComponent:
         """``raise_if_denied`` against the current selection. See ``selection_denial``."""
         self.raise_if_denied(self.selected_value)
 
+    def unlisted_selection_error(self) -> ValueError | None:
+        """The error naming the current selection if it is a model this node does not offer, else ``None``.
+
+        Only a node built with ``keep_unlisted_values=True`` can hold such a
+        selection; without it, ``Options`` replaces the value on assignment.
+        Return it from ``validate_before_workflow_run`` and raise it at the top
+        of the execute path. A non-``str`` selection (a connected driver) is not
+        the dropdown's to judge, and returns ``None``.
+        """
+        selection = self.selected_value
+        if not isinstance(selection, str):
+            return None
+        if selection in self._model_choices:
+            return None
+        return ValueError(
+            f"Attempted to use model '{selection}'. Failed because this node does not offer that model. "
+            "Pick a model from the list."
+        )
+
     def pick_permitted_default(self) -> str | None:
         """Return the value the node should use as its ``default_value=``, or ``None``.
 
@@ -508,8 +543,8 @@ class ModelAccessComponent:
         if retired and isinstance(value, str):
             # The trait converters that ran before this one belonged to the stale
             # ``Options``, so a retired value with no migration passed them. Run the
-            # repaired trait's own, so it lands on ``choices[0]`` like any other
-            # assignment outside the list.
+            # repaired trait's own, so it is handled like any other assignment outside
+            # the list: it lands on ``choices[0]``, or is kept with ``keep_unlisted_values``.
             for options in self._parameter.find_elements_by_type(Options):
                 for converter in options.converters_for_trait():
                     value = converter(value)
@@ -635,6 +670,10 @@ class ModelAccessComponent:
                 f"deprecated_values is invalid: {'; '.join(problems)}."
             )
             raise ValueError(msg)
+
+    def _build_options(self) -> Options:
+        """The ``Options`` trait the component installs, over ``_dropdown_choices``."""
+        return Options(choices=self._dropdown_choices(), keep_unlisted=self._keep_unlisted_values)
 
     def _dropdown_choices(self) -> list[str]:
         """The list handed to ``Options.choices``: current choices plus legacy keys.
