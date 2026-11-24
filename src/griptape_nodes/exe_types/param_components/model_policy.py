@@ -81,6 +81,15 @@ CHECK_FAILED_DECORATION = DenialDecoration(
     badge_lead="`{value}` can't be used right now.",
 )
 
+# For a saved model a node's list does not offer, kept by ``keep_unlisted_values``. Neither a
+# license verdict nor an engine fault, so it reads as neither.
+UNLISTED_DECORATION = DenialDecoration(
+    icon="alert-triangle",
+    row_subtitle="Not offered by this node",
+    badge_title="Model Not Available",
+    badge_lead="Model `{value}` is not offered by this node.",
+)
+
 
 @dataclass(frozen=True)
 class ModelPolicySnapshot:

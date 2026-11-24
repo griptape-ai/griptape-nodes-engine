@@ -135,6 +135,7 @@ def _build_probe_node_with_component(
     default_model: str,
     initial_stored_value: str | None = None,
     deprecated_values: dict[str, str] | None = None,
+    keep_unlisted_values: bool = False,
 ) -> tuple[_AccessProbeNode, ModelAccessComponent, Parameter]:
     """Build node + parameter + component (fully installed) and return all three.
 
@@ -172,6 +173,7 @@ def _build_probe_node_with_component(
         model_choices=model_choices,
         default_model=default_model,
         deprecated_values=deprecated_values,
+        keep_unlisted_values=keep_unlisted_values,
     )
     return node, component, param
 
@@ -1108,6 +1110,152 @@ class TestDeprecatedValuesMigration:
         assert node.get_parameter_value(param.name) == "beta"
 
 
+class TestKeepUnlistedValues:
+    """A saved model the list does not offer stays as saved, and is reported by name.
+
+    The report goes through the existing selection gate (``selection_denial`` /
+    ``raise_if_selection_denied``), not a separate method. The kept value is
+    deliberately not ``choices[0]``, so a test cannot pass because ``Options``
+    snapped it there.
+    """
+
+    def test_an_unlisted_value_is_snapped_to_the_first_choice_by_default(self) -> None:
+        node, helper, param = _build_probe_node_with_component(model_choices=["alpha", "beta"], default_model="beta")
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True, skip_before_value_set=True)
+
+        assert node.get_parameter_value(param.name) == "alpha"
+        assert helper.selection_denial() is None
+        helper.raise_if_selection_denied()
+
+    def test_an_unlisted_value_is_kept_on_the_workflow_load_path(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True, skip_before_value_set=True)
+
+        assert node.get_parameter_value(param.name) == "gamma"
+
+    def test_selection_denial_names_the_unlisted_model(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        denial = helper.selection_denial()
+
+        assert denial is not None
+        assert "'gamma'" in denial.reason()
+
+    def test_raise_if_selection_denied_names_the_unlisted_model(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        with pytest.raises(RuntimeError, match="'gamma'"):
+            helper.raise_if_selection_denied()
+
+    def test_a_listed_value_has_no_error(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "alpha")
+
+        assert helper.selection_denial() is None
+        helper.raise_if_selection_denied()
+
+    def test_a_legacy_value_still_migrates(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+            keep_unlisted_values=True,
+        )
+
+        node.set_parameter_value(param.name, "Beta", initial_setup=True)
+
+        assert node.get_parameter_value(param.name) == "beta"
+        assert helper.selection_denial() is None
+
+    def test_the_unlisted_value_is_not_offered(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        assert [row["name"] for row in param.ui_options["data"]] == ["alpha", "beta"]
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert "gamma" not in options_trait.choices
+
+    def test_reinstalled_options_still_keep_unlisted_values(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        helper.reinstall_options()
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        assert node.get_parameter_value(param.name) == "gamma"
+
+    def test_a_connected_driver_has_no_error(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, object(), initial_setup=True)
+
+        assert helper.selection_denial() is None
+
+    def test_an_unlisted_value_is_badged_on_the_workflow_load_path(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True, skip_before_value_set=True)
+
+        badge = param.get_badge()
+        assert badge is not None
+        assert badge.title == "Model Not Available"
+        assert "`gamma`" in badge.message
+        assert "license" not in badge.message.lower()
+
+    def test_picking_a_listed_value_clears_the_unlisted_badge(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        node.set_parameter_value(param.name, "alpha")
+        helper.on_value_changed("alpha")
+
+        assert param.get_badge() is None
+
+    def test_selection_denial_message_does_not_call_an_unlisted_model_unpermitted(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        message = helper.selection_denial_message()
+
+        assert message is not None
+        assert "'gamma'" in message
+        assert "not permitted" not in message
+
+    def test_raise_if_selection_denied_does_not_call_an_unlisted_model_unpermitted(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        with pytest.raises(RuntimeError) as raised:
+            helper.raise_if_selection_denied()
+
+        assert "not permitted" not in str(raised.value)
+
+
 class TestMigrateValue:
     def test_returns_canonical_choice_for_a_legacy_value(self) -> None:
         _node, helper, _param = _build_probe_node_with_component(
@@ -1471,6 +1619,26 @@ class TestSelectionReadingApi:
             node.set_parameter_value(param.name, "alpha", initial_setup=True)
             with pytest.raises(RuntimeError, match="not permitted"):
                 helper.raise_if_selection_denied()
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_alpha)
+
+    def test_selection_denial_message_names_a_license_denial(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_alpha)
+        try:
+            node, helper, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="beta"
+            )
+            assert helper.selection_denial_message() is None
+
+            node.set_parameter_value(param.name, "alpha", initial_setup=True)
+            assert helper.selection_denial_message() == "Model 'alpha' is not permitted. Alpha not enabled."
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 
