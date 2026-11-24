@@ -40,8 +40,9 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
     def inject_metadata(self, pil_image: Image.Image, metadata: dict[str, str]) -> bytes:
         """Inject metadata into EXIF UserComment field as JSON.
 
-        Serializes metadata dictionary to JSON and stores in EXIF UserComment.
-        Preserves all existing EXIF tags.
+        Merges metadata over the JSON object already in UserComment and stores the result
+        as JSON. New metadata overwrites existing keys with the same name. A UserComment that
+        is not a JSON object is replaced. Preserves all other EXIF tags.
 
         Args:
             pil_image: PIL Image to inject metadata into
@@ -56,8 +57,9 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
         # Get existing EXIF data to preserve it
         exif_data = pil_image.getexif()
 
-        # Serialize metadata to JSON for UserComment field
-        metadata_json = json.dumps(metadata, separators=(",", ":"))
+        # Layer new metadata over the custom metadata already in UserComment
+        merged_metadata = {**self._read_user_comment_json(exif_data), **metadata}
+        metadata_json = json.dumps(merged_metadata, separators=(",", ":"))
 
         # Set UserComment field
         exif_data[EXIF_USERCOMMENT_TAG] = metadata_json
@@ -189,30 +191,42 @@ class ExifMetadataDriver(BaseImageMetadataDriver):
             exif_data: EXIF data object from PIL
             metadata: Dictionary to populate with custom metadata (modified in-place)
         """
+        custom_metadata = self._read_user_comment_json(exif_data)
+
+        # Merge custom metadata directly into metadata dict
+        for key, value in custom_metadata.items():
+            metadata[key] = str(value)
+
+        if custom_metadata:
+            logger.debug("Merged %d custom metadata entries from EXIF UserComment", len(custom_metadata))
+
+    def _read_user_comment_json(self, exif_data: Any) -> dict[str, Any]:
+        """Read the JSON object stored in the EXIF UserComment field.
+
+        Args:
+            exif_data: EXIF data object from PIL
+
+        Returns:
+            The parsed JSON object, empty dict if UserComment is missing or not a JSON object
+        """
         user_comment = exif_data.get(EXIF_USERCOMMENT_TAG)
         if not user_comment:
-            return
+            return {}
 
-        # Parse JSON from UserComment field
+        # Pillow handles the character code prefix, but might return bytes or string
+        if isinstance(user_comment, bytes):
+            comment_str = user_comment.decode("utf-8", errors="ignore").strip("\x00")
+        else:
+            comment_str = str(user_comment)
+
         try:
-            # Pillow handles the character code prefix, but might return bytes or string
-            if isinstance(user_comment, bytes):
-                comment_str = user_comment.decode("utf-8", errors="ignore").strip("\x00")
-            else:
-                comment_str = str(user_comment)
-
             custom_metadata = json.loads(comment_str)
-            if not isinstance(custom_metadata, dict):
-                logger.debug("UserComment is not a dict, skipping custom metadata")
-                return
-
-            # Merge custom metadata directly into metadata dict
-            for key, value in custom_metadata.items():
-                metadata[key] = str(value)
-
-            if custom_metadata:
-                logger.debug("Merged %d custom metadata entries from EXIF UserComment", len(custom_metadata))
-        except (json.JSONDecodeError, ValueError) as e:
+        except (ValueError, RecursionError) as e:
             logger.debug("Could not parse UserComment as JSON: %s", e)
-        except Exception as e:
-            logger.debug("Unexpected error parsing UserComment: %s", e)
+            return {}
+
+        if not isinstance(custom_metadata, dict):
+            logger.debug("UserComment is not a dict, skipping custom metadata")
+            return {}
+
+        return custom_metadata
