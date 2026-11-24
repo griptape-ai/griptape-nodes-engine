@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import zlib
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -62,10 +63,19 @@ from griptape_nodes.retained_mode.managers.undo.plan import (
     plan_restore,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
+from griptape_nodes.retained_mode.runtime.undo_history import (
+    OpenStep,
+    OutsideEdit,
+    RunOutput,
+    StepPending,
+    StepStillRunningError,
+)
 from griptape_nodes.serialization.commands import decode_commands, encode_commands
 from griptape_nodes.serialization.values import ValueEncodeError, dump_json
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator
+
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -83,34 +93,60 @@ _REBUILD_EVENTS = frozenset({ResultPayload, ExecutionPayload})
 
 
 @dataclass(eq=False)
-class _Recording:
-    """The step a request and everything it dispatches belong to.
+class _OutsideEdit:
+    """A client's request in no undo group, which drops what could be redone if it changes the workflow.
 
     Args:
-        workflow: The workflow the step changes.
-        label: What the step is called, or None for a client's change outside any step.
-        open: Whether the request is still being handled. A task it started can outlive it.
+        workflow: The workflow it acts on.
+        running: Whether the request is still being handled. A task it started can outlive it.
     """
 
     workflow: WorkflowRuntime
-    label: str | None
-    open: bool = True
+    running: bool = True
 
 
-# Nested requests inherit the step through the context. So do tasks a request starts, but only
-# until the request finishes: what a task changes after that is a change outside any step.
-_recording: ContextVar[_Recording | None] = ContextVar("undo_recording", default=None)
+# What the request being handled records into: the step it is part of, a change outside any step, or
+# nothing, for a run. Requests it dispatches and tasks it starts inherit it through the context.
+_recording: ContextVar[OpenStep | _OutsideEdit | None] = ContextVar("undo_recording", default=None)
 
 
-@dataclass(frozen=True)
-class DispatchScope:
-    token: Token[_Recording | None]
-    # What the request records into, or None for a run, which records into nothing.
-    recording: _Recording | None
-    # The workflow whose step the request is part of, or None for a run, which is part of none.
-    workflow: WorkflowRuntime | None
-    # Whether the request is part of a step, rather than a change outside any step.
-    in_step: bool = True
+class UndoDispatch:
+    """Undo's part in handling one request: noting what the request changed."""
+
+    def __init__(self, request: RequestPayload, workflow: WorkflowRuntime | None) -> None:
+        self._request = request
+        self._workflow = workflow
+
+    def note(self, result: ResultPayload) -> None:
+        """Note what ``result`` reports the request changed.
+
+        Call before anything squelches its ``altered_workflow_state``, such as a load keeping the
+        workflow from looking unsaved: the history has to know of every change, or an undo would
+        take it back.
+        """
+        request = self._request
+        if not result.altered_workflow_state:
+            return
+        if never_alters_workflow(type(request)):
+            logger.error(
+                "%s reported a change to the workflow, but its results say it never changes one, which "
+                "undo relies on before it runs. Give it results that can report a change.",
+                type(request).__name__,
+            )
+        if self._workflow is None:
+            return
+        history = self._workflow.undo
+        # An undo or redo leaves the workflow at a checkpoint, which its own result reports as a change.
+        if history.restoring or isinstance(request, (UndoRequest, RedoRequest)):
+            return
+        recording = _recording.get()
+        if isinstance(recording, OpenStep) and recording is history.open_step and recording.running:
+            history.note(StepPending(recording))
+        elif isinstance(recording, _OutsideEdit) and recording.workflow is self._workflow and recording.running:
+            history.note(OutsideEdit())
+        else:
+            # A run's change, or one a task made after the request that started it finished.
+            history.note(RunOutput())
 
 
 class UndoManager(EngineScoped):
@@ -118,98 +154,42 @@ class UndoManager(EngineScoped):
         super().__init__(engine)
         event_manager.register_request_handlers(self)
 
-    async def wait_for_open_step(
+    @asynccontextmanager
+    async def dispatch(
         self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
-    ) -> None:
-        """Wait until ``request`` can start a new step, if it starts one. Call right before `begin_dispatch`.
+    ) -> AsyncIterator[UndoDispatch]:
+        """Wrap handling ``request``, which acts on ``workflow``, so the history records what it changes.
 
-        A new step starts with a checkpoint of the workflow, which has to show the step before it
-        whole. So a request that starts one waits for the requests of the step before to finish,
-        such as an agent's, rather than checkpoint them halfway and take the rest into its own step.
+        A request that starts a new step first waits for the requests of the step before to finish,
+        such as an agent's, since the step starts with a checkpoint that has to show the step before
+        whole. Nothing awaits between the wait and the checkpoint, so no other request starts a step
+        in between.
         """
-        while workflow is not None and self.starts_step_while_another_runs(request, workflow, outermost=outermost):
-            await workflow.undo.wait_until_idle()
+        step = self._step_to_wait_for(request, workflow, outermost=outermost)
+        while step is not None:
+            await step.wait_until_idle()
+            step = self._step_to_wait_for(request, workflow, outermost=outermost)
+        with self._recording(request, workflow, outermost=outermost) as undo:
+            yield undo
 
-    def starts_step_while_another_runs(
-        self, request: RequestPayload, workflow: WorkflowRuntime, *, outermost: bool
-    ) -> bool:
-        """Whether ``request`` would start a new step while a request of the step before is still running."""
-        history = workflow.undo
-        return (
-            outermost
-            and not isinstance(request, (RunControlMixin, UndoRequest, RedoRequest))
-            and not never_alters_workflow(type(request))
-            and not history.restoring
-            and request.undo_group is not None
-            and request.undo_group != history.open_group
-            and history.in_flight > 0
-        )
-
-    def begin_dispatch(
+    @contextmanager
+    def dispatch_now(
         self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
-    ) -> DispatchScope | None:
-        """Start recording a request that is part of a step. Call before its handler runs.
+    ) -> Iterator[UndoDispatch]:
+        """`dispatch` for a request handled synchronously, which cannot wait for the step before.
 
-        Only an outermost request is recorded: a request it dispatches belongs to it already. A
-        request in a group other than the one being recorded starts a new step, so the workflow is
-        checkpointed first, while it still shows the end of the step before. A request in no group
-        is a change outside any step. Everything a run changes is taken as a change outside any
-        step too, but only a client's change drops what could be redone. A request that never
-        changes the workflow is part of no step, so it leaves the open one open.
+        Raises:
+            StepStillRunningError: ``request`` would start a step while a request of the step
+                before is still being handled.
         """
-        if isinstance(request, RunControlMixin):
-            if _recording.get() is None:
-                return None
-            return DispatchScope(token=_recording.set(None), recording=None, workflow=None)
-        if not outermost or workflow is None or never_alters_workflow(type(request)):
-            return None
-        history = workflow.undo
-        if history.restoring or isinstance(request, (UndoRequest, RedoRequest)):
-            return None
-        if request.undo_group is None:
-            return self._begin_change_outside_steps(workflow)
-        if request.undo_group != history.open_group:
-            self._checkpoint(workflow)
-            history.open_group = request.undo_group
-        recording = _Recording(workflow=workflow, label=request.undo_label or _label_for(request))
-        token = _recording.set(recording)
-        history.request_started()
-        return DispatchScope(token=token, recording=recording, workflow=workflow)
-
-    def end_dispatch(self, scope: DispatchScope | None) -> None:
-        if scope is None:
-            return
-        if scope.recording is not None:
-            scope.recording.open = False
-        _recording.reset(scope.token)
-        if scope.workflow is None:
-            return
-        if scope.in_step:
-            scope.workflow.undo.request_finished()
-            return
-        # Checkpointed now rather than at the next step, so that a change that drops what could be
-        # redone stops clients offering it at once.
-        self._checkpoint(scope.workflow)
-
-    def note_altered(self, workflow: WorkflowRuntime, request: RequestPayload) -> None:
-        """Note that a request changed ``workflow``, as its result reported."""
-        history = workflow.undo
-        # An undo or redo leaves the workflow at a checkpoint, which its own result reports as a change.
-        if history.restoring or isinstance(request, (UndoRequest, RedoRequest)):
-            return
-        recording = _recording.get()
-        if recording is None or not recording.open or recording.workflow is not workflow:
-            # A run's change, a client's change made while there was nothing to redo, or one made by
-            # a task a request started, after the request finished.
-            history.stale = True
-        elif recording.label is None:
-            history.stale = True
-            history.edited = True
-        # A label sent later in the group names the step. The first request names it otherwise.
-        elif request.undo_label is not None:
-            history.pending_label = request.undo_label
-        elif history.pending_label is None:
-            history.pending_label = recording.label
+        if self._step_to_wait_for(request, workflow, outermost=outermost) is not None:
+            msg = (
+                f"Attempted to handle a {type(request).__name__}. Failed because another change to the workflow "
+                "is still being made. Send it again once that change finishes."
+            )
+            raise StepStillRunningError(msg)
+        with self._recording(request, workflow, outermost=outermost) as undo:
+            yield undo
 
     @handles(UndoRequest)
     async def on_undo_request(self, request: UndoRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG002
@@ -278,14 +258,85 @@ class UndoManager(EngineScoped):
         self.engine.report_workflow_state(workflow)
         return RedoResultSuccess(label=following.label or "", result_details=f"Redid '{following.label}'.")
 
-    def _begin_change_outside_steps(self, workflow: WorkflowRuntime) -> DispatchScope | None:
-        """Start recording a client's request in no group, which drops what could be redone if it changes the workflow."""
-        # With nothing to redo, it is only a change outside any step, which the next checkpoint takes in.
+    def _step_to_wait_for(
+        self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
+    ) -> OpenStep | None:
+        """The step before, if ``request`` would start a new step while one of that step's requests is being handled."""
+        if workflow is None or request.undo_group is None or not self._records(request, workflow, outermost=outermost):
+            return None
+        step = workflow.undo.open_step
+        if step is None or not step.running or step.group == request.undo_group:
+            return None
+        return step
+
+    @contextmanager
+    def _recording(
+        self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
+    ) -> Iterator[UndoDispatch]:
+        """Record what ``request`` changes into what it is part of, while it is handled.
+
+        Only an outermost request starts recording: a request it dispatches belongs to it already. A
+        request in the open step's group continues that step, and a request in another group starts
+        the next one, so the workflow is checkpointed first, while it still shows the end of the step
+        before. A client's request in no group is a change outside any step. A run records into
+        nothing, so what it changes is taken as a change outside any step that drops nothing.
+        """
+        token: Token[OpenStep | _OutsideEdit | None] | None = None
+        recording = None
+        if isinstance(request, RunControlMixin):
+            token = _recording.set(None)
+        else:
+            recording = self._start_recording(request, workflow, outermost=outermost)
+            if recording is not None:
+                token = _recording.set(recording)
+        try:
+            yield UndoDispatch(request, workflow)
+        finally:
+            if token is not None:
+                _recording.reset(token)
+            if isinstance(recording, OpenStep):
+                recording.request_finished()
+            elif isinstance(recording, _OutsideEdit):
+                recording.running = False
+                # Checkpointed now rather than at the next step, so that a change that drops what could
+                # be redone stops clients offering it at once.
+                self._checkpoint(recording.workflow)
+
+    def _start_recording(
+        self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
+    ) -> OpenStep | _OutsideEdit | None:
+        """What ``request`` starts recording into, or None when it records into what it inherits."""
+        if workflow is None or not self._records(request, workflow, outermost=outermost):
+            return None
+        if request.undo_group is not None:
+            return self._continue_step(request, request.undo_group, workflow)
+        # With nothing to redo, a change outside any step loses nothing, and the next checkpoint takes it in.
         if workflow.undo.redo_label is None:
             return None
-        recording = _Recording(workflow=workflow, label=None)
-        token = _recording.set(recording)
-        return DispatchScope(token=token, recording=recording, workflow=workflow, in_step=False)
+        return _OutsideEdit(workflow)
+
+    def _records(self, request: RequestPayload, workflow: WorkflowRuntime, *, outermost: bool) -> bool:
+        """Whether ``request`` is recorded, as an outermost request a client sent that can change ``workflow``."""
+        return (
+            outermost
+            and not isinstance(request, (RunControlMixin, UndoRequest, RedoRequest))
+            and not never_alters_workflow(type(request))
+            and not workflow.undo.restoring
+        )
+
+    def _continue_step(self, request: RequestPayload, group: str, workflow: WorkflowRuntime) -> OpenStep:
+        """The step ``request``, in undo group ``group``, is part of, starting it if it is the first of its group."""
+        history = workflow.undo
+        step = history.open_step
+        if step is None or step.group != group:
+            self._checkpoint(workflow)
+            step = OpenStep(group=group, label=request.undo_label or _label_for(request))
+            history.open_step = step
+        elif request.undo_label is not None:
+            # A label sent later in the group names the step.
+            step.label = request.undo_label
+        step.request_started()
+        return step
 
     def _checkpoint(self, workflow: WorkflowRuntime) -> None:
         """Take a checkpoint if the workflow may differ from the current one."""
@@ -312,13 +363,7 @@ class UndoManager(EngineScoped):
             history.clear()
             self.engine.report_workflow_state(workflow)
             return False
-        compressed = zlib.compress(text.encode(), _COMPRESSION_LEVEL)
-        current = history.current()
-        # A redo would bring the workflow back without what a client changed since, so it is dropped.
-        # A checkpoint holds no run results, so a run changes nothing a redo would lose.
-        if history.edited and history.redo_label is not None and current is not None and current.commands != compressed:
-            history.drop_redo()
-        history.record(compressed)
+        history.record(zlib.compress(text.encode(), _COMPRESSION_LEVEL))
         self.engine.report_workflow_state(workflow)
         return True
 
@@ -468,7 +513,7 @@ def _blocker(workflow: WorkflowRuntime, verb: str) -> str | None:
     """Why an undo or redo cannot run now, or None when it can."""
     if workflow.flows.run_in_progress is not None:
         return f"Attempted to {verb}. Failed because the workflow is running."
-    if workflow.undo.in_flight > 0:
+    if workflow.undo.step_running:
         return f"Attempted to {verb}. Failed because the last change is still being made."
     if workflow.undo.restoring:
         return f"Attempted to {verb}. Failed because an undo or redo is already in progress."

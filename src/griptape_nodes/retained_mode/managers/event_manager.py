@@ -49,7 +49,6 @@ from griptape_nodes.retained_mode.events.generic_events import (
     WorkflowNotOpenResultFailure,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.retained_mode.events.request_effects import never_alters_workflow
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointDenial,
@@ -67,6 +66,7 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
+from griptape_nodes.retained_mode.runtime.undo_history import StepStillRunningError
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -737,23 +737,6 @@ class EventManager(EngineScoped):
                 self._pre_dispatch_hooks.remove(hook)
             except ValueError:
                 return
-
-    def _refusal_to_start_step(
-        self, request: RequestPayload, workflow: WorkflowRuntime | None
-    ) -> GenericResultFailure | None:
-        """The failure for a synchronous request that would start an undo step while the step before is still running.
-
-        A request dispatched asynchronously waits for that step to finish instead (`UndoManager.wait_for_open_step`).
-        """
-        if workflow is None or not self.engine.undo_manager.starts_step_while_another_runs(
-            request, workflow, outermost=_active_request_type.get() is None
-        ):
-            return None
-        details = (
-            f"Attempted to handle a {type(request).__name__}. Failed because another change to the workflow "
-            "is still being made. Send it again once that change finishes."
-        )
-        return GenericResultFailure(result_details=details)
 
     def _run_pre_dispatch_hooks(
         self,
@@ -1639,20 +1622,6 @@ class EventManager(EngineScoped):
         workflow_mgr = self.engine.workflow_manager
 
         with operation_depth_mgr as depth_manager:
-            if callback_result.altered_workflow_state and never_alters_workflow(type(request)):
-                logging.getLogger("griptape_nodes").error(
-                    "%s reported a change to the workflow, but its results say it never changes one, which "
-                    "undo relies on before it runs. Give it results that can report a change.",
-                    type(request).__name__,
-                )
-            # Before the squelch below, which only keeps a load from marking the workflow unsaved:
-            # the undo history has to know of every change, or an undo would take it back.
-            if (
-                callback_result.altered_workflow_state
-                and request_workflow is not None
-                and request_workflow.workflow is not None
-            ):
-                self.engine.undo_manager.note_altered(request_workflow.workflow, request)
             # Now see if the WorkflowManager was asking us to squelch altered_workflow_state commands
             # This prevents situations like loading a workflow (which naturally alters the workflow state)
             # from coming in and immediately being flagged as being dirty.
@@ -1963,30 +1932,25 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         is_outermost_request = _active_request_type.get() is None
-        # Nothing awaits between this and begin_dispatch, so no other request can start a step in between.
-        await self.engine.undo_manager.wait_for_open_step(
-            request, handler_call.request_workflow.workflow, outermost=is_outermost_request
-        )
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
         # Act on the workflow the request names, in the handler and every task it spawns.
         binding_token = self._bind_request_workflow(handler_call.request_workflow)
-        undo_scope = None
         try:
             try:
-                # Before the handler, so a request that starts an undo step finds the step before checkpointed.
-                undo_scope = self.engine.undo_manager.begin_dispatch(
+                async with self.engine.undo_manager.dispatch(
                     request, handler_call.request_workflow.workflow, outermost=is_outermost_request
-                )
-                # Actually make the handler callback (support both sync and async):
-                with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
-                    result_payload: ResultPayload = await call_function(handler_call.function, request)
+                ) as undo:
+                    # Actually make the handler callback (support both sync and async):
+                    with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
+                        result_payload: ResultPayload = await call_function(handler_call.function, request)
+                    undo.note(result_payload)
 
-                # Queue flush request for async context (unless result type should skip flush)
-                with operation_depth_mgr:
-                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
-                        self._flush_tracked_parameter_changes()
+                    # Queue flush request for async context (unless result type should skip flush)
+                    with operation_depth_mgr:
+                        if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
+                            self._flush_tracked_parameter_changes()
             except Exception as exc:
                 return self._result_for_handler_exception(
                     request, exc, context=result_context, request_workflow=handler_call.request_workflow
@@ -1999,7 +1963,6 @@ class EventManager(EngineScoped):
                 request_workflow=handler_call.request_workflow,
             )
         finally:
-            self.engine.undo_manager.end_dispatch(undo_scope)
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
@@ -2076,7 +2039,6 @@ class EventManager(EngineScoped):
                 handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
                 the workflow the request ran in (see `_result_workflow_id`).
         """
-        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -2108,9 +2070,7 @@ class EventManager(EngineScoped):
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
         # the manager callback runs.
-        short_circuit = self._run_pre_dispatch_hooks(request, result_context) or self._refusal_to_start_step(
-            request, handler_call.request_workflow.workflow
-        )
+        short_circuit = self._run_pre_dispatch_hooks(request, result_context)
         if short_circuit is not None:
             return self._handle_request_core(
                 request,
@@ -2127,20 +2087,11 @@ class EventManager(EngineScoped):
         request_id_token = _active_request_id.set(result_context.get("request_id"))
         # Act on the workflow the request names, in the handler and every task it spawns.
         binding_token = self._bind_request_workflow(handler_call.request_workflow)
-        undo_scope = None
         try:
             try:
-                # Before the handler, so a request that starts an undo step finds the step before checkpointed.
-                undo_scope = self.engine.undo_manager.begin_dispatch(
-                    request, request_workflow, outermost=is_outermost_request
+                result_payload = self._dispatch_from_sync(
+                    callback, handler_call.function, request, request_workflow, outermost=is_outermost_request
                 )
-                with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
-                    result_payload = self._invoke_handler_from_sync(callback, handler_call.function, request)
-
-                # Queue flush request for sync context (unless result type should skip flush)
-                with operation_depth_mgr:
-                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
-                        self._flush_tracked_parameter_changes()
             except Exception as exc:
                 return self._result_for_handler_exception(
                     request, exc, context=result_context, request_workflow=handler_call.request_workflow
@@ -2153,7 +2104,6 @@ class EventManager(EngineScoped):
                 request_workflow=handler_call.request_workflow,
             )
         finally:
-            self.engine.undo_manager.end_dispatch(undo_scope)
             _active_request_id.reset(request_id_token)
             _active_request_sender.reset(sender_token)
             _active_request_type.reset(token)
@@ -2161,6 +2111,35 @@ class EventManager(EngineScoped):
             if is_outermost_request:
                 self.flush_coalesced_events()
             bound_workflow.reset(binding_token)
+
+    def _dispatch_from_sync(
+        self,
+        registered: Callable | ForwardingHandler,
+        callback: Callable,
+        request: RequestPayload,
+        workflow: WorkflowRuntime | None,
+        *,
+        outermost: bool,
+    ) -> ResultPayload:
+        """Call a request handler from sync code, as undo records it.
+
+        A request that would have to wait for an undo step to finish is refused instead, since sync
+        code cannot wait (see `UndoManager.dispatch_now`).
+        """
+        request_type = type(request)
+        try:
+            with self.engine.undo_manager.dispatch_now(request, workflow, outermost=outermost) as undo:
+                with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
+                    result_payload = self._invoke_handler_from_sync(registered, callback, request)
+                undo.note(result_payload)
+
+                # Queue flush request for sync context (unless result type should skip flush)
+                with self.engine.operation_depth_manager:
+                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
+                        self._flush_tracked_parameter_changes()
+        except StepStillRunningError as err:
+            return GenericResultFailure(result_details=str(err))
+        return result_payload
 
     def _invoke_handler_from_sync(
         self, registered: Callable | ForwardingHandler, callback: Callable, request: RequestPayload
