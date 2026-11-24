@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import itertools
 import logging
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from hypothesis import settings
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule, run_state_machine_as_test
 
 from griptape_nodes.exe_types.core_types import BaseNodeElement, Parameter, ParameterMode
 from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
@@ -1235,3 +1239,146 @@ class TestClientsAreTold:
         assert ("Set Parameter Value", None) in states
         assert states[-1] == (None, "Set Parameter Value")
 
+
+_NODES = ("a", "b")
+_VALUES = ("", "x", "y")
+# What changed since the model's current checkpoint, in the order `UndoHistory.note` ranks them.
+_CLEAN, _OUTSIDE_EDIT, _STEP_PENDING = 0, 1, 2
+
+
+class _AnyOrderOfChanges(RuleBasedStateMachine):
+    """Steps, a client's changes outside any step, runs, undos and redos in any order, against a model.
+
+    The model is the history's rules applied to the nodes' values. A checkpoint is taken when a step
+    starts, before an undo or redo, and after a change outside any step while there is something to
+    redo. It adds one for a step that changed something, dropping what could be redone, and is
+    otherwise taken in by the current one, which a change outside any step that changed something
+    makes drop what could be redone. A run changes nothing a checkpoint holds.
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        super().__init__()
+        self.engine = engine
+        engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        result = engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="undo"))
+        assert isinstance(result, EnsureWorkflowAndFlowResultSuccess), result.result_details
+        assert result.workflow_id is not None
+        self.workflow = engine.open_workflows.get(result.workflow_id)
+        for name in _NODES:
+            _add(engine, self.workflow, name)
+        self.live: dict[str, str] = dict.fromkeys(_NODES, "")
+        self.checkpoints: list[dict[str, str]] = []
+        self.current = -1
+        self.drift = _OUTSIDE_EDIT
+        self.groups = itertools.count()
+        self.open_group: str | None = None
+
+    @property
+    def can_undo(self) -> bool:
+        return self.drift == _STEP_PENDING or self.current > 0
+
+    @property
+    def can_redo(self) -> bool:
+        return self.drift != _STEP_PENDING and self.current + 1 < len(self.checkpoints)
+
+    def teardown(self) -> None:
+        self.engine.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    @rule(name=st.sampled_from(_NODES), value=st.sampled_from(_VALUES))
+    def step(self, name: str, value: str) -> None:
+        self._checkpoint()
+        self.open_group = f"step {next(self.groups)}"
+        self.continue_step(name, value)
+
+    @precondition(lambda machine: machine.open_group is not None)
+    @rule(name=st.sampled_from(_NODES), value=st.sampled_from(_VALUES))
+    def continue_step(self, name: str, value: str) -> None:
+        _set(self.engine, self.workflow, name, value, group=self.open_group)
+        self._change(name, value, _STEP_PENDING)
+
+    @rule(name=st.sampled_from(_NODES), value=st.sampled_from(_VALUES))
+    def change_outside_any_step(self, name: str, value: str) -> None:
+        _set(self.engine, self.workflow, name, value)
+        self._change(name, value, _OUTSIDE_EDIT)
+        if self.can_redo:
+            self._checkpoint()
+
+    @rule(name=st.sampled_from(_NODES))
+    def run(self, name: str) -> None:
+        _ok(self.engine, self.workflow, ResolveNodeRequest(node_name=name), f"run {next(self.groups)}")
+
+    @rule()
+    def undo(self) -> None:
+        result = _send(self.engine, self.workflow, UndoRequest())
+        if not self.can_undo:
+            assert isinstance(result, UndoResultFailure), result.result_details
+            return
+        assert isinstance(result, UndoResultSuccess), result.result_details
+        added = self._checkpoint()
+        self.open_group = None
+        if added is False:
+            # The step put back what it changed, so taking it back changes nothing.
+            return
+        self.current -= 1
+        self.live = dict(self.checkpoints[self.current])
+
+    @rule()
+    def redo(self) -> None:
+        result = _send(self.engine, self.workflow, RedoRequest())
+        if not self.can_redo:
+            assert isinstance(result, RedoResultFailure), result.result_details
+            return
+        self._checkpoint()
+        if self.current + 1 >= len(self.checkpoints):
+            assert isinstance(result, RedoResultFailure), result.result_details
+            return
+        assert isinstance(result, RedoResultSuccess), result.result_details
+        self.current += 1
+        self.live = dict(self.checkpoints[self.current])
+        self.open_group = None
+
+    @invariant()
+    def the_workflow_has_the_values_the_model_has(self) -> None:
+        assert {name: _value(self.workflow, name) for name in _NODES} == self.live
+
+    @invariant()
+    def undo_and_redo_are_offered_as_the_model_offers_them(self) -> None:
+        assert (self.workflow.undo.undo_label is not None) == self.can_undo
+        assert (self.workflow.undo.redo_label is not None) == self.can_redo
+
+    def _change(self, name: str, value: str, kind: int) -> None:
+        if self.live[name] == value:
+            return
+        self.live[name] = value
+        self.drift = max(self.drift, kind)
+
+    def _checkpoint(self) -> bool | None:
+        """Take a checkpoint. Return whether it added one for a pending step, or None when no step was pending."""
+        added = None
+        if self.current < 0:
+            self.checkpoints = [dict(self.live)]
+            self.current = 0
+        elif self.drift == _STEP_PENDING:
+            added = self.live != self.checkpoints[self.current]
+            if added:
+                del self.checkpoints[self.current + 1 :]
+                self.checkpoints.append(dict(self.live))
+                self.current += 1
+        else:
+            if self.drift == _OUTSIDE_EDIT and self.live != self.checkpoints[self.current]:
+                del self.checkpoints[self.current + 1 :]
+            self.checkpoints[self.current] = dict(self.live)
+        self.drift = _CLEAN
+        return added
+
+
+class TestAnyOrderOfChanges:
+    def test_keeps_to_the_model_of_the_history(self, engine: Engine) -> None:
+        class _OnThisEngine(_AnyOrderOfChanges):
+            def __init__(self) -> None:
+                super().__init__(engine)
+
+        run_state_machine_as_test(
+            _OnThisEngine,
+            settings=settings(max_examples=40, stateful_step_count=30, deadline=None, database=None),
+        )
