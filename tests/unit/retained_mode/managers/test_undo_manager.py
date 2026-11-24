@@ -293,6 +293,21 @@ class TestUndoAndRedo:
         _undo(engine, workflow)
         assert _value(workflow, "a") == ""
 
+    def test_undoing_a_step_that_put_back_what_it_changed_changes_nothing(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        """Rather than taking back the step before it, which the button did not name."""
+        _add(engine, workflow, "a")
+        _set(engine, workflow, "a", "first", group="one")
+        _set(engine, workflow, "a", "second", group="two")
+        _set(engine, workflow, "a", "first", group="two")
+
+        _undo(engine, workflow)
+
+        assert _value(workflow, "a") == "first"
+        _undo(engine, workflow)
+        assert _value(workflow, "a") == ""
+
     def test_a_deleted_node_comes_back_with_its_connections(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         _add(engine, workflow, "a")
         _add(engine, workflow, "b")
@@ -951,6 +966,21 @@ class TestAClientCatchingUpAfterAnUndo:
         _redo(engine, workflow)
         assert _value(workflow, "a") == "first"
 
+    def test_a_write_back_keeps_what_could_be_redone_when_the_undo_rebuilt_a_node(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        """A rebuilt node comes back after the others, which the checkpoint has to know of."""
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        _set(engine, workflow, "a", "first", group="type")
+        _undo(engine, workflow)
+
+        _ok(engine, workflow, AlterParameterDetailsRequest(node_name="a", parameter_name="value", tooltip=""))
+
+        assert workflow.undo.redo_label == "Set Parameter Value"
+        _redo(engine, workflow)
+        assert _value(workflow, "a") == "first"
+
     def test_writing_back_metadata_the_workflow_has_is_not_a_change(
         self, engine: Engine, workflow: WorkflowRuntime
     ) -> None:
@@ -1204,3 +1234,4 @@ class TestClientsAreTold:
                 states.append((event.payload.state.undo_label, event.payload.state.redo_label))
         assert ("Set Parameter Value", None) in states
         assert states[-1] == (None, "Set Parameter Value")
+
