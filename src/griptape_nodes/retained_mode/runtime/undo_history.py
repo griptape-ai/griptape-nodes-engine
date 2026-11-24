@@ -75,7 +75,7 @@ class Clean:
 
 @dataclass(frozen=True)
 class RunOutput:
-    """Something other than a client's request changed the workflow, such as a run.
+    """Something other than a client's request changed the workflow: a run, or a task a request started, once the request finished.
 
     The next checkpoint replaces the current one, so an undo takes the change back with the step
     before it. A checkpoint holds no run results, so a redo loses nothing, and is kept.
@@ -166,9 +166,9 @@ class UndoHistory:
             case OutsideEdit():
                 if commands != self._checkpoints[self._current].commands:
                     del self._checkpoints[self._current + 1 :]
-                self._replace_current(commands)
+                self.replace_current(commands)
             case Clean() | RunOutput():
-                self._replace_current(commands)
+                self.replace_current(commands)
             case _:
                 assert_never(self.drift)
         self.drift = Clean()
@@ -189,6 +189,11 @@ class UndoHistory:
         if self._current < 0:
             return None
         return self._checkpoints[self._current]
+
+    def replace_current(self, commands: bytes) -> None:
+        """Replace the current checkpoint with ``commands``, keeping the label of the step that led to it."""
+        label = self._checkpoints[self._current].label
+        self._checkpoints[self._current] = Checkpoint(commands=commands, label=label)
 
     def step_back(self) -> None:
         """Make the previous checkpoint current, once an undo rebuilt the workflow from it."""
@@ -216,8 +221,3 @@ class UndoHistory:
         if len(self._checkpoints) > MAX_STEPS + 1:
             del self._checkpoints[0]
         self._current = len(self._checkpoints) - 1
-
-    def _replace_current(self, commands: bytes) -> None:
-        """Replace the current checkpoint with ``commands``, keeping the label of the step that led to it."""
-        label = self._checkpoints[self._current].label
-        self._checkpoints[self._current] = Checkpoint(commands=commands, label=label)
