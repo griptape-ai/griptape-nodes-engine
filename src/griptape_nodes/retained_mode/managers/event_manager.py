@@ -49,6 +49,7 @@ from griptape_nodes.retained_mode.events.generic_events import (
     WorkflowNotOpenResultFailure,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.request_effects import never_alters_workflow
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointDenial,
@@ -1631,6 +1632,12 @@ class EventManager(EngineScoped):
         workflow_mgr = self.engine.workflow_manager
 
         with operation_depth_mgr as depth_manager:
+            if callback_result.altered_workflow_state and never_alters_workflow(type(request)):
+                logging.getLogger("griptape_nodes").error(
+                    "%s reported a change to the workflow, but its results say it never changes one, which "
+                    "undo relies on before it runs. Give it results that can report a change.",
+                    type(request).__name__,
+                )
             # Before the squelch below, which only keeps a load from marking the workflow unsaved:
             # the undo history has to know of every change, or an undo would take it back.
             if (
