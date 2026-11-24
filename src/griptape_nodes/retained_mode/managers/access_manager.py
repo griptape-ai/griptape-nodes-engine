@@ -49,9 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.drivers.cloud_models import (
     CUSTOM_ENDPOINT_PROVIDER_ID,
-    DEPRECATED_MODELS,
     ENGINE_MODEL_CATALOG,
-    IMAGE_DEPRECATED_MODELS,
     ProviderID,
 )
 from griptape_nodes.node_library.library_declarations import (
@@ -392,16 +390,14 @@ class AccessManager(EngineScoped):
         through the engine catalog's `provider_model_id` index to its vendor
         provider and family -- the same catalog key a node's own dropdown would
         resolve to, so a rule written for nodes also gates the same model in
-        chat. A name retired from the catalog but still saved in a provider's
-        config resolves through `DEPRECATED_MODELS` / `IMAGE_DEPRECATED_MODELS`
-        to its replacement's entry instead: only the policy identity changes,
-        never the name actually sent. Every other connection has no fixed
+        chat. A deprecated name resolves to its own entry, never its
+        replacement's, because the stored name is what runs. Every other connection has no fixed
         catalog entries, so its model gets a derived id under its own provider
         (`custom` maps to `custom_endpoint`), with no family.
 
         Returns:
             `None` when `connection_id` is `griptape_cloud` and `model_name` is
-                in neither the engine catalog nor the deprecation maps. There is
+                not in the engine catalog. There is
                 no bare-id fallback for this provider: an unresolved id would
                 carry no provider or family and so escape every provider- and
                 family-scoped deny rule.
@@ -414,10 +410,6 @@ class AccessManager(EngineScoped):
                 model_families=None,
             )
         resolved = _ENGINE_CATALOG_BY_PROVIDER_MODEL_ID.get(model_name)
-        if resolved is None:
-            replacement_name = DEPRECATED_MODELS.get(model_name) or IMAGE_DEPRECATED_MODELS.get(model_name)
-            if replacement_name is not None:
-                resolved = _ENGINE_CATALOG_BY_PROVIDER_MODEL_ID.get(replacement_name)
         if resolved is None:
             return None
         families = [resolved.model.family] if resolved.model.family else None

@@ -631,6 +631,54 @@ IMAGE_DEPRECATED_MODELS = {
 }
 
 
+# Deprecated names a saved config still sends to Cloud as stored, each under the
+# key griptape-nodes-library-standard declares for it: policy checks the model
+# that runs, not its replacement. A deprecated name missing here has no catalog
+# identity and is refused like any unknown name.
+DEPRECATED_MODEL_CATALOG_ARGS = [
+    {
+        "name": "claude-4-5-sonnet",
+        "key": "gtc_claude_sonnet_4_5",
+        "provider": "anthropic",
+        "display_name": "Claude Sonnet 4.5",
+        "family": "Claude 4",
+        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
+    },
+    {
+        "name": "claude-sonnet-4-6",
+        "key": "gtc_claude_sonnet_4_6",
+        "provider": "anthropic",
+        "display_name": "Claude Sonnet 4.6",
+        "family": "Claude 4",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "claude-opus-4-7",
+        "key": "gtc_claude_opus_4_7",
+        "provider": "anthropic",
+        "display_name": "Claude Opus 4.7",
+        "family": "Claude 4",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+    {
+        "name": "dall-e-3",
+        "key": "openai_dall_e_3",
+        "provider": "openai",
+        "display_name": "DALL-E 3",
+        "family": "DALL-E",
+        "key_support": KeySupport.REQUIRES_CUSTOMER_KEY,
+    },
+    {
+        "name": "gpt-image-1",
+        "key": "gtc_gpt_image_1",
+        "provider": "openai",
+        "display_name": "GPT Image 1",
+        "family": "GPT Image",
+        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+    },
+]
+
+
 # Model IDs whose backend does not accept top_p (the OpenAI o-series).
 # Kept in sync with the o-entries in MODEL_CHOICES_ARGS.
 O_SERIES_MODELS = {"o1", "o3", "o3-mini", "o4-mini"}
@@ -740,9 +788,9 @@ CUSTOM_ENDPOINT_PROVIDER_ID = "custom_endpoint"
 def _build_engine_model_catalog() -> ModelCatalogLibraryProperty:
     """Build the engine's own model catalog: Griptape Cloud models under their vendor, plus local/custom providers.
 
-    Every Griptape Cloud chat and image model gets the key, provider, and
-    family carried on its `MODEL_CHOICES_ARGS` / `IMAGE_MODEL_CHOICES_ARGS`
-    entry, matching what `griptape-nodes-library-standard` declares for the
+    Every Griptape Cloud chat and image model, and every deprecated name in
+    `DEPRECATED_MODEL_CATALOG_ARGS`, gets the key, provider, and family carried
+    on its entry, matching what `griptape-nodes-library-standard` declares for the
     same `provider_model_id`, so a rule written for a node also gates the same
     model in chat. `ollama`, `lmstudio`, and `custom_endpoint` declare no fixed
     models -- their models are discovered at runtime and resolve to a derived
@@ -754,7 +802,7 @@ def _build_engine_model_catalog() -> ModelCatalogLibraryProperty:
         provider_id: ModelProvider(display_name=display_name)
         for provider_id, display_name in _VENDOR_PROVIDER_DISPLAY_NAMES.items()
     }
-    for catalog in (MODEL_CHOICES_ARGS, IMAGE_MODEL_CHOICES_ARGS):
+    for catalog in (MODEL_CHOICES_ARGS, IMAGE_MODEL_CHOICES_ARGS, DEPRECATED_MODEL_CATALOG_ARGS):
         for entry in catalog:
             providers[str(entry["provider"])].models[str(entry["key"])] = Model(
                 display_name=str(entry["display_name"]),

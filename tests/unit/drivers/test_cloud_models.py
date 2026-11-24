@@ -4,6 +4,7 @@ from pydantic_ai.settings import ModelSettings
 from griptape_nodes.drivers.cloud_models import (
     _PRESET_KEY_KINDS,
     CUSTOM_ENDPOINT_PROVIDER_ID,
+    DEPRECATED_MODEL_CATALOG_ARGS,
     DEPRECATED_MODELS,
     ENGINE_MODEL_CATALOG,
     IMAGE_DEPRECATED_MODELS,
@@ -142,6 +143,14 @@ class TestEngineModelCatalog:
     catalog entry missing either would silently escape a provider- or
     family-scoped rule.
     """
+
+    def test_every_deprecated_catalog_entry_is_a_deprecated_name(self) -> None:
+        deprecated = {*DEPRECATED_MODELS, *IMAGE_DEPRECATED_MODELS}
+        for entry in DEPRECATED_MODEL_CATALOG_ARGS:
+            assert entry["name"] in deprecated, (
+                f"{entry['name']} is in DEPRECATED_MODEL_CATALOG_ARGS but not in DEPRECATED_MODELS or "
+                "IMAGE_DEPRECATED_MODELS."
+            )
 
     def test_every_catalog_model_has_a_provider_and_family(self) -> None:
         for resolved in iter_catalog_models(ENGINE_MODEL_CATALOG):

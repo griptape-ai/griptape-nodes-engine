@@ -884,21 +884,26 @@ class TestResolveChatModel:
         assert resolved.provider_id == "custom_endpoint"
         assert resolved.model_families is None
 
-    def test_deprecated_prompt_name_resolves_to_its_replacements_catalog_entry(self) -> None:
+    def test_deprecated_prompt_name_resolves_to_its_own_catalog_entry(self) -> None:
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
 
         resolved = AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="claude-sonnet-4-6")
         assert resolved is not None
-        assert resolved.model_id == "gtc_claude_sonnet_5"
+        assert resolved.model_id == "gtc_claude_sonnet_4_6"
         assert resolved.provider_id == "anthropic"
 
-    def test_deprecated_image_name_resolves_to_its_replacements_catalog_entry(self) -> None:
+    def test_deprecated_image_name_resolves_to_its_own_catalog_entry(self) -> None:
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
 
         resolved = AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="dall-e-3")
         assert resolved is not None
-        assert resolved.model_id == "gtc_gpt_image_1_mini"
+        assert resolved.model_id == "openai_dall_e_3"
         assert resolved.provider_id == "openai"
+
+    def test_deprecated_name_with_no_catalog_key_is_unresolved(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        assert AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="claude-3-7-sonnet") is None
 
 
 class TestChatModelDenial:
@@ -1029,8 +1034,32 @@ class TestChatModelDenial:
         )
         assert denial_message is None
 
-    def test_rule_on_the_replacements_key_also_denies_the_deprecated_name(self, engine: Engine) -> None:
-        """A rule written for `gtc_claude_sonnet_5` also denies the deprecated name `claude-sonnet-4-6`."""
+    def test_rule_on_the_deprecated_models_own_key_denies_it(self, engine: Engine) -> None:
+        """A rule on `gtc_claude_sonnet_4_6` denies a run that sends `claude-sonnet-4-6`."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        def deny_sonnet_4_6(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_4_6":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+            return None
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(deny_sonnet_4_6)
+        try:
+            denial_message = manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-4-6"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_sonnet_4_6)
+
+        assert denial_message == "model 'claude-sonnet-4-6' is not permitted: Sonnet is not in your plan."
+
+    def test_rule_on_the_replacements_key_does_not_deny_the_deprecated_name(self, engine: Engine) -> None:
+        """The deprecated name runs as itself, so its replacement's rule doesn't apply to it."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             CheckpointAction,
             CheckpointDenial,
@@ -1039,19 +1068,19 @@ class TestChatModelDenial:
 
         def deny_sonnet_5(checkpoint: object) -> CheckpointDenial | None:
             if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":  # type: ignore[attr-defined]
-                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet 5 is not in your plan."),))
             return None
 
         manager = engine.access_manager
         engine.event_manager.add_authorization_hook(deny_sonnet_5)
         try:
             denial_message = manager.chat_model_denial(
-                action=CheckpointAction.OFFER_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-4-6"
+                action=CheckpointAction.INVOKE_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-4-6"
             )
         finally:
             engine.event_manager.remove_authorization_hook(deny_sonnet_5)
 
-        assert denial_message == "model 'claude-sonnet-4-6' is not permitted: Sonnet is not in your plan."
+        assert denial_message is None
 
 
 class TestDerivedModelId:

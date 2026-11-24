@@ -725,9 +725,9 @@ class AgentManager(EngineScoped):
     def _update_provider_denial_message(self, existing: ProviderConfig, pd: UpdateProviderPayload) -> str | None:
         """The `OfferModel` refusal for an update's resulting type+model pair, or `None` when it's permitted.
 
-        Only re-checks when the update actually sets `type` or `model`: tightening
-        policy against an already-configured provider must not retroactively
-        block an unrelated edit (base URL, icon, API key) to it.
+        Checked whenever the update sets `type` or `model`. The editor sends
+        `model` on every settings save, so saving a provider whose model is now
+        denied fails until an allowed model is picked.
         """
         if pd.type is None and pd.model is None:
             return None
