@@ -12,8 +12,9 @@ class Options(Trait):
     A value outside ``choices`` is replaced with ``choices[0]`` and then rejected, unless
     ``allow_custom`` lets the artist type their own or ``keep_unlisted`` stores it as it is.
     ``keep_unlisted`` accepts any value on every assignment but changes nothing in the dropdown;
-    it is for a node that reports an unlisted value itself, such as a saved model its list no
-    longer offers. It is the node's to set, so it is not saved with the workflow.
+    nothing rejects the value, so it is only for a node that reports an unlisted value itself, as
+    ``ModelAccessComponent(keep_unlisted_values=True)`` does. It is the node's to set, so it is not
+    saved with the workflow.
     """
 
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]

@@ -1208,6 +1208,41 @@ class TestKeepUnlistedValues:
 
         assert helper.selection_denial() is None
 
+    def test_an_unlisted_value_is_badged_on_the_workflow_load_path(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+
+        node.set_parameter_value(param.name, "gamma", initial_setup=True, skip_before_value_set=True)
+
+        badge = param.get_badge()
+        assert badge is not None
+        assert badge.title == "Model Not Available"
+        assert "`gamma`" in badge.message
+        assert "license" not in badge.message.lower()
+
+    def test_picking_a_listed_value_clears_the_unlisted_badge(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        node.set_parameter_value(param.name, "alpha")
+        helper.on_value_changed("alpha")
+
+        assert param.get_badge() is None
+
+    def test_raise_if_selection_denied_does_not_call_an_unlisted_model_unpermitted(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        with pytest.raises(RuntimeError) as raised:
+            helper.raise_if_selection_denied()
+
+        assert "not permitted" not in str(raised.value)
+
 
 class TestMigrateValue:
     def test_returns_canonical_choice_for_a_legacy_value(self) -> None:

@@ -77,6 +77,8 @@ instead: the value is stored as saved, and the existing selection gate --
 ``query_for_denial`` / ``raise_if_denied`` / ``selection_denial`` /
 ``raise_if_selection_denied`` -- reports it, naming that model, so the run
 fails the same way a license denial does rather than quietly using another.
+The parameter's badge names it too, worded as an unlisted model rather than
+a license verdict.
 
 Nodes that reinstall the ``Options`` trait themselves (e.g. after a driver
 disconnect) call ``reinstall_options()`` to put the component's trait +
@@ -106,6 +108,7 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.elements import parameter_messages
 from griptape_nodes.exe_types.param_components.model_policy import (
+    UNLISTED_DECORATION,
     ModelPolicySnapshot,
     apply_denial_badge,
     node_access_request,
@@ -194,8 +197,9 @@ class ModelAccessComponent:
         and ``deprecated_values`` as it is, rather than replacing it with
         ``choices[0]``. That holds on every assignment, not only workflow load,
         so a script or an upstream string is not rejected when it is set either.
-        The dropdown still offers only ``model_choices``. The existing selection
-        gate reports such a value itself -- see ``query_for_denial``.
+        The dropdown still offers only ``model_choices``. The parameter shows a
+        "Model Not Available" badge naming the value, and the existing selection
+        gate reports it itself -- see ``query_for_denial``.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -340,6 +344,10 @@ class ModelAccessComponent:
         if not isinstance(value, str):
             parameter.clear_badge()
             return
+        unlisted_denial = self._unlisted_denial(value)
+        if unlisted_denial is not None:
+            apply_denial_badge(parameter, value, unlisted_denial, decoration=UNLISTED_DECORATION)
+            return
         apply_denial_badge(parameter, value, self._cached_denial(value), decoration=self._snapshot.decoration)
 
     def on_value_set(self, parameter: Parameter, value: Any) -> None:
@@ -454,6 +462,10 @@ class ModelAccessComponent:
         denial = self.query_for_denial(value)
         if denial is None:
             return
+        if self._unlisted_denial(value) is not None:
+            # The denial's own detail names the model; "not permitted" would read as a license verdict.
+            msg = f"Cannot run {type(self._node).__name__}: {denial.reason()}"
+            raise RuntimeError(msg)
         msg = f"Cannot run {type(self._node).__name__}: '{value}' is not permitted. {denial.reason()}"
         raise RuntimeError(msg)
 
@@ -541,6 +553,10 @@ class ModelAccessComponent:
             self._show_repair_message(retired, selected=selected, current=value)
         else:
             self._hide_repair_message()
+        if isinstance(value, str) and self._unlisted_denial(value) is not None:
+            # Workflow load assigns with ``initial_setup=True``, which skips ``after_value_set``,
+            # so a kept unlisted value's badge has to be raised here.
+            self.on_value_changed(value)
         return value
 
     def _repair_stale_dropdown(self) -> list[str]:
