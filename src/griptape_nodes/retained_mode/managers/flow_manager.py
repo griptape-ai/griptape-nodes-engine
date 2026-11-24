@@ -2057,7 +2057,7 @@ class FlowManager(EngineScoped):
             # Gets all nodes in that connected group to be ran
             nodes = self.get_all_connected_nodes_in(workflow, flow_node)
         else:
-            nodes = flow.nodes.values()
+            nodes = list(flow.nodes.values())
         # If we're just running the whole flow
         all_exceptions = []
         for node in nodes:
@@ -2065,13 +2065,12 @@ class FlowManager(EngineScoped):
             if exceptions:
                 all_exceptions = all_exceptions + exceptions
 
-        nodes_list = list(nodes)
         for library_name in LibraryRegistry.list_libraries():
             advanced_library = LibraryRegistry.get_library(library_name).get_advanced_library()
             if advanced_library is None:
                 continue
             try:
-                library_exceptions = advanced_library.validate_flow_before_run(flow, nodes_list)
+                library_exceptions = advanced_library.validate_flow_before_run(flow, nodes)
             except Exception as err:
                 all_exceptions.append(err)
                 break

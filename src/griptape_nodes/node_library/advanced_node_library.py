@@ -291,38 +291,12 @@ class AdvancedNodeLibrary:
         return []
 
     def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None:
-        """Validate a whole flow before it starts running.
+        """Validate a whole flow, and every node it will run, before it starts.
 
-        Called once per library, for every library loaded in the process, just before a flow
-        starts running. ``nodes`` is every node that will run, not just the nodes this library
-        owns, so a library can enforce rules that span the whole graph — a rule that needs to
-        see two nodes at once has nowhere else to live.
-
-        This is the one hook on this class that is **not** notification only. Where
-        ``get_execution_event_listeners()`` and the other hooks above only observe and cannot
-        fail the operation, a non-empty return value here, or an exception this method raises,
-        stops the flow from starting. The exceptions are reported back to the caller as
-        validation failures alongside any raised by the nodes' own
-        ``validate_before_workflow_run()``.
-
-        **First failure wins.** If one library's call raises, or returns a non-empty list, the
-        engine stops calling further libraries' hooks for this validation pass; it does not
-        collect failures from every library.
-
-        **Keep it quick.** The caller waits for this to return before the flow can start.
-
-        Args:
-            flow: The flow about to run.
-            nodes: Every node that will run as part of it.
-
-        Returns:
-            A list of exceptions if validation fails, or None (or an empty list) if it passes.
-
-        Example:
-            def validate_flow_before_run(self, flow, nodes):
-                if len(nodes) > self._max_nodes_per_run:
-                    return [RuntimeError(f"Flow '{flow.name}' exceeds the node limit for this license.")]
-                return None
+        Unlike the other hooks on this class, this one can block: a non-empty return, or a
+        raised exception, stops the flow and is reported as a validation failure. First
+        failure wins — one library failing stops the rest from being called. Keep it quick;
+        the flow waits for this to return.
         """
 
     def get_app_event_listeners(
