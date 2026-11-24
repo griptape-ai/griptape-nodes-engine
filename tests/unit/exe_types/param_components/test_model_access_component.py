@@ -1232,6 +1232,18 @@ class TestKeepUnlistedValues:
 
         assert param.get_badge() is None
 
+    def test_selection_denial_message_does_not_call_an_unlisted_model_unpermitted(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        message = helper.selection_denial_message()
+
+        assert message is not None
+        assert "'gamma'" in message
+        assert "not permitted" not in message
+
     def test_raise_if_selection_denied_does_not_call_an_unlisted_model_unpermitted(self) -> None:
         node, helper, param = _build_probe_node_with_component(
             model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
@@ -1607,6 +1619,26 @@ class TestSelectionReadingApi:
             node.set_parameter_value(param.name, "alpha", initial_setup=True)
             with pytest.raises(RuntimeError, match="not permitted"):
                 helper.raise_if_selection_denied()
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_alpha)
+
+    def test_selection_denial_message_names_a_license_denial(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_alpha)
+        try:
+            node, helper, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="beta"
+            )
+            assert helper.selection_denial_message() is None
+
+            node.set_parameter_value(param.name, "alpha", initial_setup=True)
+            assert helper.selection_denial_message() == "Model 'alpha' is not permitted. Alpha not enabled."
         finally:
             engine.event_manager.remove_authorization_hook(deny_alpha)
 

@@ -64,6 +64,9 @@ failure-routing idiom that matches their base class:
   - SuccessFailureNode / GriptapeProxyNode nodes call ``selection_denial()``
     and route the reason into ``self._set_status_results(was_successful=False,
     result_details=denial.reason())``.
+  - A caller that leads the reason with wording of its own, such as "is not
+    permitted", calls ``selection_denial_message()`` instead, which words the
+    sentence for the kind of denial.
 
 Both read the current selection off the parameter the component owns, so a node
 never restates its own parameter's name. ``query_for_denial(value)`` and
@@ -459,14 +462,10 @@ class ModelAccessComponent:
         subclasses should call ``query_for_denial`` directly instead so they
         can route the failure into ``_set_status_results``.
         """
-        denial = self.query_for_denial(value)
-        if denial is None:
+        message = self._denial_message(value)
+        if message is None:
             return
-        if self._unlisted_denial(value) is not None:
-            # The denial's own detail names the model; "not permitted" would read as a license verdict.
-            msg = f"Cannot run {type(self._node).__name__}: {denial.reason()}"
-            raise RuntimeError(msg)
-        msg = f"Cannot run {type(self._node).__name__}: '{value}' is not permitted. {denial.reason()}"
+        msg = f"Cannot run {type(self._node).__name__}: {message}"
         raise RuntimeError(msg)
 
     def selection_denial(self) -> CheckpointDenial | None:
@@ -478,6 +477,15 @@ class ModelAccessComponent:
         per node.
         """
         return self.query_for_denial(self.selected_value)
+
+    def selection_denial_message(self) -> str | None:
+        """The artist-facing sentence for the current selection's denial, or ``None`` if it is allowed.
+
+        Surface it as is rather than prefixing ``selection_denial().reason()`` with wording of your
+        own: only the component knows whether a denial is a license verdict or a model this node
+        does not offer, and the two must not read alike.
+        """
+        return self._denial_message(self.selected_value)
 
     def raise_if_selection_denied(self) -> None:
         """``raise_if_denied`` against the current selection. See ``selection_denial``."""
@@ -690,6 +698,15 @@ class ModelAccessComponent:
         so they are accepted but never offered.
         """
         return [*self._model_choices, *self._deprecated_values]
+
+    def _denial_message(self, value: Any) -> str | None:
+        """``query_for_denial`` as one artist-facing sentence, worded for the kind of denial."""
+        denial = self.query_for_denial(value)
+        if denial is None:
+            return None
+        if isinstance(value, str) and self._unlisted_denial(value) is not None:
+            return denial.reason()
+        return f"Model '{value}' is not permitted. {denial.reason()}"
 
     def _unlisted_denial(self, value: str) -> CheckpointDenial | None:
         """The denial for ``value`` if it is a model this node does not offer, else ``None``.
