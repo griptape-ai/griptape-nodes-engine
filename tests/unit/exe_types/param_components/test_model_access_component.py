@@ -1113,8 +1113,10 @@ class TestDeprecatedValuesMigration:
 class TestKeepUnlistedValues:
     """A saved model the list does not offer stays as saved, and is reported by name.
 
-    The kept value is deliberately not ``choices[0]``, so a test cannot pass
-    because ``Options`` snapped it there.
+    The report goes through the existing selection gate (``selection_denial`` /
+    ``raise_if_selection_denied``), not a separate method. The kept value is
+    deliberately not ``choices[0]``, so a test cannot pass because ``Options``
+    snapped it there.
     """
 
     def test_an_unlisted_value_is_snapped_to_the_first_choice_by_default(self) -> None:
@@ -1123,7 +1125,8 @@ class TestKeepUnlistedValues:
         node.set_parameter_value(param.name, "gamma", initial_setup=True, skip_before_value_set=True)
 
         assert node.get_parameter_value(param.name) == "alpha"
-        assert helper.unlisted_selection_error() is None
+        assert helper.selection_denial() is None
+        helper.raise_if_selection_denied()
 
     def test_an_unlisted_value_is_kept_on_the_workflow_load_path(self) -> None:
         node, _helper, param = _build_probe_node_with_component(
@@ -1134,16 +1137,25 @@ class TestKeepUnlistedValues:
 
         assert node.get_parameter_value(param.name) == "gamma"
 
-    def test_the_error_names_the_unlisted_model(self) -> None:
+    def test_selection_denial_names_the_unlisted_model(self) -> None:
         node, helper, param = _build_probe_node_with_component(
             model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
         )
         node.set_parameter_value(param.name, "gamma", initial_setup=True)
 
-        error = helper.unlisted_selection_error()
+        denial = helper.selection_denial()
 
-        assert isinstance(error, ValueError)
-        assert "'gamma'" in str(error)
+        assert denial is not None
+        assert "'gamma'" in denial.reason()
+
+    def test_raise_if_selection_denied_names_the_unlisted_model(self) -> None:
+        node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="beta", keep_unlisted_values=True
+        )
+        node.set_parameter_value(param.name, "gamma", initial_setup=True)
+
+        with pytest.raises(RuntimeError, match="'gamma'"):
+            helper.raise_if_selection_denied()
 
     def test_a_listed_value_has_no_error(self) -> None:
         node, helper, param = _build_probe_node_with_component(
@@ -1151,7 +1163,8 @@ class TestKeepUnlistedValues:
         )
         node.set_parameter_value(param.name, "alpha")
 
-        assert helper.unlisted_selection_error() is None
+        assert helper.selection_denial() is None
+        helper.raise_if_selection_denied()
 
     def test_a_legacy_value_still_migrates(self) -> None:
         node, helper, param = _build_probe_node_with_component(
@@ -1164,7 +1177,7 @@ class TestKeepUnlistedValues:
         node.set_parameter_value(param.name, "Beta", initial_setup=True)
 
         assert node.get_parameter_value(param.name) == "beta"
-        assert helper.unlisted_selection_error() is None
+        assert helper.selection_denial() is None
 
     def test_the_unlisted_value_is_not_offered(self) -> None:
         node, _helper, param = _build_probe_node_with_component(
@@ -1193,7 +1206,7 @@ class TestKeepUnlistedValues:
         )
         node.set_parameter_value(param.name, object(), initial_setup=True)
 
-        assert helper.unlisted_selection_error() is None
+        assert helper.selection_denial() is None
 
 
 class TestMigrateValue:

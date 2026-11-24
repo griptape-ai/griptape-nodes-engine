@@ -73,9 +73,10 @@ somewhere other than the dropdown.
 A saved value outside ``model_choices`` that no ``deprecated_values`` key
 covers is replaced with ``choices[0]`` by default. A node whose list used to be
 open-ended (fetched from the provider, say) passes ``keep_unlisted_values=True``
-instead: the value is stored as saved, and the node reports
-``unlisted_selection_error()`` from its validation and execute paths so the run
-fails naming that model rather than quietly using another.
+instead: the value is stored as saved, and the existing selection gate --
+``query_for_denial`` / ``raise_if_denied`` / ``selection_denial`` /
+``raise_if_selection_denied`` -- reports it, naming that model, so the run
+fails the same way a license denial does rather than quietly using another.
 
 Nodes that reinstall the ``Options`` trait themselves (e.g. after a driver
 disconnect) call ``reinstall_options()`` to put the component's trait +
@@ -111,6 +112,7 @@ from griptape_nodes.exe_types.param_components.model_policy import (
     query_model_policy,
 )
 from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeResultSuccess
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -119,7 +121,6 @@ logger = logging.getLogger("griptape_nodes")
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
     from griptape_nodes.traits.button import ButtonDetailsMessagePayload
 
 _REFRESH_ICON = "list-restart"
@@ -193,8 +194,8 @@ class ModelAccessComponent:
         and ``deprecated_values`` as it is, rather than replacing it with
         ``choices[0]``. That holds on every assignment, not only workflow load,
         so a script or an upstream string is not rejected when it is set either.
-        The dropdown still offers only ``model_choices``. A node that sets it
-        must report ``unlisted_selection_error()``.
+        The dropdown still offers only ``model_choices``. The existing selection
+        gate reports such a value itself -- see ``query_for_denial``.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -384,6 +385,10 @@ class ModelAccessComponent:
 
         - Non-string values (driver objects, ``None``, anything else): return
           ``None``. Bypasses the gate entirely -- see paragraph above.
+        - A node built with ``keep_unlisted_values=True`` holding a value outside
+          ``model_choices``: return a denial naming that model. Checked before
+          every license question below, since a model this node does not offer
+          is not something license policy was ever asked about.
         - Initial snapshot resolution failed (see ``ModelPolicySnapshot``): return
           a **synthesized** denial saying the models could not be checked. This
           is the fail-closed contract -- a broken library registration must not
@@ -404,6 +409,9 @@ class ModelAccessComponent:
         # source of truth for the model in this state; bypass the gate.
         if not isinstance(value, str):
             return None
+        unlisted_denial = self._unlisted_denial(value)
+        if unlisted_denial is not None:
+            return unlisted_denial
         # Snapshot-level refusals first: an unresolvable node (a developer setup bug must not
         # silently open the gate) and a denial policy handed us that no row can carry. Both are
         # decisions about the whole parameter, so the live per-id re-query below cannot answer
@@ -462,25 +470,6 @@ class ModelAccessComponent:
     def raise_if_selection_denied(self) -> None:
         """``raise_if_denied`` against the current selection. See ``selection_denial``."""
         self.raise_if_denied(self.selected_value)
-
-    def unlisted_selection_error(self) -> ValueError | None:
-        """The error naming the current selection if it is a model this node does not offer, else ``None``.
-
-        Only a node built with ``keep_unlisted_values=True`` can hold such a
-        selection; without it, ``Options`` replaces the value on assignment.
-        Return it from ``validate_before_workflow_run`` and raise it at the top
-        of the execute path. A non-``str`` selection (a connected driver) is not
-        the dropdown's to judge, and returns ``None``.
-        """
-        selection = self.selected_value
-        if not isinstance(selection, str):
-            return None
-        if selection in self._model_choices:
-            return None
-        return ValueError(
-            f"Attempted to use model '{selection}'. Failed because this node does not offer that model. "
-            "Pick a model from the list."
-        )
 
     def pick_permitted_default(self) -> str | None:
         """Return the value the node should use as its ``default_value=``, or ``None``.
@@ -685,6 +674,26 @@ class ModelAccessComponent:
         so they are accepted but never offered.
         """
         return [*self._model_choices, *self._deprecated_values]
+
+    def _unlisted_denial(self, value: str) -> CheckpointDenial | None:
+        """The denial for ``value`` if it is a model this node does not offer, else ``None``.
+
+        Only reachable on a node built with ``keep_unlisted_values=True`` and
+        holding such a value; without that flag ``Options`` replaces the value
+        on assignment, so no stored selection can ever be unlisted.
+        """
+        if not self._keep_unlisted_values or value in self._model_choices:
+            return None
+        return CheckpointDenial(
+            failures=(
+                CheckpointFailure(
+                    detail=(
+                        f"Attempted to use model '{value}'. Failed because this node does not offer "
+                        "that model. Pick a model from the list."
+                    )
+                ),
+            )
+        )
 
     def _cached_denial(self, choice: str) -> CheckpointDenial | None:
         """The cached verdict for ``choice``, via the shared snapshot rules.

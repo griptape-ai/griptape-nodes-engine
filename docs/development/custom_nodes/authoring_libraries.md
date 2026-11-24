@@ -280,22 +280,7 @@ Each key is accepted wherever a value is assigned, including workflow load, and 
 
 A saved workflow also stores the dropdown it was saved with. When such a workflow is opened, `ModelAccessComponent` checks whether that stored dropdown still lists a model that is now a `deprecated_values` key and lists nothing that is neither a current choice nor a `deprecated_values` key. If so, the component rebuilds the dropdown from the node's current `model_choices`, so a retired model disappears without any repair code in the node. The engine logs a warning that names the retired models, the node shows a "Model list updated" message that names them too (it hides again when the model is next assigned), and the stored selection moves to its `deprecated_values` replacement. The component adds that message to the node itself, in a hidden `ParameterMessage` named `<parameter name>_model_list_updated`. The workflow file is not rewritten until the artist saves it. Do not add a converter of your own for this. A retired model therefore has to be moved into `deprecated_values` for the repair to recognise it. A dropdown your node fills on purpose (for example a third-party provider's list) is left alone as long as it names at least one model outside your `model_choices` and `deprecated_values` keys.
 
-Any other saved value outside `model_choices` is replaced with the first choice when the workflow loads. If your node's list used to be open-ended, for example fetched from the provider, you can't map every value it may have saved. Pass `keep_unlisted_values=True` to store such a value as saved, and report it so the run fails naming that model instead of quietly using another:
-
-```python
-def validate_before_workflow_run(self) -> list[Exception] | None:
-    error = self._model_access.unlisted_selection_error()
-    if error is not None:
-        return [error]
-    ...
-
-
-def process(self) -> None:
-    error = self._model_access.unlisted_selection_error()
-    if error is not None:
-        raise error
-    ...
-```
+Any other saved value outside `model_choices` is replaced with the first choice when the workflow loads. If your node's list used to be open-ended, for example fetched from the provider, you can't map every value it may have saved. Pass `keep_unlisted_values=True` to store such a value as saved instead: the existing selection gate -- `query_for_denial` / `raise_if_denied` / `selection_denial` / `raise_if_selection_denied` -- reports it by name, so the run fails naming that model instead of quietly using another. You don't call anything extra from `validate_before_workflow_run` or `process` beyond what you already call for license denials.
 
 The dropdown still offers only `model_choices`, and a `deprecated_values` key still migrates to its replacement.
 
