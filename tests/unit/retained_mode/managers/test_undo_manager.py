@@ -467,6 +467,22 @@ class TestWhatAnUndoLeavesAlone:
 
         assert _node(workflow, "a") is before
 
+    def test_the_size_the_editor_first_records_is_kept(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """Recording it is no change, so a checkpoint taken before it has no say on it."""
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        before = _node(workflow, "a")
+        _set(engine, workflow, "b", "first", group="one")
+        _set(engine, workflow, "b", "second", group="two")
+        size = {"width": 600, "height": 236}
+        _ok(engine, workflow, SetNodeMetadataRequest(node_name="a", metadata={"size": size}))
+
+        _undo(engine, workflow)
+        _undo(engine, workflow)
+
+        assert _node(workflow, "a") is before
+        assert _node_metadata(workflow, "a")["size"] == size
+
     def test_a_metadata_key_the_step_added_is_removed(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         _add(engine, workflow, "a")
         _ok(engine, workflow, SetNodeMetadataRequest(node_name="a", metadata={"note": "hi"}), "annotate")
