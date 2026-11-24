@@ -818,3 +818,286 @@ class TestCodecAccess:
         # query carries the container the caller supplied.
         assert query_attrs.get("container_format") == "mp4"
         assert enforcement_attrs.get("container_format") == "mp4"
+
+
+class TestResolveChatModel:
+    """`AccessManager.resolve_chat_model`: the chat sidebar's id/provider/family resolution.
+
+    Called in-process by `AgentManager`, not through an event -- these tests go
+    straight at the manager instance rather than through `engine.handle_request`.
+    """
+
+    def test_griptape_cloud_model_resolves_to_its_catalog_key(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="claude-sonnet-5")
+        assert resolved is not None
+        assert resolved.model_id == "gtc_claude_sonnet_5"
+        assert resolved.provider_id == "anthropic"
+        assert resolved.model_families == ["Claude 5"]
+
+    def test_griptape_cloud_model_never_resolves_to_the_griptape_cloud_provider(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="gpt-5")
+        assert resolved is not None
+        assert resolved.provider_id == "openai"
+
+    def test_unresolved_griptape_cloud_model_returns_none(self) -> None:
+        """No bare-id fallback: an unresolved id would carry no provider/family and escape every deny rule."""
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="not-a-real-model")
+        assert resolved is None
+
+    def test_ollama_model_gets_a_derived_id_under_its_own_provider(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="ollama", model_name="llama3.2")
+        assert resolved is not None
+        assert resolved.model_id == "ollama/llama3.2"
+        assert resolved.provider_id == "ollama"
+        assert resolved.model_families is None
+
+    def test_ollama_model_name_containing_slashes_splits_only_at_the_first(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="ollama", model_name="hf.co/user/model:tag")
+        assert resolved is not None
+        assert resolved.model_id == "ollama/hf.co/user/model:tag"
+        assert resolved.provider_id == "ollama"
+
+    def test_lmstudio_model_gets_a_derived_id(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="lmstudio", model_name="some-local-model")
+        assert resolved is not None
+        assert resolved.model_id == "lmstudio/some-local-model"
+        assert resolved.provider_id == "lmstudio"
+
+    def test_custom_connection_maps_to_custom_endpoint_provider(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="custom", model_name="my-endpoint-model")
+        assert resolved is not None
+        assert resolved.model_id == "custom_endpoint/my-endpoint-model"
+        assert resolved.provider_id == "custom_endpoint"
+        assert resolved.model_families is None
+
+    def test_deprecated_prompt_name_resolves_to_its_own_catalog_entry(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="claude-sonnet-4-6")
+        assert resolved is not None
+        assert resolved.model_id == "gtc_claude_sonnet_4_6"
+        assert resolved.provider_id == "anthropic"
+
+    def test_deprecated_image_name_resolves_to_its_own_catalog_entry(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        resolved = AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="dall-e-3")
+        assert resolved is not None
+        assert resolved.model_id == "openai_dall_e_3"
+        assert resolved.provider_id == "openai"
+
+    def test_deprecated_name_with_no_catalog_key_is_unresolved(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        assert AccessManager.resolve_chat_model(connection_id="griptape_cloud", model_name="claude-3-7-sonnet") is None
+
+
+class TestChatModelDenial:
+    """`AccessManager.chat_model_denial`: the chat sidebar's `OfferModel` / `InvokeModel` refusal."""
+
+    def test_no_hook_is_allowed(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
+
+        manager = engine.access_manager
+        for action in (CheckpointAction.OFFER_MODEL, CheckpointAction.INVOKE_MODEL):
+            assert (
+                manager.chat_model_denial(action=action, connection_id="griptape_cloud", model_name="claude-sonnet-5")
+                is None
+            )
+
+    def test_node_rule_also_denies_the_same_chat_model(self, engine: Engine) -> None:
+        """A rule written against the node catalog key also gates the chat model sharing that key."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        def deny(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+            return None
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(deny)
+        try:
+            denial_message = manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-5"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(deny)
+
+        assert denial_message == "model 'claude-sonnet-5' is not permitted: Sonnet is not in your plan."
+
+    def test_provider_rule_denies_an_ollama_model(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        def deny_ollama(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "ollama":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
+            return None
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(deny_ollama)
+        try:
+            denial_message = manager.chat_model_denial(
+                action=CheckpointAction.INVOKE_MODEL, connection_id="ollama", model_name="llama3.2"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_ollama)
+
+        assert denial_message is not None
+
+    def test_offer_model_action_reaches_the_hook(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
+
+        seen_actions: list[str] = []
+
+        def record(checkpoint: object) -> None:
+            seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(record)
+        try:
+            manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-5"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(record)
+
+        assert seen_actions == ["OfferModel"]
+
+    def test_invoke_model_action_reaches_the_hook(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
+
+        seen_actions: list[str] = []
+
+        def record(checkpoint: object) -> None:
+            seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(record)
+        try:
+            manager.chat_model_denial(
+                action=CheckpointAction.INVOKE_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-5"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(record)
+
+        assert seen_actions == ["InvokeModel"]
+
+    def test_unresolved_griptape_cloud_model_is_refused_and_never_asked_of_policy(self, engine: Engine) -> None:
+        """An unknown model is refused outright; it is never offered/invoked and the hook is never consulted."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
+
+        seen_actions: list[str] = []
+
+        def record(checkpoint: object) -> None:
+            seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(record)
+        try:
+            denial_message = manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id="griptape_cloud", model_name="not-a-real-model"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(record)
+
+        assert denial_message == "'not-a-real-model' is not a Griptape Cloud catalog model."
+        assert seen_actions == []
+
+    def test_deprecated_name_with_no_hook_is_allowed(self, engine: Engine) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
+
+        manager = engine.access_manager
+        denial_message = manager.chat_model_denial(
+            action=CheckpointAction.OFFER_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-4-6"
+        )
+        assert denial_message is None
+
+    def test_rule_on_the_deprecated_models_own_key_denies_it(self, engine: Engine) -> None:
+        """A rule on `gtc_claude_sonnet_4_6` denies a run that sends `claude-sonnet-4-6`."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        def deny_sonnet_4_6(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_4_6":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+            return None
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(deny_sonnet_4_6)
+        try:
+            denial_message = manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-4-6"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_sonnet_4_6)
+
+        assert denial_message == "model 'claude-sonnet-4-6' is not permitted: Sonnet is not in your plan."
+
+    def test_rule_on_the_replacements_key_does_not_deny_the_deprecated_name(self, engine: Engine) -> None:
+        """The deprecated name runs as itself, so its replacement's rule doesn't apply to it."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        def deny_sonnet_5(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet 5 is not in your plan."),))
+            return None
+
+        manager = engine.access_manager
+        engine.event_manager.add_authorization_hook(deny_sonnet_5)
+        try:
+            denial_message = manager.chat_model_denial(
+                action=CheckpointAction.INVOKE_MODEL, connection_id="griptape_cloud", model_name="claude-sonnet-4-6"
+            )
+        finally:
+            engine.event_manager.remove_authorization_hook(deny_sonnet_5)
+
+        assert denial_message is None
+
+
+class TestDerivedModelId:
+    """`build_derived_model_id`: the `<provider>/<model>` id format."""
+
+    def test_joins_provider_and_model(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import build_derived_model_id
+
+        assert build_derived_model_id("ollama", "llama3.2") == "ollama/llama3.2"
+
+    def test_model_half_may_contain_slashes(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import build_derived_model_id
+
+        assert build_derived_model_id("ollama", "hf.co/user/model:tag") == "ollama/hf.co/user/model:tag"
+
+    def test_provider_id_may_not_contain_a_slash(self) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import build_derived_model_id
+
+        with pytest.raises(ValueError, match="/"):
+            build_derived_model_id("not/allowed", "model")

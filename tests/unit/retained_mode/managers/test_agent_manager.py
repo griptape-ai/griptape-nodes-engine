@@ -43,6 +43,7 @@ from griptape_nodes.drivers.cloud_models import (
     provider_catalog_entries,
 )
 from griptape_nodes.node_library.advanced_node_library import MCPTool
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -117,6 +118,11 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _run_event_to_payload,
     _RunnerCacheKey,
 )
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointDenial,
+    CheckpointFailure,
+)
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.servers.mcp import LibraryMCPTools
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError, refusal_from_body
@@ -127,19 +133,23 @@ _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
 
 
 @pytest.fixture
-def agent_manager() -> AgentManager:
+def agent_manager(engine: Engine) -> AgentManager:
     """Build a bare `AgentManager` without running `__init__`.
 
-    The handler only reads module constants, so the manager's wiring (thread
+    The handler only reads module constants and the engine's `AccessManager`
+    (for the `OfferModel` check), so the rest of the manager's wiring (thread
     storage, event handlers, MCP) is irrelevant.
     """
-    return AgentManager.__new__(AgentManager)
+    manager = AgentManager.__new__(AgentManager)
+    manager._engine = engine  # type: ignore[assignment]
+    return manager
 
 
 @pytest.fixture
-def providers_manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
+def providers_manager(monkeypatch: pytest.MonkeyPatch, engine: Engine) -> AgentManager:
     """Build an AgentManager with a known two-provider list, no config I/O."""
     manager = AgentManager.__new__(AgentManager)
+    manager._engine = engine  # type: ignore[assignment]
     manager._providers = [
         ProviderConfig(name="griptape_cloud", type="griptape_cloud", model="gpt-4o"),
         ProviderConfig(name="my-ollama", type="ollama", model="llama3.2", base_url="http://localhost:11434/v1"),
@@ -360,6 +370,97 @@ class TestOnHandleListAgentModelsRequest:
             assert key in result.deprecated_models
         for key in IMAGE_DEPRECATED_MODELS:
             assert key in result.deprecated_models
+
+    def test_denied_model_is_missing_from_allowed_list_and_reports_its_denial(
+        self, agent_manager: AgentManager, engine: Engine
+    ) -> None:
+        def deny_sonnet(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_sonnet)
+
+        result = agent_manager.on_handle_list_agent_models_request(ListAgentModelsRequest())
+
+        assert isinstance(result, ListAgentModelsResultSuccess)
+        assert "claude-sonnet-5" not in result.prompt_models
+        assert (
+            result.denied_prompt_models["claude-sonnet-5"]
+            == "model 'claude-sonnet-5' is not permitted: Sonnet is not in your plan."
+        )
+        # Every other model stays allowed.
+        assert len(result.prompt_models) == len(MODEL_CHOICES) - 1
+        assert result.denied_image_models == {}
+
+    def test_denied_image_model_is_missing_from_allowed_list_and_reports_its_denial(
+        self, agent_manager: AgentManager, engine: Engine
+    ) -> None:
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
+
+        denied_image_model = IMAGE_MODEL_CHOICES[0]
+        denied_image_model_key = AccessManager.resolve_chat_model(
+            connection_id="griptape_cloud", model_name=denied_image_model
+        )
+        assert denied_image_model_key is not None
+
+        def deny_image(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            # The checkpoint's `id` is the catalog key (e.g. `gtc_gpt_image_1_5`), not the wire
+            # name the sidebar sent (`gpt-image-1.5`).
+            if checkpoint.attributes.get("id") == denied_image_model_key.model_id:
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Image generation is off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_image)
+
+        result = agent_manager.on_handle_list_agent_models_request(ListAgentModelsRequest())
+
+        assert isinstance(result, ListAgentModelsResultSuccess)
+        assert denied_image_model not in result.image_models
+        assert (
+            result.denied_image_models[denied_image_model]
+            == f"model '{denied_image_model}' is not permitted: Image generation is off."
+        )
+        assert result.denied_prompt_models == {}
+
+    def test_every_model_denied_returns_an_empty_allowed_list(
+        self, agent_manager: AgentManager, engine: Engine
+    ) -> None:
+        def deny_everything(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial:
+            return CheckpointDenial(failures=(CheckpointFailure(detail="Closed policy."),))
+
+        engine.event_manager.add_authorization_hook(deny_everything)
+
+        result = agent_manager.on_handle_list_agent_models_request(ListAgentModelsRequest())
+
+        assert isinstance(result, ListAgentModelsResultSuccess)
+        assert result.prompt_models == []
+        assert result.image_models == []
+        assert set(result.denied_prompt_models) == set(MODEL_CHOICES)
+        assert set(result.denied_image_models) == set(IMAGE_MODEL_CHOICES)
+
+    def test_no_hook_denies_nothing(self, agent_manager: AgentManager) -> None:
+        """Unchanged from before policy existed: no hook registered means everything is allowed."""
+        result = agent_manager.on_handle_list_agent_models_request(ListAgentModelsRequest())
+
+        assert isinstance(result, ListAgentModelsResultSuccess)
+        assert result.denied_prompt_models == {}
+        assert result.denied_image_models == {}
+
+    def test_node_rule_also_denies_the_shared_chat_model(self, agent_manager: AgentManager, engine: Engine) -> None:
+        """A rule written against the node catalog key (`gtc_claude_sonnet_5`) also gates `claude-sonnet-5` in chat."""
+
+        def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Denied by node-shaped rule."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny)
+
+        result = agent_manager.on_handle_list_agent_models_request(ListAgentModelsRequest())
+
+        assert isinstance(result, ListAgentModelsResultSuccess)
+        assert "claude-sonnet-5" not in result.prompt_models
 
 
 class TestOnHandleCancelAgentRequest:
@@ -823,6 +924,76 @@ class TestCreateAgentProvider:
             if isinstance(result, CreateAgentProviderResultFailure):
                 assert "not a known preset id" not in str(result.result_details)
 
+    def test_create_fails_when_provider_type_is_denied(self, providers_manager: AgentManager, engine: Engine) -> None:
+        """Provider rule: denying `ModelProvider::"ollama"` refuses creating an Ollama provider."""
+
+        def deny_ollama(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "ollama":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_ollama)
+
+        result = providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(
+                provider=CreateProviderPayload(name="home-ollama", type="ollama", model="mistral")
+            )
+        )
+
+        assert isinstance(result, CreateAgentProviderResultFailure)
+        assert "Local models are off." in str(result.result_details)
+        assert not any(p.name == "home-ollama" for p in providers_manager._providers)
+
+    def test_create_fails_when_model_is_denied(self, providers_manager: AgentManager, engine: Engine) -> None:
+        def deny_sonnet(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_sonnet)
+
+        result = providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(
+                provider=CreateProviderPayload(name="new-cloud", type="griptape_cloud", model="claude-sonnet-5")
+            )
+        )
+
+        assert isinstance(result, CreateAgentProviderResultFailure)
+        assert "Sonnet is not in your plan." in str(result.result_details)
+
+    def test_create_fails_for_an_unrecognized_griptape_cloud_model(self, providers_manager: AgentManager) -> None:
+        """No hook needed: an unknown Griptape Cloud model name is refused outright, not resolved to a bare id."""
+        result = providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(
+                provider=CreateProviderPayload(name="new-cloud", type="griptape_cloud", model="not-a-real-model")
+            )
+        )
+
+        assert isinstance(result, CreateAgentProviderResultFailure)
+        assert "not a Griptape Cloud catalog model" in str(result.result_details)
+        assert not any(p.name == "new-cloud" for p in providers_manager._providers)
+
+    def test_local_only_policy_refuses_creating_a_custom_endpoint_provider(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Allowing only `ollama` and `lmstudio` refuses every other provider, including `custom_endpoint`."""
+
+        def allow_only_local(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") in ("ollama", "lmstudio"):
+                return None
+            return CheckpointDenial(failures=(CheckpointFailure(detail="Local models only."),))
+
+        engine.event_manager.add_authorization_hook(allow_only_local)
+
+        result = providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(
+                provider=CreateProviderPayload(name="my-custom", type="custom", model="whatever-model")
+            )
+        )
+
+        assert isinstance(result, CreateAgentProviderResultFailure)
+        assert "Local models only." in str(result.result_details)
+
 
 # ---------------------------------------------------------------------------
 # UpdateAgentProviderRequest
@@ -933,6 +1104,72 @@ class TestUpdateAgentProvider:
         assert isinstance(result, UpdateAgentProviderResultSuccess)
         updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
         assert updated.type == "lmstudio"
+
+    def test_update_fails_when_new_model_is_denied(self, providers_manager: AgentManager, engine: Engine) -> None:
+        def deny_phi3(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "ollama/phi3":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="phi3 is blocked."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_phi3)
+
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="phi3"))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultFailure)
+        assert "phi3 is blocked." in str(result.result_details)
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.model == "llama3.2"  # unchanged
+
+    def test_update_fails_when_new_type_makes_the_existing_model_denied(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Provider rule: switching `my-ollama`'s type to a denied provider is refused, even with no model edit."""
+
+        def deny_lmstudio(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "lmstudio":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="LM Studio is off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_lmstudio)
+
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(type="lmstudio"))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultFailure)
+        assert "LM Studio is off." in str(result.result_details)
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.type == "ollama"  # unchanged
+
+    def test_update_fails_for_an_unrecognized_griptape_cloud_model(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="griptape_cloud", provider=UpdateProviderPayload(model="not-a-real-model"))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultFailure)
+        assert "not a Griptape Cloud catalog model" in str(result.result_details)
+
+    def test_update_of_an_unrelated_field_is_not_blocked_by_an_already_denied_model(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Tightening policy against an already-configured provider must not block an unrelated edit to it."""
+
+        def deny_llama(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "ollama/llama3.2":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="llama3.2 is blocked."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_llama)
+
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(icon="server"))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultSuccess)
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.icon == "server"
 
 
 # ---------------------------------------------------------------------------
@@ -1143,7 +1380,48 @@ class TestListProviderModels:
         # possible via the recorder, but we verify success indicates the key
         # was accepted (mocked endpoint ignores it).
         assert isinstance(result, ListProviderModelsResultSuccess)
-        assert result.models == ["some-model"]
+
+    @pytest.mark.asyncio
+    async def test_provider_rule_filters_out_a_denied_discovered_model(
+        self, providers_manager: AgentManager, engine: Engine, patch_get: _GetRecorder
+    ) -> None:
+        """A provider-wide deny (`ModelProvider::"ollama"`) drops every model discovered from it."""
+        base_url = "http://localhost:11434/v1"
+        payload = json.dumps({"data": [{"id": "llama3.2"}, {"id": "phi3"}]}).encode()
+        patch_get.responses[f"{base_url}/models"] = httpx2.Response(200, content=payload)
+
+        def deny_ollama(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "ollama":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_ollama)
+
+        result = await providers_manager.on_handle_list_provider_models_request(
+            ListProviderModelsRequest(provider="ollama", base_url=base_url)
+        )
+
+        assert isinstance(result, ListProviderModelsResultSuccess)
+        assert result.models == []
+
+    @pytest.mark.asyncio
+    async def test_griptape_cloud_branch_also_honors_model_rules(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        def deny_sonnet(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_sonnet)
+
+        result = await providers_manager.on_handle_list_provider_models_request(
+            ListProviderModelsRequest(provider="griptape_cloud")
+        )
+
+        assert isinstance(result, ListProviderModelsResultSuccess)
+        assert "claude-sonnet-5" not in result.models
+        assert result.models == [m for m in MODEL_CHOICES if m != "claude-sonnet-5"]
 
     @pytest.mark.asyncio
     async def test_entries_without_id_are_excluded(
@@ -1264,6 +1542,142 @@ class TestConfigureAgentActiveProvider:
         assert isinstance(result, ConfigureAgentResultSuccess)
         gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
         assert gc.model == "gpt-5"
+
+    def test_configure_fails_when_new_model_is_denied(self, providers_manager: AgentManager, engine: Engine) -> None:
+        def deny_sonnet(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_claude_sonnet_5":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Sonnet is not in your plan."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_sonnet)
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(prompt_driver=PromptDriverConfig(model="claude-sonnet-5"))
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Sonnet is not in your plan." in str(result.result_details)
+        gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
+        assert gc.model == "gpt-4o"  # unchanged
+
+    def test_configure_fails_when_switching_to_a_denied_active_provider(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Switching to a different provider is itself an offer: its existing model must still be allowed."""
+
+        def deny_ollama(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "ollama":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_ollama)
+
+        result = providers_manager.on_handle_configure_agent_request(ConfigureAgentRequest(active_provider="my-ollama"))
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Local models are off." in str(result.result_details)
+        assert providers_manager._active_provider_name == "griptape_cloud"  # unchanged
+
+    def test_configure_fails_for_an_unrecognized_griptape_cloud_model(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(prompt_driver=PromptDriverConfig(model="not-a-real-model"))
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "not a Griptape Cloud catalog model" in str(result.result_details)
+
+    def test_configure_of_an_unrelated_field_is_not_blocked_by_an_already_denied_active_model(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Tightening policy against the already-active provider must not block an unrelated edit."""
+
+        def deny_gpt4o(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_gpt_4o":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="gpt-4o is blocked."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_gpt4o)
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(image_generation_driver={"model": "gpt-image-1-mini"})
+        )
+
+        assert isinstance(result, ConfigureAgentResultSuccess)
+        assert providers_manager._image_model_name == "gpt-image-1-mini"
+
+    def test_configure_fails_when_new_image_model_is_denied(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Configure refuses a denied image model up front, rather than only failing on first use."""
+
+        def deny_image(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_gpt_image_1_mini":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Image generation is off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_image)
+        original_image_model = providers_manager._image_model_name
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(image_generation_driver={"model": "gpt-image-1-mini"})
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Image generation is off." in str(result.result_details)
+        assert providers_manager._image_model_name == original_image_model  # unchanged
+
+    def test_configure_combined_request_checks_the_pre_switch_prompt_provider_not_the_switched_to_one(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """Setting `prompt_driver.model` together with `active_provider` checks the pair each field writes.
+
+        `_apply_prompt_driver_config` writes the new model onto the provider
+        active *before* the switch (a pre-existing mutation-order quirk, left as
+        is) -- so the offer check for `prompt_driver.model` must target that
+        provider (`griptape_cloud`), not the one `active_provider` switches to
+        (`my-ollama`). A hook that only denies the Anthropic provider would
+        incorrectly allow this request if the check targeted `my-ollama` instead.
+        """
+
+        def deny_anthropic(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "anthropic":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic models are off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_anthropic)
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(
+                active_provider="my-ollama", prompt_driver=PromptDriverConfig(model="claude-sonnet-5")
+            )
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Anthropic models are off." in str(result.result_details)
+        # Neither write happened: the request is refused as a whole.
+        assert providers_manager._active_provider_name == "griptape_cloud"
+        gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
+        assert gc.model == "gpt-4o"
+
+    def test_configure_combined_request_also_checks_the_switched_to_providers_own_model(
+        self, providers_manager: AgentManager, engine: Engine
+    ) -> None:
+        """The switched-to provider's own stored model is checked independently of the prompt-model check."""
+
+        def deny_ollama(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("provider_id") == "ollama":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Local models are off."),))
+            return None
+
+        engine.event_manager.add_authorization_hook(deny_ollama)
+
+        result = providers_manager.on_handle_configure_agent_request(
+            ConfigureAgentRequest(active_provider="my-ollama", prompt_driver=PromptDriverConfig(model="gpt-5"))
+        )
+
+        assert isinstance(result, ConfigureAgentResultFailure)
+        assert "Local models are off." in str(result.result_details)
+        assert providers_manager._active_provider_name == "griptape_cloud"
 
 
 class TestEngineMcpToolset:
@@ -1535,6 +1949,112 @@ class TestAttributionHeaders:
         assert asked == []
 
 
+class TestRunAgentInvokeGate:
+    """`InvokeModel` gates every `RunAgentRequest`, before `_build_runner` builds or reuses a runner.
+
+    This is the gate that matters: `agent.providers` can be edited in the
+    config file directly, skipping every offer check made when the provider
+    was created or last updated.
+    """
+
+    @staticmethod
+    def _manager(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        denial_message: str | None,
+    ) -> tuple[AgentManager, MagicMock]:
+        """A manager whose `InvokeModel` check answers with `denial_message`, and a spy on `_build_runner`."""
+        manager = AgentManager.__new__(AgentManager)
+        manager._active_runs = {}
+        manager._mcp_toolsets = MCPToolsetCache()
+        manager._mcp_server_port = 1234
+        manager._active_provider_name = "griptape_cloud"
+        manager._providers = [ProviderConfig(name="griptape_cloud", type="griptape_cloud", model="gpt-4o")]
+        # Non-empty history keeps `is_first_run` False, so the title update is skipped.
+        manager._thread_storage = SimpleNamespace(  # type: ignore[assignment]
+            load_history=lambda _t: [object()],
+            get_thread_metadata=lambda _t: SimpleNamespace(tool_grants=[]),
+            update_thread_metadata=lambda _t, **_kw: {},
+            append_run_record=lambda thread_id, record: None,  # noqa: ARG005
+        )
+        monkeypatch.setattr(manager, "_validate_thread_for_run", lambda _thread_id: "t1")
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + "._compose_prompt", _stub_compose_prompt)
+
+        build_runner_mock = MagicMock(side_effect=AssertionError("_build_runner must not be reached when denied"))
+        monkeypatch.setattr(manager, "_build_runner", build_runner_mock)
+
+        manager._engine = SimpleNamespace(  # type: ignore[assignment]
+            event_manager=SimpleNamespace(put_event=lambda _e: None),
+            handle_request=lambda _r: GetEnabledMCPServersResultSuccess(servers={}, result_details="none"),
+            ahandle_request=_no_attribution,
+            library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
+            only_open_workflow_or_none=lambda: None,
+            access_manager=SimpleNamespace(chat_model_denial=lambda **_kw: denial_message),
+        )
+        return manager, build_runner_mock
+
+    @pytest.mark.asyncio
+    async def test_denied_model_refuses_the_run_before_building_a_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager, build_runner_mock = self._manager(
+            monkeypatch, denial_message="model 'gpt-4o' is not permitted: Sonnet is not in your plan."
+        )
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "Sonnet is not in your plan." in str(result.result_details)
+        build_runner_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_hook_proceeds_to_build_the_runner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No hook registered: everything is allowed, as today."""
+        manager, build_runner_mock = self._manager(monkeypatch, denial_message=None)
+
+        async def fake_run(*_a: object, **_k: object) -> AgentRunResult:
+            return AgentRunResult(thread_id="t1", output="done", message_count=2)
+
+        build_runner_mock.side_effect = None
+        build_runner_mock.return_value = SimpleNamespace(run=fake_run)
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultSuccess)
+        build_runner_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unrecognized_griptape_cloud_default_model_refuses_the_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A denied default model (never chosen by the user) is refused on the first run; nothing picks another."""
+        manager, build_runner_mock = self._manager(
+            monkeypatch, denial_message="'not-a-real-model' is not a Griptape Cloud catalog model."
+        )
+        # As if `agent.providers` was edited in the config file directly, bypassing every offer check.
+        manager._providers = [ProviderConfig(name="griptape_cloud", type="griptape_cloud", model="not-a-real-model")]
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "not a Griptape Cloud catalog model" in str(result.result_details)
+        build_runner_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_provider_rule_refuses_running_on_a_denied_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Provider rules: denying `ModelProvider::"ollama"` refuses running on one, not just creating one."""
+        manager, build_runner_mock = self._manager(
+            monkeypatch, denial_message="model 'llama3.2' is not permitted: Local models are off."
+        )
+        # As if `agent.providers` was edited in the config file directly, bypassing every offer check.
+        manager._providers = [ProviderConfig(name="my-ollama", type="ollama", model="llama3.2")]
+        manager._active_provider_name = "my-ollama"
+
+        result = await manager.on_handle_run_agent_request(_run_request())
+
+        assert isinstance(result, RunAgentResultFailure)
+        assert "Local models are off." in str(result.result_details)
+        build_runner_mock.assert_not_called()
+
+
 class TestRunAgentResultPayloadContract:
     """`_run_agent`'s three success branches must agree on the payload's keys.
 
@@ -1585,6 +2105,8 @@ class TestRunAgentResultPayloadContract:
             # neither the node types nor a flow.
             library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
             only_open_workflow_or_none=lambda: None,
+            # These tests are about the payload shape, not policy: always allow.
+            access_manager=SimpleNamespace(chat_model_denial=lambda **_kw: None),
         )
         return manager
 

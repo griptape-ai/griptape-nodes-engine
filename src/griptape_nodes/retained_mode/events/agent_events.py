@@ -754,10 +754,11 @@ class ListAgentModelsRequest(RequestPayload):
 
     Use when: Populating the chat sidebar's model-picker dropdowns. The
     engine-bundled agent is wired to Griptape Cloud (`GriptapeCloudPromptDriver`,
-    `GriptapeCloudImageGenerationDriver`), so this returns the GTC catalog.
+    `GriptapeCloudImageGenerationDriver`), so this returns the GTC catalog,
+    filtered through the license policy's `OfferModel` checkpoint.
 
-    Results: ListAgentModelsResultSuccess (with model lists and deprecation map) |
-        ListAgentModelsResultFailure (engine error).
+    Results: ListAgentModelsResultSuccess (with allowed/denied model lists and
+        deprecation map) | ListAgentModelsResultFailure (engine error).
     """
 
 
@@ -767,8 +768,17 @@ class ListAgentModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     """Agent model lists retrieved successfully.
 
     Args:
-        prompt_models: Ordered list of prompt-model IDs available on Griptape Cloud.
-        image_models: Ordered list of image-model IDs available on Griptape Cloud.
+        prompt_models: Ordered list of prompt-model IDs permitted by the license
+            policy's `OfferModel` checkpoint. A model denied by policy is absent
+            from this list, not just from the GTC catalog.
+        image_models: Ordered list of image-model IDs permitted by policy, on the
+            same terms as `prompt_models`.
+        denied_prompt_models: Maps a prompt-model id denied by policy to its
+            denial's reason. A model appears here instead of in `prompt_models`,
+            never both. Empty when no hook is registered or nothing is denied.
+            Additive field; a client that does not read it sees the same allowed
+            lists as before policy existed.
+        denied_image_models: Same as `denied_prompt_models`, for the image namespace.
         deprecated_models: Mapping of deprecated model ID to live replacement
             (covers both the prompt and image namespaces).
         providers: Ordered list of provider catalog entries. Each entry has:
@@ -781,6 +791,8 @@ class ListAgentModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
 
     prompt_models: list[str] = field(default_factory=list)
     image_models: list[str] = field(default_factory=list)
+    denied_prompt_models: dict[str, str] = field(default_factory=dict)
+    denied_image_models: dict[str, str] = field(default_factory=dict)
     deprecated_models: dict[str, str] = field(default_factory=dict)
     providers: list[ProviderCatalogEntry] = field(default_factory=list)
 
