@@ -121,3 +121,13 @@ class TestArbitraryCodeExecManager:
         assert isinstance(result, RunArbitraryPythonStringResultSuccess)
         assert result.found_variable_values == {"a": 1, "b": "hello", "c": [1, 2, 3]}
         assert result.missing_variables == []
+
+    def test_reports_a_change_to_the_workflow_whether_it_succeeds_or_fails(self, engine: Engine) -> None:
+        """The code can change the workflow, before failing too, and nothing can tell afterwards whether it did."""
+        succeeded = engine.handle_request(RunArbitraryPythonStringRequest(python_string="x = 1"))
+        failed = engine.handle_request(RunArbitraryPythonStringRequest(python_string="raise ValueError('no')"))
+
+        assert isinstance(succeeded, RunArbitraryPythonStringResultSuccess)
+        assert succeeded.altered_workflow_state
+        assert isinstance(failed, RunArbitraryPythonStringResultFailure)
+        assert failed.altered_workflow_state
