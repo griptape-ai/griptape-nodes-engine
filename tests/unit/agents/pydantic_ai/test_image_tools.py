@@ -20,6 +20,7 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
     register_image_tools,
 )
 from griptape_nodes.agents.pydantic_ai.tool_approval import ToolApprovalDeps
+from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.utils.budget_refusal import BUDGET_REPLY_HALT_PREFIX, BudgetExceededError
 from tests.unit.utils.test_budget_refusal import a_refusal_body
 
@@ -52,7 +53,7 @@ def _make_toolset(
     config: ImageGenerationToolsetConfig, static_files: _FakeStaticFilesManager
 ) -> ImageGenerationToolset:
     """Build a toolset, casting the fake static file manager to the real type."""
-    return ImageGenerationToolset(config, cast("StaticFilesManager", static_files))
+    return ImageGenerationToolset(config, cast("StaticFilesManager", static_files), current_engine().access_manager)
 
 
 def _ctx(
@@ -144,7 +145,12 @@ class TestRegistration:
             return ModelResponse(parts=[TextPart("done")])
 
         agent: Agent[None, str] = Agent(FunctionModel(respond))
-        register_image_tools(agent, ImageGenerationToolsetConfig(api_key="k"), cast("StaticFilesManager", static_files))
+        register_image_tools(
+            agent,
+            ImageGenerationToolsetConfig(api_key="k"),
+            cast("StaticFilesManager", static_files),
+            current_engine().access_manager,
+        )
         await agent.run("draw a bird")
 
         (tool,) = offered[0].function_tools
@@ -342,7 +348,7 @@ class TestGenerateImageInvokeGate:
         engine.event_manager.add_authorization_hook(deny_image)
         toolset = _make_toolset(ImageGenerationToolsetConfig(api_key="k"), static_files)
 
-        with pytest.raises(PermissionError, match="Image generation is off"):
+        with pytest.raises(ModelRetry, match="Image generation is off"):
             await toolset.generate_image(_ctx(), "a red bird")
 
         assert patch_transport.requests == []

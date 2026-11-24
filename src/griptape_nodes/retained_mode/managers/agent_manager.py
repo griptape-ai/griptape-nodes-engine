@@ -592,6 +592,10 @@ class _ActiveRun:
     loop: asyncio.AbstractEventLoop
 
 
+class ChatModelDeniedError(Exception):
+    """An agent run refused because policy denies its provider and model."""
+
+
 class _RunnerCacheKey(NamedTuple):
     """Everything baked into an agent at construction time.
 
@@ -1008,7 +1012,7 @@ class AgentManager(EngineScoped):
         )
         if denial_message is not None:
             msg = f"Attempted to run the agent. Failed because {denial_message}"
-            raise PermissionError(msg)
+            raise ChatModelDeniedError(msg)
 
         runner = self._build_runner(
             provider_name=provider_name,
@@ -1612,6 +1616,7 @@ class AgentManager(EngineScoped):
             system_prompt=self._system_prompt_extra or None,
             image_config=image_config,
             static_files_manager=self.static_files_manager,
+            access_manager=self.engine.access_manager,
             usage_limits=DEFAULT_AGENT_USAGE_LIMITS,
         )
         self._runner_cache[cache_key] = runner
