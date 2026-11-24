@@ -159,7 +159,11 @@ def _unit_matches(root: str, target_index: Index, live_index: Index) -> bool:
 def _edit_in_place(target: _Node, live: _Node) -> NodeEdit | None:
     edit = NodeEdit()
     target_metadata = target.commands.create_node_command.metadata or {}
-    live_metadata = live.commands.create_node_command.metadata or {}
+    live_metadata = dict(live.commands.create_node_command.metadata or {})
+    # A node without a size is drawn at the size the editor first records for it, which is no change
+    # (see `NodeManager.on_set_node_metadata_request`), so a checkpoint without one keeps the size.
+    if "size" not in target_metadata:
+        live_metadata.pop("size", None)
     if target_metadata != live_metadata:
         edit.metadata = target_metadata
         edit.removed_metadata_keys = sorted(live_metadata.keys() - target_metadata.keys())
