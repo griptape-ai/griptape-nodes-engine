@@ -688,11 +688,13 @@ class TestTwoClientsAtOnce:
     def test_a_synchronous_request_that_cannot_wait_is_refused(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         _add(engine, workflow, "a")
         _set(engine, workflow, "a", "first", group="agent")
-        workflow.undo.request_started()
+        step = workflow.undo.open_step
+        assert step is not None
+        step.request_started()
         try:
             result = _send(engine, workflow, _setting("a", "second"), "user")
         finally:
-            workflow.undo.request_finished()
+            step.request_finished()
 
         assert result.failed()
         assert _value(workflow, "a") == "first"
@@ -715,11 +717,13 @@ class TestTwoClientsAtOnce:
     def test_a_read_is_not_held_up_by_a_step_still_running(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         _add(engine, workflow, "a")
         _set(engine, workflow, "a", "first", group="agent")
-        workflow.undo.request_started()
+        step = workflow.undo.open_step
+        assert step is not None
+        step.request_started()
         try:
             result = _send(engine, workflow, GetNodeMetadataRequest(node_name="a"), "user")
         finally:
-            workflow.undo.request_finished()
+            step.request_finished()
 
         assert result.succeeded(), result.result_details
 

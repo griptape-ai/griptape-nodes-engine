@@ -1,4 +1,19 @@
-from griptape_nodes.retained_mode.runtime.undo_history import MAX_STEPS, UndoHistory
+from griptape_nodes.retained_mode.runtime.undo_history import (
+    MAX_STEPS,
+    Clean,
+    OpenStep,
+    OutsideEdit,
+    RunOutput,
+    StepPending,
+    UndoHistory,
+)
+
+
+def _step(history: UndoHistory, label: str) -> None:
+    """Note a change by a step called ``label``."""
+    step = OpenStep(group=label, label=label)
+    history.open_step = step
+    history.note(StepPending(step))
 
 
 def _with_steps(*labels: str) -> UndoHistory:
@@ -6,7 +21,7 @@ def _with_steps(*labels: str) -> UndoHistory:
     history = UndoHistory()
     history.record(b"start")
     for label in labels:
-        history.pending_label = label
+        _step(history, label)
         history.record(label.encode())
     return history
 
@@ -32,7 +47,7 @@ class TestSteps:
     def test_a_pending_step_can_be_undone_before_it_is_checkpointed(self) -> None:
         history = _with_steps()
 
-        history.pending_label = "Move"
+        _step(history, "Move")
 
         assert history.undo_label == "Move"
         assert history.needs_checkpoint
@@ -46,6 +61,27 @@ class TestSteps:
         assert previous is not None
         assert previous.commands == b"start"
         assert history.undo_label == "Move"
+
+    def test_a_step_that_left_the_workflow_as_it_was_adds_none(self) -> None:
+        history = _with_steps("Move")
+
+        _step(history, "Set Value")
+        history.record(b"Move")
+
+        assert history.undo_label == "Move"
+        assert not history.needs_checkpoint
+
+    def test_a_step_takes_the_label_its_requests_name_it_by_last(self) -> None:
+        history = _with_steps()
+        _step(history, "Set Parameter Value")
+        assert history.open_step is not None
+
+        history.open_step.label = "Group 3 Nodes"
+        history.record(b"grouped")
+
+        current = history.current()
+        assert current is not None
+        assert current.label == "Group 3 Nodes"
 
     def test_stepping_back_and_forth_moves_the_labels(self) -> None:
         history = _with_steps("Move", "Rename")
@@ -63,11 +99,18 @@ class TestSteps:
         assert history.undo_label == "Rename"
         assert history.redo_label is None
 
+    def test_stepping_back_closes_the_open_step(self) -> None:
+        history = _with_steps("Move")
+
+        history.step_back()
+
+        assert history.open_step is None
+
     def test_a_new_step_drops_what_could_be_redone(self) -> None:
         history = _with_steps("Move", "Rename")
         history.step_back()
 
-        history.pending_label = "Delete"
+        _step(history, "Delete")
         history.record(b"Delete")
 
         assert history.redo_label is None
@@ -87,11 +130,11 @@ class TestSteps:
         assert undone == MAX_STEPS
 
 
-class TestChangesOutsideAStep:
-    def test_replace_the_current_checkpoint_instead_of_adding_a_step(self) -> None:
+class TestARun:
+    def test_replaces_the_current_checkpoint_instead_of_adding_a_step(self) -> None:
         history = _with_steps("Move")
 
-        history.stale = True
+        history.note(RunOutput())
         history.record(b"Move, then a run")
 
         assert history.undo_label == "Move"
@@ -100,33 +143,103 @@ class TestChangesOutsideAStep:
         assert current.commands == b"Move, then a run"
         assert current.label == "Move"
 
-    def test_can_drop_what_could_be_redone(self) -> None:
+    def test_keeps_what_could_be_redone(self) -> None:
         history = _with_steps("Move", "Rename")
         history.step_back()
 
-        history.drop_redo()
-
-        assert history.undo_label == "Move"
-        assert history.redo_label is None
-
-    def test_keep_what_could_be_redone(self) -> None:
-        history = _with_steps("Move", "Rename")
-        history.step_back()
-
-        history.stale = True
+        history.note(RunOutput())
         history.record(b"Move, then a run")
 
         assert history.redo_label == "Rename"
 
 
+class TestAClientsChangeOutsideAStep:
+    def test_replaces_the_current_checkpoint_instead_of_adding_a_step(self) -> None:
+        history = _with_steps("Move")
+
+        history.note(OutsideEdit())
+        history.record(b"Move, then a resize")
+
+        assert history.undo_label == "Move"
+        current = history.current()
+        assert current is not None
+        assert current.commands == b"Move, then a resize"
+
+    def test_drops_what_could_be_redone(self) -> None:
+        history = _with_steps("Move", "Rename")
+        history.step_back()
+
+        history.note(OutsideEdit())
+        history.record(b"Move, then a resize")
+
+        assert history.undo_label == "Move"
+        assert history.redo_label is None
+
+    def test_that_left_the_workflow_as_it_was_keeps_what_could_be_redone(self) -> None:
+        """Such as an editor writing back what it shows after an undo."""
+        history = _with_steps("Move", "Rename")
+        history.step_back()
+
+        history.note(OutsideEdit())
+        history.record(b"Move")
+
+        assert history.redo_label == "Rename"
+
+
+class TestChangesBeforeOneCheckpoint:
+    def test_a_run_does_not_hide_a_clients_change(self) -> None:
+        history = _with_steps("Move", "Rename")
+        history.step_back()
+
+        history.note(OutsideEdit())
+        history.note(RunOutput())
+        history.record(b"Move, then a resize and a run")
+
+        assert history.redo_label is None
+
+    def test_a_clients_change_outside_a_step_does_not_hide_a_step(self) -> None:
+        history = _with_steps("Move")
+
+        _step(history, "Rename")
+        history.note(OutsideEdit())
+        history.record(b"Rename, then a resize")
+
+        assert history.undo_label == "Rename"
+        previous = history.previous()
+        assert previous is not None
+        assert previous.commands == b"Move"
+
+    def test_a_checkpoint_leaves_the_history_clean(self) -> None:
+        history = _with_steps("Move")
+
+        history.note(OutsideEdit())
+        history.record(b"Move, then a resize")
+
+        assert history.drift == Clean()
+        assert not history.needs_checkpoint
+
+
+class TestOpenStep:
+    def test_is_running_while_any_of_its_requests_is(self) -> None:
+        step = OpenStep(group="drag", label="Move")
+
+        step.request_started()
+        step.request_started()
+        step.request_finished()
+
+        assert step.running
+        step.request_finished()
+        assert not step.running
+
+
 class TestClearing:
     def test_forgets_every_checkpoint(self) -> None:
         history = _with_steps("Move")
-        history.open_group = "drag"
+        history.open_step = OpenStep(group="drag", label="Move")
 
         history.clear()
 
         assert history.undo_label is None
         assert history.current() is None
-        assert history.open_group is None
+        assert history.open_step is None
         assert history.needs_checkpoint
