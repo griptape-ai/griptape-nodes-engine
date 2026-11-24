@@ -166,7 +166,7 @@ A request becomes undoable when it carries an `undo_group`, any string you choos
 
 An undo changes only the nodes the step changed, and brings each back the way a save made before the step would reopen it:
 
-- Nodes the step didn't change are left as they are, with their latest results and anything they hold in memory, such as a loaded model. A node whose position, size or lock the step changed is changed back in place. Any other node the step changed is rebuilt and marked to run again, with every node downstream of it.
+- Nodes the step didn't change are left as they are, with their latest results and anything they hold in memory, such as a loaded model. A node whose position, size or lock the step changed is changed back in place. Any other node the step changed is rebuilt and marked to run again, with every node downstream of it. A group is rebuilt with its members.
 - A change made by a request without an `undo_group`, or by a run, is taken back along with the step before it. Running, stepping through, cancelling and resetting a run are never steps.
 - Workflow variables are left as they are.
 - Each workflow keeps its last 100 steps. Closing it, or restarting the engine, clears them.
