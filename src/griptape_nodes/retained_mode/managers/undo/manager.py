@@ -82,26 +82,31 @@ _COMPRESSION_LEVEL = 1
 _REBUILD_EVENTS = frozenset({ResultPayload, ExecutionPayload})
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class _Recording:
     """The step a request and everything it dispatches belong to.
 
     Args:
         workflow: The workflow the step changes.
         label: What the step is called, or None for a client's change outside any step.
+        open: Whether the request is still being handled. A task it started can outlive it.
     """
 
     workflow: WorkflowRuntime
     label: str | None
+    open: bool = True
 
 
-# Nested requests, and tasks a request starts, inherit the step through the context.
+# Nested requests inherit the step through the context. So do tasks a request starts, but only
+# until the request finishes: what a task changes after that is a change outside any step.
 _recording: ContextVar[_Recording | None] = ContextVar("undo_recording", default=None)
 
 
 @dataclass(frozen=True)
 class DispatchScope:
     token: Token[_Recording | None]
+    # What the request records into, or None for a run, which records into nothing.
+    recording: _Recording | None
     # The workflow whose step the request is part of, or None for a run, which is part of none.
     workflow: WorkflowRuntime | None
     # Whether the request is part of a step, rather than a change outside any step.
@@ -155,7 +160,7 @@ class UndoManager(EngineScoped):
         if isinstance(request, RunControlMixin):
             if _recording.get() is None:
                 return None
-            return DispatchScope(token=_recording.set(None), workflow=None)
+            return DispatchScope(token=_recording.set(None), recording=None, workflow=None)
         if not outermost or workflow is None or never_alters_workflow(type(request)):
             return None
         history = workflow.undo
@@ -166,14 +171,16 @@ class UndoManager(EngineScoped):
         if request.undo_group != history.open_group:
             self._checkpoint(workflow)
             history.open_group = request.undo_group
-        label = request.undo_label or _label_for(request)
-        token = _recording.set(_Recording(workflow=workflow, label=label))
+        recording = _Recording(workflow=workflow, label=request.undo_label or _label_for(request))
+        token = _recording.set(recording)
         history.request_started()
-        return DispatchScope(token=token, workflow=workflow)
+        return DispatchScope(token=token, recording=recording, workflow=workflow)
 
     def end_dispatch(self, scope: DispatchScope | None) -> None:
         if scope is None:
             return
+        if scope.recording is not None:
+            scope.recording.open = False
         _recording.reset(scope.token)
         if scope.workflow is None:
             return
@@ -191,8 +198,9 @@ class UndoManager(EngineScoped):
         if history.restoring or isinstance(request, (UndoRequest, RedoRequest)):
             return
         recording = _recording.get()
-        if recording is None or recording.workflow is not workflow:
-            # A run's change, or a client's change made while there was nothing to redo.
+        if recording is None or not recording.open or recording.workflow is not workflow:
+            # A run's change, a client's change made while there was nothing to redo, or one made by
+            # a task a request started, after the request finished.
             history.stale = True
         elif recording.label is None:
             history.stale = True
@@ -275,8 +283,9 @@ class UndoManager(EngineScoped):
         # With nothing to redo, it is only a change outside any step, which the next checkpoint takes in.
         if workflow.undo.redo_label is None:
             return None
-        token = _recording.set(_Recording(workflow=workflow, label=None))
-        return DispatchScope(token=token, workflow=workflow, in_step=False)
+        recording = _Recording(workflow=workflow, label=None)
+        token = _recording.set(recording)
+        return DispatchScope(token=token, recording=recording, workflow=workflow, in_step=False)
 
     def _checkpoint(self, workflow: WorkflowRuntime) -> None:
         """Take a checkpoint if the workflow may differ from the current one."""

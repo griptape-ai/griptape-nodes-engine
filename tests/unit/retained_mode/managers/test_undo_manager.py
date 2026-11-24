@@ -724,6 +724,46 @@ class TestTwoClientsAtOnce:
         assert result.succeeded(), result.result_details
 
 
+class TestATaskARequestStarted:
+    def test_is_not_part_of_the_step_once_the_request_finished(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        """Such as a node that fills in a dropdown a few seconds after it is created."""
+        _add(engine, workflow, "a", group="setup")
+        _add(engine, workflow, "b", group="setup")
+        original = engine.event_manager.get_manager_for_request_type(SetParameterValueRequest)
+        assert callable(original)
+
+        async def scenario() -> None:
+            undone = asyncio.Event()
+            tasks: list[asyncio.Task] = []
+
+            async def fills_in_later() -> None:
+                await undone.wait()
+                await workflow.ahandle_request(_setting("b", "filled in"))
+
+            async def starts_a_task(request: SetParameterValueRequest, workflow: WorkflowRuntime) -> Any:
+                if request.value == "typed":
+                    tasks.append(asyncio.create_task(fills_in_later()))
+                result = original(request, workflow=workflow)
+                if inspect.isawaitable(result):
+                    result = await result
+                return result
+
+            engine.event_manager.replace_manager_for_request_type(SetParameterValueRequest, starts_a_task)
+            try:
+                await _send_async(engine, workflow, _setting("a", "typed"), "user")
+                await _send_async(engine, workflow, UndoRequest(), "user")
+                undone.set()
+                await asyncio.gather(*tasks)
+            finally:
+                engine.event_manager.replace_manager_for_request_type(SetParameterValueRequest, original)
+
+        asyncio.run(scenario())
+
+        # Not a step named after the request that started it, which would drop what could be redone.
+        assert workflow.undo.undo_label == "Create Node"
+        assert workflow.undo.redo_label == "Set Parameter Value"
+
+
 def _setting(name: str, value: str) -> SetParameterValueRequest:
     return SetParameterValueRequest(node_name=name, parameter_name="value", value=value)
 
