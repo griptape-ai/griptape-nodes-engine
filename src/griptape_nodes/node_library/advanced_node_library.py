@@ -8,6 +8,8 @@ from pydantic import TypeAdapter
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from griptape_nodes.exe_types.flow import ControlFlow
+    from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.library_registry import Library, LibrarySchema
     from griptape_nodes.retained_mode.events.base_events import (
         AppPayload,
@@ -287,6 +289,41 @@ class AdvancedNodeLibrary:
                 ]
         """
         return []
+
+    def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None:
+        """Validate a whole flow before it starts running.
+
+        Called once per library, for every library loaded in the process, just before a flow
+        starts running. ``nodes`` is every node that will run, not just the nodes this library
+        owns, so a library can enforce rules that span the whole graph — a rule that needs to
+        see two nodes at once has nowhere else to live.
+
+        This is the one hook on this class that is **not** notification only. Where
+        ``get_execution_event_listeners()`` and the other hooks above only observe and cannot
+        fail the operation, a non-empty return value here, or an exception this method raises,
+        stops the flow from starting. The exceptions are reported back to the caller as
+        validation failures alongside any raised by the nodes' own
+        ``validate_before_workflow_run()``.
+
+        **First failure wins.** If one library's call raises, or returns a non-empty list, the
+        engine stops calling further libraries' hooks for this validation pass; it does not
+        collect failures from every library.
+
+        **Keep it quick.** The caller waits for this to return before the flow can start.
+
+        Args:
+            flow: The flow about to run.
+            nodes: Every node that will run as part of it.
+
+        Returns:
+            A list of exceptions if validation fails, or None (or an empty list) if it passes.
+
+        Example:
+            def validate_flow_before_run(self, flow, nodes):
+                if len(nodes) > self._max_nodes_per_run:
+                    return [RuntimeError(f"Flow '{flow.name}' exceeds the node limit for this license.")]
+                return None
+        """
 
     def get_app_event_listeners(
         self,

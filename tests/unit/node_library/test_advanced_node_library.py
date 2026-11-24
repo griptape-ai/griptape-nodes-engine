@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
 from griptape_nodes.node_library.library_registry import Library, LibrarySchema
 
@@ -76,3 +78,25 @@ class TestGetEventListeners:
 
     def test_app_event_listeners_default_to_none(self) -> None:
         assert AdvancedNodeLibrary().get_app_event_listeners() == []
+
+
+class TestValidateFlowBeforeRun:
+    def test_base_class_is_noop(self) -> None:
+        adv = AdvancedNodeLibrary()
+        flow = MagicMock(spec=ControlFlow)
+        nodes: list[BaseNode] = [MagicMock(spec=BaseNode), MagicMock(spec=BaseNode)]
+        assert adv.validate_flow_before_run(flow, nodes) is None
+
+    def test_subclass_can_override(self) -> None:
+        flow = MagicMock(spec=ControlFlow)
+        nodes: list[BaseNode] = [MagicMock(spec=BaseNode)]
+
+        class MyLib(AdvancedNodeLibrary):
+            def validate_flow_before_run(self, flow: object, nodes: list) -> list[Exception] | None:
+                return [RuntimeError(f"flow {flow} with {len(nodes)} nodes is invalid")]
+
+        adv = MyLib()
+        exceptions = adv.validate_flow_before_run(flow, nodes)
+        assert exceptions is not None
+        assert len(exceptions) == 1
+        assert str(exceptions[0]) == f"flow {flow} with {len(nodes)} nodes is invalid"

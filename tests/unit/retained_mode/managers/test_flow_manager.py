@@ -21,6 +21,8 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -61,7 +63,10 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
     AddParameterToNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.events.validation_events import ValidateFlowDependenciesResultSuccess
+from griptape_nodes.retained_mode.events.validation_events import (
+    ValidateFlowDependenciesRequest,
+    ValidateFlowDependenciesResultSuccess,
+)
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.managers.flow_manager import StartFlowFromNodeSpec, StartFlowSpec
 from griptape_nodes.retained_mode.managers.node_manager import ResolveNodeSpec
@@ -460,6 +465,90 @@ class TestStartFlowFailureMessage:
 
         assert isinstance(result, StartFlowFromNodeResultFailure)
         assert str(result.result_details) == "Attempted to run flow 'f'. Failed due to: boom"
+
+
+class TestValidateFlowDependenciesLibraryHooks:
+    """AdvancedNodeLibrary.validate_flow_before_run() can block a flow from starting."""
+
+    @pytest.fixture
+    def flow_name(self, engine: Engine) -> str:
+        engine.context_manager.push_workflow(workflow_name="library_hook_workflow")
+        create_result = engine.handle_request(CreateFlowRequest(parent_flow_name=None, set_as_new_context=False))
+        assert isinstance(create_result, CreateFlowResultSuccess)
+        return create_result.flow_name
+
+    @pytest.mark.asyncio
+    async def test_no_advanced_library_leaves_validation_unaffected(self, engine: Engine, flow_name: str) -> None:
+        with patch.object(LibraryRegistry, "list_libraries", return_value=[]):
+            result = await engine.flow_manager.on_validate_flow_dependencies_request(
+                ValidateFlowDependenciesRequest(flow_name=flow_name), _a_workflow(engine)
+            )
+
+        assert isinstance(result, ValidateFlowDependenciesResultSuccess)
+        assert result.validation_succeeded is True
+        assert result.exceptions == []
+
+    @pytest.mark.asyncio
+    async def test_library_hook_returning_exceptions_blocks_the_flow(self, engine: Engine, flow_name: str) -> None:
+        failure = RuntimeError("flow violates a cross-library rule")
+        advanced_library = AdvancedNodeLibrary()
+        with (
+            patch.object(advanced_library, "validate_flow_before_run", return_value=[failure]),
+            patch.object(LibraryRegistry, "list_libraries", return_value=["Failing Library"]),
+            patch.object(LibraryRegistry, "get_library") as mock_get_library,
+        ):
+            mock_get_library.return_value.get_advanced_library.return_value = advanced_library
+            result = await engine.flow_manager.on_validate_flow_dependencies_request(
+                ValidateFlowDependenciesRequest(flow_name=flow_name), _a_workflow(engine)
+            )
+
+        assert isinstance(result, ValidateFlowDependenciesResultSuccess)
+        assert result.validation_succeeded is False
+        assert result.exceptions == [failure]
+
+    @pytest.mark.asyncio
+    async def test_library_hook_raising_blocks_the_flow(self, engine: Engine, flow_name: str) -> None:
+        failure = RuntimeError("the hook itself blew up")
+        advanced_library = AdvancedNodeLibrary()
+        with (
+            patch.object(advanced_library, "validate_flow_before_run", side_effect=failure),
+            patch.object(LibraryRegistry, "list_libraries", return_value=["Failing Library"]),
+            patch.object(LibraryRegistry, "get_library") as mock_get_library,
+        ):
+            mock_get_library.return_value.get_advanced_library.return_value = advanced_library
+            result = await engine.flow_manager.on_validate_flow_dependencies_request(
+                ValidateFlowDependenciesRequest(flow_name=flow_name), _a_workflow(engine)
+            )
+
+        assert isinstance(result, ValidateFlowDependenciesResultSuccess)
+        assert result.validation_succeeded is False
+        assert result.exceptions == [failure]
+
+    @pytest.mark.asyncio
+    async def test_first_failing_library_stops_further_libraries_from_being_called(
+        self, engine: Engine, flow_name: str
+    ) -> None:
+        failing_library = AdvancedNodeLibrary()
+        second_library = AdvancedNodeLibrary()
+        with (
+            patch.object(
+                failing_library, "validate_flow_before_run", return_value=[RuntimeError("first library failed")]
+            ),
+            patch.object(second_library, "validate_flow_before_run", return_value=None) as second_hook,
+            patch.object(LibraryRegistry, "list_libraries", return_value=["First Library", "Second Library"]),
+            patch.object(LibraryRegistry, "get_library") as mock_get_library,
+        ):
+            mock_get_library.side_effect = lambda name: {
+                "First Library": MagicMock(get_advanced_library=MagicMock(return_value=failing_library)),
+                "Second Library": MagicMock(get_advanced_library=MagicMock(return_value=second_library)),
+            }[name]
+            result = await engine.flow_manager.on_validate_flow_dependencies_request(
+                ValidateFlowDependenciesRequest(flow_name=flow_name), _a_workflow(engine)
+            )
+
+        assert isinstance(result, ValidateFlowDependenciesResultSuccess)
+        assert result.validation_succeeded is False
+        second_hook.assert_not_called()
 
 
 class TestListNodesInFlowRequest:

@@ -33,6 +33,7 @@ from griptape_nodes.exe_types.node_types import (
 )
 from griptape_nodes.machines.control_flow import CompleteState, ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories, NodeState
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     ResultDetails,
@@ -2063,6 +2064,20 @@ class FlowManager(EngineScoped):
             exceptions = node.validate_before_workflow_run()
             if exceptions:
                 all_exceptions = all_exceptions + exceptions
+
+        nodes_list = list(nodes)
+        for library_name in LibraryRegistry.list_libraries():
+            advanced_library = LibraryRegistry.get_library(library_name).get_advanced_library()
+            if advanced_library is None:
+                continue
+            try:
+                library_exceptions = advanced_library.validate_flow_before_run(flow, nodes_list)
+            except Exception as err:
+                all_exceptions.append(err)
+                break
+            if library_exceptions:
+                all_exceptions.extend(library_exceptions)
+                break
         return ValidateFlowDependenciesResultSuccess(
             validation_succeeded=len(all_exceptions) == 0,
             exceptions=all_exceptions,

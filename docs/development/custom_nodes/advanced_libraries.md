@@ -38,6 +38,8 @@ list in the manifest. That is the common case and it needs no Python beyond the 
     [`get_app_event_listeners`](#get_app_event_listeners).
 - **Register a competing provider** for an engine request type, such as a workflow
     publisher. See [Publishing](../../guides/publishing.md).
+- **Block a flow from running** when it, or the graph around it, breaks a rule only your
+    library knows about. See [`validate_flow_before_run`](#validate_flow_before_run).
 
 ## Wiring one up
 
@@ -474,6 +476,44 @@ reported as an `AppEventListenerRegistrationProblem`. One thing to watch for: li
 load while Griptape Nodes starts up, so a listener for `AppInitializationComplete` doesn't
 hear the startup that loaded its library. Do that work in
 [`after_library_nodes_loaded`](#after_library_nodes_loaded) instead.
+
+### `validate_flow_before_run`
+
+```python
+def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None: ...
+```
+
+Runs once per library, for every library loaded in the process, just before a flow
+starts running — after every node's own `validate_before_workflow_run()` has already run,
+and before the flow's first node executes. `nodes` is every node the run will touch, not
+just the ones your library owns, so this is the place for a rule that only makes sense
+looking at the whole graph: a node count against a license limit, two node types that
+must not appear together, a required node that is missing.
+
+This is the one hook on this page that is **not** notification only. Every other hook —
+most pointedly [`get_execution_event_listeners`](#get_execution_event_listeners), which
+also watches a run but can only observe it — is notification only, and a callback that
+raises is logged and ignored while the run carries on. Here, a non-empty return value, or
+an exception you raise, **stops the flow from starting**:
+
+```python
+class LicenseLibrary(AdvancedNodeLibrary):
+    def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None:
+        if len(nodes) > self._max_nodes_per_run:
+            return [RuntimeError(f"Flow '{flow.name}' exceeds the node limit for this license.")]
+        return None
+```
+
+The exceptions you return land in the same list as any raised by the nodes' own
+`validate_before_workflow_run()`, and the caller sees them as validation failures, not as
+a run that started and then failed.
+
+Constraints on the mechanism:
+
+- **First failure wins.** If one library's call raises, or returns a non-empty list, the
+    engine stops calling further libraries' hooks for that validation pass. It does not
+    collect failures from every library that would have failed.
+- **Keep it quick.** The flow waits for this to return before it can start.
 
 ## Registering node types without listing them in the manifest
 
