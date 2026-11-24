@@ -53,6 +53,7 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_loading import node_loading
+from griptape_nodes.exe_types.node_metadata import without_first_size
 from griptape_nodes.exe_types.node_types import (
     ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
@@ -1759,20 +1760,13 @@ class NodeManager(EngineScoped):
                 result = SetNodeMetadataResultFailure(result_details=details)
                 return result
 
-        changed_keys = {
-            key for key, value in request.metadata.items() if key not in node.metadata or node.metadata[key] != value
-        }
-        # The editor writes a node's size the first time it draws a node that has none. It would draw
-        # the node at that size anyway, so recording it is not a change to the workflow.
-        records_first_size = changed_keys == {"size"} and "size" not in node.metadata
-        removed_keys = {key for key in request.remove_keys if key in node.metadata}
-        altered = (bool(changed_keys) and not records_first_size) or bool(removed_keys)
-
+        before = dict(node.metadata)
         # We can't completely overwrite metadata.
         for key, value in request.metadata.items():
             node.metadata[key] = value
-        for key in removed_keys:
-            del node.metadata[key]
+        for key in request.remove_keys:
+            node.metadata.pop(key, None)
+        altered = without_first_size(before, node.metadata) != before
         details = f"Successfully set metadata for a Node '{node_name}'."
         result = SetNodeMetadataResultSuccess(result_details=details, altered_workflow_state=altered)
         return result
