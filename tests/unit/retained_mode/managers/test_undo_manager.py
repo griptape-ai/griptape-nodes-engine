@@ -29,6 +29,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     DeleteNodeRequest,
+    GetNodeMetadataRequest,
     SetLockNodeStateRequest,
     SetNodeMetadataRequest,
 )
@@ -695,6 +696,32 @@ class TestTwoClientsAtOnce:
 
         assert result.failed()
         assert _value(workflow, "a") == "first"
+
+    def test_a_read_between_two_requests_of_a_step_leaves_it_whole(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        """Such as an agent reading the workflow while the editor groups nodes."""
+        _add(engine, workflow, "a")
+        _add(engine, workflow, "b")
+        _set(engine, workflow, "a", "first", group="user")
+        _ok(engine, workflow, GetNodeMetadataRequest(node_name="a"), "agent")
+        _set(engine, workflow, "b", "second", group="user")
+
+        _undo(engine, workflow)
+
+        assert _value(workflow, "a") == ""
+        assert _value(workflow, "b") == ""
+
+    def test_a_read_is_not_held_up_by_a_step_still_running(self, engine: Engine, workflow: WorkflowRuntime) -> None:
+        _add(engine, workflow, "a")
+        _set(engine, workflow, "a", "first", group="agent")
+        workflow.undo.request_started()
+        try:
+            result = _send(engine, workflow, GetNodeMetadataRequest(node_name="a"), "user")
+        finally:
+            workflow.undo.request_finished()
+
+        assert result.succeeded(), result.result_details
 
 
 def _setting(name: str, value: str) -> SetParameterValueRequest:

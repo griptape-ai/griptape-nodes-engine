@@ -44,6 +44,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SetNodeMetadataRequest,
     UnresolveNodeRequest,
 )
+from griptape_nodes.retained_mode.events.request_effects import never_alters_workflow
 from griptape_nodes.retained_mode.events.undo_events import (
     RedoRequest,
     RedoResultFailure,
@@ -132,6 +133,7 @@ class UndoManager(EngineScoped):
         return (
             outermost
             and not isinstance(request, (RunControlMixin, UndoRequest, RedoRequest))
+            and not never_alters_workflow(type(request))
             and not history.restoring
             and request.undo_group is not None
             and request.undo_group != history.open_group
@@ -147,13 +149,14 @@ class UndoManager(EngineScoped):
         request in a group other than the one being recorded starts a new step, so the workflow is
         checkpointed first, while it still shows the end of the step before. A request in no group
         is a change outside any step. Everything a run changes is taken as a change outside any
-        step too, but only a client's change drops what could be redone.
+        step too, but only a client's change drops what could be redone. A request that never
+        changes the workflow is part of no step, so it leaves the open one open.
         """
         if isinstance(request, RunControlMixin):
             if _recording.get() is None:
                 return None
             return DispatchScope(token=_recording.set(None), workflow=None)
-        if not outermost or workflow is None:
+        if not outermost or workflow is None or never_alters_workflow(type(request)):
             return None
         history = workflow.undo
         if history.restoring or isinstance(request, (UndoRequest, RedoRequest)):
