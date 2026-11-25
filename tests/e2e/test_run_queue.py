@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from griptape_nodes.exe_types.node_types import NodeResolutionState
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+)
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelFlowRequest,
     CancelFlowResultSuccess,
@@ -221,6 +225,49 @@ async def test_a_node_that_joined_a_run_can_run_again_while_that_run_goes_on(
     assert isinstance(await _finish(holding), ResolveNodeResultSuccess)
     assert executed.count("Next") == runs_of_next, executed
     assert engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()) is False, flow_name
+
+
+@pytest.mark.usefixtures("parallel_mode")
+@pytest.mark.asyncio
+async def test_a_node_that_joined_a_run_reads_a_node_that_already_ran_in_it(
+    engine: Engine, flow_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, create_node: Callable[..., str]
+) -> None:
+    """A joining node reads the value of a node that ran earlier in the same run, rather than running it again.
+
+    ``C`` is wired into a control flow (``C -> D``) and ``B`` reads it. ``C`` runs first, while ``Holder``
+    keeps the run going, so by the time ``B`` joins, ``C`` holds this run's value.
+    """
+    for name in ("C", "D", "B"):
+        create_node(NODE_TYPE, name, flow_name, library_name=LIBRARY_NAME)
+    _connect(engine, "C", "exec_out", "D", "exec_in")
+    _connect(engine, "C", "result", "B", "linked_text")
+    _set_parameter(engine, "C", "text", "from C")
+    executed = _record_executions(engine, monkeypatch)
+    holding = asyncio.create_task(engine.ahandle_request(ResolveNodeRequest(node_name="Holder")))
+    await _wait_for_state(engine, "Holder", NodeResolutionState.RESOLVING)
+
+    assert isinstance(await engine.ahandle_request(ResolveNodeRequest(node_name="C")), ResolveNodeResultSuccess)
+    await _wait_for_state(engine, "C", NodeResolutionState.RESOLVED)
+    before_b = len(executed)
+    assert isinstance(await engine.ahandle_request(ResolveNodeRequest(node_name="B")), ResolveNodeResultSuccess)
+    await _wait_for_state(engine, "B", NodeResolutionState.RESOLVED)
+
+    assert executed[before_b:] == ["B"]
+    assert engine.node_manager.get_node_by_name("B").parameter_output_values["result"] == "from C"
+    _open_gate(tmp_path)
+    await _finish(holding)
+
+
+def _connect(engine: Engine, source: str, source_parameter: str, target: str, target_parameter: str) -> None:
+    result = engine.handle_request(
+        CreateConnectionRequest(
+            source_node_name=source,
+            source_parameter_name=source_parameter,
+            target_node_name=target,
+            target_parameter_name=target_parameter,
+        )
+    )
+    assert isinstance(result, CreateConnectionResultSuccess), result
 
 
 def _record_executions(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
