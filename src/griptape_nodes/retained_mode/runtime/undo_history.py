@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import assert_never
+from typing import TYPE_CHECKING, assert_never
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 MAX_STEPS = 100
 
@@ -163,8 +166,12 @@ class UndoHistory:
         if _PRECEDENCE[type(change)] >= _PRECEDENCE[type(self.drift)]:
             self.drift = change
 
-    def record(self, commands: bytes) -> Checkpointed:
-        """Take a checkpoint of the workflow as it is now, ``commands``, according to what changed since the last."""
+    def record(self, commands: bytes, *, differs: Callable[[bytes], bool]) -> Checkpointed:
+        """Take a checkpoint of the workflow as it is now, ``commands``, according to what changed since the last.
+
+        ``differs`` says whether the workflow differs from a checkpoint, given its commands, in anything
+        an undo to it would change. Two checkpoints can differ only in a value a run or a connection set.
+        """
         if self._current < 0:
             self._checkpoints = [Checkpoint(commands=commands, label=None)]
             self._current = 0
@@ -172,9 +179,9 @@ class UndoHistory:
         else:
             match self.drift:
                 case StepPending(step=step):
-                    checkpointed = self._add_unless_unchanged(commands, step.label)
+                    checkpointed = self._add_unless_unchanged(commands, step.label, differs=differs)
                 case OutsideEdit():
-                    if commands != self._checkpoints[self._current].commands:
+                    if differs(self._checkpoints[self._current].commands):
                         del self._checkpoints[self._current + 1 :]
                     self._replace_current(commands)
                     checkpointed = Checkpointed.REPLACED
@@ -207,8 +214,8 @@ class UndoHistory:
         """Make the previous checkpoint current, as ``rebuilt``, the workflow an undo rebuilt from it.
 
         A rebuild leaves the workflow as the checkpoint holds it in all but what rebuilding changes,
-        such as the order of its nodes. Checkpoints are compared by their bytes, so the current one
-        has to be the workflow as it is, or a change that leaves it as it was would look like one.
+        such as the order of its nodes. The current one is the workflow as it is, so a change that
+        leaves it as it was compares equal by its bytes, without being planned.
         """
         self._current -= 1
         self._replace_current(rebuilt)
@@ -231,9 +238,11 @@ class UndoHistory:
         self.drift = Clean()
         self.open_step = None
 
-    def _add_unless_unchanged(self, commands: bytes, label: str) -> Checkpointed:
+    def _add_unless_unchanged(self, commands: bytes, label: str, *, differs: Callable[[bytes], bool]) -> Checkpointed:
         """Add a checkpoint for a step, dropping what could be redone, unless the step left the workflow as it was."""
-        if commands == self._checkpoints[self._current].commands:
+        if not differs(self._checkpoints[self._current].commands):
+            # Taken in by the current one, which then holds the values the runs since set.
+            self._replace_current(commands)
             return Checkpointed.UNCHANGED
         del self._checkpoints[self._current + 1 :]
         self._checkpoints.append(Checkpoint(commands=commands, label=label))

@@ -1,6 +1,13 @@
 """Work out what an undo or redo has to change to bring the live workflow to a checkpoint.
 
 Both sides are serializations of what the user edited, without run results (see `UndoManager`).
+A value a node's own run set on one of its parameters, such as a seed it rolled or the status it
+reported, is a run result too, and so is one a connection fed it, with what the node derived from it,
+such as a preview. A serialization holds them like any other value, so the comparison leaves out the
+parameters whose live value a run or a connection set, on both sides, and the node keeps those values.
+Leaving them out of the serialization instead would not do: a value that came from opening a saved
+workflow is held as an edit, and a run since makes it the run's.
+
 A node that matches its checkpoint is left alone, so it keeps everything it holds: its results,
 the objects it cached, and the ids of its elements. A node whose position, size or other metadata
 differs, or whose lock differs, is changed in place, since neither changes what it computes. Any
@@ -14,6 +21,7 @@ flow they live in, so a group and its members are only made together.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +30,9 @@ from griptape_nodes.retained_mode.events.node_events import SerializedNodeComman
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+
+# Each live node's parameters whose value a run or a connection set, by node name.
+NotEdits = Mapping[str, frozenset[str]]
 
 
 @dataclass
@@ -64,14 +75,14 @@ class RestorePlan:
         )
 
 
-def plan_restore(target: SerializedFlowCommands, live: SerializedFlowCommands) -> RestorePlan:
-    """What brings ``live`` to ``target``."""
+def plan_restore(target: SerializedFlowCommands, live: SerializedFlowCommands, not_edits: NotEdits) -> RestorePlan:
+    """What brings ``live`` to ``target``, leaving out of the comparison the parameters ``not_edits`` names."""
     target_index = Index.of(target)
     live_index = Index.of(live)
     plan = RestorePlan()
 
     for root in sorted(target_index.units.keys() | live_index.units.keys()):
-        if _unit_matches(root, target_index, live_index):
+        if _unit_matches(root, target_index, live_index, not_edits):
             for name in target_index.units[root]:
                 plan.kept.add(name)
                 edit = _edit_in_place(target_index.nodes[name], live_index.nodes[name])
@@ -146,13 +157,14 @@ def _level_to_build(level: SerializedFlowCommands, to_build: set[str], *, is_top
     )
 
 
-def _unit_matches(root: str, target_index: Index, live_index: Index) -> bool:
+def _unit_matches(root: str, target_index: Index, live_index: Index, not_edits: NotEdits) -> bool:
     target_unit = target_index.units.get(root)
     live_unit = live_index.units.get(root)
     if target_unit is None or live_unit is None or target_unit != live_unit:
         return False
     return all(
-        target_index.nodes[name].build_key(target_index) == live_index.nodes[name].build_key(live_index)
+        target_index.nodes[name].build_key(target_index, not_edits.get(name, frozenset()))
+        == live_index.nodes[name].build_key(live_index, not_edits.get(name, frozenset()))
         for name in target_unit
     )
 
@@ -192,14 +204,15 @@ class _Node:
     def name(self) -> str:
         return _name(self.commands)
 
-    def build_key(self, index: Index) -> tuple[Any, ...]:
-        """Everything about the node that only building it again can change."""
+    def build_key(self, index: Index, not_edits: frozenset[str]) -> tuple[Any, ...]:
+        """Everything about the node that only building it again can change, but the values of the parameters ``not_edits`` names."""
         set_value_commands = self.level.set_parameter_value_commands.get(self.commands.node_uuid, [])
         # Values are pooled under a hash of their content, so the same value has the same key in any
         # serialization.
         values = frozenset(
             (command.set_parameter_value_command.parameter_name, command.unique_value_uuid)
             for command in set_value_commands
+            if command.set_parameter_value_command.parameter_name not in not_edits
         )
         create_command = dataclasses.replace(self.commands.create_node_command, metadata={})
         return (

@@ -64,6 +64,7 @@ from griptape_nodes.exe_types.node_types import (
     TransformedParameterValue,
     _values_differ,
     aprocess_scope,
+    connection_feed_scope,
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
@@ -3095,7 +3096,11 @@ class NodeManager(EngineScoped):
         output_snapshot = dict(node.parameter_output_values) if should_check_output_side_effects else None
 
         try:
-            finalized_value, modified = self._set_and_pass_through_values(request, node)
+            if incoming_node_set:
+                with connection_feed_scope(node):
+                    finalized_value, modified = self._set_and_pass_through_values(request, node)
+            else:
+                finalized_value, modified = self._set_and_pass_through_values(request, node)
         except InvalidParameterValueError as err:
             details = f"Couldn't set '{node_name}.{request.parameter_name}'.\n\n{err}"
             return SetParameterValueResultFailure(result_details=details)

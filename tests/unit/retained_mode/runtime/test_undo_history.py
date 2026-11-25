@@ -10,6 +10,11 @@ from griptape_nodes.retained_mode.runtime.undo_history import (
 )
 
 
+def _record(history: UndoHistory, commands: bytes) -> Checkpointed:
+    """Take a checkpoint of ``commands``, as differing from a checkpoint whose commands aren't the same."""
+    return history.record(commands, differs=lambda checkpoint: checkpoint != commands)
+
+
 def _step(history: UndoHistory, label: str) -> None:
     """Note a change by a step called ``label``."""
     step = OpenStep(group=label, label=label)
@@ -33,10 +38,10 @@ def _step_forward(history: UndoHistory) -> None:
 def _with_steps(*labels: str) -> UndoHistory:
     """A history at the end of a step for each label, its checkpoints holding the label as their commands."""
     history = UndoHistory()
-    history.record(b"start")
+    _record(history, b"start")
     for label in labels:
         _step(history, label)
-        history.record(label.encode())
+        _record(history, label.encode())
     return history
 
 
@@ -51,7 +56,7 @@ class TestAnEmptyHistory:
     def test_its_first_checkpoint_is_not_a_step(self) -> None:
         history = UndoHistory()
 
-        checkpointed = history.record(b"start")
+        checkpointed = _record(history, b"start")
 
         assert checkpointed is Checkpointed.STARTED
         assert history.undo_label is None
@@ -81,11 +86,24 @@ class TestSteps:
         history = _with_steps("Move")
 
         _step(history, "Set Value")
-        checkpointed = history.record(b"Move")
+        checkpointed = _record(history, b"Move")
 
         assert checkpointed is Checkpointed.UNCHANGED
         assert history.undo_label == "Move"
         assert not history.needs_checkpoint
+
+    def test_a_step_that_differs_only_in_what_an_undo_would_keep_adds_none(self) -> None:
+        """Such as a seed a run rolled. The current checkpoint takes it in."""
+        history = _with_steps("Move")
+
+        _step(history, "Set Value")
+        checkpointed = history.record(b"Move, then a run", differs=lambda _checkpoint: False)
+
+        assert checkpointed is Checkpointed.UNCHANGED
+        assert history.undo_label == "Move"
+        current = history.current()
+        assert current is not None
+        assert current.commands == b"Move, then a run"
 
     def test_a_step_takes_the_label_its_requests_name_it_by_last(self) -> None:
         history = _with_steps()
@@ -93,7 +111,7 @@ class TestSteps:
         assert history.open_step is not None
 
         history.open_step.label = "Group 3 Nodes"
-        history.record(b"grouped")
+        _record(history, b"grouped")
 
         current = history.current()
         assert current is not None
@@ -127,7 +145,7 @@ class TestSteps:
         _step_back(history)
 
         _step(history, "Delete")
-        checkpointed = history.record(b"Delete")
+        checkpointed = _record(history, b"Delete")
 
         assert checkpointed is Checkpointed.ADDED
         assert history.redo_label is None
@@ -152,7 +170,7 @@ class TestARun:
         history = _with_steps("Move")
 
         history.note(RunOutput())
-        checkpointed = history.record(b"Move, then a run")
+        checkpointed = _record(history, b"Move, then a run")
 
         assert checkpointed is Checkpointed.REPLACED
         assert history.undo_label == "Move"
@@ -166,7 +184,7 @@ class TestARun:
         _step_back(history)
 
         history.note(RunOutput())
-        history.record(b"Move, then a run")
+        _record(history, b"Move, then a run")
 
         assert history.redo_label == "Rename"
 
@@ -176,7 +194,7 @@ class TestAClientsChangeOutsideAStep:
         history = _with_steps("Move")
 
         history.note(OutsideEdit())
-        history.record(b"Move, then a resize")
+        _record(history, b"Move, then a resize")
 
         assert history.undo_label == "Move"
         current = history.current()
@@ -188,7 +206,7 @@ class TestAClientsChangeOutsideAStep:
         _step_back(history)
 
         history.note(OutsideEdit())
-        history.record(b"Move, then a resize")
+        _record(history, b"Move, then a resize")
 
         assert history.undo_label == "Move"
         assert history.redo_label is None
@@ -199,7 +217,16 @@ class TestAClientsChangeOutsideAStep:
         _step_back(history)
 
         history.note(OutsideEdit())
-        history.record(b"Move")
+        _record(history, b"Move")
+
+        assert history.redo_label == "Rename"
+
+    def test_that_differs_only_in_what_an_undo_would_keep_keeps_what_could_be_redone(self) -> None:
+        history = _with_steps("Move", "Rename")
+        _step_back(history)
+
+        history.note(OutsideEdit())
+        history.record(b"Move, then a run", differs=lambda _checkpoint: False)
 
         assert history.redo_label == "Rename"
 
@@ -211,7 +238,7 @@ class TestChangesBeforeOneCheckpoint:
 
         history.note(OutsideEdit())
         history.note(RunOutput())
-        history.record(b"Move, then a resize and a run")
+        _record(history, b"Move, then a resize and a run")
 
         assert history.redo_label is None
 
@@ -220,7 +247,7 @@ class TestChangesBeforeOneCheckpoint:
 
         _step(history, "Rename")
         history.note(OutsideEdit())
-        history.record(b"Rename, then a resize")
+        _record(history, b"Rename, then a resize")
 
         assert history.undo_label == "Rename"
         previous = history.previous()
@@ -231,7 +258,7 @@ class TestChangesBeforeOneCheckpoint:
         history = _with_steps("Move")
 
         history.note(OutsideEdit())
-        history.record(b"Move, then a resize")
+        _record(history, b"Move, then a resize")
 
         assert history.drift == Clean()
         assert not history.needs_checkpoint
@@ -270,7 +297,7 @@ class TestARebuild:
 
         history.step_back(b"Move, reordered")
         history.note(OutsideEdit())
-        history.record(b"Move, reordered")
+        _record(history, b"Move, reordered")
 
         current = history.current()
         assert current is not None

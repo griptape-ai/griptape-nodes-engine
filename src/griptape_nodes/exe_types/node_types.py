@@ -11,7 +11,7 @@ from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from enum import StrEnum, auto
+from enum import Enum, StrEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
@@ -141,6 +141,19 @@ _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=F
 # node, and on that node the value is an ordinary authored one, not something it produced.
 _running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
 
+# The node taking in a value through an incoming connection, while it sets that value and what its
+# hooks derive from it (see `connection_feed_scope`).
+_fed_node: ContextVar[BaseNode | None] = ContextVar("_node_types_fed_node", default=None)
+
+
+class _ValueOrigin(Enum):
+    """Where a parameter's value came from, when it wasn't an edit."""
+
+    # This node's own run set it.
+    RUN = "run"
+    # It came in through an incoming connection, or the node derived it from one as it came in.
+    CONNECTION = "connection"
+
 
 @functools.cache
 def _base_node_attribute_names() -> frozenset[str]:
@@ -225,6 +238,20 @@ def aprocess_scope(
         _in_aprocess.reset(token)
         _running_node.reset(node_token)
         VariableResolver.reset_cache(cache_token)
+
+
+@contextmanager
+def connection_feed_scope(node: BaseNode) -> Iterator[None]:
+    """Mark the enclosed block as ``node`` taking in a value through an incoming connection.
+
+    What ``node`` sets on itself meanwhile, the value and what its hooks derive from it, came from the
+    connection, not an edit (see `BaseNode.parameters_set_by_run_or_connection`).
+    """
+    token = _fed_node.set(node)
+    try:
+        yield
+    finally:
+        _fed_node.reset(token)
 
 
 class ImportDependency(NamedTuple):
@@ -378,8 +405,8 @@ class BaseNode(ABC):
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
     _parameters_added_after_construction: set[str]
     _parameters_added_during_execution: set[str]
-    # The parameters whose value this node's own run set, until something else sets them.
-    _parameters_set_by_run: set[str]
+    # Where each parameter's value came from, when it wasn't an edit, until an edit sets it.
+    _value_origins: dict[str, _ValueOrigin]
     _engine: Engine | None
 
     @property
@@ -417,8 +444,20 @@ class BaseNode(ABC):
         travel back from a worker with the run's outputs (see `take_values_set_by_run`).
         """
         return {
-            name: self.parameter_values[name] for name in self._parameters_set_by_run if name in self.parameter_values
+            name: self.parameter_values[name]
+            for name, origin in self._value_origins.items()
+            if origin is _ValueOrigin.RUN and name in self.parameter_values
         }
+
+    @property
+    def parameters_set_by_run_or_connection(self) -> frozenset[str]:
+        """The parameters whose value no edit set since a run or a connection did.
+
+        This node's own run set it, such as a seed it rolled or the status it reported, or it came in
+        through a connection, with what the node derived from it as it did, such as a preview. An undo
+        leaves these out of what it compares, as results rather than changes.
+        """
+        return frozenset(self._value_origins)
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -478,7 +517,7 @@ class BaseNode(ABC):
         self._deferred_inputs_were_reset = False
         self._parameters_added_after_construction = set()
         self._parameters_added_during_execution = set()
-        self._parameters_set_by_run = set()
+        self._value_origins = {}
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -1307,16 +1346,21 @@ class BaseNode(ABC):
             self.parameter_output_values[parameter.name] = value
 
     def _record_who_set(self, parameter: Parameter) -> None:
-        """Record whether this node's own run set `parameter`, for `values_set_by_run`.
+        """Record where `parameter`'s value came from, for `values_set_by_run` and `parameters_set_by_run_or_connection`.
 
-        The same window as `_also_record_as_result`: this node's body running. A value set any other
-        way, such as by an edit, a connection, or loading the workflow, is no longer the run's. A
-        container's child is left out, as there: its container travels for it.
+        The run's window is the same as `_also_record_as_result`'s: this node's body running. A
+        connection's is this node taking in a value through it (`connection_feed_scope`). A value set
+        any other way, such as by an edit or loading the workflow, is an edit. A container's child is
+        left out, as there: its container travels for it.
         """
-        if _running_node.get() is self and parameter.parent_container_name is None:
-            self._parameters_set_by_run.add(parameter.name)
-            return
-        self._parameters_set_by_run.discard(parameter.name)
+        if parameter.parent_container_name is None:
+            if _running_node.get() is self:
+                self._value_origins[parameter.name] = _ValueOrigin.RUN
+                return
+            if _fed_node.get() is self:
+                self._value_origins[parameter.name] = _ValueOrigin.CONNECTION
+                return
+        self._value_origins.pop(parameter.name, None)
 
     def take_values_set_by_run(self, values: dict[str, Any]) -> None:
         """Take the values a run of this node set on its parameters where it ran, such as in a worker.
@@ -1326,7 +1370,7 @@ class BaseNode(ABC):
         """
         for name, value in values.items():
             self.parameter_values[name] = value
-            self._parameters_set_by_run.add(name)
+            self._value_origins[name] = _ValueOrigin.RUN
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]

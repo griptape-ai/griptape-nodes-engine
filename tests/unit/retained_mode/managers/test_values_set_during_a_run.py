@@ -10,8 +10,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from griptape_nodes.exe_types.node_types import BaseNode, aprocess_scope
+from griptape_nodes.exe_types.node_types import BaseNode, aprocess_scope, connection_feed_scope
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
+from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from tests.unit.retained_mode.managers.test_workflow_save_load_roundtrip import (
     _clear_library_registry_state,  # noqa: F401  -- autouse fixture, needed in this module too
     _create_round_trip_node,
@@ -112,6 +113,61 @@ class TestWhatTheRunSet:
 
         assert node.get_parameter_value("value") == _SEED
         assert node.values_set_by_run == {"value": _SEED}
+
+
+class TestWhatARunOrAConnectionSet:
+    """A node knows which of its values a run or a connection set, as an undo keeps them."""
+
+    def test_includes_what_its_run_set(self, engine: Engine, tmp_path: Path) -> None:
+        node = _node_running_its_body(engine, tmp_path, "run_or_connection_run")
+
+        with aprocess_scope(None, node):
+            node.set_parameter_value("value", _SEED)
+
+        assert node.parameters_set_by_run_or_connection == {"value"}
+
+    def test_includes_what_a_connection_fed_and_what_the_node_derived_from_it(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        """Such as a preview built from a connected image. None of it is the node's run."""
+        node = _node_running_its_body(engine, tmp_path, "run_or_connection_fed")
+
+        with connection_feed_scope(node):
+            node.set_parameter_value("value", "fed")
+            node.set_parameter_value("value2", "derived from what was fed")
+
+        assert node.parameters_set_by_run_or_connection == {"value", "value2"}
+        assert node.values_set_by_run == {}
+
+    def test_includes_a_value_passed_through_a_connection(self, engine: Engine, tmp_path: Path) -> None:
+        flow_name, library_name = _fresh_flow(engine, "passed", tmp_path)
+        _create_round_trip_node(engine, "Upstream", flow_name, library_name)
+        node = engine.object_manager.attempt_get_object_by_name_as_type(
+            _create_round_trip_node(engine, "Downstream", flow_name, library_name), BaseNode
+        )
+        assert node is not None
+
+        result = engine.handle_request(
+            SetParameterValueRequest(
+                node_name=node.name,
+                parameter_name="value",
+                value="passed",
+                incoming_connection_source_node_name="Upstream",
+                incoming_connection_source_parameter_name="value",
+            )
+        )
+
+        assert result.succeeded(), result.result_details
+        assert node.parameters_set_by_run_or_connection == {"value"}
+
+    def test_an_edit_takes_it_back(self, engine: Engine, tmp_path: Path) -> None:
+        node = _node_running_its_body(engine, tmp_path, "run_or_connection_edited")
+        with connection_feed_scope(node):
+            node.set_parameter_value("value", "fed")
+
+        _set_value(engine, node.name, "value", "edited")
+
+        assert node.parameters_set_by_run_or_connection == frozenset()
 
 
 class TestWhatAWorkerSendsBack:
