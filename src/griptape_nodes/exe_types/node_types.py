@@ -378,6 +378,8 @@ class BaseNode(ABC):
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
     _parameters_added_after_construction: set[str]
     _parameters_added_during_execution: set[str]
+    # The parameters whose value this node's own run set, until something else sets them.
+    _parameters_set_by_run: set[str]
     _engine: Engine | None
 
     @property
@@ -406,6 +408,17 @@ class BaseNode(ABC):
         why this is narrower than ``parameters_added_after_construction``.
         """
         return self._parameters_added_during_execution
+
+    @property
+    def values_set_by_run(self) -> dict[str, Any]:
+        """The values this node's own run gave its parameters, which nothing has set since.
+
+        Such as a seed a node rolls while it runs. They are what the run computed with, so they
+        travel back from a worker with the run's outputs (see `take_values_set_by_run`).
+        """
+        return {
+            name: self.parameter_values[name] for name in self._parameters_set_by_run if name in self.parameter_values
+        }
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -465,6 +478,7 @@ class BaseNode(ABC):
         self._deferred_inputs_were_reset = False
         self._parameters_added_after_construction = set()
         self._parameters_added_during_execution = set()
+        self._parameters_set_by_run = set()
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -1231,6 +1245,7 @@ class BaseNode(ABC):
                 # ACTUALLY SET THE NEW VALUE
                 self.parameter_values[param_name] = final_value
                 self._also_record_as_result(parameter, final_value)
+                self._record_who_set(parameter)
 
                 # Allow custom node logic to respond after it's been set.
                 # A connected list's hook sees the list the node now reads, its rows' items included.
@@ -1243,6 +1258,7 @@ class BaseNode(ABC):
         else:
             self.parameter_values[param_name] = candidate_value
             self._also_record_as_result(parameter, candidate_value)
+            self._record_who_set(parameter)
         if parameter.parent_container_name is not None:
             container = self.get_parameter_by_name(parameter.parent_container_name)
             if isinstance(container, ParameterContainer):
@@ -1296,6 +1312,28 @@ class BaseNode(ABC):
             and ParameterMode.OUTPUT in parameter.allowed_modes
         ):
             self.parameter_output_values[parameter.name] = value
+
+    def _record_who_set(self, parameter: Parameter) -> None:
+        """Record whether this node's own run set `parameter`, for `values_set_by_run`.
+
+        The same window as `_also_record_as_result`: this node's body running. A value set any other
+        way, such as by an edit, a connection, or loading the workflow, is no longer the run's. A
+        container's child is left out, as there: its container travels for it.
+        """
+        if _running_node.get() is self and parameter.parent_container_name is None:
+            self._parameters_set_by_run.add(parameter.name)
+            return
+        self._parameters_set_by_run.discard(parameter.name)
+
+    def take_values_set_by_run(self, values: dict[str, Any]) -> None:
+        """Take the values a run of this node set on its parameters where it ran, such as in a worker.
+
+        Written straight in, as the run's outputs are: the node's value hooks already ran where the
+        node ran, and running them again here would treat the run's value as an edit.
+        """
+        for name, value in values.items():
+            self.parameter_values[name] = value
+            self._parameters_set_by_run.add(name)
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]
