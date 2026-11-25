@@ -482,10 +482,9 @@ class SerializedNodeCommands:
         create_node_command (CreateNodeRequest): The command to create the node.
         element_modification_commands (list[RequestPayload]): A list of commands to create or modify the elements (including Parameters) of the node.
         node_dependencies (NodeDependencies): Dependencies that this node has on external resources (workflows, files, imports, libraries).
-        node_uuid (NodeUUID): The UUID of this particular node. During deserialization, this UUID will be used to correlate this node's instance
-            with the connections and parameter values necessary. We cannot use node name because Griptape Nodes enforces unique names, and we cannot
-            predict the name that will be selected upon instantiation. Similarly, the same serialized node may be deserialized multiple times, such
-            as during copy/paste or duplicate.
+        node_uuid (NodeUUID): Names this node within the serialization, so its connections and parameter values can refer to it. A serialized
+            node takes the name of the node it was made from, which is unique in its workflow, so the same workflow always serializes the same.
+            It is only a reference: the node a deserialization creates may get another name, such as when pasting a copy next to the original.
     """
 
     # Have to use str instead of the UUID class because it's not JSON serializable >:-/
