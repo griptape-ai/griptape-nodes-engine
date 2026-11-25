@@ -386,17 +386,6 @@ MODEL_CHOICES_ARGS = [
         "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
     },
     {
-        "name": "o3",
-        "icon": "logos/openai.svg",
-        "args": _OPENAI_ARGS,
-        "vision": True,
-        "key": "gtc_o3",
-        "provider": "openai",
-        "display_name": "o3",
-        "family": "o-series",
-        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    },
-    {
         "name": "o3-mini",
         "icon": "logos/openai.svg",
         "args": _OPENAI_ARGS,
@@ -583,6 +572,7 @@ DEPRECATED_MODELS = {
     "o1-mini": "o3-mini",
     # OpenAI
     "gpt-5.2-chat": "gpt-5.2",
+    "o3": "gpt-5",
     "o4-mini": "gpt-5-mini",
     # Google
     "gemini-2.0-flash": "gemini-2.5-flash",
@@ -652,7 +642,7 @@ DEPRECATED_MODEL_CATALOG_ARGS = [
 
 # Model IDs whose backend does not accept top_p (the OpenAI o-series).
 # Kept in sync with the o-entries in MODEL_CHOICES_ARGS.
-O_SERIES_MODELS = {"o1", "o3", "o3-mini"}
+O_SERIES_MODELS = {"o1", "o3-mini"}
 
 
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
