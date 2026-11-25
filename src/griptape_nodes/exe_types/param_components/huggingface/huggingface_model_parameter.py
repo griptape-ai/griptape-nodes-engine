@@ -104,6 +104,7 @@ class HuggingFaceModelParameter(ABC):
         self._policy = ModelPolicySnapshot()
         if gated is not False:
             self._refresh_policy()
+        self._bind_existing_parameters()
 
     @property
     def _download_param_name(self) -> str:
@@ -299,6 +300,34 @@ class HuggingFaceModelParameter(ABC):
     def remove_input_parameters(self) -> None:
         self._node.remove_parameter_element_by_name(self._parameter_name)
         self._node.remove_parameter_element_by_name(self._download_param_name)
+
+    def _bind_existing_parameters(self) -> None:
+        """Attach this component's handlers to its parameters when they are already on the node.
+
+        A saved workflow recreates parameters added after the node was built from saved data, and
+        functions are not saved, so the buttons and the converter come back without handlers. A node
+        that builds a new component on load instead of adding the parameters again, as the diffusers
+        PipelineBuilder does, reaches this with them in place. The newest component replaces any
+        earlier one's handlers: PipelineBuilder builds a component for its default pipeline type
+        before the one for the saved type.
+        """
+        parameter = self._node.get_parameter_by_name(self._parameter_name)
+        if parameter is not None:
+            for refresh_button in parameter.find_elements_by_type(Button):
+                refresh_button.on_click_callback = self._on_refresh_click
+            # Drop an earlier component's converter, which would update the button for the wrong model list.
+            parameter._converters = [
+                converter
+                for converter in parameter._converters
+                if not isinstance(getattr(converter, "__self__", None), HuggingFaceModelParameter)
+            ]
+            parameter.add_converter(self._on_selection_changed)
+
+        download_parameter = self._node.get_parameter_by_name(self._download_param_name)
+        if download_parameter is not None:
+            # A loaded download button is a plain Parameter carrying the Button trait, not a ParameterButton.
+            for download_button in download_parameter.find_elements_by_type(Button):
+                download_button.on_click_callback = self._on_download_click
 
     def get_choices(self) -> list[str]:
         self._repo_revisions = self.fetch_repo_revisions()
