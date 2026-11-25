@@ -1,4 +1,4 @@
-"""Tests for `validate_library_declarations` and `detect_retired_node_declarations`."""
+"""Tests for the cross-reference checks in `griptape_nodes.node_library.library_validation`."""
 
 from __future__ import annotations
 
@@ -17,15 +17,20 @@ from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
     NodeDefinition,
+    NodeDeprecationMetadata,
+    NodeDeprecationReplacement,
     NodeMetadata,
+    WorkflowNodeDefinition,
 )
 from griptape_nodes.node_library.library_validation import (
     detect_retired_node_declarations,
+    find_unresolved_deprecation_replacements,
     validate_library_declarations,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     DuplicateModelIdProblem,
     RetiredNodeDeclarationProblem,
+    UnresolvedDeprecationReplacementProblem,
     UnresolvedModelProviderUsageReferenceProblem,
     UnresolvedModelUsageReferenceProblem,
 )
@@ -320,3 +325,100 @@ class TestDetectRetiredNodeDeclarations:
         assert detect_retired_node_declarations({"name": "No Nodes"}) == []
         assert detect_retired_node_declarations({"name": "Bad", "nodes": "not-a-list"}) == []
         assert detect_retired_node_declarations({"name": "Bad", "nodes": [42, {"metadata": None}]}) == []
+
+
+# ---------- Deprecation replacements ----------
+
+
+def _deprecated_node(display_name: str, *, library: str, node_type: str) -> NodeDefinition:
+    return NodeDefinition(
+        class_name=display_name.replace(" ", ""),
+        file_path="node.py",
+        metadata=NodeMetadata(
+            category="Test",
+            description="old node",
+            display_name=display_name,
+            deprecation=NodeDeprecationMetadata(
+                replacement=NodeDeprecationReplacement(library=library, node_type=node_type)
+            ),
+        ),
+    )
+
+
+class TestDeprecationReplacements:
+    def test_replacement_in_another_loaded_library_resolves(self) -> None:
+        schema = _make_schema(nodes=[_deprecated_node("Old Node", library="Other Library", node_type="NewNode")])
+
+        problems = find_unresolved_deprecation_replacements(schema, {"Other Library": {"NewNode"}})
+
+        assert problems == []
+
+    def test_replacement_in_the_same_library_resolves(self) -> None:
+        schema = _make_schema(nodes=[_deprecated_node("Old Node", library="Test Library", node_type="NewNode")])
+
+        problems = find_unresolved_deprecation_replacements(schema, {"Test Library": {"OldNode", "NewNode"}})
+
+        assert problems == []
+
+    def test_missing_node_type_in_a_loaded_library_is_reported(self) -> None:
+        schema = _make_schema(nodes=[_deprecated_node("Old Node", library="Other Library", node_type="Gone")])
+
+        problems = find_unresolved_deprecation_replacements(schema, {"Other Library": {"NewNode"}})
+
+        assert problems == [
+            UnresolvedDeprecationReplacementProblem(
+                display_name="Old Node",
+                replacement_library="Other Library",
+                replacement_node_type="Gone",
+                replacement_library_loaded=True,
+            )
+        ]
+        message = UnresolvedDeprecationReplacementProblem.collate_problems_for_display(problems)  # type: ignore[arg-type]
+        assert "has no node type 'Gone'" in message
+
+    def test_replacement_in_a_library_that_is_not_loaded_is_reported(self) -> None:
+        schema = _make_schema(nodes=[_deprecated_node("Old Node", library="Absent Library", node_type="NewNode")])
+
+        problems = find_unresolved_deprecation_replacements(schema, {"Test Library": {"OldNode"}})
+
+        assert len(problems) == 1
+        problem = problems[0]
+        assert isinstance(problem, UnresolvedDeprecationReplacementProblem)
+        assert not problem.replacement_library_loaded
+        message = UnresolvedDeprecationReplacementProblem.collate_problems_for_display([problem])
+        assert "library 'Absent Library' is not loaded" in message
+
+    def test_workflow_nodes_are_checked(self) -> None:
+        schema = _make_schema()
+        schema.workflow_nodes = [
+            WorkflowNodeDefinition(
+                node_type="OldWorkflowNode",
+                workflow_path="workflows/old.py",
+                metadata=NodeMetadata(
+                    category="Test",
+                    description="old workflow node",
+                    display_name="Old Workflow Node",
+                    deprecation=NodeDeprecationMetadata(
+                        replacement=NodeDeprecationReplacement(library="Other Library", node_type="Gone")
+                    ),
+                ),
+            )
+        ]
+
+        problems = find_unresolved_deprecation_replacements(schema, {"Other Library": set()})
+
+        assert [problem.display_name for problem in problems] == ["Old Workflow Node"]  # type: ignore[attr-defined]
+
+    def test_deprecation_without_a_replacement_is_not_checked(self) -> None:
+        node = NodeDefinition(
+            class_name="OldNode",
+            file_path="node.py",
+            metadata=_make_node_metadata(deprecation=NodeDeprecationMetadata(deprecation_message="Gone soon.")),
+        )
+
+        assert find_unresolved_deprecation_replacements(_make_schema(nodes=[node]), {}) == []
+
+    def test_manifest_without_a_replacement_still_validates(self) -> None:
+        metadata = NodeDeprecationMetadata.model_validate({"deprecation_message": "Use X.", "removal_version": "2.0.0"})
+
+        assert metadata.replacement is None

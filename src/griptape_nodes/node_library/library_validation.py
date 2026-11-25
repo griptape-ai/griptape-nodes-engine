@@ -12,6 +12,11 @@ that list is non-empty.
 `detect_retired_node_declarations` runs against the *raw* JSON before Pydantic
 validation, turning declaration `type` tags that were valid in an older schema
 into targeted migration guidance instead of opaque discriminator errors.
+
+`find_unresolved_deprecation_replacements` checks a deprecated node's
+`deprecation.replacement` against every loaded library. A replacement can live
+in another library, so it runs once every library has loaded and again whenever
+a library registers or unloads.
 """
 
 from __future__ import annotations
@@ -30,11 +35,14 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     DuplicateModelIdProblem,
     LibraryProblem,
     RetiredNodeDeclarationProblem,
+    UnresolvedDeprecationReplacementProblem,
     UnresolvedModelProviderUsageReferenceProblem,
     UnresolvedModelUsageReferenceProblem,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from griptape_nodes.node_library.library_registry import LibrarySchema
 
 # Node declaration `type` tags removed in a schema version, mapped to migration guidance.
@@ -73,6 +81,38 @@ def validate_library_declarations(library_data: LibrarySchema) -> list[LibraryPr
         problems=problems,
     )
 
+    return problems
+
+
+def find_unresolved_deprecation_replacements(
+    library_data: LibrarySchema,
+    node_types_by_library: Mapping[str, set[str]],
+) -> list[LibraryProblem]:
+    """Report each deprecated node whose replacement no loaded library provides.
+
+    Args:
+        library_data: The library whose deprecated nodes are checked.
+        node_types_by_library: Every loaded library's name mapped to the node types it registered.
+    """
+    node_metadata = [node.metadata for node in library_data.nodes]
+    node_metadata.extend(node.metadata for node in library_data.workflow_nodes or [])
+
+    problems: list[LibraryProblem] = []
+    for metadata in node_metadata:
+        if metadata.deprecation is None or metadata.deprecation.replacement is None:
+            continue
+        replacement = metadata.deprecation.replacement
+        replacement_node_types = node_types_by_library.get(replacement.library)
+        if replacement_node_types is not None and replacement.node_type in replacement_node_types:
+            continue
+        problems.append(
+            UnresolvedDeprecationReplacementProblem(
+                display_name=metadata.display_name,
+                replacement_library=replacement.library,
+                replacement_node_type=replacement.node_type,
+                replacement_library_loaded=replacement_node_types is not None,
+            )
+        )
     return problems
 
 

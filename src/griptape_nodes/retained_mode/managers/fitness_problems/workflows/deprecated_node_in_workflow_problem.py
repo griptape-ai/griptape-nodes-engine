@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows.workflow_problem import WorkflowProblem
+
+if TYPE_CHECKING:
+    from griptape_nodes.node_library.library_registry import NodeDeprecationReplacement
 
 
 @dataclass
@@ -20,6 +24,7 @@ class DeprecatedNodeInWorkflowProblem(WorkflowProblem):
     workflow_library_version: str | None
     removal_version: str | None
     deprecation_message: str | None
+    replacement: NodeDeprecationReplacement | None = None
 
     @classmethod
     def collate_problems_for_display(cls, instances: list[DeprecatedNodeInWorkflowProblem]) -> str:
@@ -35,11 +40,16 @@ class DeprecatedNodeInWorkflowProblem(WorkflowProblem):
             message = (
                 f"Uses deprecated node '{problem.node_display_name}' from '{problem.library_name}' ({removal_info})"
             )
+            sentences = [message]
             if problem.deprecation_message:
-                message += f". {problem.deprecation_message}"
-            else:
-                message += ". No remediation steps provided by library author."
-            return message
+                sentences.append(problem.deprecation_message.rstrip("."))
+            if problem.replacement is not None:
+                sentences.append(
+                    f"Use '{problem.replacement.node_type}' from library '{problem.replacement.library}' instead"
+                )
+            if not problem.deprecation_message and problem.replacement is None:
+                sentences.append("No remediation steps provided by library author")
+            return ". ".join(sentences) + "."
 
         # Group by library
         by_library = defaultdict(list)
@@ -72,12 +82,19 @@ class DeprecatedNodeInWorkflowProblem(WorkflowProblem):
 
                 if message:
                     output_lines.append(f"    {message}:")
-                    output_lines.extend(f"      - {node.node_display_name}" for node in message_nodes)
+                    output_lines.extend(f"      - {cls._node_line(node)}" for node in message_nodes)
                 else:
-                    # No remediation steps provided
-                    output_lines.extend(
-                        f"    - {node.node_display_name} (no remediation steps provided by library author)"
-                        for node in message_nodes
-                    )
+                    output_lines.extend(f"    - {cls._node_line(node)}" for node in message_nodes)
 
         return "\n".join(output_lines)
+
+    @staticmethod
+    def _node_line(problem: DeprecatedNodeInWorkflowProblem) -> str:
+        if problem.replacement is not None:
+            return (
+                f"{problem.node_display_name} (use '{problem.replacement.node_type}' "
+                f"from library '{problem.replacement.library}')"
+            )
+        if problem.deprecation_message:
+            return problem.node_display_name
+        return f"{problem.node_display_name} (no remediation steps provided by library author)"

@@ -10,6 +10,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibrarySchema,
 )
+from griptape_nodes.node_library.library_validation import find_unresolved_deprecation_replacements
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
@@ -37,6 +38,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryRequest,
 )
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import UnresolvedDeprecationReplacementProblem
 from griptape_nodes.retained_mode.managers.library.catalog import LibraryCatalog
 from griptape_nodes.retained_mode.managers.library.common import (
     LIBRARY_CONFIG_FILENAME,
@@ -329,6 +331,8 @@ class LibraryManager(EngineScoped):
 
                 await self._load_and_track_library(lib_path, current_library_index, total_libraries)
 
+            self.refresh_deprecation_replacement_problems()
+
             # Remove any missing libraries AFTER we've loaded them for the user. Not when the
             # environment provides the libraries: the config's entries were not what loaded, and a
             # studio launch must leave the artist's own settings as it found them.
@@ -377,6 +381,38 @@ class LibraryManager(EngineScoped):
                 )
             )
         return statuses
+
+    def refresh_deprecation_replacement_problems(self) -> None:
+        """Recompute, for every loaded library, the problems for deprecated nodes whose replacement isn't loaded.
+
+        A replacement can live in another library, so this reads the whole registry and replaces
+        the previous verdict on every library: registering one library can resolve another's
+        replacement, and unloading one can break it. Runs after every register and unload, and
+        again once a full load finishes.
+        """
+        # A worker loads only the libraries it serves, so a replacement in another library would
+        # look missing there. The orchestrator loads them all and reports for everyone.
+        if self._is_worker:
+            return
+        node_types_by_library = {
+            library_name: set(LibraryRegistry.get_library(name=library_name).get_registered_nodes())
+            for library_name in LibraryRegistry.list_libraries()
+        }
+        for library_info in self._library_file_path_to_info.values():
+            library_info.problems = [
+                problem
+                for problem in library_info.problems
+                if not isinstance(problem, UnresolvedDeprecationReplacementProblem)
+            ]
+            if library_info.lifecycle_state != LibraryLifecycleState.LOADED or library_info.library_name is None:
+                continue
+            if library_info.library_name not in node_types_by_library:
+                continue
+            library_data = LibraryRegistry.get_library(name=library_info.library_name).get_library_data()
+            problems = find_unresolved_deprecation_replacements(library_data, node_types_by_library)
+            # Fitness is left alone: a library with a deprecated node is already FLAWED for that
+            # node's deprecation warning, whether or not its replacement resolves.
+            library_info.problems.extend(problems)
 
     async def _load_and_track_library(self, lib_path: str, index: int, total: int) -> None:
         """Load a single library and emit the corresponding progress event."""

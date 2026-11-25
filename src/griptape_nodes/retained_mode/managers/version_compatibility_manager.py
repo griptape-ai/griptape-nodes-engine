@@ -217,20 +217,24 @@ class VersionCompatibilityManager(EngineScoped):
     def _check_library_for_deprecated_nodes(
         self, library_data: LibrarySchema
     ) -> list[LibraryVersionCompatibilityIssue]:
-        """Check a library for deprecated nodes."""
+        """Check a library for deprecated nodes, workflow nodes included."""
+        # A workflow node has no Python class, so its node type stands in for one.
+        node_types_and_metadata = [(node.class_name, node.metadata) for node in library_data.nodes]
+        node_types_and_metadata.extend((node.node_type, node.metadata) for node in library_data.workflow_nodes or [])
         return [
             LibraryVersionCompatibilityIssue(
                 problem=DeprecatedNodeWarningProblem(
-                    display_name=node.metadata.display_name,
-                    class_name=node.class_name,
-                    removal_version=node.metadata.deprecation.removal_version,
-                    deprecation_message=node.metadata.deprecation.deprecation_message,
+                    display_name=metadata.display_name,
+                    class_name=node_type,
+                    removal_version=metadata.deprecation.removal_version,
+                    deprecation_message=metadata.deprecation.deprecation_message,
+                    replacement=metadata.deprecation.replacement,
                 ),
                 severity=LibraryManager.LibraryFitness.FLAWED,
             )
-            for node in library_data.nodes
-            if node.metadata.deprecation is not None
-        ] or []
+            for node_type, metadata in node_types_and_metadata
+            if metadata.deprecation is not None
+        ]
 
     def _check_library_for_beta_feature_problems(
         self, library_data: LibrarySchema
@@ -394,6 +398,7 @@ class VersionCompatibilityManager(EngineScoped):
                         workflow_library_version=workflow_library_version,
                         removal_version=deprecation.removal_version,
                         deprecation_message=deprecation.deprecation_message,
+                        replacement=deprecation.replacement,
                     ),
                     severity=WorkflowStatus.FLAWED,
                 )

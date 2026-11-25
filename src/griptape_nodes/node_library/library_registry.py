@@ -166,11 +166,20 @@ class IconVariant(BaseModel):
     dark: str
 
 
+class NodeDeprecationReplacement(BaseModel):
+    """The node to use in place of a deprecated node. It may live in another library."""
+
+    library: str
+    node_type: str
+
+
 class NodeDeprecationMetadata(BaseModel):
     """Metadata about a deprecated node."""
 
     deprecation_message: str | None = None
     removal_version: str | None = None
+    # Checked once every library has loaded and when one registers or unloads; an unresolved one is a library problem.
+    replacement: NodeDeprecationReplacement | None = None
 
 
 class NodeMetadata(BaseModel):
@@ -257,8 +266,9 @@ class LibrarySchema(BaseModel):
     # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
     # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
     # optional beta_features list, which older engines ignore. 0.15.0 adds the optional
-    # documentation_path, which older engines ignore.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.15.0"
+    # documentation_path, which older engines ignore. 0.16.0 adds the optional
+    # deprecation.replacement on node metadata, which older engines ignore.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.16.0"
 
     name: str
     library_schema_version: str

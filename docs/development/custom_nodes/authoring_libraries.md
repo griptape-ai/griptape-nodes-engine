@@ -110,7 +110,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 - **beta_features**: Experimental features users can turn on from the editor's Beta Features page. See [Beta Features](#beta-features) below.
 - **widgets**: Register custom JS widget components (see [Custom Widgets](custom_widgets.md))
 - **categories**: Group nodes in UI with colors and icons
-- **nodes**: List node classes, file paths, and metadata
+- **nodes**: List node classes, file paths, and metadata. A node's `metadata.deprecation` marks it deprecated; see [Deprecating a Node](#deprecating-a-node) below.
 - **advanced_library_path**: Optional Python file declaring an `AdvancedNodeLibrary` subclass, for libraries that need to run code at load and unload, own a request type, or register node types the manifest does not list (see [Advanced Libraries](advanced_libraries.md))
 - **workflow_nodes**: Nodes generated from saved workflow files instead of Python classes. See [Nodes From Workflow Files](#nodes-from-workflow-files) below.
 - **workflows**: Template workflow files
@@ -176,6 +176,36 @@ The workflow is also registered as a workflow in its own right, so it shows up i
 workflow picker under your library as soon as the library loads, next to the workflows in your
 `workflows` list. To make it a template, set `is_template = true` in its metadata header. To keep a
 workflow that only exists to back a node out of the picker, set `is_internal = true` instead.
+
+### Deprecating a Node
+
+Mark a node deprecated with a `deprecation` block in its `metadata`. The node still loads, so existing
+workflows keep working, and the editor and agents steer users away from it:
+
+```jsonc
+"metadata": {
+  "category": "image",
+  "description": "Loads an image",
+  "display_name": "Load Image (Legacy)",
+  "deprecation": {
+    "deprecation_message": "Superseded by a node that also reads image metadata.",
+    "removal_version": "2.0.0",
+    "replacement": { "library": "Griptape Nodes Library", "node_type": "LoadImage" }
+  }
+}
+```
+
+| Field                 | Meaning                                                                                                                                     |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deprecation_message` | Optional text shown with the deprecation notice, such as why the node is deprecated. The notice names the `replacement` itself.             |
+| `removal_version`     | Optional version in which the node will be removed.                                                                                         |
+| `replacement`         | Optional node to use instead: the `library` name it's registered in and its `node_type` (the class name, or a workflow node's `node_type`). |
+
+The replacement can live in another library. Once every library has loaded, and again whenever a
+library is registered or unloaded, the engine checks that the named library is loaded and registers
+that node type. If it doesn't, the deprecated node's
+library gets a problem in Library Management saying which part is missing. The deprecated node still
+loads either way. `replacement` needs library schema `0.16.0`; older engines ignore it.
 
 ### Library and Node Declarations
 

@@ -346,17 +346,24 @@ def _render_node_types(libraries: Mapping[str, Mapping[str, NodeMetadata]]) -> s
         lines.append(f"Library '{library_name}':")
         by_category: dict[str, list[str]] = {}
         for node_type, metadata in node_metadata.items():
-            by_category.setdefault(metadata.category, []).append(_render_node_type(node_type, metadata))
+            by_category.setdefault(metadata.category, []).append(_render_node_type(node_type, metadata, libraries))
         for category, node_lines in by_category.items():
             lines.append(f"  {category}:")
             lines.extend(f"    - {line}" for line in node_lines)
     return "\n".join(lines)
 
 
-def _render_node_type(node_type: str, metadata: NodeMetadata) -> str:
+def _render_node_type(
+    node_type: str, metadata: NodeMetadata, libraries: Mapping[str, Mapping[str, NodeMetadata]]
+) -> str:
     label = node_type
     if metadata.deprecation is not None:
-        label = f"{label} (deprecated, do not use for new work)"
+        replacement = metadata.deprecation.replacement
+        # Name the replacement only when it is one of the node types listed, so it can be created.
+        if replacement is not None and replacement.node_type in libraries.get(replacement.library, {}):
+            label = f"{label} (deprecated, use '{replacement.node_type}' from library '{replacement.library}' instead)"
+        else:
+            label = f"{label} (deprecated, do not use for new work)"
     description = " ".join(metadata.description.split())
     if len(description) > _MAX_NODE_DESCRIPTION_LENGTH:
         description = f"{description[: _MAX_NODE_DESCRIPTION_LENGTH - 3]}..."

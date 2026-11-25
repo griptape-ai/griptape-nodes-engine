@@ -14,6 +14,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryRegistry,
     LibrarySchema,
     NodeDeprecationMetadata,
+    NodeDeprecationReplacement,
     NodeMetadata,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
@@ -117,6 +118,34 @@ class TestRenderNodeTypes:
             "  edit:",
             "    - Blur: Blurs",
         ]
+
+    def test_deprecated_node_type_names_its_replacement(self) -> None:
+        libraries = {
+            "Images": {"OldLoader": self._replaced_metadata(library="Media", node_type="LoadImage")},
+            "Media": {"LoadImage": _metadata("image", "Loads an image")},
+        }
+
+        lines = _render_node_types(libraries).splitlines()
+
+        assert "    - OldLoader (deprecated, use 'LoadImage' from library 'Media' instead): Old loader" in lines
+
+    def test_replacement_that_is_not_listed_is_not_named(self) -> None:
+        libraries = {"Images": {"OldLoader": self._replaced_metadata(library="Media", node_type="LoadImage")}}
+
+        line = _render_node_types(libraries).splitlines()[-1]
+
+        assert line == "    - OldLoader (deprecated, do not use for new work): Old loader"
+
+    @staticmethod
+    def _replaced_metadata(*, library: str, node_type: str) -> NodeMetadata:
+        return NodeMetadata(
+            category="image",
+            description="Old loader",
+            display_name="",
+            deprecation=NodeDeprecationMetadata(
+                replacement=NodeDeprecationReplacement(library=library, node_type=node_type)
+            ),
+        )
 
     def test_long_description_is_cut(self) -> None:
         libraries = {"L": {"Wordy": _metadata("c", "word " * 100)}}
