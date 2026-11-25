@@ -178,6 +178,15 @@ hovering the row gives the reason:
 - Nothing in your config registers the library at all, so there is no entry
     to remove, and deleting the files would leave whatever did register it
     pointing at nothing.
+- The library's folder is not one Griptape Nodes installed. A library you
+    pointed the engine at yourself — a checkout you are developing in, say —
+    is yours, so **Uninstall** will not delete it. Remove its entry from
+    **Libraries To Register** and the folder stays where it is.
+
+If the library's files are still in use when you uninstall it — which Windows
+enforces strictly — the folder is removed the next time the engine starts.
+The library is unregistered and unloaded straight away either way, and the
+message tells you a restart is needed.
 
 An uninstall can also leave a **Libraries To Register** entry naming a folder
 the engine scans rather than the library itself. That entry is what loads the

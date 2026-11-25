@@ -21,6 +21,7 @@ from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
     EnvironmentManagedBlocker,
     NotFoundBlocker,
+    OutsideLibrariesDirectoryBlocker,
     PreviewUninstallLibraryRequest,
     PreviewUninstallLibraryResultFailure,
     PreviewUninstallLibraryResultSuccess,
@@ -84,7 +85,8 @@ class _DirectoryDeletion:
 
     deleted: bool = False
     outcome: DeletionOutcome | None = None
-    failure: UninstallLibraryResultFailure | None = None
+    # The folder was in use, so it is recorded for removal at the next engine start.
+    deferred: bool = False
 
 
 class _ConfigEntryRemoval(Enum):
@@ -180,18 +182,14 @@ class LibraryUninstall(EngineScoped):
             resolved.library_name, resolved.library_path
         )
 
-        deletion = await self._uninstall_delete_directory(
-            resolved, config_entry_removed=config_entry_removed, unloaded=unloaded
-        )
-        if deletion.failure is not None:
-            return deletion.failure
+        deletion = await self._uninstall_delete_directory(resolved)
 
         return self._uninstall_success(
             resolved,
             unloaded=unloaded,
             config_entry_removed=config_entry_removed,
             deletion=deletion,
-            restart_required=restart_required,
+            restart_required=restart_required or deletion.deferred,
         )
 
     def _uninstall_remove_config_entry(
@@ -235,15 +233,18 @@ class LibraryUninstall(EngineScoped):
             return False, UninstallLibraryResultFailure(result_details=details, failure_reason="unload_failed")
         return True, None
 
-    async def _uninstall_delete_directory(
-        self, resolved: _Resolution, *, config_entry_removed: bool, unloaded: bool
-    ) -> _DirectoryDeletion:
-        """Step 3 (most destructive): delete the install directory, or treat its absence as success."""
+    async def _uninstall_delete_directory(self, resolved: _Resolution) -> _DirectoryDeletion:
+        """Step 3 (most destructive): delete the install directory, or record it for the next start."""
         if resolved.install_directory is None:
             return _DirectoryDeletion()
         if not await anyio.Path(resolved.install_directory).exists():
             # Already gone is success -- the goal (no install on disk) is met.
             return _DirectoryDeletion(deleted=True)
+
+        # The library's worker has its environment on its import path, so the files stay open
+        # until the worker is gone. The reset stops it for the same reason.
+        await self.engine.library_manager.workers.stop_worker_for_library(resolved.library_name)
+
         delete_result = await self.engine.ahandle_request(
             DeleteFileRequest(
                 path=str(resolved.install_directory),
@@ -256,24 +257,11 @@ class LibraryUninstall(EngineScoped):
             # request. Same goal state, so report it the same way.
             if not await anyio.Path(resolved.install_directory).exists():
                 return _DirectoryDeletion(deleted=True)
-            # Name only the steps that ran, or troubleshooting looks for an edit that
-            # never happened.
-            undone = [
-                name
-                for name, happened in (("its config entry", config_entry_removed), ("its registry load", unloaded))
-                if happened
-            ]
-            if undone:
-                done_so_far = f"{' and '.join(undone).capitalize()} were removed, but its"
-            else:
-                done_so_far = "Its"
-            details = (
-                f"Attempted to uninstall Library '{resolved.library_name}'. {done_so_far} folder at "
-                f"{resolved.install_directory} could not be deleted: {delete_result.result_details}"
-            )
-            return _DirectoryDeletion(
-                failure=UninstallLibraryResultFailure(result_details=details, failure_reason="directory_delete_failed")
-            )
+            # This process imported the library's code and Python cannot unload it, and on Windows
+            # a loaded file cannot be deleted at all. Record the folder for removal at the next
+            # start, before any library loads, rather than leave the uninstall half done.
+            self.engine.library_manager.reset.schedule_removal([resolved.install_directory])
+            return _DirectoryDeletion(deferred=True)
         outcome = delete_result.outcome if isinstance(delete_result, DeleteFileResultSuccess) else None
         return _DirectoryDeletion(deleted=True, outcome=outcome)
 
@@ -292,7 +280,10 @@ class LibraryUninstall(EngineScoped):
             kinds = ", ".join(sorted({type(entry).__name__ for entry in resolved.remaining_registrations}))
             message += f" Something still registers it ({kinds})."
             level = logging.WARNING
-        if restart_required:
+        if deletion.deferred:
+            message += " Its folder was in use, so restart the engine to finish removing it."
+            level = logging.WARNING
+        elif restart_required:
             message += " Restart the engine to finish removing it from memory."
             level = logging.WARNING
 
@@ -307,6 +298,7 @@ class LibraryUninstall(EngineScoped):
             unloaded=unloaded,
             config_entry_removed=config_entry_removed,
             directory_deleted=deletion.deleted,
+            directory_removal_deferred=deletion.deferred,
             deletion_outcome=deletion.outcome,
             restart_required=restart_required,
             result_details=ResultDetails(message=message, level=level),
@@ -354,6 +346,21 @@ class LibraryUninstall(EngineScoped):
             return self._blocked_resolution(
                 library_info,
                 blocked_by=UnsafePathBlocker(path=str(install_directory)),
+                classification=classification,
+                install_directory=install_directory,
+            )
+
+        # A `libraries_to_register` entry can name any folder, including a checkout the user is
+        # developing in. The engine installs under the libraries root, so anything outside it is
+        # the user's to delete.
+        libraries_root = self.engine.config_manager.resolved_libraries_root()
+        if not self._engine_installed_directory(install_directory, libraries_root):
+            return self._blocked_resolution(
+                library_info,
+                blocked_by=OutsideLibrariesDirectoryBlocker(
+                    install_directory=str(install_directory),
+                    libraries_directory=str(libraries_root),
+                ),
                 classification=classification,
                 install_directory=install_directory,
             )
@@ -458,6 +465,12 @@ class LibraryUninstall(EngineScoped):
             LIBRARIES_TO_DOWNLOAD_KEY if classification.registered_in == "download" else LIBRARIES_TO_REGISTER_KEY
         )
         return self.engine.config_manager.shadowed_by(config_key)
+
+    def _engine_installed_directory(self, install_directory: Path, libraries_root: Path) -> bool:
+        """Whether the engine installed this folder, which is what makes deleting it its to do."""
+        target = canonicalize_for_identity(install_directory)
+        root = canonicalize_for_identity(libraries_root)
+        return target.is_relative_to(root)
 
     def _is_protected_directory(self, install_directory: Path) -> bool:
         """Whether deleting `install_directory` would take the workspace, libraries root, or home with it."""

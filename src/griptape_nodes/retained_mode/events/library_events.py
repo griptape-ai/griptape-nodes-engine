@@ -1469,6 +1469,23 @@ class UnwritableConfigBlocker:
 
 
 @dataclass
+class OutsideLibrariesDirectoryBlocker:
+    """The library's folder sits outside the engine's libraries directory, so the engine did not install it.
+
+    A `libraries_to_register` entry can name any folder on disk, including a checkout the user
+    is developing in. The engine removes only what it installed.
+
+    Args:
+        install_directory: The folder that would have been deleted.
+        libraries_directory: The folder the engine installs libraries into.
+    """
+
+    install_directory: str
+    libraries_directory: str
+    kind: Literal["outside_libraries_directory"] = "outside_libraries_directory"
+
+
+@dataclass
 class UnmatchedEntryBlocker:
     """Nothing in the config matched this library.
 
@@ -1488,12 +1505,13 @@ UninstallBlocker = (
     | NotFoundBlocker
     | UnwritableConfigBlocker
     | UnmatchedEntryBlocker
+    | OutsideLibrariesDirectoryBlocker
 )
 
 
 # Which step failed once an uninstall was under way. Refusals never get this far; they travel as
 # `blocked_by`.
-UninstallFailureReason = Literal["config_write_failed", "unload_failed", "directory_delete_failed"]
+UninstallFailureReason = Literal["config_write_failed", "unload_failed"]
 
 
 @dataclass
@@ -1586,6 +1604,9 @@ class UninstallLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     unloaded: bool = False
     config_entry_removed: bool = False
     directory_deleted: bool = False
+    # True when the folder was in use and is removed at the next engine start instead. The
+    # library is unregistered and unloaded either way, and `restart_required` is set.
+    directory_removal_deferred: bool = False
     # Which kind of delete the folder got. None when this call deleted nothing, including when
     # the folder was already gone. `PREFER_RECYCLE_BIN` falls back to a permanent delete where
     # the platform has no recycle bin, so the editor can only promise recovery when this says so.

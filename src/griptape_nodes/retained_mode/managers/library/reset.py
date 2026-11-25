@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import anyio
 
+from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
@@ -41,8 +42,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 PENDING_RESETS_FILENAME = "pending_library_resets.json"
-# Only directories with these names are ever removed from the pending file, so a hand-edited or
-# corrupted entry cannot point the startup removal at anything but a library environment.
+# A reset records a library environment here; an uninstall records a whole install directory.
+# Nothing else is ever removed, so a hand-edited or corrupted entry cannot point the startup
+# removal somewhere else. See `_removable_at_startup`.
 LIBRARY_ENV_DIR_NAMES = frozenset({".venv", ".venv-exec"})
 
 
@@ -174,8 +176,12 @@ class LibraryReset(EngineScoped):
         remaining: list[str] = []
         for env_path_str in self._read_pending(pending_path):
             env_path = Path(env_path_str)
-            if env_path.name not in LIBRARY_ENV_DIR_NAMES:
-                logger.warning("Ignoring '%s' in %s: it is not a library environment.", env_path, pending_path)
+            if not self._removable_at_startup(env_path):
+                logger.warning(
+                    "Ignoring '%s' in %s: it is neither a library environment nor inside the libraries directory.",
+                    env_path,
+                    pending_path,
+                )
                 continue
             if not await anyio.Path(env_path).exists():
                 continue
@@ -194,7 +200,10 @@ class LibraryReset(EngineScoped):
         self._write_pending(pending_path, remaining)
 
     def schedule_removal(self, env_paths: list[Path]) -> None:
-        """Record environment directories to remove the next time the engine starts."""
+        """Record directories to remove the next time the engine starts, before any library loads.
+
+        Each must satisfy `_removable_at_startup`, or the startup pass skips it.
+        """
         pending_path = self.pending_resets_path()
         pending = self._read_pending(pending_path)
         for env_path in env_paths:
@@ -229,8 +238,20 @@ class LibraryReset(EngineScoped):
             )
         return f"Attempted to reset Library '{library_name}'. Its environments were removed, but it failed to load again: {reason}"
 
+    def _removable_at_startup(self, path: Path) -> bool:
+        """Whether the startup pass may delete this recorded path.
+
+        Two shapes qualify: a library environment, which a reset records, and a directory inside
+        the libraries root, which an uninstall records. The libraries root itself never does.
+        """
+        if path.name in LIBRARY_ENV_DIR_NAMES:
+            return True
+        libraries_root = canonicalize_for_identity(self.engine.config_manager.resolved_libraries_root())
+        target = canonicalize_for_identity(path)
+        return target != libraries_root and target.is_relative_to(libraries_root)
+
     async def _remove_env_dir(self, env_path: Path) -> str | None:
-        """Delete an environment directory, returning why it is still there, or None once it is gone.
+        """Delete a recorded directory, returning why it is still there, or None once it is gone.
 
         Checked by looking afterwards: off Windows, `remove_readonly` returns without raising, so
         rmtree carries on past a file it could not delete and finishes without an error.

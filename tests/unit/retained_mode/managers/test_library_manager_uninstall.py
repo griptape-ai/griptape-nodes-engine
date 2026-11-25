@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 import anyio
 import pytest
+import send2trash
 
 from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
@@ -28,6 +29,7 @@ from griptape_nodes.node_library.library_registry import (
 from griptape_nodes.retained_mode.events.library_events import (
     EnvironmentManagedBlocker,
     NotFoundBlocker,
+    OutsideLibrariesDirectoryBlocker,
     PreviewUninstallLibraryRequest,
     PreviewUninstallLibraryResultFailure,
     PreviewUninstallLibraryResultSuccess,
@@ -154,6 +156,9 @@ def workspace(tmp_path: Path, engine: Engine) -> Path:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     engine.config_manager.set_config_value("workspace_directory", str(workspace))
+    # The uninstall deletes only what the engine installed, which means inside the libraries
+    # root. Point that at the `libs` folder these tests install into.
+    engine.config_manager.set_config_value("libraries_directory", "libs")
     return workspace
 
 
@@ -431,7 +436,7 @@ class TestDirectoryEntryNamingOneLibrary:
 
     @pytest.mark.asyncio
     async def test_entry_naming_the_deleted_folder_is_removed_with_it(self, engine: Engine, workspace: Path) -> None:
-        lib_dir = workspace / "mylib"
+        lib_dir = workspace / "libs" / "mylib"
         manifest = _write_manifest(lib_dir, "My Library")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(lib_dir)])
         _track(engine.library_manager, manifest, library_name="My Library", registered_path=str(lib_dir))
@@ -449,7 +454,7 @@ class TestDirectoryEntryNamingOneLibrary:
     @pytest.mark.asyncio
     async def test_entry_naming_a_folder_of_several_goes_too(self, engine: Engine, workspace: Path) -> None:
         """Two manifests inside the entry's own folder: the delete takes both, so the entry goes."""
-        lib_dir = workspace / "bundle"
+        lib_dir = workspace / "libs" / "bundle"
         manifest = _write_manifest(lib_dir, "Bundle Main")
         nested = _write_manifest(lib_dir / "extra", "Bundle Extra")
         engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(lib_dir)])
@@ -473,7 +478,7 @@ class TestDownloadProvisionedLibrary:
     async def test_uninstall_removes_download_entry_and_deletes_repo_directory(
         self, engine: Engine, workspace: Path
     ) -> None:
-        libraries_root = workspace / "libraries"
+        libraries_root = workspace / "libs"
         repo_dir = libraries_root / "griptape-nodes-library-sample"
         manifest = _write_manifest(repo_dir, "Sample Library")
         engine.config_manager.set_config_value(
@@ -782,6 +787,104 @@ class TestDeletionOutcome:
         assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
         assert result.directory_deleted
         assert result.deletion_outcome is None
+
+
+class TestOutsideLibrariesDirectory:
+    """The engine deletes only what it installed, which means inside the libraries root."""
+
+    @pytest.mark.asyncio
+    async def test_a_library_the_engine_did_not_install_is_refused(self, engine: Engine, workspace: Path) -> None:
+        """A checkout the user is developing in is registered, not installed. Deleting it is not ours."""
+        checkout = workspace / "code" / "my-library"
+        manifest = _write_manifest(checkout, "Dev Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Dev Library", registered_path=str(manifest))
+
+        result = await engine.ahandle_request(UninstallLibraryRequest(library_path=str(manifest)))
+
+        assert isinstance(result, UninstallLibraryResultFailure)
+        assert isinstance(result.blocked_by, OutsideLibrariesDirectoryBlocker)
+        # Nothing moved: the files are the user's and the entry still loads them.
+        assert await anyio.Path(manifest).exists()
+        assert engine.config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]) == [str(manifest)]
+
+    @pytest.mark.asyncio
+    async def test_the_preview_reports_the_same_refusal(self, engine: Engine, workspace: Path) -> None:
+        """So the editor greys the button out instead of failing after the click."""
+        checkout = workspace / "code" / "my-library"
+        manifest = _write_manifest(checkout, "Dev Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Dev Library", registered_path=str(manifest))
+
+        preview = await _preview(engine, manifest)
+
+        assert isinstance(preview.blocked_by, OutsideLibrariesDirectoryBlocker)
+        assert preview.blocked_by.install_directory == str(checkout)
+
+
+class TestFolderInUse:
+    """A loaded library's files stay open, and on Windows cannot be deleted at all."""
+
+    @pytest.mark.asyncio
+    async def test_the_worker_is_stopped_before_the_delete(
+        self, engine: Engine, workspace: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worker has the library's environment on its import path, so it holds the files."""
+        manifest = _write_manifest(workspace / "libs" / "worker_lib", "Worker Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Worker Library", registered_path=str(manifest))
+        stopped: list[str] = []
+
+        async def _record(library_name: str) -> None:
+            stopped.append(library_name)
+
+        monkeypatch.setattr(engine.library_manager.workers, "stop_worker_for_library", _record)
+
+        result = await _uninstall_after_preview(engine, manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert stopped == ["Worker Library"]
+
+    @pytest.mark.asyncio
+    async def test_a_locked_folder_is_removed_at_the_next_start(
+        self, engine: Engine, workspace: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rather than fail with the entry already gone, record the folder and say so."""
+        lib_dir = workspace / "libs" / "locked_lib"
+        manifest = _write_manifest(lib_dir, "Locked Library")
+        engine.config_manager.set_config_value(LIBRARIES_TO_REGISTER_KEY, [str(manifest)])
+        _track(engine.library_manager, manifest, library_name="Locked Library", registered_path=str(manifest))
+
+        def _locked(*_args: object, **_kwargs: object) -> None:
+            msg = "The process cannot access the file because it is being used by another process."
+            raise OSError(msg)
+
+        # What Windows does to a loaded library: neither route to the folder works.
+        monkeypatch.setattr(send2trash, "send2trash", _locked)
+        monkeypatch.setattr(shutil, "rmtree", _locked)
+        scheduled: list[list[Path]] = []
+        monkeypatch.setattr(engine.library_manager.reset, "schedule_removal", scheduled.append)
+
+        result = await _uninstall_after_preview(engine, manifest)
+
+        assert isinstance(result, UninstallLibraryResultSuccess), result.result_details
+        assert result.directory_removal_deferred is True
+        assert result.directory_deleted is False
+        assert result.restart_required is True
+        assert scheduled == [[lib_dir]]
+        # The unregistering half still happened, so the engine stops loading it now.
+        assert result.config_entry_removed is True
+
+    def test_the_startup_pass_only_removes_what_it_should(self, engine: Engine, workspace: Path) -> None:
+        """The pending file is on disk, so a corrupted entry must not point the removal anywhere."""
+        reset = engine.library_manager.reset
+        libraries_root = engine.config_manager.resolved_libraries_root()
+
+        assert reset._removable_at_startup(libraries_root / "some-library") is True
+        assert reset._removable_at_startup(workspace / "code" / "my-library" / ".venv") is True
+        assert reset._removable_at_startup(libraries_root) is False
+        assert reset._removable_at_startup(workspace / "code" / "my-library") is False
+        assert reset._removable_at_startup(Path.home()) is False
 
 
 class TestConcurrentUninstalls:
