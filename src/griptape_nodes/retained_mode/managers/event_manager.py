@@ -1895,7 +1895,6 @@ class EventManager(EngineScoped):
                 handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
                 the workflow the request ran in (see `_result_workflow_id`).
         """
-        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -1939,18 +1938,12 @@ class EventManager(EngineScoped):
         binding_token = self._bind_request_workflow(handler_call.request_workflow)
         try:
             try:
-                async with self.engine.undo_manager.dispatch(
-                    request, handler_call.request_workflow.workflow, outermost=is_outermost_request
-                ) as undo:
-                    # Actually make the handler callback (support both sync and async):
-                    with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
-                        result_payload: ResultPayload = await call_function(handler_call.function, request)
-                    undo.note(result_payload)
-
-                    # Queue flush request for async context (unless result type should skip flush)
-                    with operation_depth_mgr:
-                        if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
-                            self._flush_tracked_parameter_changes()
+                result_payload = await self._dispatch(
+                    handler_call.function,
+                    request,
+                    handler_call.request_workflow.workflow,
+                    outermost=is_outermost_request,
+                )
             except Exception as exc:
                 return self._result_for_handler_exception(
                     request, exc, context=result_context, request_workflow=handler_call.request_workflow
@@ -2111,6 +2104,22 @@ class EventManager(EngineScoped):
             if is_outermost_request:
                 self.flush_coalesced_events()
             bound_workflow.reset(binding_token)
+
+    async def _dispatch(
+        self, callback: Callable, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
+    ) -> ResultPayload:
+        """Call a request handler, sync or async, as undo records it (see `UndoManager.dispatch`)."""
+        request_type = type(request)
+        async with self.engine.undo_manager.dispatch(request, workflow, outermost=outermost) as undo:
+            with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
+                result_payload: ResultPayload = await call_function(callback, request)
+            undo.note(result_payload)
+
+            # Queue flush request for async context (unless result type should skip flush)
+            with self.engine.operation_depth_manager:
+                if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
+                    self._flush_tracked_parameter_changes()
+        return result_payload
 
     def _dispatch_from_sync(
         self,
