@@ -3,7 +3,6 @@
 import asyncio
 import itertools
 import json
-import tempfile
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -120,37 +119,29 @@ class _ClassifyControlNode(ControlNode):
 
 
 @pytest.fixture
-def image_without_metadata() -> Generator[str, None, None]:
+def image_without_metadata(tmp_path: Path) -> str:
     """A plain PNG with no embedded text chunks."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        Image.new("RGB", (4, 4), color="red").save(f, format="PNG")
-        path = f.name
-    try:
-        yield path
-    finally:
-        Path(path).unlink(missing_ok=True)
+    path = tmp_path / "without_metadata.png"
+    Image.new("RGB", (4, 4), color="red").save(path, format="PNG")
+    return str(path)
 
 
 @pytest.fixture
-def image_with_unrelated_metadata() -> Generator[str, None, None]:
+def image_with_unrelated_metadata(tmp_path: Path) -> str:
     """A PNG that has metadata but no gtn flow commands key."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        info = PngInfo()
-        info.add_text("Description", "not a workflow")
-        Image.new("RGB", (4, 4), color="green").save(f, format="PNG", pnginfo=info)
-        path = f.name
-    try:
-        yield path
-    finally:
-        Path(path).unlink(missing_ok=True)
+    path = tmp_path / "unrelated_metadata.png"
+    info = PngInfo()
+    info.add_text("Description", "not a workflow")
+    Image.new("RGB", (4, 4), color="green").save(path, format="PNG", pnginfo=info)
+    return str(path)
 
 
-def _image_with_flow_commands_text(text: str) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        info = PngInfo()
-        info.add_text(FLOW_COMMANDS_KEY, text)
-        Image.new("RGB", (4, 4), color="blue").save(f, format="PNG", pnginfo=info)
-        return f.name
+def _image_with_flow_commands_text(text: str, directory: Path) -> str:
+    path = directory / "flow_commands.png"
+    info = PngInfo()
+    info.add_text(FLOW_COMMANDS_KEY, text)
+    Image.new("RGB", (4, 4), color="blue").save(path, format="PNG", pnginfo=info)
+    return str(path)
 
 
 @pytest.fixture
@@ -165,9 +156,9 @@ def empty_flow_commands(engine: Engine) -> SerializedFlowCommands:
 
 
 @pytest.fixture
-def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands) -> Generator[str, None, None]:
+def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands, tmp_path: Path) -> Generator[str, None, None]:
     """A PNG whose FLOW_COMMANDS_KEY payload is flow commands encoded as JSON."""
-    path = _image_with_flow_commands_text(json.dumps(encode_commands(empty_flow_commands)))
+    path = _image_with_flow_commands_text(json.dumps(encode_commands(empty_flow_commands)), tmp_path)
     try:
         yield path
     finally:
@@ -250,8 +241,10 @@ class TestExtractFlowCommandsFromImageMetadata:
             ("not json or base64!", "neither JSON nor base64"),
         ],
     )
-    def test_returns_failure_when_flow_commands_are_unreadable(self, engine: Engine, text: str, reason: str) -> None:
-        path = _image_with_flow_commands_text(text)
+    def test_returns_failure_when_flow_commands_are_unreadable(
+        self, engine: Engine, text: str, reason: str, tmp_path: Path
+    ) -> None:
+        path = _image_with_flow_commands_text(text, tmp_path)
         try:
             result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
                 ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
@@ -262,8 +255,8 @@ class TestExtractFlowCommandsFromImageMetadata:
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
         assert reason in str(result.result_details)
 
-    def test_closes_the_image_when_flow_commands_are_damaged(self, engine: Engine) -> None:
-        path = _image_with_flow_commands_text(json.dumps({"version": 1, "commands": {"flow_name": "x"}}))
+    def test_closes_the_image_when_flow_commands_are_damaged(self, engine: Engine, tmp_path: Path) -> None:
+        path = _image_with_flow_commands_text(json.dumps({"version": 1, "commands": {"flow_name": "x"}}), tmp_path)
         opened: list[ImageFile.ImageFile] = []
         real_open = Image.open
 

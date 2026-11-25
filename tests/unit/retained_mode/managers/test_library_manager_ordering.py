@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -15,7 +14,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable
 
     from griptape_nodes.retained_mode.engine import Engine
 
@@ -48,10 +47,9 @@ class TestLibraryManagerDeterministicOrdering:
     """Test that library loading maintains deterministic order."""
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
+    def temp_dir(self, tmp_path: Path) -> Path:
         """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+        return tmp_path.resolve()
 
     @pytest.mark.asyncio
     async def test_discover_library_files_preserves_config_order(self, engine: Engine, temp_dir: Path) -> None:

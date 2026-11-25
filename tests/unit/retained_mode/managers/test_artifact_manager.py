@@ -1,6 +1,5 @@
 import json
 import os
-import tempfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -728,14 +727,8 @@ class TestGeneratePreview:
     """Tests for preview generation functionality."""
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create temporary directory for test files."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    @pytest.fixture
-    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
-        """Set up a real project in ProjectManager with temp_dir as workspace."""
+    def mock_project(self, tmp_path: Path, engine: Engine) -> None:
+        """Set up a real project in ProjectManager with tmp_path as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
@@ -748,11 +741,11 @@ class TestGeneratePreview:
         situation_schemas = project_manager._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
         directory_schemas = project_manager._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
 
-        # Create ProjectInfo with temp_dir as workspace
+        # Create ProjectInfo with tmp_path as workspace
         project_info = ProjectInfo(
             project_id="test_project",
-            project_file_path=temp_dir / "project.yml",
-            project_base_dir=temp_dir,
+            project_file_path=tmp_path / "project.yml",
+            project_base_dir=tmp_path,
             template=DEFAULT_PROJECT_TEMPLATE,
             validation=validation,
             parsed_situation_schemas=situation_schemas,
@@ -764,13 +757,13 @@ class TestGeneratePreview:
         project_manager._current_project_id = "test_project"
 
     @pytest.fixture
-    def test_image_path(self, temp_dir: Path) -> Path:
+    def test_image_path(self, tmp_path: Path) -> Path:
         """Create a real test image file for preview generation.
 
         Returns:
             Path to a 100x100 JPEG test image with known properties
         """
-        image_path = temp_dir / "test_source.jpg"
+        image_path = tmp_path / "test_source.jpg"
 
         # Create a simple test image (100x100 red square)
         img = Image.new("RGB", (100, 100), color="red")
@@ -785,14 +778,14 @@ class TestGeneratePreview:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, tmp_path: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
         # Set workspace_path after provider registration since registration triggers load_configs()
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         return manager
 
     @pytest.mark.asyncio
@@ -875,10 +868,10 @@ class TestGeneratePreview:
 
     @pytest.mark.asyncio
     async def test_generate_preview_source_file_not_found(
-        self, artifact_manager: ArtifactManager, temp_dir: Path
+        self, artifact_manager: ArtifactManager, tmp_path: Path
     ) -> None:
         """Test generating preview for non-existent file."""
-        nonexistent_path = temp_dir / "nonexistent.jpg"
+        nonexistent_path = tmp_path / "nonexistent.jpg"
         parsed_macro = ParsedMacro(str(nonexistent_path))
         macro_path = MacroPath(parsed_macro=parsed_macro, variables={})
 
@@ -896,10 +889,10 @@ class TestGeneratePreview:
         assert "file not found" in str(result.result_details).lower()
 
     @pytest.mark.asyncio
-    async def test_generate_preview_unsupported_format(self, artifact_manager: ArtifactManager, temp_dir: Path) -> None:
+    async def test_generate_preview_unsupported_format(self, artifact_manager: ArtifactManager, tmp_path: Path) -> None:
         """Test generating preview for unsupported format."""
         # Create a .txt file
-        txt_path = temp_dir / "test.txt"
+        txt_path = tmp_path / "test.txt"
         txt_path.write_text("This is not an image")
 
         parsed_macro = ParsedMacro(str(txt_path))
@@ -1224,14 +1217,8 @@ class TestPreviewMetadataDoesNotCreateSidecar:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create temporary directory for test files."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    @pytest.fixture
-    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
-        """Set up a real project in ProjectManager with temp_dir as workspace."""
+    def mock_project(self, tmp_path: Path, engine: Engine) -> None:
+        """Set up a real project in ProjectManager with tmp_path as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
@@ -1244,8 +1231,8 @@ class TestPreviewMetadataDoesNotCreateSidecar:
 
         project_info = ProjectInfo(
             project_id="test_project",
-            project_file_path=temp_dir / "project.yml",
-            project_base_dir=temp_dir,
+            project_file_path=tmp_path / "project.yml",
+            project_base_dir=tmp_path,
             template=DEFAULT_PROJECT_TEMPLATE,
             validation=validation,
             parsed_situation_schemas=situation_schemas,
@@ -1256,9 +1243,9 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         project_manager._current_project_id = "test_project"
 
     @pytest.fixture
-    def test_image_path(self, temp_dir: Path) -> Path:
+    def test_image_path(self, tmp_path: Path) -> Path:
         """Create a real test image file."""
-        image_path = temp_dir / "test_source.jpg"
+        image_path = tmp_path / "test_source.jpg"
         img = Image.new("RGB", (100, 100), color="red")
         img.save(str(image_path), format="JPEG")
         return image_path
@@ -1270,17 +1257,17 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, tmp_path: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         return manager
 
     @pytest.mark.asyncio
     async def test_no_sidecar_created_for_preview_metadata_json(
-        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, temp_dir: Path
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, tmp_path: Path
     ) -> None:
         """Test that generating a preview with metadata does not create a sidecar for the metadata JSON."""
         request = GeneratePreviewRequest(
@@ -1294,7 +1281,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
         assert isinstance(result, GeneratePreviewResultSuccess)
 
-        metadata_dir = anyio.Path(temp_dir / ".griptape-nodes-metadata")
+        metadata_dir = anyio.Path(tmp_path / ".griptape-nodes-metadata")
         if await metadata_dir.exists():
             sidecar_files = [f async for f in metadata_dir.rglob("*") if await f.is_file()]
             assert sidecar_files == [], (
@@ -1303,7 +1290,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
 
     @pytest.mark.asyncio
     async def test_no_nested_previews_dir_in_metadata(
-        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, temp_dir: Path
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, tmp_path: Path
     ) -> None:
         """Test that .griptape-nodes-metadata/ does not contain a nested .griptape-nodes-previews/ dir."""
         request = GeneratePreviewRequest(
@@ -1317,14 +1304,14 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
         assert isinstance(result, GeneratePreviewResultSuccess)
 
-        nested_previews = anyio.Path(temp_dir / ".griptape-nodes-metadata" / ".griptape-nodes-previews")
+        nested_previews = anyio.Path(tmp_path / ".griptape-nodes-metadata" / ".griptape-nodes-previews")
         assert not await nested_previews.exists(), (
             ".griptape-nodes-previews/ was nested inside .griptape-nodes-metadata/"
         )
 
     @pytest.mark.asyncio
     async def test_no_double_json_extension_files(
-        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, temp_dir: Path
+        self, artifact_manager: ArtifactManager, test_macro_path: MacroPath, tmp_path: Path
     ) -> None:
         """Test that no .json.json files are created anywhere in the project."""
         request = GeneratePreviewRequest(
@@ -1338,7 +1325,7 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         result = await artifact_manager.on_handle_generate_preview_request(request, _open_workflow())
         assert isinstance(result, GeneratePreviewResultSuccess)
 
-        double_json_files = [f async for f in anyio.Path(temp_dir).rglob("*.json.json")]
+        double_json_files = [f async for f in anyio.Path(tmp_path).rglob("*.json.json")]
         assert double_json_files == [], f"Files with .json.json double extension were created: {double_json_files}"
 
 
@@ -1346,14 +1333,8 @@ class TestGetPreviewForArtifact:
     """Tests for preview retrieval functionality."""
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create temporary directory for test files."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    @pytest.fixture
-    def mock_project(self, temp_dir: Path, engine: Engine) -> None:
-        """Set up a real project in ProjectManager with temp_dir as workspace."""
+    def mock_project(self, tmp_path: Path, engine: Engine) -> None:
+        """Set up a real project in ProjectManager with tmp_path as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
@@ -1366,11 +1347,11 @@ class TestGetPreviewForArtifact:
         situation_schemas = project_manager._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
         directory_schemas = project_manager._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
 
-        # Create ProjectInfo with temp_dir as workspace
+        # Create ProjectInfo with tmp_path as workspace
         project_info = ProjectInfo(
             project_id="test_project",
-            project_file_path=temp_dir / "project.yml",
-            project_base_dir=temp_dir,
+            project_file_path=tmp_path / "project.yml",
+            project_base_dir=tmp_path,
             template=DEFAULT_PROJECT_TEMPLATE,
             validation=validation,
             parsed_situation_schemas=situation_schemas,
@@ -1382,9 +1363,9 @@ class TestGetPreviewForArtifact:
         project_manager._current_project_id = "test_project"
 
     @pytest.fixture
-    def test_image_path(self, temp_dir: Path) -> Path:
+    def test_image_path(self, tmp_path: Path) -> Path:
         """Create a real test image file."""
-        image_path = temp_dir / "test_source.jpg"
+        image_path = tmp_path / "test_source.jpg"
 
         # Create a simple test image (100x100 red square)
         img = Image.new("RGB", (100, 100), color="red")
@@ -1399,14 +1380,14 @@ class TestGetPreviewForArtifact:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @pytest.fixture
-    def artifact_manager(self, mock_project: None, temp_dir: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
+    def artifact_manager(self, mock_project: None, tmp_path: Path, engine: Engine) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager with ImageArtifactProvider registered."""
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
         # Set workspace_path after provider registration since registration triggers load_configs()
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         return manager
 
     @pytest.fixture
@@ -1447,11 +1428,11 @@ class TestGetPreviewForArtifact:
         assert Path(result.paths_to_preview).exists()
         assert Path(result.paths_to_preview).is_absolute()
 
-    def test_get_preview_source_file_not_found(self, artifact_manager: ArtifactManager, temp_dir: Path) -> None:
+    def test_get_preview_source_file_not_found(self, artifact_manager: ArtifactManager, tmp_path: Path) -> None:
         """Test getting preview for non-existent source file."""
         import asyncio
 
-        nonexistent_path = temp_dir / "nonexistent.jpg"
+        nonexistent_path = tmp_path / "nonexistent.jpg"
         parsed_macro = ParsedMacro(str(nonexistent_path))
         macro_path = MacroPath(parsed_macro=parsed_macro, variables={})
 
@@ -1912,7 +1893,7 @@ class TestGeneratorValidation:
         assert len(errors) >= 1
         assert any(e["loc"][0] == "corner_radius_percent" and "greater_than_equal" in e["type"] for e in errors)
 
-    def test_generator_constructor_uses_validation(self) -> None:
+    def test_generator_constructor_uses_validation(self, tmp_path: Path) -> None:
         """Test generator constructors use Pydantic validation and raise ValidationError on invalid params."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
             PILThumbnailGenerator,
@@ -1920,18 +1901,17 @@ class TestGeneratorValidation:
 
         invalid_params = {"max_width": "not_a_number", "max_height": 768}
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source_path = Path(tmpdir) / "test.png"
-            dest_dir = Path(tmpdir) / "preview"
+        source_path = tmp_path / "test.png"
+        dest_dir = tmp_path / "preview"
 
-            with pytest.raises(ValidationError):
-                PILThumbnailGenerator(
-                    source_file_location=str(source_path),
-                    preview_format="webp",
-                    destination_preview_directory=str(dest_dir),
-                    destination_preview_file_name="preview.webp",
-                    params=invalid_params,
-                )
+        with pytest.raises(ValidationError):
+            PILThumbnailGenerator(
+                source_file_location=str(source_path),
+                preview_format="webp",
+                destination_preview_directory=str(dest_dir),
+                destination_preview_file_name="preview.webp",
+                params=invalid_params,
+            )
 
     @pytest.mark.asyncio
     async def test_get_artifact_schemas_structure(self) -> None:

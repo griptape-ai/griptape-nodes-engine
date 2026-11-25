@@ -11,7 +11,6 @@ Tests cover:
 
 import logging
 import sys
-import tempfile
 import unicodedata
 from collections.abc import Generator
 from io import BytesIO
@@ -78,24 +77,18 @@ def unsaved_workflow(engine: Engine) -> Generator[None, None, None]:
 class TestCreateNewWarningLevelResultDetails:
     """Test CREATE_NEW policy with WARNING-level ResultDetails on fallback."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_create_new_fallback_warning_level(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_new_fallback_warning_level(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW returns WARNING-level ResultDetails when falling back to indexed path."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
 
         # Create the originally requested file so CREATE_NEW must fall back
         file_path.write_text("Original file")
@@ -111,7 +104,7 @@ class TestCreateNewWarningLevelResultDetails:
         # Should succeed but with indexed filename
         assert isinstance(result, WriteFileResultSuccess)
         assert result.final_file_path != str(file_path)  # Different from requested
-        assert (temp_dir / "test_1.txt").exists()
+        assert (tmp_path / "test_1.txt").exists()
 
         # Check ResultDetails is DEBUG level
         assert isinstance(result.result_details, ResultDetails)
@@ -122,10 +115,10 @@ class TestCreateNewWarningLevelResultDetails:
         assert "already existed" in detail.message.lower()
         assert str(file_path) in detail.message or "test.txt" in detail.message
 
-    def test_create_new_first_try_no_warning(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_new_first_try_no_warning(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW returns normal success (not WARNING) when first-try succeeds."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "newfile.txt"
+        file_path = tmp_path / "newfile.txt"
 
         # Don't create the file - let CREATE_NEW succeed on first try
         request = WriteFileRequest(
@@ -147,10 +140,10 @@ class TestCreateNewWarningLevelResultDetails:
         assert detail.level == logging.DEBUG  # Normal success is DEBUG, not WARNING
         assert "successfully" in detail.message.lower()
 
-    def test_create_new_fallback_multiple_times(self, engine: Engine, temp_dir: Path) -> None:
+    def test_create_new_fallback_multiple_times(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW generates multiple DEBUG messages for multiple fallbacks."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "output.txt"
+        file_path = tmp_path / "output.txt"
 
         # Create original file
         file_path.write_text("Original")
@@ -181,24 +174,18 @@ class TestCreateNewWarningLevelResultDetails:
 class TestBlanketExceptionHandling:
     """Test blanket exception handlers catch unexpected errors."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_blanket_exception_on_path_resolution(self, engine: Engine, temp_dir: Path) -> None:
+    def test_blanket_exception_on_path_resolution(self, engine: Engine, tmp_path: Path) -> None:
         """Test blanket exception handler for unexpected error during path resolution."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
@@ -211,10 +198,10 @@ class TestBlanketExceptionHandling:
         assert isinstance(result.result_details, ResultDetails)
         assert "unexpected error" in result.result_details.result_details[0].message.lower()
 
-    def test_blanket_exception_on_write_operation(self, engine: Engine, temp_dir: Path) -> None:
+    def test_blanket_exception_on_write_operation(self, engine: Engine, tmp_path: Path) -> None:
         """Test blanket exception handler for unexpected error during write."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
 
@@ -231,7 +218,7 @@ class TestBlanketExceptionHandling:
         assert "i/o error" in result.result_details.result_details[0].message.lower()
 
     def test_text_overwrite_translates_newlines_to_platform_linesep(
-        self, engine: Engine, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Str OVERWRITE keeps the text-mode newline translation open(mode="w") did.
 
@@ -242,7 +229,7 @@ class TestBlanketExceptionHandling:
 
         monkeypatch.setattr(os_module, "linesep", "\r\n")
 
-        file_path = temp_dir / "text.txt"
+        file_path = tmp_path / "text.txt"
         request = WriteFileRequest(file_path=str(file_path), content="line one\nline two\n")
 
         result = engine.os_manager.engine.handle_request(request)
@@ -250,9 +237,9 @@ class TestBlanketExceptionHandling:
         assert isinstance(result, WriteFileResultSuccess)
         assert file_path.read_bytes() == b"line one\r\nline two\r\n"
 
-    def test_unencodable_text_overwrite_maps_to_encoding_error(self, engine: Engine, temp_dir: Path) -> None:
+    def test_unencodable_text_overwrite_maps_to_encoding_error(self, engine: Engine, tmp_path: Path) -> None:
         """Text that cannot be represented in the requested encoding fails as ENCODING_ERROR."""
-        file_path = temp_dir / "text.txt"
+        file_path = tmp_path / "text.txt"
         request = WriteFileRequest(file_path=str(file_path), content="naïve café", encoding="ascii")
 
         result = engine.os_manager.engine.handle_request(request)
@@ -261,9 +248,9 @@ class TestBlanketExceptionHandling:
         assert result.failure_reason == FileIOFailureReason.ENCODING_ERROR
         assert not file_path.exists()
 
-    def test_directory_destination_on_overwrite_maps_to_is_directory(self, engine: Engine, temp_dir: Path) -> None:
+    def test_directory_destination_on_overwrite_maps_to_is_directory(self, engine: Engine, tmp_path: Path) -> None:
         """An overwrite whose destination is a directory fails as IS_DIRECTORY."""
-        request = WriteFileRequest(file_path=str(temp_dir / "some.txt"), content="Content")
+        request = WriteFileRequest(file_path=str(tmp_path / "some.txt"), content="Content")
 
         with patch(
             "griptape_nodes.retained_mode.managers.filesystem.file_writing.atomic_write_bytes",
@@ -274,12 +261,12 @@ class TestBlanketExceptionHandling:
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
 
-    def test_windows_sharing_violation_maps_to_file_locked(self, engine: Engine, temp_dir: Path) -> None:
+    def test_windows_sharing_violation_maps_to_file_locked(self, engine: Engine, tmp_path: Path) -> None:
         """A Windows sharing violation on the rename reports FILE_LOCKED, not PERMISSION_DENIED."""
         locked_error = PermissionError("The process cannot access the file")
         locked_error.winerror = 32  # ERROR_SHARING_VIOLATION  # type: ignore[attr-defined]
 
-        request = WriteFileRequest(file_path=str(temp_dir / "held.png"), content=b"payload")
+        request = WriteFileRequest(file_path=str(tmp_path / "held.png"), content=b"payload")
 
         with patch(
             "griptape_nodes.retained_mode.managers.filesystem.file_writing.atomic_write_bytes",
@@ -291,7 +278,7 @@ class TestBlanketExceptionHandling:
         assert result.failure_reason == FileIOFailureReason.FILE_LOCKED
         assert "in use by another process" in str(result.result_details)
 
-    def test_disk_full_on_overwrite_maps_to_disk_full(self, engine: Engine, temp_dir: Path) -> None:
+    def test_disk_full_on_overwrite_maps_to_disk_full(self, engine: Engine, tmp_path: Path) -> None:
         """A full destination volume fails as DISK_FULL with an actionable message.
 
         Workstations with small local disks and assets on nearly-full shared storage
@@ -301,7 +288,7 @@ class TestBlanketExceptionHandling:
         import errno
 
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
         file_path.write_text("previous content")
 
         request = WriteFileRequest(file_path=str(file_path), content="Content")
@@ -320,10 +307,10 @@ class TestBlanketExceptionHandling:
         assert "left unchanged" in message
         assert file_path.read_text() == "previous content"
 
-    def test_blanket_exception_on_macro_resolution_in_candidate_loop(self, engine: Engine, temp_dir: Path) -> None:
+    def test_blanket_exception_on_macro_resolution_in_candidate_loop(self, engine: Engine, tmp_path: Path) -> None:
         """Test blanket exception handler for unexpected error during CREATE_NEW macro resolution."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "output.txt"
+        file_path = tmp_path / "output.txt"
 
         # Create original file to trigger CREATE_NEW fallback
         file_path.write_text("Original")
@@ -353,24 +340,18 @@ class TestBlanketExceptionHandling:
 class TestParentDirectoryMatchCase:
     """Test match/case error messages for parent directory failures."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_parent_directory_permission_denied_message(self, engine: Engine, temp_dir: Path) -> None:
+    def test_parent_directory_permission_denied_message(self, engine: Engine, tmp_path: Path) -> None:
         """Test match/case generates correct message for PERMISSION_DENIED."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "subdir" / "test.txt"
+        file_path = tmp_path / "subdir" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
 
@@ -387,10 +368,10 @@ class TestParentDirectoryMatchCase:
         assert "permission denied" in message.lower()
         assert "parent directory" in message.lower()
 
-    def test_parent_directory_no_create_message(self, engine: Engine, temp_dir: Path) -> None:
+    def test_parent_directory_no_create_message(self, engine: Engine, tmp_path: Path) -> None:
         """Test match/case generates correct message for POLICY_NO_CREATE_PARENT_DIRS."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "nonexistent" / "test.txt"
+        file_path = tmp_path / "nonexistent" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=False)
 
@@ -404,10 +385,10 @@ class TestParentDirectoryMatchCase:
         assert "parent directory" in message.lower()
         assert "not exist" in message.lower() or "does not exist" in message.lower()
 
-    def test_parent_directory_generic_io_error_message(self, engine: Engine, temp_dir: Path) -> None:
+    def test_parent_directory_generic_io_error_message(self, engine: Engine, tmp_path: Path) -> None:
         """Test match/case default case generates generic error message."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "subdir" / "test.txt"
+        file_path = tmp_path / "subdir" / "test.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="Content", create_parents=True)
 
@@ -427,31 +408,25 @@ class TestParentDirectoryMatchCase:
 class TestOnDemandCandidateGeneration:
     """Test that CREATE_NEW generates candidates on-demand, not all upfront."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_on_demand_generation_early_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_on_demand_generation_early_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW only resolves macros until it finds available filename."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "output.txt"
+        file_path = tmp_path / "output.txt"
 
         # CREATE_NEW always tries the first-try path first (without index)
         # So create files output.txt, output_1.txt, output_2.txt, output_3.txt, output_4.txt
         # Leave output_5.txt available
         file_path.write_text("Original")  # output.txt
         for i in range(1, 5):
-            (temp_dir / f"output_{i}.txt").write_text(f"File {i}")
+            (tmp_path / f"output_{i}.txt").write_text(f"File {i}")
 
         request = WriteFileRequest(
             file_path=str(file_path),
@@ -472,7 +447,7 @@ class TestOnDemandCandidateGeneration:
             result = os_manager.engine.handle_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        assert (temp_dir / "output_5.txt").exists()
+        assert (tmp_path / "output_5.txt").exists()
 
         # Should only resolve macros for candidates we actually need to try, not all 1000
         # (May include scanning calls, but definitely not 1000)
@@ -485,10 +460,10 @@ class TestOnDemandCandidateGeneration:
             f"Expected >= {min_expected_resolutions} macro resolution, got {resolve_call_count}"
         )
 
-    def test_on_demand_generation_stops_on_success(self, engine: Engine, temp_dir: Path) -> None:
+    def test_on_demand_generation_stops_on_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW stops generating candidates immediately after successful write."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "test.txt"
+        file_path = tmp_path / "test.txt"
 
         # Create original file to trigger fallback
         file_path.write_text("Original")
@@ -524,24 +499,18 @@ class TestMetadataInjection:
 
     INJECT_PATH = "griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider.collect_workflow_metadata"
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to temp_dir for all tests."""
+    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+        """Automatically set workspace to tmp_path for all tests."""
         original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = temp_dir
+        engine.config_manager.workspace_path = tmp_path
         yield
         engine.config_manager.workspace_path = original_workspace
 
-    def test_metadata_injected_for_bytes_content(self, engine: Engine, temp_dir: Path) -> None:
+    def test_metadata_injected_for_bytes_content(self, engine: Engine, tmp_path: Path) -> None:
         """Test that metadata is collected and embedded for bytes content."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "image.png"
+        file_path = tmp_path / "image.png"
         original_bytes = b"fake png bytes"
         injected_bytes = b"fake png bytes with metadata"
 
@@ -561,7 +530,7 @@ class TestMetadataInjection:
 
     @pytest.mark.parametrize("named", [True, False])
     def test_metadata_is_collected_for_the_workflow_the_request_names(
-        self, engine: Engine, temp_dir: Path, *, named: bool
+        self, engine: Engine, tmp_path: Path, *, named: bool
     ) -> None:
         """The embedded metadata describes the workflow the sidecar records: the named one, or none."""
         workflow = engine.current_workflow()
@@ -573,7 +542,7 @@ class TestMetadataInjection:
 
         provider = MagicMock()
         provider.collect_metadata_for_write.side_effect = collect
-        request = WriteFileRequest(file_path=str(temp_dir / "image.png"), content=b"png")
+        request = WriteFileRequest(file_path=str(tmp_path / "image.png"), content=b"png")
         with patch.object(engine.artifact_manager, "provider_for_write", return_value=provider):
             if named:
                 result = workflow.handle_request(request)
@@ -587,10 +556,10 @@ class TestMetadataInjection:
         else:
             assert seen == [None]
 
-    def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, temp_dir: Path) -> None:
+    def test_metadata_not_injected_when_skip_flag_set(self, engine: Engine, tmp_path: Path) -> None:
         """Test that injection is skipped when skip_metadata_injection=True."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "image.png"
+        file_path = tmp_path / "image.png"
 
         request = WriteFileRequest(
             file_path=str(file_path),
@@ -604,10 +573,10 @@ class TestMetadataInjection:
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
-    def test_metadata_not_injected_when_config_disabled(self, engine: Engine, temp_dir: Path) -> None:
+    def test_metadata_not_injected_when_config_disabled(self, engine: Engine, tmp_path: Path) -> None:
         """Test that injection is skipped when auto_inject_workflow_metadata config is False."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "image.png"
+        file_path = tmp_path / "image.png"
 
         request = WriteFileRequest(file_path=str(file_path), content=b"fake png bytes")
 
@@ -626,10 +595,10 @@ class TestMetadataInjection:
         assert isinstance(result, WriteFileResultSuccess)
         mock_prepare.assert_not_called()
 
-    def test_metadata_not_injected_for_str_content(self, engine: Engine, temp_dir: Path) -> None:
+    def test_metadata_not_injected_for_str_content(self, engine: Engine, tmp_path: Path) -> None:
         """Test that injection is skipped for str content (only bytes are images)."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "text.txt"
+        file_path = tmp_path / "text.txt"
 
         request = WriteFileRequest(file_path=str(file_path), content="text content")
 
@@ -640,14 +609,14 @@ class TestMetadataInjection:
         mock_prepare.assert_not_called()
 
     def test_injection_failure_logs_warning_and_write_succeeds(
-        self, engine: Engine, temp_dir: Path, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Test that injection failure logs a warning and the write succeeds with original content."""
         engine.artifact_manager.on_handle_register_artifact_provider_request(
             RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         )
         os_manager = engine.os_manager
-        file_path = temp_dir / "image.png"
+        file_path = tmp_path / "image.png"
         original_bytes = b"fake png bytes"
 
         request = WriteFileRequest(file_path=str(file_path), content=original_bytes)
@@ -659,10 +628,10 @@ class TestMetadataInjection:
         assert file_path.read_bytes() == original_bytes
         assert any("Attempted to collect workflow metadata" in record.message for record in caplog.records)
 
-    def test_injected_content_is_written_to_disk(self, engine: Engine, temp_dir: Path) -> None:
+    def test_injected_content_is_written_to_disk(self, engine: Engine, tmp_path: Path) -> None:
         """Test that the injected (modified) content is what gets written to disk."""
         os_manager = engine.os_manager
-        file_path = temp_dir / "image.png"
+        file_path = tmp_path / "image.png"
         original_bytes = b"fake png bytes"
         injected_bytes = b"fake png bytes with metadata injected"
 
@@ -682,14 +651,13 @@ class TestSidecarMetadata:
     """Test sidecar metadata file creation alongside file writes."""
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
+    def temp_dir(self, tmp_path: Path) -> Path:
         """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Resolve so the path matches what ConfigManager.workspace_path and
-            # the canonicalized project_base_dir store. On Windows, tempfile
-            # returns the 8.3 short form (C:\Users\RUNNER~1\...); both sides
-            # must agree for decompose_source_path's relative_to() check to hold.
-            yield Path(tmpdir).resolve()
+        # Resolve so the path matches what ConfigManager.workspace_path and
+        # the canonicalized project_base_dir store. On Windows, temporary paths
+        # returns the 8.3 short form (C:\Users\RUNNER~1\...); both sides
+        # must agree for decompose_source_path's relative_to() check to hold.
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -859,10 +827,9 @@ class TestExtensionCoercion:
     """Test extension coercion (rename suffix to match sniffed bytes) inside OSManager."""
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
+    def temp_dir(self, tmp_path: Path) -> Path:
         """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -991,9 +958,8 @@ class TestOSWritePermissionVet:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -1333,9 +1299,8 @@ class TestExtensionCoercionDoesNotClobberPriorSave:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -1436,11 +1401,10 @@ class TestCreateNewMacroIndexSeed:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # On Windows tempfile may return the 8.3 short form; resolve so the test's
-            # comparisons match what the macro resolver canonicalizes to.
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        # Resolve so the test's
+        # comparisons match what the macro resolver canonicalizes to.
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -1704,9 +1668,8 @@ class TestOptionalPaddedIndexCollision:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -1873,9 +1836,8 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -2002,9 +1964,8 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -2092,9 +2053,8 @@ class TestWriteTempFileRequest:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_workspace(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:
@@ -2274,9 +2234,8 @@ class TestFailedWriteLeavesNoLitter:
     """
 
     @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, engine: Engine) -> Generator[None, None, None]:

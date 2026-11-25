@@ -1,7 +1,5 @@
-import tempfile
 import threading
 import time
-from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -39,12 +37,6 @@ def _route_resolution_through_dispatch(engine: Mock) -> Mock:
 
 class TestStaticFilesManagerSaveStaticFile:
     """Test StaticFilesManager.save_static_file() method with ExistingFilePolicy support."""
-
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
 
     @pytest.fixture
     def mock_config_manager(self) -> Mock:
