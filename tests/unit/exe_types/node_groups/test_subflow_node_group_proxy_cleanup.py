@@ -145,3 +145,37 @@ def test_a_proxy_goes_once_nothing_connects_through_it(grouped: WorkflowRuntime)
     group = grouped.objects.get_as_type("group", _Group)
     assert group is not None
     assert group.get_parameter_by_name("result") is None
+
+
+def test_a_connection_into_a_group_inside_a_group_runs_through_both(workflow: WorkflowRuntime) -> None:
+    """The outer group remaps the inner group's connection to its proxy as it is made, which deletes it.
+
+    The inner proxy has no connection for a moment then, and has to stay for the one still to come.
+    """
+    for name in ("outside", "inside"):
+        _ok(workflow, CreateNodeRequest(node_type="_Pass", specific_library_name=_LIBRARY, node_name=name))
+    _ok(
+        workflow,
+        CreateNodeRequest(
+            node_type="_Group", specific_library_name=_LIBRARY, node_name="inner", node_names_to_add=["inside"]
+        ),
+    )
+    _ok(
+        workflow,
+        CreateNodeRequest(
+            node_type="_Group", specific_library_name=_LIBRARY, node_name="outer", node_names_to_add=["inner"]
+        ),
+    )
+
+    _ok(
+        workflow,
+        CreateConnectionRequest(
+            source_node_name="outside",
+            source_parameter_name="result",
+            target_node_name="inside",
+            target_parameter_name="value",
+        ),
+    )
+
+    hops = {(source, target) for source, _, target, _ in _connections(workflow)}
+    assert hops == {("outside", "outer"), ("outer", "inner"), ("inner", "inside")}
