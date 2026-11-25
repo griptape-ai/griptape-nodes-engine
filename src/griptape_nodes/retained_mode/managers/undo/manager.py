@@ -64,6 +64,7 @@ from griptape_nodes.retained_mode.managers.undo.plan import (
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.retained_mode.runtime.undo_history import (
+    Checkpointed,
     OpenStep,
     OutsideEdit,
     RunOutput,
@@ -93,7 +94,7 @@ _REBUILD_EVENTS = frozenset({ResultPayload, ExecutionPayload})
 
 
 @dataclass(eq=False)
-class _OutsideEdit:
+class _UngroupedRequest:
     """A client's request in no undo group, which drops what could be redone if it changes the workflow.
 
     Args:
@@ -105,9 +106,17 @@ class _OutsideEdit:
     running: bool = True
 
 
+@dataclass(frozen=True)
+class _Live:
+    """The workflow as an undo or redo found it, and what checkpointing it did."""
+
+    commands: SerializedFlowCommands
+    checkpointed: Checkpointed
+
+
 # What the request being handled records into: the step it is part of, a change outside any step, or
 # nothing, for a run. Requests it dispatches and tasks it starts inherit it through the context.
-_recording: ContextVar[OpenStep | _OutsideEdit | None] = ContextVar("undo_recording", default=None)
+_recording: ContextVar[OpenStep | _UngroupedRequest | None] = ContextVar("undo_recording", default=None)
 
 
 class UndoDispatch:
@@ -142,7 +151,7 @@ class UndoDispatch:
         recording = _recording.get()
         if isinstance(recording, OpenStep) and recording is history.open_step and recording.running:
             history.note(StepPending(recording))
-        elif isinstance(recording, _OutsideEdit) and recording.workflow is self._workflow and recording.running:
+        elif isinstance(recording, _UngroupedRequest) and recording.workflow is self._workflow and recording.running:
             history.note(OutsideEdit())
         else:
             # A run's change, or one a task made after the request that started it finished.
@@ -196,26 +205,22 @@ class UndoManager(EngineScoped):
         blocker = _blocker(workflow, "undo")
         if blocker is not None:
             return UndoResultFailure(result_details=_routine(blocker))
-        if workflow.undo.undo_label is None:
-            return UndoResultFailure(
-                result_details=_routine("Attempted to undo. Failed because there is nothing to undo.")
-            )
         history = workflow.undo
-        pending = history.drift if isinstance(history.drift, StepPending) else None
-        before = history.current()
-        # Checkpointed even when nothing reported a change, so the current checkpoint is the
-        # workflow as it is, and a redo after this undo comes back to it.
-        live = self._serialize(workflow)
-        if live is None or not self._record(workflow, live):
+        label = history.undo_label
+        if label is None:
             return UndoResultFailure(
                 result_details=_routine("Attempted to undo. Failed because there is nothing to undo.")
             )
-        if pending is not None and history.current() is before:
+        live = self._checkpoint_live(workflow)
+        if live is None:
+            return UndoResultFailure(
+                result_details=_routine("Attempted to undo. Failed because there is nothing to undo.")
+            )
+        if live.checkpointed is Checkpointed.UNCHANGED:
             # The step it names put back what it changed, so it added no checkpoint. Taking it back
             # changes nothing, rather than taking back the step before it.
-            history.open_step = None
+            history.close_step()
             self.engine.report_workflow_state(workflow)
-            label = pending.step.label
             return UndoResultSuccess(label=label, result_details=f"Undid '{label}'.")
         previous = history.previous()
         current = history.current()
@@ -223,7 +228,7 @@ class UndoManager(EngineScoped):
             return UndoResultFailure(
                 result_details=_routine("Attempted to undo. Failed because there is nothing to undo.")
             )
-        return await self._undo_to(workflow, previous, current, live)
+        return await self._undo_to(workflow, previous, current, live.commands)
 
     @handles(RedoRequest)
     async def on_redo_request(self, request: RedoRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG002
@@ -234,8 +239,8 @@ class UndoManager(EngineScoped):
             return RedoResultFailure(
                 result_details=_routine("Attempted to redo. Failed because there is nothing to redo.")
             )
-        live = self._serialize(workflow)
-        if live is None or not self._record(workflow, live):
+        live = self._checkpoint_live(workflow)
+        if live is None:
             return RedoResultFailure(
                 result_details=_routine("Attempted to redo. Failed because there is nothing to redo.")
             )
@@ -245,7 +250,7 @@ class UndoManager(EngineScoped):
             return RedoResultFailure(
                 result_details=_routine("Attempted to redo. Failed because there is nothing to redo.")
             )
-        return await self._redo_to(workflow, following, current, live)
+        return await self._redo_to(workflow, following, current, live.commands)
 
     async def _undo_to(
         self, workflow: WorkflowRuntime, previous: Checkpoint, current: Checkpoint, live: SerializedFlowCommands
@@ -257,8 +262,10 @@ class UndoManager(EngineScoped):
             return UndoResultFailure(
                 result_details=f"Attempted to undo '{current.label}'. {restored}", workflow_rebuilt=True
             )
-        workflow.undo.step_back()
-        self._checkpoint_rebuilt(workflow, restored)
+        rebuilt = self._compress(workflow, restored)
+        # Without it, the history is forgotten (see `_compress`).
+        if rebuilt is not None:
+            workflow.undo.step_back(rebuilt)
         self.engine.report_workflow_state(workflow)
         return UndoResultSuccess(label=current.label or "", result_details=f"Undid '{current.label}'.")
 
@@ -272,8 +279,10 @@ class UndoManager(EngineScoped):
             return RedoResultFailure(
                 result_details=f"Attempted to redo '{following.label}'. {restored}", workflow_rebuilt=True
             )
-        workflow.undo.step_forward()
-        self._checkpoint_rebuilt(workflow, restored)
+        rebuilt = self._compress(workflow, restored)
+        # Without it, the history is forgotten (see `_compress`).
+        if rebuilt is not None:
+            workflow.undo.step_forward(rebuilt)
         self.engine.report_workflow_state(workflow)
         return RedoResultSuccess(label=following.label or "", result_details=f"Redid '{following.label}'.")
 
@@ -300,7 +309,7 @@ class UndoManager(EngineScoped):
         before. A client's request in no group is a change outside any step. A run records into
         nothing, so what it changes is taken as a change outside any step that drops nothing.
         """
-        token: Token[OpenStep | _OutsideEdit | None] | None = None
+        token: Token[OpenStep | _UngroupedRequest | None] | None = None
         recording = None
         if isinstance(request, RunControlMixin):
             token = _recording.set(None)
@@ -315,7 +324,7 @@ class UndoManager(EngineScoped):
                 _recording.reset(token)
             if isinstance(recording, OpenStep):
                 recording.request_finished()
-            elif isinstance(recording, _OutsideEdit):
+            elif isinstance(recording, _UngroupedRequest):
                 recording.running = False
                 # Checkpointed now rather than at the next step, so that a change that drops what could
                 # be redone stops clients offering it at once.
@@ -324,13 +333,13 @@ class UndoManager(EngineScoped):
 
     def _start_recording(
         self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
-    ) -> OpenStep | _OutsideEdit | None:
+    ) -> OpenStep | _UngroupedRequest | None:
         """What ``request`` starts recording into, or None when it records into what it inherits."""
         if workflow is None or not self._records(request, workflow, outermost=outermost):
             return None
         if request.undo_group is not None:
             return self._continue_step(request, request.undo_group, workflow)
-        return _OutsideEdit(workflow)
+        return _UngroupedRequest(workflow)
 
     def _records(self, request: RequestPayload, workflow: WorkflowRuntime, *, outermost: bool) -> bool:
         """Whether ``request`` is recorded, as an outermost request a client sent that can change ``workflow``."""
@@ -364,30 +373,31 @@ class UndoManager(EngineScoped):
             return
         self._record(workflow, commands)
 
-    def _record(self, workflow: WorkflowRuntime, commands: SerializedFlowCommands) -> bool:
-        """Checkpoint ``commands``, the workflow as it is now.
+    def _checkpoint_live(self, workflow: WorkflowRuntime) -> _Live | None:
+        """Checkpoint the workflow as it is, even when nothing reported a change, so an undo or redo starts from it.
 
-        Forgets the history and returns False when they cannot be written down, since the steps
+        Returns None when it could not be checkpointed, which forgets the history.
+        """
+        commands = self._serialize(workflow)
+        if commands is None:
+            return None
+        checkpointed = self._record(workflow, commands)
+        if checkpointed is None:
+            return None
+        return _Live(commands=commands, checkpointed=checkpointed)
+
+    def _record(self, workflow: WorkflowRuntime, commands: SerializedFlowCommands) -> Checkpointed | None:
+        """Checkpoint ``commands``, the workflow as it is now, and return what that did.
+
+        Forgets the history and returns None when they cannot be written down, since the steps
         around them could no longer be undone faithfully.
         """
         compressed = self._compress(workflow, commands)
         if compressed is None:
-            return False
-        workflow.undo.record(compressed)
+            return None
+        checkpointed = workflow.undo.record(compressed)
         self.engine.report_workflow_state(workflow)
-        return True
-
-    def _checkpoint_rebuilt(self, workflow: WorkflowRuntime, commands: SerializedFlowCommands) -> None:
-        """Make ``commands``, the workflow as an undo or redo rebuilt it, the current checkpoint.
-
-        The rebuilt workflow matches the checkpoint in all but what rebuilding changes, such as the
-        order of its nodes. A checkpoint is compared by its bytes, so it has to be the workflow as it
-        is, or a change that leaves it as it was would look like one.
-        """
-        compressed = self._compress(workflow, commands)
-        if compressed is None:
-            return
-        workflow.undo.replace_current(compressed)
+        return checkpointed
 
     def _compress(self, workflow: WorkflowRuntime, commands: SerializedFlowCommands) -> bytes | None:
         """``commands`` as a checkpoint holds them, or None, forgetting the history, when they cannot be written down."""
