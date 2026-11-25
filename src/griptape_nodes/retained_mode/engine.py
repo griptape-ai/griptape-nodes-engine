@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     )
     from griptape_nodes.retained_mode.managers.os_manager import OSManager
     from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+    from griptape_nodes.retained_mode.managers.provenance_manager import ProvenanceManager
     from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
     from griptape_nodes.retained_mode.managers.session_manager import SessionManager
@@ -229,6 +230,7 @@ class Engine:
     _user_manager: UserManager
     _project_manager: ProjectManager
     _artifact_manager: ArtifactManager
+    _provenance_manager: ProvenanceManager
     _manifest_manager: ManifestManager
     _budget_manager: BudgetManager
     _diagnostics_manager: DiagnosticsManager
@@ -268,6 +270,7 @@ class Engine:
         )
         from griptape_nodes.retained_mode.managers.os_manager import OSManager
         from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+        from griptape_nodes.retained_mode.managers.provenance_manager import ProvenanceManager
         from griptape_nodes.retained_mode.managers.read_through_secrets_manager import ReadThroughSecretsManager
         from griptape_nodes.retained_mode.managers.resource_manager import ResourceManager
         from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
@@ -339,6 +342,7 @@ class Engine:
             self._event_manager, self._config_manager, self._secrets_manager, engine=self
         )
         self._artifact_manager = ArtifactManager(self._event_manager, engine=self)
+        self._provenance_manager = ProvenanceManager(self._event_manager, engine=self)
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
         self._budget_manager = BudgetManager(self._event_manager, engine=self)
         self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
@@ -455,6 +459,10 @@ class Engine:
     @property
     def artifact_manager(self) -> ArtifactManager:
         return self._artifact_manager
+
+    @property
+    def provenance_manager(self) -> ProvenanceManager:
+        return self._provenance_manager
 
     @property
     def manifest_manager(self) -> ManifestManager:

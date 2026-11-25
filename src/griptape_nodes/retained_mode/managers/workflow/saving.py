@@ -780,11 +780,10 @@ class WorkflowSaver(EngineScoped):
         semantics). Pass ``create_versioned_workflow`` for the versioned-save
         flow that bumps the padded index every save (issue #4945).
         """
-        extra_vars: dict[str, str | int] = {}
         if sub_dirs:
-            extra_vars["sub_dirs"] = sub_dirs
-
-        destination = ProjectFileDestination.from_situation(file_name, situation_name, **extra_vars)
+            destination = ProjectFileDestination.from_situation(file_name, situation_name, sub_dirs=sub_dirs)
+        else:
+            destination = ProjectFileDestination.from_situation(file_name, situation_name)
         relative_file_path = str(Path(sub_dirs) / file_name) if sub_dirs else file_name
         return WorkflowSavePath(
             destination=destination,

@@ -48,6 +48,7 @@ from griptape_nodes.retained_mode.events.static_file_events import (
     CreateStaticFileUploadUrlResultSuccess,
     StaticFileChanged,
 )
+from griptape_nodes.retained_mode.file_metadata.provenance_record import ProvenanceContent
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SidecarContent,
     SituationMetadata,
@@ -753,6 +754,7 @@ class StaticFilesManager(EngineScoped):
         existing_file_policy: ExistingFilePolicy | None = None,
         *,
         skip_metadata_injection: bool = False,
+        provenance: ProvenanceContent | None = None,
     ) -> str:
         """Save a static file for the workflow the caller is bound to; see `save_static_file_in`.
 
@@ -764,9 +766,10 @@ class StaticFilesManager(EngineScoped):
             file_name,
             existing_file_policy,
             skip_metadata_injection=skip_metadata_injection,
+            provenance=provenance,
         )
 
-    def save_static_file_in(
+    def save_static_file_in(  # noqa: PLR0913
         self,
         workflow: "WorkflowRuntime | None",
         data: bytes,
@@ -774,6 +777,7 @@ class StaticFilesManager(EngineScoped):
         existing_file_policy: ExistingFilePolicy | None = None,
         *,
         skip_metadata_injection: bool = False,
+        provenance: ProvenanceContent | None = None,
     ) -> str:
         """Saves a static file to the workspace directory, at the `save_static_file` situation's path for `workflow`.
 
@@ -789,6 +793,10 @@ class StaticFilesManager(EngineScoped):
                 - CREATE_NEW: Auto-generate unique filename (e.g., file_1.txt, file_2.txt)
                 - FAIL: Raise FileExistsError if file exists
             skip_metadata_injection: If True, skip automatic workflow metadata injection.
+            provenance: Optional provenance election for this save. None keeps the
+                legacy behavior (a record synthesized from the sidecar situation via
+                the deprecation shim); pass an explicit election to control capture --
+                e.g. ingestion copies pass NO_PROVENANCE_RECORDED.
 
         Returns:
             The URL of the saved file for UI display (with cache-busting). Note: the actual filename
@@ -814,6 +822,7 @@ class StaticFilesManager(EngineScoped):
             effective_policy,
             skip_metadata_injection=skip_metadata_injection,
             file_metadata=resolved.file_metadata,
+            provenance=provenance,
         )
 
     def save_workspace_static_file(
@@ -842,7 +851,7 @@ class StaticFilesManager(EngineScoped):
             file_metadata=None,
         )
 
-    def _save_to_storage(
+    def _save_to_storage(  # noqa: PLR0913
         self,
         file_path: Path,
         data: bytes,
@@ -850,6 +859,7 @@ class StaticFilesManager(EngineScoped):
         *,
         skip_metadata_injection: bool,
         file_metadata: SidecarContent | None,
+        provenance: ProvenanceContent | None = None,
     ) -> str:
         """Write `data` through the storage driver at `file_path` and return a download URL for what it wrote.
 
@@ -865,6 +875,7 @@ class StaticFilesManager(EngineScoped):
                 existing_file_policy,
                 skip_metadata_injection=skip_metadata_injection,
                 file_metadata=file_metadata,
+                provenance=provenance,
             )
         except FileExistsError:
             raise

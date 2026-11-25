@@ -218,6 +218,7 @@ def _saver_node(engine: Engine, workflow: _RecordingWorkflow, *, connected: obje
     node.workflow = workflow.runtime
     node._require_workflow.return_value = workflow.runtime
     node.get_parameter_value.return_value = "out.png"
+    node.metadata = {}
 
     def answer(request: RequestPayload) -> ResultPayload:
         return _CONNECTED_DESTINATION_RESULTS[type(request)](destination=connected, result_details="ok")
