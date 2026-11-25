@@ -281,8 +281,8 @@ class WorkflowStateChangedEvent(AppPayload):
 class WorkflowDetailsChangedEvent(AppPayload):
     """What clients are told of an open workflow, other than its state, changed. Every client gets it.
 
-    Sent for a change to its name, file, description, thumbnail or template flag, whichever request
-    made it. Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries them.
+    Sent for a change to its name, file, description, thumbnail, template flag or whether it has a flow,
+    whichever request made it. Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries them.
 
     Args:
         open_workflow: The workflow as it is now.
