@@ -30,6 +30,7 @@ def node_stub(name: str) -> BaseNode:
     node = MagicMock(spec=BaseNode)
     node.name = name
     node.lock = False
+    node.is_frozen = False
     node.state = NodeResolutionState.UNRESOLVED
     node.parameters = []
     # Instance attributes, so spec=BaseNode does not supply them. on_update touches both

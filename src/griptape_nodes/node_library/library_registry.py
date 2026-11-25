@@ -185,6 +185,10 @@ class NodeMetadata(BaseModel):
     group: str | None = None
     deprecation: NodeDeprecationMetadata | None = None
     is_node_group: bool | None = None
+    # True for node types users should not add from the node library or search, such as a publish
+    # target's Configuration node, which the engine creates, or a deprecated node kept only so older
+    # workflows still open. The node still loads and works when a workflow already holds it.
+    hidden_from_library: bool | None = None
     # Declarative properties / capabilities for this node.
     # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[NodeDeclaration] = Field(default_factory=list)
