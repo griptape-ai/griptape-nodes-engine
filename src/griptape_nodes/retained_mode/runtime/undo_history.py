@@ -140,10 +140,6 @@ class UndoHistory:
         return self.open_step is not None and self.open_step.running
 
     @property
-    def has_checkpoint(self) -> bool:
-        return self._current >= 0
-
-    @property
     def needs_checkpoint(self) -> bool:
         """Whether the workflow may differ from the current checkpoint, or there is none yet."""
         return self._current < 0 or not isinstance(self.drift, Clean)
