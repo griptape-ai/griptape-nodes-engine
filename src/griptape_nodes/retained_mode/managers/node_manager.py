@@ -6,6 +6,7 @@ import dataclasses
 import json
 import logging
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 from uuid import uuid4
@@ -322,6 +323,12 @@ _SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.
 # node still in one of these states has NOT received its inputs and would fall back to its
 # parameter defaults if an upstream disappeared first.
 _UNCOLLECTED_NODE_STATES = frozenset({NodeState.WAITING, NodeState.QUEUED})
+
+
+# Reference copies shared by a batch of serializations, keyed by node class, library, and node type.
+_ReferenceNodes = dict[tuple[type, Any, Any], BaseNode]
+
+_shared_reference_nodes: ContextVar[_ReferenceNodes | None] = ContextVar("shared_reference_nodes", default=None)
 
 
 @dataclass
@@ -4763,27 +4770,12 @@ class NodeManager(EngineScoped):
         A saved workflow replays them after creating the node, and a worker applies them to the copy it
         runs, so both rebuild the same shape.
         """
-        # We're going to compare this node instance vs. a canonical one. Rez that one up.
+        # We're going to compare this node instance vs. a canonical one.
         # For ErrorProxyNode, we can't create a reference node, so skip comparison.
-        # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation
-        # detector skips this ephemeral instance's declarative ``add_parameter``
-        # calls (this construction bypasses ``LibraryRegistry.create_node``).
-        #
-        # Carry the node's library and type so the reference resolves the same
-        # library-backed ``__init__`` data the live node did (e.g. a model
-        # dropdown sourced from the ``model_catalog``); otherwise it would look
-        # mutated.
         if isinstance(node, ErrorProxyNode):
             reference_node = None
         else:
-            with LibraryRegistry.constructing_node(throwaway=True):
-                reference_node = type(node)(
-                    name="REFERENCE NODE",
-                    metadata={
-                        "library": node.metadata.get("library"),
-                        "node_type": node.metadata.get("node_type"),
-                    },
-                )
+            reference_node = self._reference_node_for(node)
 
         # Now creation or alteration of all of the elements.
         element_modification_commands = []
@@ -5065,7 +5057,13 @@ class NodeManager(EngineScoped):
         return DeserializeNodeFromCommandsResultSuccess(node_name=node_name, result_details=details)
 
     @handles(SerializeSelectedNodesToCommandsRequest)
-    def on_serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
+    def on_serialize_selected_nodes_to_commands(
+        self, request: SerializeSelectedNodesToCommandsRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        with self.sharing_reference_nodes():
+            return self._serialize_selected_nodes_to_commands(request, workflow)
+
+    def _serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
         self, request: SerializeSelectedNodesToCommandsRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """This will take the selected nodes in the Object manager and serialize them into commands."""
@@ -5533,6 +5531,42 @@ class NodeManager(EngineScoped):
             )
             return
         parameter.add_trait(trait)
+
+    @contextmanager
+    def sharing_reference_nodes(self) -> Iterator[None]:
+        """Build each node type's reference copy once for a batch of serializations.
+
+        Serializing a node compares it with a freshly built copy of its type, and building one runs the
+        type's ``__init__``. Nothing changes the copies between the serializations of one save, so every
+        node of a type can be compared with the same copy. Copies are not kept past the batch, because
+        what ``__init__`` builds can depend on engine state that changes, such as the model catalog.
+        """
+        if _shared_reference_nodes.get() is not None:
+            yield
+            return
+        token = _shared_reference_nodes.set({})
+        try:
+            yield
+        finally:
+            _shared_reference_nodes.reset(token)
+
+    def _reference_node_for(self, node: BaseNode) -> BaseNode:
+        library = node.metadata.get("library")
+        node_type = node.metadata.get("node_type")
+        key = (type(node), library, node_type)
+        shared = _shared_reference_nodes.get()
+        if shared is not None and key in shared:
+            return shared[key]
+        # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation detector skips
+        # this ephemeral instance's declarative ``add_parameter`` calls (this construction bypasses
+        # ``LibraryRegistry.create_node``). Carry the node's library and type so the reference
+        # resolves the same library-backed ``__init__`` data the live node did (e.g. a model
+        # dropdown sourced from the ``model_catalog``); otherwise it would look mutated.
+        with LibraryRegistry.constructing_node(throwaway=True):
+            reference_node = type(node)(name="REFERENCE NODE", metadata={"library": library, "node_type": node_type})
+        if shared is not None:
+            shared[key] = reference_node
+        return reference_node
 
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
