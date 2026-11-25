@@ -19,7 +19,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -40,10 +40,12 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
     OpenWorkflowInfo,
+    OpenWorkflowState,
     SessionHeartbeatRequest,
     SessionHeartbeatResultFailure,
     SessionHeartbeatResultSuccess,
     WorkflowClosedEvent,
+    WorkflowDetailsChangedEvent,
     WorkflowOpenedEvent,
     WorkflowStateChangedEvent,
 )
@@ -882,8 +884,33 @@ class Engine:
             workflow_file_path=file_path,
             is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),
+            description=entry.metadata.description,
+            image=entry.metadata.image,
+            is_template=bool(entry.metadata.is_template),
             state=workflow.state(),
         )
+
+    def report_workflow_details(self) -> None:
+        """Tell every client of each open workflow whose details changed since they were last told.
+
+        Details are everything `open_workflow_info` reports but the state, which
+        `report_workflow_state` reports. The event manager calls this after every request, since
+        requests that change them, such as a save, a rename or `SetWorkflowMetadataRequest`, need not
+        name the workflow they change. Says nothing of a workflow still building, which its
+        `WorkflowOpenedEvent` will report, or of one with no registry entry to report from.
+        """
+        for workflow in self._open_workflows.all_open():
+            if self.is_opening(workflow):
+                continue
+            # Runs after every request, so a missing entry must not fail the request that ran.
+            if self.workflow_registry.find_by_id(workflow.workflow_id) is None:
+                continue
+            info = self.open_workflow_info(workflow)
+            details = replace(info, state=OpenWorkflowState())
+            if details == workflow.reported_details:
+                continue
+            workflow.reported_details = details
+            self._event_manager.put_event(AppEvent(payload=WorkflowDetailsChangedEvent(open_workflow=info)))
 
     def report_workflow_state(self, workflow: WorkflowRuntime) -> None:
         """Tell every client of `workflow`'s state if it changed since they were last told.
@@ -1046,6 +1073,7 @@ class Engine:
                 workflow.has_unsaved_changes = False
                 opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
                 workflow.reported_state = opened_event.open_workflow.state
+                workflow.reported_details = replace(opened_event.open_workflow, state=OpenWorkflowState())
                 self._event_manager.put_event(AppEvent(payload=opened_event))
             build_ended.set()
 

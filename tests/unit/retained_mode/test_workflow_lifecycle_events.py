@@ -618,6 +618,9 @@ class TestWorkers:
             workflow_file_path=None,
             is_saved=False,
             has_active_flow=True,
+            description=None,
+            image=None,
+            is_template=False,
         )
 
         def relay_open(_request: _RelayedOpenRequest) -> ResultPayload:
