@@ -23,6 +23,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
@@ -57,6 +58,7 @@ from griptape_nodes.retained_mode.events.undo_events import (
 from griptape_nodes.retained_mode.managers.event_manager import EventSuppressionContext
 from griptape_nodes.retained_mode.managers.undo.element_ids import element_ids, restore_element_ids
 from griptape_nodes.retained_mode.managers.undo.plan import (
+    NotEdits,
     RestorePlan,
     commands_to_build,
     plan_rebuild,
@@ -395,7 +397,14 @@ class UndoManager(EngineScoped):
         compressed = self._compress(workflow, commands)
         if compressed is None:
             return None
-        checkpointed = workflow.undo.record(compressed)
+        not_edits = _not_edits(workflow)
+
+        def differs(checkpoint: bytes) -> bool:
+            if checkpoint == compressed:
+                return False
+            return not plan_restore(_decode(checkpoint), commands, not_edits).changes_nothing
+
+        checkpointed = workflow.undo.record(compressed, differs=differs)
         self.engine.report_workflow_state(workflow)
         return checkpointed
 
@@ -472,7 +481,7 @@ class UndoManager(EngineScoped):
         if flow is None:
             return "Failed because the workflow has no flow."
         ids = element_ids(workflow)
-        plan = plan_restore(target, live)
+        plan = plan_restore(target, live, _not_edits(workflow))
         reached = live
         built: set[str] = set()
         # Each pass rebuilds at least one kept node, or ends, so there are at most as many passes as nodes.
@@ -485,7 +494,7 @@ class UndoManager(EngineScoped):
             if now is None:
                 return "Failed because the workflow could not be read back."
             reached = now
-            check = plan_restore(target, now)
+            check = plan_restore(target, now, _not_edits(workflow))
             # A rebuilt node is as close to the checkpoint as opening a saved workflow gets it.
             drifted = (check.units_to_build | check.node_edits.keys()) - built
             if not drifted:
@@ -527,6 +536,12 @@ class UndoManager(EngineScoped):
         # So that clients can tell what is unchanged, and their requests by element id still work.
         restore_element_ids(workflow, ids)
         return None
+
+
+def _not_edits(workflow: WorkflowRuntime) -> NotEdits:
+    """Each node's parameters whose value a run or a connection set, as `plan_restore` leaves them out."""
+    nodes = workflow.objects.get_filtered_subset(type=BaseNode).values()
+    return {node.name: node.parameters_set_by_run_or_connection for node in nodes}
 
 
 def _requests_for(flow_name: str, target: SerializedFlowCommands, plan: RestorePlan) -> list[RequestPayload]:

@@ -140,6 +140,47 @@ class _GrowsOnConnect(_PassThrough):
         self.remove_parameter_element_by_name("extra")
 
 
+class _RollsASeed(_PassThrough):
+    """Rolls a new seed into its own parameter each time it runs, as a generation node does."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="seed",
+                type="int",
+                default_value=0,
+                tooltip="",
+                allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+            )
+        )
+
+    def process(self) -> None:
+        super().process()
+        self.set_parameter_value("seed", self.get_parameter_value("seed") + 1)
+
+
+class _Previews(_PassThrough):
+    """Shows a preview of its input, which it works out whenever the input is set, as an image node does."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata=metadata)
+        self.add_parameter(
+            Parameter(
+                name="preview",
+                type="str",
+                default_value="",
+                tooltip="",
+                allowed_modes={ParameterMode.PROPERTY},
+            )
+        )
+
+    def after_value_set(self, parameter: Parameter, value: Any) -> None:
+        if parameter.name == "value":
+            self.set_parameter_value("preview", f"preview of {value}")
+        return super().after_value_set(parameter, value)
+
+
 class _Group(SubflowNodeGroup):
     """A group that keeps its members in a flow of their own."""
 
@@ -160,7 +201,7 @@ def _library() -> Iterator[None]:
     library = LibraryRegistry.generate_new_library(library_data=schema)
     library.register_new_node_type(_PassThrough, NodeMetadata(category="t", description="d", display_name="Pass"))
     library.register_new_node_type(_Group, NodeMetadata(category="t", description="d", display_name="Group"))
-    for node_type in (_HoldsAnObject, _ForgetsOnDisconnect, _GrowsOnConnect):
+    for node_type in (_HoldsAnObject, _ForgetsOnDisconnect, _GrowsOnConnect, _RollsASeed, _Previews):
         library.register_new_node_type(node_type, NodeMetadata(category="t", description="d", display_name="t"))
     yield
     LibraryRegistry._clear()
@@ -1106,6 +1147,60 @@ class TestRunResults:
             assert node is not None
             assert node.state is state, name
 
+    def test_a_node_keeps_the_values_its_run_set_when_the_undo_did_not_touch_it(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        _add(engine, workflow, "generator", node_type="_RollsASeed")
+        _add(engine, workflow, "other")
+        _ok(engine, workflow, SetParameterValueRequest(node_name="generator", parameter_name="seed", value=7), "type")
+        _set(engine, workflow, "other", "edited", group="edit other")
+        rolled = 8
+        _ok(engine, workflow, ResolveNodeRequest(node_name="generator"), "click run")
+
+        _undo(engine, workflow)
+
+        generator = _node(workflow, "generator")
+        assert generator is not None
+        assert generator.state is NodeResolutionState.RESOLVED
+        assert generator.get_parameter_value("seed") == rolled
+        assert _value(workflow, "other") == ""
+
+    def test_a_node_keeps_what_it_derived_from_a_value_a_run_fed_it(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        _add(engine, workflow, "source")
+        _add(engine, workflow, "viewer", node_type="_Previews")
+        _connect(engine, workflow, "source", "viewer")
+        _set(engine, workflow, "source", "picture", group="type")
+        _ok(
+            engine,
+            workflow,
+            SetNodeMetadataRequest(node_name="viewer", metadata={"position": {"x": 9, "y": 9}}),
+            "drag",
+        )
+        _ok(engine, workflow, ResolveNodeRequest(node_name="viewer"), "click run")
+
+        _undo(engine, workflow)
+
+        viewer = _node(workflow, "viewer")
+        assert viewer is not None
+        assert viewer.state is NodeResolutionState.RESOLVED
+        assert viewer.get_parameter_value("preview") == "preview of picture"
+
+    def test_a_value_its_run_set_is_undone_like_any_other_once_edited(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        _add(engine, workflow, "generator", node_type="_RollsASeed")
+        _ok(engine, workflow, ResolveNodeRequest(node_name="generator"), "click run")
+        rolled = 1
+        _ok(engine, workflow, SetParameterValueRequest(node_name="generator", parameter_name="seed", value=5), "type")
+
+        _undo(engine, workflow)
+
+        generator = _node(workflow, "generator")
+        assert generator is not None
+        assert generator.get_parameter_value("seed") == rolled
+
     def test_moving_a_node_back_keeps_its_results(self, engine: Engine, workflow: WorkflowRuntime) -> None:
         _add(engine, workflow, "a")
         _ran(workflow, "a")
@@ -1253,7 +1348,9 @@ class _AnyOrderOfChanges(RuleBasedStateMachine):
     starts, before an undo or redo, and after a change outside any step while there is something to
     redo. It adds one for a step that changed something, dropping what could be redone, and is
     otherwise taken in by the current one, which a change outside any step that changed something
-    makes drop what could be redone. A run changes nothing a checkpoint holds.
+    makes drop what could be redone. A run changes nothing a checkpoint holds, though each node rolls
+    a seed into its own parameter when it runs, so an undo or redo keeps the run of every node whose
+    value it leaves as it was.
     """
 
     def __init__(self, engine: Engine) -> None:
@@ -1265,7 +1362,7 @@ class _AnyOrderOfChanges(RuleBasedStateMachine):
         assert result.workflow_id is not None
         self.workflow = engine.open_workflows.get(result.workflow_id)
         for name in _NODES:
-            _add(engine, self.workflow, name)
+            _add(engine, self.workflow, name, node_type="_RollsASeed")
         self.live: dict[str, str] = dict.fromkeys(_NODES, "")
         self.checkpoints: list[dict[str, str]] = []
         self.current = -1
@@ -1309,6 +1406,7 @@ class _AnyOrderOfChanges(RuleBasedStateMachine):
 
     @rule()
     def undo(self) -> None:
+        before = self._before_a_restore()
         result = _send(self.engine, self.workflow, UndoRequest())
         if not self.can_undo:
             assert isinstance(result, UndoResultFailure), result.result_details
@@ -1316,14 +1414,15 @@ class _AnyOrderOfChanges(RuleBasedStateMachine):
         assert isinstance(result, UndoResultSuccess), result.result_details
         added = self._checkpoint()
         self.open_group = None
-        if added is False:
-            # The step put back what it changed, so taking it back changes nothing.
-            return
-        self.current -= 1
-        self.live = dict(self.checkpoints[self.current])
+        if added is not False:
+            # Unless the step put back what it changed, so taking it back changes nothing.
+            self.current -= 1
+            self.live = dict(self.checkpoints[self.current])
+        self._assert_untouched_nodes_kept_their_runs(before)
 
     @rule()
     def redo(self) -> None:
+        before = self._before_a_restore()
         result = _send(self.engine, self.workflow, RedoRequest())
         if not self.can_redo:
             assert isinstance(result, RedoResultFailure), result.result_details
@@ -1336,6 +1435,7 @@ class _AnyOrderOfChanges(RuleBasedStateMachine):
         self.current += 1
         self.live = dict(self.checkpoints[self.current])
         self.open_group = None
+        self._assert_untouched_nodes_kept_their_runs(before)
 
     @invariant()
     def the_workflow_has_the_values_the_model_has(self) -> None:
@@ -1345,6 +1445,23 @@ class _AnyOrderOfChanges(RuleBasedStateMachine):
     def undo_and_redo_are_offered_as_the_model_offers_them(self) -> None:
         assert (self.workflow.undo.undo_label is not None) == self.can_undo
         assert (self.workflow.undo.redo_label is not None) == self.can_redo
+
+    def _before_a_restore(self) -> dict[str, tuple[str, NodeResolutionState]]:
+        """Each node's value and run state."""
+        states = {}
+        for name in _NODES:
+            node = _node(self.workflow, name)
+            assert node is not None
+            states[name] = (self.live[name], node.state)
+        return states
+
+    def _assert_untouched_nodes_kept_their_runs(self, before: dict[str, tuple[str, NodeResolutionState]]) -> None:
+        for name, (value, state) in before.items():
+            if self.live[name] != value:
+                continue
+            node = _node(self.workflow, name)
+            assert node is not None
+            assert node.state is state, f"'{name}' lost its run, though its value stayed '{value}'"
 
     def _change(self, name: str, value: str, kind: int) -> None:
         if self.live[name] == value:

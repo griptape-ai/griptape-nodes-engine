@@ -24,7 +24,8 @@ one request at a time.
 ## Results
 
 Undo leaves every node the change didn't touch as it is, so it keeps its results and anything it
-has loaded, such as a model, and a node you moved back doesn't need to run again. A node whose
+has loaded, such as a model, and a node you moved back doesn't need to run again. A value a node
+sets on itself while it runs, such as a seed it rolls, stays as the run left it. A node whose
 settings or connections changed is marked to run again, with every node downstream of it, the same
 as if you had changed it by hand. So is a node you deleted and brought back, and every node in a
 group you made or took apart.
