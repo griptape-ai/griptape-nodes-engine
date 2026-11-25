@@ -141,6 +141,9 @@ class TestEngineHeartbeatOpenWorkflows:
                 workflow_file_path=None,
                 is_saved=False,
                 has_active_flow=False,
+                description=None,
+                image=None,
+                is_template=False,
             )
         ]
         assert result.current_workflow == workflow.name

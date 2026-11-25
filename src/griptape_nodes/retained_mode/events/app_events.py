@@ -80,6 +80,10 @@ class OpenWorkflowInfo:
         workflow_file_path: Path to the workflow file. None exactly while the workflow is unsaved.
         is_saved: Whether the workflow has a file, for clients that are not sent its path.
         has_active_flow: Whether the workflow has a current flow.
+        description: The workflow's description, or None when it has none.
+        image: The workflow's thumbnail as its metadata names it: a file name under the
+            `save_workflow_thumbnail` situation, or a URL. None when it has none.
+        is_template: Whether the workflow is a template.
         state: Its unsaved changes and runs.
     """
 
@@ -89,6 +93,9 @@ class OpenWorkflowInfo:
     workflow_file_path: str | None
     is_saved: bool
     has_active_flow: bool
+    description: str | None
+    image: str | None
+    is_template: bool
     state: OpenWorkflowState = field(default_factory=OpenWorkflowState)
 
 
@@ -267,6 +274,21 @@ class WorkflowStateChangedEvent(AppPayload):
 
     workflow_id: str
     state: OpenWorkflowState
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowDetailsChangedEvent(AppPayload):
+    """What clients are told of an open workflow, other than its state, changed. Every client gets it.
+
+    Sent for a change to its name, file, description, thumbnail or template flag, whichever request
+    made it. Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries them.
+
+    Args:
+        open_workflow: The workflow as it is now.
+    """
+
+    open_workflow: OpenWorkflowInfo
 
 
 @dataclass

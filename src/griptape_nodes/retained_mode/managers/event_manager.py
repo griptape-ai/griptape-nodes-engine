@@ -1628,6 +1628,7 @@ class EventManager(EngineScoped):
             if workflow_mgr.should_squelch_workflow_altered():
                 callback_result.altered_workflow_state = False
             self._record_workflow_altered(callback_result, request_workflow)
+            self.engine.report_workflow_details()
 
             # Override failure log level if requested, except for a crash: `failure_log_level`
             # silences failures its caller EXPECTS, so honoring it for an exception a handler or

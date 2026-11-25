@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.flow import ControlFlow
-from griptape_nodes.retained_mode.events.app_events import OpenWorkflowState, WorkflowRunState
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo, OpenWorkflowState, WorkflowRunState
 from griptape_nodes.retained_mode.events.base_events import build_execution_event
 from griptape_nodes.retained_mode.runtime.binding import bound_workflow
 from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
@@ -58,6 +58,8 @@ class WorkflowRuntime:
         self.undo = UndoHistory()
         # The state clients were last told of, so `Engine.report_workflow_state` tells them only of a change.
         self.reported_state: OpenWorkflowState | None = None
+        # The details clients were last told of, so `Engine.report_workflow_details` tells them only of a change.
+        self.reported_details: OpenWorkflowInfo | None = None
 
     def state(self) -> OpenWorkflowState:
         """Its unsaved changes and runs, as clients are told of them."""
