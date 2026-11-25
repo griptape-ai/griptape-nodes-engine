@@ -4256,7 +4256,6 @@ class NodeManager(EngineScoped):
             return self._worker_execution_result(node)
         return ExecuteNodeResultSuccess(
             parameter_output_values=dict(node.parameter_output_values),
-            parameter_values_set_by_run=node.values_set_by_run,
             result_details=f"Node '{node_name}' executed successfully.",
         )
 
@@ -4273,20 +4272,27 @@ class NodeManager(EngineScoped):
                 f"stays in that process and the next node receives a reference to it."
             )
             return ExecuteNodeResultFailure(result_details=details)
+        set_by_run = node.values_set_by_run
         return ExecuteNodeResultSuccess(
             parameter_output_values=output_values,
-            parameter_values_set_by_run=self._sendable_values_set_by_run(node),
+            parameter_values_set_by_run=self._sendable_values_set_by_run(node, set_by_run, output_values),
+            outputs_set_by_run=sorted(set_by_run.keys() & output_values.keys()),
             result_details=f"Node '{node.name}' executed successfully.",
         )
 
     @staticmethod
-    def _sendable_values_set_by_run(node: BaseNode) -> dict[str, Any]:
-        """The values the node's run set on itself that can leave the worker, warning of the others.
+    def _sendable_values_set_by_run(
+        node: BaseNode, set_by_run: dict[str, Any], output_values: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The values the node's run set on itself that can leave the worker besides its outputs, warning of the others.
 
-        Inputs are not cached for egress (see cache_outputs_for_egress), so only plain data travels.
+        A value that is also an output travels with the outputs. Other inputs are not cached for egress
+        (see cache_outputs_for_egress), so only plain data travels.
         """
         sendable: dict[str, Any] = {}
-        for name, value in node.values_set_by_run.items():
+        for name, value in set_by_run.items():
+            if name in output_values:
+                continue
             encoded = try_encode(value)
             if not isinstance(encoded, Unencodable):
                 sendable[name] = value

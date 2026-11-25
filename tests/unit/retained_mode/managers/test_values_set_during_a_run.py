@@ -115,15 +115,30 @@ class TestWhatTheRunSet:
 
 
 class TestWhatAWorkerSendsBack:
-    def test_the_values_its_run_set(self, engine: Engine, tmp_path: Path) -> None:
-        node = _node_running_its_body(engine, tmp_path, "worker_sends")
+    def test_names_a_value_its_run_set_that_travels_as_an_output(self, engine: Engine, tmp_path: Path) -> None:
+        """Such as a seed, which is an output too. It is sent once, with the outputs."""
+        node = _node_running_its_body(engine, tmp_path, "worker_names")
         with aprocess_scope(None, node):
             node.set_parameter_value("value", _SEED)
 
         result = engine.node_manager._worker_execution_result(node)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
+        assert result.parameter_output_values == {"value": _SEED}
+        assert result.outputs_set_by_run == ["value"]
+        assert result.parameter_values_set_by_run == {}
+
+    def test_sends_a_value_its_run_set_that_is_not_an_output(self, engine: Engine, tmp_path: Path) -> None:
+        node = _node_running_its_body(engine, tmp_path, "worker_sends")
+        with aprocess_scope(None, node):
+            node.set_parameter_value("value", _SEED)
+            node.parameter_output_values.silent_clear()
+
+        result = engine.node_manager._worker_execution_result(node)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
         assert result.parameter_values_set_by_run == {"value": _SEED}
+        assert result.outputs_set_by_run == []
 
     def test_not_a_value_with_no_plain_data_form(
         self, engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture

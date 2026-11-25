@@ -464,7 +464,12 @@ class NodeExecutor(EngineScoped):
             for name, value in result.parameter_output_values.items():
                 node.parameter_output_values[name] = value
             # So a node that ran in a worker computes with the same values next time, as one run here does.
-            node.take_values_set_by_run(result.parameter_values_set_by_run)
+            node.take_values_set_by_run(
+                {
+                    **result.parameter_values_set_by_run,
+                    **{name: result.parameter_output_values[name] for name in result.outputs_set_by_run},
+                }
+            )
         finally:
             current_executing_node_name.reset(token)
             # A connection torn down while this node was running left its input value in place so the
