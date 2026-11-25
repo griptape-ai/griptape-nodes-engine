@@ -5,7 +5,7 @@ functions. The diffusers PipelineBuilder builds a fresh component on load instea
 parameters again, so the component has to attach its handlers to the parameters it finds.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from unittest.mock import patch
 
 import pytest
@@ -75,3 +75,24 @@ def test_the_newest_component_replaces_an_earlier_ones_handlers() -> None:
     assert model is not None
     assert model._converters == [component._on_selection_changed]
     assert _button(node.get_parameter_by_name("model_download")).on_click_callback == component._on_download_click
+
+
+class _OwnConverterParameter(HuggingFaceRepoParameter):
+    def _selection_converter(self) -> Callable[[object], object]:
+        return self._own_converter
+
+    def _own_converter(self, value: object) -> object:
+        return value
+
+
+def test_a_subclass_converter_is_used_for_both_building_and_binding() -> None:
+    """A subclass that overrides the converter gets it on a loaded parameter, not the base one."""
+    node = MockNode()
+    _OwnConverterParameter(node, repo_ids=[REPO], gated=False).add_input_parameters()
+    _strip_handlers_as_a_load_does(node)
+
+    component = _OwnConverterParameter(node, repo_ids=[REPO], gated=False)
+
+    model = node.get_parameter_by_name("model")
+    assert model is not None
+    assert model._converters == [component._own_converter]

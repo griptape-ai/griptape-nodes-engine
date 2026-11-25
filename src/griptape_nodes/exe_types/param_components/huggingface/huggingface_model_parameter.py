@@ -1,6 +1,7 @@
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -272,7 +273,7 @@ class HuggingFaceModelParameter(ABC):
             },
             tooltip=self._parameter_name,
             allowed_modes={ParameterMode.PROPERTY},
-            converters=[self._on_selection_changed],
+            converters=[self._selection_converter()],
             accept_any=False,
         )
 
@@ -321,13 +322,21 @@ class HuggingFaceModelParameter(ABC):
                 for converter in parameter._converters
                 if not isinstance(getattr(converter, "__self__", None), HuggingFaceModelParameter)
             ]
-            parameter.add_converter(self._on_selection_changed)
+            parameter.add_converter(self._selection_converter())
 
         download_parameter = self._node.get_parameter_by_name(self._download_param_name)
         if download_parameter is not None:
             # A loaded download button is a plain Parameter carrying the Button trait, not a ParameterButton.
             for download_button in download_parameter.find_elements_by_type(Button):
                 download_button.on_click_callback = self._on_download_click
+
+    def _selection_converter(self) -> Callable[[object], object]:
+        """The converter on the model parameter, used both when building it and when binding a loaded one.
+
+        A subclass whose model parameter needs a different converter overrides this rather than
+        naming its own in ``add_input_parameters``, so a loaded parameter gets the same one.
+        """
+        return self._on_selection_changed
 
     def get_choices(self) -> list[str]:
         self._repo_revisions = self.fetch_repo_revisions()
