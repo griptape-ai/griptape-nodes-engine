@@ -5957,12 +5957,14 @@ class NodeManager(EngineScoped):
             except ValueError as err:
                 details = f"Attempted to lock node '{request.node_name}'. Failed because the Node could not be found. Error: {err}"
                 return SetLockNodeStateResultFailure(result_details=details)
+        altered = node.lock != request.lock
         node.lock = request.lock
         self._unresolve_unlocked_node_left_unexecuted(workflow, node)
         return SetLockNodeStateResultSuccess(
             node_name=node_name,
             locked=node.lock,
             result_details=f"Successfully set lock state to {node.lock} for node '{node_name}'.",
+            altered_workflow_state=altered,
         )
 
     @handles(BatchSetNodeLockStateRequest)
@@ -5971,12 +5973,14 @@ class NodeManager(EngineScoped):
     ) -> ResultPayload:
         updated: list[str] = []
         failed: dict[str, str] = {}
+        altered = False
         for name in request.node_names:
             try:
                 node = self.get_node_by_name_in(workflow, name)
             except ValueError as err:
                 failed[name] = f"Node not found. Error: {err}"
                 continue
+            altered = altered or node.lock != request.lock
             node.lock = request.lock
             self._unresolve_unlocked_node_left_unexecuted(workflow, node)
             updated.append(name)
@@ -5991,6 +5995,7 @@ class NodeManager(EngineScoped):
             updated_nodes=updated,
             failed_nodes=failed,
             result_details=details,
+            altered_workflow_state=altered,
         )
 
     def _unresolve_unlocked_node_left_unexecuted(self, workflow: WorkflowRuntime, node: BaseNode) -> None:

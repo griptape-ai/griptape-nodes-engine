@@ -425,8 +425,11 @@ class SetLockNodeStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetLockNodeStateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Node locked successfully."""
+class SetLockNodeStateResultSuccess(ResultPayloadSuccess):
+    """Node locked successfully. A saved workflow keeps its lock.
+
+    `altered_workflow_state` is False when the node already had the requested lock state.
+    """
 
     node_name: str
     locked: bool
@@ -458,8 +461,11 @@ class BatchSetNodeLockStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeLockStateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Batch node lock state update completed successfully."""
+class BatchSetNodeLockStateResultSuccess(ResultPayloadSuccess):
+    """Batch node lock state update completed successfully.
+
+    `altered_workflow_state` is False when every node already had the requested lock state.
+    """
 
     updated_nodes: list[str]
     failed_nodes: dict[str, str] = field(default_factory=dict)
