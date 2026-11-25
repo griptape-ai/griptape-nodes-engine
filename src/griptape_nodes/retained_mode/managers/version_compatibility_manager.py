@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import semver
 
+from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
 from griptape_nodes.retained_mode.beta_features import find_beta_feature_date_issues, parse_library_beta_features
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -41,7 +42,7 @@ from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.node_library.library_registry import LibrarySchema
+    from griptape_nodes.node_library.library_registry import LibrarySchema, NodeMetadata
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.parameter_events import (
@@ -217,20 +218,34 @@ class VersionCompatibilityManager(EngineScoped):
     def _check_library_for_deprecated_nodes(
         self, library_data: LibrarySchema
     ) -> list[LibraryVersionCompatibilityIssue]:
-        """Check a library for deprecated nodes."""
-        return [
-            LibraryVersionCompatibilityIssue(
-                problem=DeprecatedNodeWarningProblem(
-                    display_name=node.metadata.display_name,
-                    class_name=node.class_name,
-                    removal_version=node.metadata.deprecation.removal_version,
-                    deprecation_message=node.metadata.deprecation.deprecation_message,
-                ),
-                severity=LibraryManager.LibraryFitness.FLAWED,
+        """Check a library for deprecated nodes.
+
+        A node is deprecated when it has `metadata.deprecation` or declares the
+        DEPRECATED lifecycle stage. Only `metadata.deprecation` carries a removal
+        version and message.
+        """
+        issues: list[LibraryVersionCompatibilityIssue] = []
+        for node in library_data.nodes:
+            deprecation = node.metadata.deprecation
+            if deprecation is None and not self._declares_deprecated_stage(node.metadata):
+                continue
+            removal_version = None
+            deprecation_message = None
+            if deprecation is not None:
+                removal_version = deprecation.removal_version
+                deprecation_message = deprecation.deprecation_message
+            issues.append(
+                LibraryVersionCompatibilityIssue(
+                    problem=DeprecatedNodeWarningProblem(
+                        display_name=node.metadata.display_name,
+                        class_name=node.class_name,
+                        removal_version=removal_version,
+                        deprecation_message=deprecation_message,
+                    ),
+                    severity=LibraryManager.LibraryFitness.FLAWED,
+                )
             )
-            for node in library_data.nodes
-            if node.metadata.deprecation is not None
-        ] or []
+        return issues
 
     def _check_library_for_beta_feature_problems(
         self, library_data: LibrarySchema
@@ -430,3 +445,16 @@ class VersionCompatibilityManager(EngineScoped):
             return semver.VersionInfo(major=result.major, minor=result.minor, patch=result.patch)
         msg = "Failed to get engine version"
         raise RuntimeError(msg)
+
+    @staticmethod
+    def _declares_deprecated_stage(node_metadata: NodeMetadata) -> bool:
+        """Whether the node's own lifecycle stage declaration is DEPRECATED. The first declaration wins."""
+        node_stage = next(
+            (
+                declaration.stage
+                for declaration in node_metadata.declarations
+                if isinstance(declaration, LifecycleStageNodeProperty)
+            ),
+            None,
+        )
+        return node_stage == LifecycleStage.DEPRECATED

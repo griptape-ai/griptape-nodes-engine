@@ -1,4 +1,4 @@
-"""Tests for VersionCompatibilityManager's workflow compatibility checks."""
+"""Tests for VersionCompatibilityManager's library and workflow compatibility checks."""
 
 from __future__ import annotations
 
@@ -7,10 +7,14 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
     LibrarySchema,
+    NodeDefinition,
+    NodeDeprecationMetadata,
+    NodeMetadata,
 )
 from griptape_nodes.node_library.workflow_registry import (
     LibraryNameAndNodeType,
@@ -22,6 +26,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesResultFailure,
     ListRegisteredLibrariesResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import DeprecatedNodeWarningProblem
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import NodeTypeNotFoundProblem
 
 if TYPE_CHECKING:
@@ -29,6 +34,82 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
+
+
+def _library_with_node(node_metadata: NodeMetadata) -> LibrarySchema:
+    """Build a library schema holding one node with the given metadata."""
+    return LibrarySchema(
+        name="Lifecycle Library",
+        library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+        metadata=LibraryMetadata(
+            author="t",
+            description="d",
+            library_version="1.0.0",
+            engine_version="1.0.0",
+            tags=[],
+        ),
+        categories=[],
+        nodes=[NodeDefinition(class_name="OldNode", file_path="old_node.py", metadata=node_metadata)],
+    )
+
+
+def _node_metadata(
+    *, stage: LifecycleStage | None = None, deprecation: NodeDeprecationMetadata | None = None
+) -> NodeMetadata:
+    """Build node metadata with an optional lifecycle stage declaration and deprecation block."""
+    declarations = []
+    if stage is not None:
+        declarations.append(LifecycleStageNodeProperty(stage=stage))
+    return NodeMetadata(
+        category="c",
+        description="d",
+        display_name="Old Node",
+        deprecation=deprecation,
+        declarations=declarations,
+    )
+
+
+def _deprecated_node_problems(engine: Engine, library: LibrarySchema) -> list[DeprecatedNodeWarningProblem]:
+    issues = engine.version_compatibility_manager.check_library_version_compatibility(library)
+    return [issue.problem for issue in issues if isinstance(issue.problem, DeprecatedNodeWarningProblem)]
+
+
+class TestCheckLibraryForDeprecatedNodes:
+    """Either way of marking a node deprecated reports it as a library problem."""
+
+    def test_reports_a_node_deprecated_only_by_lifecycle_stage(self, engine: Engine) -> None:
+        library = _library_with_node(_node_metadata(stage=LifecycleStage.DEPRECATED))
+
+        problems = _deprecated_node_problems(engine, library)
+
+        assert problems == [
+            DeprecatedNodeWarningProblem(
+                display_name="Old Node",
+                class_name="OldNode",
+                removal_version=None,
+                deprecation_message=None,
+            )
+        ]
+
+    def test_takes_message_and_removal_version_from_deprecation_metadata(self, engine: Engine) -> None:
+        deprecation = NodeDeprecationMetadata(deprecation_message="Use New Node.", removal_version="2.0.0")
+        library = _library_with_node(_node_metadata(stage=LifecycleStage.DEPRECATED, deprecation=deprecation))
+
+        problems = _deprecated_node_problems(engine, library)
+
+        assert problems == [
+            DeprecatedNodeWarningProblem(
+                display_name="Old Node",
+                class_name="OldNode",
+                removal_version="2.0.0",
+                deprecation_message="Use New Node.",
+            )
+        ]
+
+    def test_does_not_report_a_node_with_another_stage(self, engine: Engine) -> None:
+        library = _library_with_node(_node_metadata(stage=LifecycleStage.BETA))
+
+        assert _deprecated_node_problems(engine, library) == []
 
 
 def _register_library_with_no_node_types(name: str) -> None:
