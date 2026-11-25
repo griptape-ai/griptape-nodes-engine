@@ -499,8 +499,7 @@ class SerializeFlowToCommandsRequest(RequestPayload, GraphAccessMixin):
             This can be useful so that the contents of a flow can be deserialized into an existing flow instead of creating a new one and deserializing the nodes into that.
             Copy/paste can make use of this.
         include_run_results (bool): If set to False, leaves out what a run produced: every node is written as
-            unresolved, without its output values or the input values its connections fed it. What is left is
-            what the user edited.
+            unresolved, without its output values.
     """
 
     broadcast_result: bool = False

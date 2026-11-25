@@ -21,6 +21,7 @@ import zlib
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -61,6 +62,7 @@ from griptape_nodes.retained_mode.managers.undo.plan import (
     NotEdits,
     RestorePlan,
     commands_to_build,
+    levels,
     plan_rebuild,
     plan_restore,
 )
@@ -82,7 +84,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.runtime.undo_history import Checkpoint
+    from griptape_nodes.retained_mode.runtime.undo_history import Checkpoint, UndoHistory
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
@@ -114,6 +116,48 @@ class _Live:
 
     commands: SerializedFlowCommands
     checkpointed: Checkpointed
+
+
+class _Way(Enum):
+    """Whether a restore takes the last step back or puts the last one taken back again."""
+
+    UNDO = "undo"
+    REDO = "redo"
+
+    def offered(self, history: UndoHistory) -> str | None:
+        """What the history offers to take back or put back, or None when there is nothing."""
+        if self is _Way.UNDO:
+            return history.undo_label
+        return history.redo_label
+
+    def target(self, history: UndoHistory) -> Checkpoint | None:
+        """The checkpoint to restore. Take a checkpoint first, so the current one is up to date."""
+        if self is _Way.UNDO:
+            return history.previous()
+        return history.next()
+
+    def step_label(self, target: Checkpoint, current: Checkpoint) -> str:
+        """What the step between ``current`` and ``target`` is called, which the later of the two holds."""
+        if self is _Way.UNDO:
+            return current.label or ""
+        return target.label or ""
+
+    def arrive(self, history: UndoHistory, rebuilt: bytes) -> None:
+        """Make the target current, as ``rebuilt``, the workflow the restore left."""
+        if self is _Way.UNDO:
+            history.step_back(rebuilt)
+            return
+        history.step_forward(rebuilt)
+
+    def success(self, label: str) -> ResultPayload:
+        if self is _Way.UNDO:
+            return UndoResultSuccess(label=label, result_details=f"Undid '{label}'.")
+        return RedoResultSuccess(label=label, result_details=f"Redid '{label}'.")
+
+    def failure(self, details: ResultDetails | str, *, workflow_rebuilt: bool = False) -> ResultPayload:
+        if self is _Way.UNDO:
+            return UndoResultFailure(result_details=details, workflow_rebuilt=workflow_rebuilt)
+        return RedoResultFailure(result_details=details, workflow_rebuilt=workflow_rebuilt)
 
 
 # What the request being handled records into: the step it is part of, a change outside any step, or
@@ -204,89 +248,55 @@ class UndoManager(EngineScoped):
 
     @handles(UndoRequest)
     async def on_undo_request(self, request: UndoRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG002
-        blocker = _blocker(workflow, "undo")
-        if blocker is not None:
-            return UndoResultFailure(result_details=_routine(blocker))
-        history = workflow.undo
-        label = history.undo_label
-        if label is None:
-            return UndoResultFailure(
-                result_details=_routine("Attempted to undo. Failed because there is nothing to undo.")
-            )
-        live = self._checkpoint_live(workflow)
-        if live is None:
-            return UndoResultFailure(
-                result_details=_routine("Attempted to undo. Failed because there is nothing to undo.")
-            )
-        if live.checkpointed is Checkpointed.UNCHANGED:
-            # The step it names put back what it changed, so it added no checkpoint. Taking it back
-            # changes nothing, rather than taking back the step before it.
-            history.close_step()
-            self.engine.report_workflow_state(workflow)
-            return UndoResultSuccess(label=label, result_details=f"Undid '{label}'.")
-        previous = history.previous()
-        current = history.current()
-        if previous is None or current is None:
-            return UndoResultFailure(
-                result_details=_routine("Attempted to undo. Failed because there is nothing to undo.")
-            )
-        return await self._undo_to(workflow, previous, current, live.commands)
+        return await self._move(workflow, _Way.UNDO)
 
     @handles(RedoRequest)
     async def on_redo_request(self, request: RedoRequest, workflow: WorkflowRuntime) -> ResultPayload:  # noqa: ARG002
-        blocker = _blocker(workflow, "redo")
+        return await self._move(workflow, _Way.REDO)
+
+    async def _move(self, workflow: WorkflowRuntime, way: _Way) -> ResultPayload:
+        """Take back the last step, or put back the last one taken back, as ``way`` says."""
+        blocker = _blocker(workflow, way.value)
         if blocker is not None:
-            return RedoResultFailure(result_details=_routine(blocker))
-        if workflow.undo.redo_label is None:
-            return RedoResultFailure(
-                result_details=_routine("Attempted to redo. Failed because there is nothing to redo.")
-            )
+            return way.failure(_routine(blocker))
+        nothing = _routine(f"Attempted to {way.value}. Failed because there is nothing to {way.value}.")
+        history = workflow.undo
+        offered = way.offered(history)
+        if offered is None:
+            return way.failure(nothing)
         live = self._checkpoint_live(workflow)
         if live is None:
-            return RedoResultFailure(
-                result_details=_routine("Attempted to redo. Failed because there is nothing to redo.")
-            )
-        following = workflow.undo.next()
-        current = workflow.undo.current()
-        if following is None or current is None:
-            return RedoResultFailure(
-                result_details=_routine("Attempted to redo. Failed because there is nothing to redo.")
-            )
-        return await self._redo_to(workflow, following, current, live.commands)
+            return way.failure(nothing)
+        if live.checkpointed is Checkpointed.UNCHANGED:
+            # The step an undo names put back what it changed, so it added no checkpoint. Taking it back
+            # changes nothing, rather than taking back the step before it. A redo never finds this: a
+            # pending step leaves nothing to redo.
+            history.close_step()
+            self.engine.report_workflow_state(workflow)
+            return way.success(offered)
+        return await self._restore_step(workflow, way, live.commands, nothing)
 
-    async def _undo_to(
-        self, workflow: WorkflowRuntime, previous: Checkpoint, current: Checkpoint, live: SerializedFlowCommands
+    async def _restore_step(
+        self, workflow: WorkflowRuntime, way: _Way, live: SerializedFlowCommands, nothing: ResultDetails
     ) -> ResultPayload:
-        restored = await self._restore(workflow, previous, current, live)
+        """Restore the checkpoint ``way`` leads to from ``live``, the workflow just checkpointed."""
+        history = workflow.undo
+        current = history.current()
+        target = way.target(history)
+        if current is None or target is None:
+            return way.failure(nothing)
+        label = way.step_label(target, current)
+        restored = await self._restore(workflow, target, current, live)
         if isinstance(restored, str):
             # A failed rebuild forgets the history.
             self.engine.report_workflow_state(workflow)
-            return UndoResultFailure(
-                result_details=f"Attempted to undo '{current.label}'. {restored}", workflow_rebuilt=True
-            )
+            return way.failure(f"Attempted to {way.value} '{label}'. {restored}", workflow_rebuilt=True)
         rebuilt = self._compress(workflow, restored)
         # Without it, the history is forgotten (see `_compress`).
         if rebuilt is not None:
-            workflow.undo.step_back(rebuilt)
+            way.arrive(history, rebuilt)
         self.engine.report_workflow_state(workflow)
-        return UndoResultSuccess(label=current.label or "", result_details=f"Undid '{current.label}'.")
-
-    async def _redo_to(
-        self, workflow: WorkflowRuntime, following: Checkpoint, current: Checkpoint, live: SerializedFlowCommands
-    ) -> ResultPayload:
-        restored = await self._restore(workflow, following, current, live)
-        if isinstance(restored, str):
-            # A failed rebuild forgets the history.
-            self.engine.report_workflow_state(workflow)
-            return RedoResultFailure(
-                result_details=f"Attempted to redo '{following.label}'. {restored}", workflow_rebuilt=True
-            )
-        rebuilt = self._compress(workflow, restored)
-        # Without it, the history is forgotten (see `_compress`).
-        if rebuilt is not None:
-            workflow.undo.step_forward(rebuilt)
-        self.engine.report_workflow_state(workflow)
-        return RedoResultSuccess(label=following.label or "", result_details=f"Redid '{following.label}'.")
+        return way.success(label)
 
     def _step_to_wait_for(
         self, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
@@ -595,14 +605,14 @@ def _without_variables(commands: SerializedFlowCommands) -> SerializedFlowComman
 
     Changes ``commands`` in place.
     """
-    levels = _levels(commands)
+    all_levels = levels(commands)
     referenced = {
         command.unique_value_uuid
-        for level in levels
+        for level in all_levels
         for set_value_commands in level.set_parameter_value_commands.values()
         for command in set_value_commands
     }
-    for level in levels:
+    for level in all_levels:
         level.serialized_variable_commands = []
         level.unique_parameter_uuid_to_values = {
             value_uuid: value
@@ -610,13 +620,6 @@ def _without_variables(commands: SerializedFlowCommands) -> SerializedFlowComman
             if value_uuid in referenced
         }
     return commands
-
-
-def _levels(commands: SerializedFlowCommands) -> list[SerializedFlowCommands]:
-    levels = [commands]
-    for sub_flow_commands in commands.sub_flows_commands:
-        levels.extend(_levels(sub_flow_commands))
-    return levels
 
 
 def _decode(commands: bytes) -> SerializedFlowCommands:

@@ -160,6 +160,14 @@ class _RollsASeed(_PassThrough):
         self.set_parameter_value("seed", self.get_parameter_value("seed") + 1)
 
 
+class _GeneratesAnImage(_RollsASeed):
+    """Outputs what it made from the seed it rolled, so each run sends on something different."""
+
+    def process(self) -> None:
+        super().process()
+        self.parameter_output_values["result"] = f"image {self.get_parameter_value('seed')}"
+
+
 class _Previews(_PassThrough):
     """Shows a preview of its input, which it works out whenever the input is set, as an image node does."""
 
@@ -201,7 +209,7 @@ def _library() -> Iterator[None]:
     library = LibraryRegistry.generate_new_library(library_data=schema)
     library.register_new_node_type(_PassThrough, NodeMetadata(category="t", description="d", display_name="Pass"))
     library.register_new_node_type(_Group, NodeMetadata(category="t", description="d", display_name="Group"))
-    for node_type in (_HoldsAnObject, _ForgetsOnDisconnect, _GrowsOnConnect, _RollsASeed, _Previews):
+    for node_type in (_HoldsAnObject, _ForgetsOnDisconnect, _GrowsOnConnect, _RollsASeed, _GeneratesAnImage, _Previews):
         library.register_new_node_type(node_type, NodeMetadata(category="t", description="d", display_name="t"))
     yield
     LibraryRegistry._clear()
@@ -1186,6 +1194,30 @@ class TestRunResults:
         assert viewer is not None
         assert viewer.state is NodeResolutionState.RESOLVED
         assert viewer.get_parameter_value("preview") == "preview of picture"
+
+    def test_a_node_keeps_a_value_a_run_fed_it_since_the_checkpoint(
+        self, engine: Engine, workflow: WorkflowRuntime
+    ) -> None:
+        _add(engine, workflow, "generator", node_type="_GeneratesAnImage")
+        _add(engine, workflow, "viewer", node_type="_Previews")
+        _connect(engine, workflow, "generator", "viewer")
+        _ok(engine, workflow, ResolveNodeRequest(node_name="viewer"), "click run")
+        _ok(
+            engine,
+            workflow,
+            SetNodeMetadataRequest(node_name="viewer", metadata={"position": {"x": 9, "y": 9}}),
+            "drag",
+        )
+        _ok(engine, workflow, ResolveNodeRequest(node_name="generator"), "run the generator again")
+        _ok(engine, workflow, ResolveNodeRequest(node_name="viewer"), "run the viewer again")
+
+        _undo(engine, workflow)
+
+        viewer = _node(workflow, "viewer")
+        assert viewer is not None
+        assert viewer.metadata.get("position") != {"x": 9, "y": 9}
+        assert viewer.get_parameter_value("value") == "image 2"
+        assert viewer.get_parameter_value("preview") == "preview of image 2"
 
     def test_a_value_its_run_set_is_undone_like_any_other_once_edited(
         self, engine: Engine, workflow: WorkflowRuntime

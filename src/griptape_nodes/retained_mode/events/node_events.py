@@ -607,8 +607,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
         use_pickling: Deprecated and ignored. The value pool always holds encoded values.
-        include_run_results: If False, writes the node as unresolved, without its output values or the input
-            values its connections fed it.
+        include_run_results: If False, writes the node as unresolved, without its output values.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """

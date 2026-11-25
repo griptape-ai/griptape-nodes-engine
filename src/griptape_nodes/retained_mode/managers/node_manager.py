@@ -4716,10 +4716,6 @@ class NodeManager(EngineScoped):
 
             # Now assignment of values to all of the parameters.
             set_value_commands = []
-            if request.include_run_results:
-                run_fed_parameter_names: frozenset[str] = frozenset()
-            else:
-                run_fed_parameter_names = frozenset(workflow.flows.connections.incoming_index.get(node_name, {}))
 
             # ErrorProxyNode uses normal parameter serialization now since we create real parameters
             # Only AlterParameterDetailsRequest commands are recorded and replayed
@@ -4737,7 +4733,6 @@ class NodeManager(EngineScoped):
                     create_node_request=create_node_request,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
                     include_run_results=request.include_run_results,
-                    run_fed_parameter_names=run_fed_parameter_names,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -5681,7 +5676,6 @@ class NodeManager(EngineScoped):
         *,
         serialize_all_parameter_values: bool = False,
         include_run_results: bool = True,
-        run_fed_parameter_names: frozenset[str] = frozenset(),
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
 
@@ -5700,8 +5694,7 @@ class NodeManager(EngineScoped):
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Remembers how each value was saved, by identity
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
-            include_run_results (bool): If False, leave out the output value, and the input value of a parameter in run_fed_parameter_names
-            run_fed_parameter_names (frozenset[str]): The parameters whose input value a connection feeds, so a run set it
+            include_run_results (bool): If False, leave out the output value
 
         Returns:
             None (if no value to be serialized) or an IndirectSetParameterValueCommand linking the value to the unique value map
@@ -5712,8 +5705,6 @@ class NodeManager(EngineScoped):
         """
         output_value = None
         internal_value = None
-        if not include_run_results and parameter.name in run_fed_parameter_names:
-            return None
         if include_run_results and parameter.name in node.parameter_output_values:
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]

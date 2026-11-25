@@ -241,8 +241,8 @@ class Index:
     def of(cls, commands: SerializedFlowCommands) -> Index:
         index = cls()
         names_by_uuid: dict[SerializedNodeCommands.NodeUUID, str] = {}
-        levels = _levels(commands)
-        for level in levels:
+        all_levels = levels(commands)
+        for level in all_levels:
             for node_commands in level.serialized_node_commands:
                 node = _Node(commands=node_commands, level=level)
                 index.nodes[node.name] = node
@@ -254,7 +254,7 @@ class Index:
                 if member is not None:
                     index.group_of[member] = node.name
         incoming: dict[str, set[tuple[str, str, str]]] = {}
-        for level in levels:
+        for level in all_levels:
             for connection in level.serialized_connections:
                 source = names_by_uuid.get(connection.source_node_uuid)
                 target = names_by_uuid.get(connection.target_node_uuid)
@@ -293,15 +293,15 @@ def _name(commands: SerializedNodeCommands) -> str:
 
 
 def _all_node_commands(level: SerializedFlowCommands) -> list[SerializedNodeCommands]:
-    return [node_commands for sub_level in _levels(level) for node_commands in sub_level.serialized_node_commands]
+    return [node_commands for sub_level in levels(level) for node_commands in sub_level.serialized_node_commands]
 
 
-def _levels(commands: SerializedFlowCommands) -> list[SerializedFlowCommands]:
+def levels(commands: SerializedFlowCommands) -> list[SerializedFlowCommands]:
     """The flow and every flow beneath it."""
-    levels = [commands]
+    found = [commands]
     for sub_flow_commands in commands.sub_flows_commands:
-        levels.extend(_levels(sub_flow_commands))
-    return levels
+        found.extend(levels(sub_flow_commands))
+    return found
 
 
 def _level_name(level: SerializedFlowCommands) -> str | None:
