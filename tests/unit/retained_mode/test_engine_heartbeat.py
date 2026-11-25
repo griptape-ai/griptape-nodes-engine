@@ -144,7 +144,6 @@ class TestEngineHeartbeatOpenWorkflows:
                 description=None,
                 image=None,
                 is_template=False,
-                is_griptape_provided=False,
             )
         ]
         assert result.current_workflow == workflow.name

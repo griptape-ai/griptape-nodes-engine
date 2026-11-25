@@ -621,7 +621,6 @@ class TestWorkers:
             description=None,
             image=None,
             is_template=False,
-            is_griptape_provided=False,
         )
 
         def relay_open(_request: _RelayedOpenRequest) -> ResultPayload:
