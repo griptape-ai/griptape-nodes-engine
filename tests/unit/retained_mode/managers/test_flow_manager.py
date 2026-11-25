@@ -504,7 +504,9 @@ class TestValidateFlowDependenciesLibraryHooks:
 
         assert isinstance(result, ValidateFlowDependenciesResultSuccess)
         assert result.validation_succeeded is False
-        assert result.exceptions == [failure]
+        assert len(result.exceptions) == 1
+        assert "Failing Library" in str(result.exceptions[0])
+        assert str(failure) in str(result.exceptions[0])
 
     @pytest.mark.asyncio
     async def test_library_hook_raising_blocks_the_flow(self, engine: Engine, flow_name: str) -> None:
@@ -522,7 +524,29 @@ class TestValidateFlowDependenciesLibraryHooks:
 
         assert isinstance(result, ValidateFlowDependenciesResultSuccess)
         assert result.validation_succeeded is False
-        assert result.exceptions == [failure]
+        assert len(result.exceptions) == 1
+        assert "Failing Library" in str(result.exceptions[0])
+        assert str(failure) in str(result.exceptions[0])
+
+    @pytest.mark.asyncio
+    async def test_run_library_validation_false_skips_library_hooks(self, engine: Engine, flow_name: str) -> None:
+        advanced_library = AdvancedNodeLibrary()
+        with (
+            patch.object(
+                advanced_library, "validate_flow_before_run", return_value=[RuntimeError("should not run")]
+            ) as hook,
+            patch.object(LibraryRegistry, "list_libraries", return_value=["Some Library"]),
+            patch.object(LibraryRegistry, "get_library") as mock_get_library,
+        ):
+            mock_get_library.return_value.get_advanced_library.return_value = advanced_library
+            result = await engine.flow_manager.on_validate_flow_dependencies_request(
+                ValidateFlowDependenciesRequest(flow_name=flow_name, run_library_validation=False),
+                _a_workflow(engine),
+            )
+
+        assert isinstance(result, ValidateFlowDependenciesResultSuccess)
+        assert result.validation_succeeded is True
+        hook.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_first_failing_library_stops_further_libraries_from_being_called(

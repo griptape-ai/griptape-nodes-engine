@@ -296,7 +296,8 @@ class AdvancedNodeLibrary:
         Unlike the other hooks on this class, this one can block: a non-empty return, or a
         raised exception, stops the flow and is reported as a validation failure. First
         failure wins — one library failing stops the rest from being called. Keep it quick;
-        the flow waits for this to return.
+        the flow waits for this to return. Only a top-level flow start calls this — not a
+        subflow/loop-iteration start, and not resolving a single node.
         """
 
     def get_app_event_listeners(

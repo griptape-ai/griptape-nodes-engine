@@ -514,6 +514,14 @@ Constraints on the mechanism:
     engine stops calling further libraries' hooks for that validation pass. It does not
     collect failures from every library that would have failed.
 - **Keep it quick.** The flow waits for this to return before it can start.
+- **Only a top-level flow start runs it.** A subflow or loop-iteration start (for example a
+    `ForEachGroupNode` body) validates its own nodes without calling library hooks again —
+    the hook's contract is "once, before the top-level flow's first node runs," and by the
+    time a subflow starts, nodes outside it have already run. Resolving a single node
+    (`ResolveNodeRequest`) does not call it either: only that node's own dependency chain is
+    validated, the same way `validate_before_workflow_run()` is. A rule meant to block every
+    run, such as a license limit, still needs the node-level hook as a backstop if it must
+    hold even when a user runs one node at a time.
 
 ## Registering node types without listing them in the manifest
 

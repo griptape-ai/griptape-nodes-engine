@@ -1773,10 +1773,14 @@ class FlowManager(EngineScoped):
         if isinstance(start_node, StartLocalSubflowResultFailure):
             return start_node
 
-        # Run validation before starting the subflow
+        # Run validation before starting the subflow. Library validation hooks are skipped here:
+        # they're contracted to run once, before the top-level flow's first node runs, and a
+        # subflow start happens mid-run, once per loop iteration.
         validation_result = await self.on_validate_flow_dependencies_request(
             ValidateFlowDependenciesRequest(
-                flow_name=flow_name, flow_node_name=start_node.name if start_node else None
+                flow_name=flow_name,
+                flow_node_name=start_node.name if start_node else None,
+                run_library_validation=False,
             ),
             workflow,
         )
@@ -2065,6 +2069,16 @@ class FlowManager(EngineScoped):
             if exceptions:
                 all_exceptions = all_exceptions + exceptions
 
+        if request.run_library_validation:
+            all_exceptions = all_exceptions + self._run_library_flow_validation_hooks(flow, nodes)
+        return ValidateFlowDependenciesResultSuccess(
+            validation_succeeded=len(all_exceptions) == 0,
+            exceptions=all_exceptions,
+            result_details=f"Validated flow dependencies: {len(all_exceptions)} exceptions found",
+        )
+
+    def _run_library_flow_validation_hooks(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception]:
+        """Run every loaded library's validate_flow_before_run hook. First failure wins."""
         for library_name in LibraryRegistry.list_libraries():
             advanced_library = LibraryRegistry.get_library(library_name).get_advanced_library()
             if advanced_library is None:
@@ -2072,16 +2086,13 @@ class FlowManager(EngineScoped):
             try:
                 library_exceptions = advanced_library.validate_flow_before_run(flow, nodes)
             except Exception as err:
-                all_exceptions.append(err)
-                break
+                logger.exception("Library '%s' validate_flow_before_run raised an exception", library_name)
+                return [RuntimeError(f"Library '{library_name}' rejected the flow: {err}")]
             if library_exceptions:
-                all_exceptions.extend(library_exceptions)
-                break
-        return ValidateFlowDependenciesResultSuccess(
-            validation_succeeded=len(all_exceptions) == 0,
-            exceptions=all_exceptions,
-            result_details=f"Validated flow dependencies: {len(all_exceptions)} exceptions found",
-        )
+                return [
+                    RuntimeError(f"Library '{library_name}' rejected the flow: {exc}") for exc in library_exceptions
+                ]
+        return []
 
     @handles(ListFlowsInCurrentContextRequest)
     def on_list_flows_in_current_context_request(

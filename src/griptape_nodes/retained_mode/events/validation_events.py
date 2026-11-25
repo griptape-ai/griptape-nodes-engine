@@ -26,6 +26,10 @@ class ValidateFlowDependenciesRequest(RequestPayload, GraphAccessMixin):
     Args:
         flow_name: Name of the flow to validate dependencies for
         flow_node_name: Name of the flow node to validate (None for default)
+        run_library_validation: Whether to also run each library's `validate_flow_before_run`
+            hook. True for a top-level flow start; a subflow or loop-iteration start passes
+            False, since the hook's contract is "once, before the top-level flow's first node
+            runs" and a subflow has already had nodes run before it.
 
     Results: ValidateFlowDependenciesResultSuccess (with validation status) | ValidateFlowDependenciesResultFailure (validation error)
     """
@@ -33,6 +37,7 @@ class ValidateFlowDependenciesRequest(RequestPayload, GraphAccessMixin):
     # Same inputs as StartFlow
     flow_name: str
     flow_node_name: str | None = None
+    run_library_validation: bool = True
 
 
 @dataclass
