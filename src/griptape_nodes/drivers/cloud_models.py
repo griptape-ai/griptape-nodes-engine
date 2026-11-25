@@ -132,17 +132,6 @@ MODEL_CHOICES_ARGS = [
         "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
     },
     {
-        "name": "gemini-3.5-flash",
-        "icon": "logos/google.svg",
-        "args": _GEMINI_ARGS,
-        "vision": True,
-        "key": "gtc_gemini_3_5_flash",
-        "provider": "google",
-        "display_name": "Gemini 3.5 Flash",
-        "family": "Gemini",
-        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
-    },
-    {
         "name": "gemini-3.5-flash-lite",
         "icon": "logos/google.svg",
         "args": _GEMINI_ARGS,
@@ -309,17 +298,6 @@ MODEL_CHOICES_ARGS = [
         "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
     },
     {
-        "name": "gpt-5.2-chat",
-        "icon": "logos/openai.svg",
-        "args": _OPENAI_ARGS,
-        "vision": False,
-        "key": "gtc_gpt_5_2_chat",
-        "provider": "openai",
-        "display_name": "GPT-5.2 Chat",
-        "family": "GPT",
-        "key_support": KeySupport.REQUIRES_GRIPTAPE_KEY,
-    },
-    {
         "name": "gpt-5.1",
         "icon": "logos/openai.svg",
         "args": _OPENAI_ARGS,
@@ -405,17 +383,6 @@ MODEL_CHOICES_ARGS = [
         "provider": "openai",
         "display_name": "GPT-4o",
         "family": "GPT",
-        "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
-    },
-    {
-        "name": "o4-mini",
-        "icon": "logos/openai.svg",
-        "args": _OPENAI_ARGS,
-        "vision": True,
-        "key": "gtc_o4_mini",
-        "provider": "openai",
-        "display_name": "o4 mini",
-        "family": "o-series",
         "key_support": KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
     },
     {
@@ -614,12 +581,16 @@ DEPRECATED_MODELS = {
     # Azure OpenAI
     "gpt-4.5-preview": "gpt-4.1",
     "o1-mini": "o3-mini",
+    # OpenAI
+    "gpt-5.2-chat": "gpt-5.2",
+    "o4-mini": "gpt-5-mini",
     # Google
     "gemini-2.0-flash": "gemini-2.5-flash",
     "gemini-2.5-flash-preview-05-20": "gemini-2.5-flash",
     "gemini-2.5-pro-preview-06-05": "gemini-2.5-pro",
     "gemini-3-pro": "gemini-3.1-pro",
     "gemini-3-pro-preview": "gemini-3.1-pro",
+    "gemini-3.5-flash": "gemini-3.6-flash",
 }
 
 
@@ -681,7 +652,7 @@ DEPRECATED_MODEL_CATALOG_ARGS = [
 
 # Model IDs whose backend does not accept top_p (the OpenAI o-series).
 # Kept in sync with the o-entries in MODEL_CHOICES_ARGS.
-O_SERIES_MODELS = {"o1", "o3", "o3-mini", "o4-mini"}
+O_SERIES_MODELS = {"o1", "o3", "o3-mini"}
 
 
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
