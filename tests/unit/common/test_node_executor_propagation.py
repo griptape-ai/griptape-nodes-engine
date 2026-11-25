@@ -139,6 +139,27 @@ class TestLocalExecuteCopyBack:
         assert node.parameter_output_values == {"a": 1, "b": 2}
 
 
+class TestValuesAWorkerRunSet:
+    """The engine's copy of a node that ran in a worker takes the values the run gave its own parameters."""
+
+    @pytest.mark.asyncio
+    async def test_takes_one_sent_as_an_output_from_the_outputs(self) -> None:
+        """Such as a seed, which travels once, with the outputs."""
+        node = _make_node_with_tracked_outputs()
+        result = ExecuteNodeResultSuccess(
+            result_details="ok",
+            parameter_output_values={"seed": 7, "image": "done"},
+            parameter_values_set_by_run={"note": "rolled"},
+            outputs_set_by_run=["seed"],
+        )
+
+        executor = _make_executor()
+        cast("MagicMock", executor.engine).ahandle_request = AsyncMock(return_value=result)
+        await executor.execute(_in_workflow_of(executor, node))
+
+        node.take_values_set_by_run.assert_called_once_with({"note": "rolled", "seed": 7})
+
+
 def _put_in_workflow(node: MockNode, executor: NodeExecutor) -> WorkflowRuntime:
     """Add `node` to a workflow whose requests go to the executor's engine and whose connections are a mock."""
     workflow = _workflow_of(executor)

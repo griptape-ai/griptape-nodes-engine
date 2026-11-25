@@ -4272,10 +4272,40 @@ class NodeManager(EngineScoped):
                 f"stays in that process and the next node receives a reference to it."
             )
             return ExecuteNodeResultFailure(result_details=details)
+        set_by_run = node.values_set_by_run
         return ExecuteNodeResultSuccess(
             parameter_output_values=output_values,
+            parameter_values_set_by_run=self._sendable_values_set_by_run(node, set_by_run, output_values),
+            outputs_set_by_run=sorted(set_by_run.keys() & output_values.keys()),
             result_details=f"Node '{node.name}' executed successfully.",
         )
+
+    @staticmethod
+    def _sendable_values_set_by_run(
+        node: BaseNode, set_by_run: dict[str, Any], output_values: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The values the node's run set on itself that can leave the worker besides its outputs, warning of the others.
+
+        A value that is also an output travels with the outputs. Other inputs are not cached for egress
+        (see cache_outputs_for_egress), so only plain data travels.
+        """
+        sendable: dict[str, Any] = {}
+        for name, value in set_by_run.items():
+            if name in output_values:
+                continue
+            encoded = try_encode(value)
+            if not isinstance(encoded, Unencodable):
+                sendable[name] = value
+                continue
+            logger.warning(
+                "Attempted to send the value node '%s' set on parameter '%s' while running out of %s's isolated "
+                "process. Failed because %s The node keeps the value it had before the run.",
+                node.name,
+                name,
+                node.metadata.get("library", "its library"),
+                encoded.reason,
+            )
+        return sendable
 
     def execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
         """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
