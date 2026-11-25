@@ -66,6 +66,7 @@ from griptape_nodes.retained_mode.request_handlers import (
 )
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, NoWorkflow, bound_workflow
 from griptape_nodes.retained_mode.runtime.read_observer import observe_dispatch
+from griptape_nodes.retained_mode.runtime.undo_history import StepStillRunningError
 from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
@@ -155,8 +156,8 @@ _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], 
     "_event_manager_active_post_dispatch_hooks", default=()
 )
 
-# Result/payload types whose broadcast is suppressed for the *current logical chain* only.
-# EventSuppressionContext writes this; should_suppress_event reads it.
+# The suppressions in effect for the *current logical chain* only, each with the result/payload
+# types whose broadcast it hides. EventSuppressionContext writes this; should_suppress_event reads it.
 #
 # Scoped to the context rather than to the manager on purpose. Suppression exists to hide
 # engine-internal bookkeeping -- rebuilding and tearing down the short-lived flows a loop runs
@@ -169,14 +170,16 @@ _active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], 
 # dispatches -- which is exactly the lineage meant to be hidden -- and is invisible to any task
 # or thread the engine did not spawn from inside the window.
 #
+# A task spawned inside the window copies the context, and with it this value, and may run on
+# long after the window closes. So each suppression ends when its block exits, for every context
+# holding it, rather than whenever each context happens to reset the variable.
+#
 # It fails open: work handed to a thread the engine does not control (a library-internal
 # ThreadPoolExecutor) starts from a fresh context and loses the flag, so its results are
 # broadcast as they are today. Over-broadcasting is a cosmetic event; over-suppressing desyncs
-# the editor. Frozensets are replaced, never mutated, because the value object itself is shared
+# the editor. The tuple is replaced, never mutated, because the value object itself is shared
 # with every context that copied it.
-_suppressed_event_types: ContextVar[frozenset[type]] = ContextVar(
-    "_event_manager_suppressed_event_types", default=frozenset()
-)
+_event_suppressions: ContextVar[tuple[_Suppression, ...]] = ContextVar("_event_manager_event_suppressions", default=())
 
 # Post-dispatch hooks are deliberately unbounded -- every result gets its own task so a
 # notification hook never misses a request. This is purely a "something is wrong" signal
@@ -519,9 +522,14 @@ class EventManager(EngineScoped):
 
         Matching is by ``isinstance``, so a set may name a base class such as ``ResultPayload``.
 
-        Suppression is scoped to the current context; see ``_suppressed_event_types``.
+        Suppression is scoped to the current context; see ``_event_suppressions``.
         """
-        suppressed_types = _suppressed_event_types.get()
+        suppressed_types = [
+            suppressed_type
+            for suppression in _event_suppressions.get()
+            if suppression.active
+            for suppressed_type in suppression.events
+        ]
         if not suppressed_types:
             return False
 
@@ -538,7 +546,7 @@ class EventManager(EngineScoped):
         that opened it (``EventSuppressionContext`` restores the previous value on exit) and is
         invisible to other contexts, so this is a no-op in the normal case.
         """
-        _suppressed_event_types.set(frozenset())
+        _event_suppressions.set(())
 
     def initialize_queue(self, queue: asyncio.Queue | None = None) -> None:
         """Set the event queue for this manager.
@@ -1887,7 +1895,6 @@ class EventManager(EngineScoped):
                 handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
                 the workflow the request ran in (see `_result_workflow_id`).
         """
-        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -1931,14 +1938,12 @@ class EventManager(EngineScoped):
         binding_token = self._bind_request_workflow(handler_call.request_workflow)
         try:
             try:
-                # Actually make the handler callback (support both sync and async):
-                with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
-                    result_payload: ResultPayload = await call_function(handler_call.function, request)
-
-                # Queue flush request for async context (unless result type should skip flush)
-                with operation_depth_mgr:
-                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
-                        self._flush_tracked_parameter_changes()
+                result_payload = await self._dispatch(
+                    handler_call.function,
+                    request,
+                    handler_call.request_workflow.workflow,
+                    outermost=is_outermost_request,
+                )
             except Exception as exc:
                 return self._result_for_handler_exception(
                     request, exc, context=result_context, request_workflow=handler_call.request_workflow
@@ -2027,7 +2032,6 @@ class EventManager(EngineScoped):
                 handler ignores open_workflow_id (see `RequestScope`). The result's envelope names
                 the workflow the request ran in (see `_result_workflow_id`).
         """
-        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -2070,6 +2074,7 @@ class EventManager(EngineScoped):
 
         # Expose the dispatching request type to detectors (see current_request_type).
         is_outermost_request = _active_request_type.get() is None
+        request_workflow = handler_call.request_workflow.workflow
         token = _active_request_type.set(request_type)
         sender_token = _active_request_sender.set(result_context.get("sender"))
         request_id_token = _active_request_id.set(result_context.get("request_id"))
@@ -2077,13 +2082,9 @@ class EventManager(EngineScoped):
         binding_token = self._bind_request_workflow(handler_call.request_workflow)
         try:
             try:
-                with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
-                    result_payload = self._invoke_handler_from_sync(callback, handler_call.function, request)
-
-                # Queue flush request for sync context (unless result type should skip flush)
-                with operation_depth_mgr:
-                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
-                        self._flush_tracked_parameter_changes()
+                result_payload = self._dispatch_from_sync(
+                    callback, handler_call.function, request, request_workflow, outermost=is_outermost_request
+                )
             except Exception as exc:
                 return self._result_for_handler_exception(
                     request, exc, context=result_context, request_workflow=handler_call.request_workflow
@@ -2103,6 +2104,51 @@ class EventManager(EngineScoped):
             if is_outermost_request:
                 self.flush_coalesced_events()
             bound_workflow.reset(binding_token)
+
+    async def _dispatch(
+        self, callback: Callable, request: RequestPayload, workflow: WorkflowRuntime | None, *, outermost: bool
+    ) -> ResultPayload:
+        """Call a request handler, sync or async, as undo records it (see `UndoManager.dispatch`)."""
+        request_type = type(request)
+        async with self.engine.undo_manager.dispatch(request, workflow, outermost=outermost) as undo:
+            with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
+                result_payload: ResultPayload = await call_function(callback, request)
+            undo.note(result_payload)
+
+            # Queue flush request for async context (unless result type should skip flush)
+            with self.engine.operation_depth_manager:
+                if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
+                    self._flush_tracked_parameter_changes()
+        return result_payload
+
+    def _dispatch_from_sync(
+        self,
+        registered: Callable | ForwardingHandler,
+        callback: Callable,
+        request: RequestPayload,
+        workflow: WorkflowRuntime | None,
+        *,
+        outermost: bool,
+    ) -> ResultPayload:
+        """Call a request handler from sync code, as undo records it.
+
+        A request that would have to wait for an undo step to finish is refused instead, since sync
+        code cannot wait (see `UndoManager.dispatch_now`).
+        """
+        request_type = type(request)
+        try:
+            with self.engine.undo_manager.dispatch_now(request, workflow, outermost=outermost) as undo:
+                with observe_dispatch(request_type, self._request_scopes.get(request_type), bound_workflow.get()):
+                    result_payload = self._invoke_handler_from_sync(registered, callback, request)
+                undo.note(result_payload)
+
+                # Queue flush request for sync context (unless result type should skip flush)
+                with self.engine.operation_depth_manager:
+                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
+                        self._flush_tracked_parameter_changes()
+        except StepStillRunningError as err:
+            return GenericResultFailure(result_details=str(err))
+        return result_payload
 
     def _invoke_handler_from_sync(
         self, registered: Callable | ForwardingHandler, callback: Callable, request: RequestPayload
@@ -2375,9 +2421,10 @@ class EventSuppressionContext:
     and in-process callers still receive every result in full.
 
     Suppression applies to the current context and to any nested request dispatched from inside
-    the block, not to the manager as a whole -- see ``_suppressed_event_types`` for why that
-    distinction is load-bearing. Nesting composes: the previous value is restored on exit, so an
-    inner block adding a type does not unsuppress what an outer block was already hiding.
+    the block, not to the manager as a whole -- see ``_event_suppressions`` for why that
+    distinction is load-bearing. A task spawned inside the block is suppressed only until the block
+    exits. Nesting composes: the previous value is restored on exit, so an inner block adding a type
+    does not unsuppress what an outer block was already hiding.
 
     One instance may be entered more than once, whether nested in itself or reused for a later
     block. Tokens are therefore kept on a stack rather than in a single field: with one field, a
@@ -2392,11 +2439,12 @@ class EventSuppressionContext:
     def __init__(self, manager: EventManager, events_to_suppress: AbstractSet[type]):
         self.manager = manager
         self.events_to_suppress = events_to_suppress
-        self._tokens: list[contextvars.Token[frozenset[type]]] = []
+        self._entered: list[tuple[contextvars.Token[tuple[_Suppression, ...]], _Suppression]] = []
 
     def __enter__(self) -> None:
-        currently_suppressed = _suppressed_event_types.get()
-        self._tokens.append(_suppressed_event_types.set(currently_suppressed | frozenset(self.events_to_suppress)))
+        suppression = _Suppression(events=frozenset(self.events_to_suppress))
+        token = _event_suppressions.set((*_event_suppressions.get(), suppression))
+        self._entered.append((token, suppression))
 
     def __exit__(
         self,
@@ -2404,10 +2452,21 @@ class EventSuppressionContext:
         exc_value: BaseException | None,
         exc_traceback: types.TracebackType | None,
     ) -> None:
-        if not self._tokens:
+        if not self._entered:
             return
 
-        _suppressed_event_types.reset(self._tokens.pop())
+        token, suppression = self._entered.pop()
+        # Ends it for the tasks spawned inside the block too, which still hold it.
+        suppression.active = False
+        _event_suppressions.reset(token)
+
+
+@dataclass(eq=False)
+class _Suppression:
+    """One ``EventSuppressionContext`` block: the types it hides, while it is still open."""
+
+    events: frozenset[type]
+    active: bool = True
 
 
 class EventTranslationContext:

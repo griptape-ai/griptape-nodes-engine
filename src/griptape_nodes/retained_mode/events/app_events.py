@@ -55,12 +55,17 @@ class OpenWorkflowState:
         queued_run_count: Runs waiting for the run in progress to end.
         last_run_error: Why the latest run failed, or None when none failed. Cleared when the next run
             starts, and left None by a run that succeeded or was cancelled.
+        undo_label: What `UndoRequest` would take back, such as "Set Parameter Value", or None when
+            there is nothing to undo.
+        redo_label: What `RedoRequest` would put back, or None when there is nothing to redo.
     """
 
     has_unsaved_changes: bool = False
     run_state: WorkflowRunState = WorkflowRunState.IDLE
     queued_run_count: int = 0
     last_run_error: str | None = None
+    undo_label: str | None = None
+    redo_label: str | None = None
 
 
 @dataclass

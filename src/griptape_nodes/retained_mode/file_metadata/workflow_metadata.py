@@ -55,6 +55,8 @@ def _serialize_flow(workflow: WorkflowRuntime, flow_name: str | None = None) -> 
     if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
         logger.warning("Failed to serialize flow '%s' to commands", flow_name or "current")
         return None
+    for value_left_out in serialize_result.values_left_out:
+        logger.warning(value_left_out.save_warning())
 
     try:
         text = dump_json(encode_commands(serialize_result.serialized_flow_commands), separators=(",", ":"))

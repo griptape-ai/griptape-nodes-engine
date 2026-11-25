@@ -53,6 +53,7 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_loading import node_loading
+from griptape_nodes.exe_types.node_metadata import without_first_size
 from griptape_nodes.exe_types.node_types import (
     ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
@@ -63,6 +64,7 @@ from griptape_nodes.exe_types.node_types import (
     TransformedParameterValue,
     _values_differ,
     aprocess_scope,
+    connection_feed_scope,
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
@@ -207,6 +209,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeRequest,
     UnresolveNodeResultFailure,
     UnresolveNodeResultSuccess,
+    ValueLeftOut,
 )
 from griptape_nodes.retained_mode.events.object_events import (
     RenameObjectRequest,
@@ -1758,17 +1761,13 @@ class NodeManager(EngineScoped):
                 result = SetNodeMetadataResultFailure(result_details=details)
                 return result
 
-        changed_keys = {
-            key for key, value in request.metadata.items() if key not in node.metadata or node.metadata[key] != value
-        }
-        # The editor writes a node's size the first time it draws a node that has none. It would draw
-        # the node at that size anyway, so recording it is not a change to the workflow.
-        records_first_size = changed_keys == {"size"} and "size" not in node.metadata
-        altered = bool(changed_keys) and not records_first_size
-
+        before = dict(node.metadata)
         # We can't completely overwrite metadata.
         for key, value in request.metadata.items():
             node.metadata[key] = value
+        for key in request.remove_keys:
+            node.metadata.pop(key, None)
+        altered = without_first_size(before, node.metadata) != before
         details = f"Successfully set metadata for a Node '{node_name}'."
         result = SetNodeMetadataResultSuccess(result_details=details, altered_workflow_state=altered)
         return result
@@ -3097,7 +3096,11 @@ class NodeManager(EngineScoped):
         output_snapshot = dict(node.parameter_output_values) if should_check_output_side_effects else None
 
         try:
-            finalized_value, modified = self._set_and_pass_through_values(request, node)
+            if incoming_node_set:
+                with connection_feed_scope(node):
+                    finalized_value, modified = self._set_and_pass_through_values(request, node)
+            else:
+                finalized_value, modified = self._set_and_pass_through_values(request, node)
         except InvalidParameterValueError as err:
             details = f"Couldn't set '{node_name}.{request.parameter_name}'.\n\n{err}"
             return SetParameterValueResultFailure(result_details=details)
@@ -4692,15 +4695,18 @@ class NodeManager(EngineScoped):
 
                 # Get the creation details for regular nodes
                 metadata_copy = copy.deepcopy(node.metadata)
+                # A node resolved only by a locked pass-through never ran, so it reloads unresolved.
+                if not request.include_run_results or node.resolved_while_locked:
+                    resolution = NodeResolutionState.UNRESOLVED.value
+                else:
+                    resolution = node.state.value
                 # Per live node, never per serialized form -- see the group branch above.
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,
                     specific_library_name=serialized_library_name,
                     metadata=metadata_copy,
-                    # If it is actively resolving, mark as unresolved.
-                    # A node resolved only by a locked pass-through never ran, so it reloads unresolved.
-                    resolution=NodeResolutionState.UNRESOLVED.value if node.resolved_while_locked else node.state.value,
+                    resolution=resolution,
                     initial_setup=True,
                 )
 
@@ -4710,6 +4716,10 @@ class NodeManager(EngineScoped):
 
             # Now assignment of values to all of the parameters.
             set_value_commands = []
+            if request.include_run_results:
+                run_fed_parameter_names: frozenset[str] = frozenset()
+            else:
+                run_fed_parameter_names = frozenset(workflow.flows.connections.incoming_index.get(node_name, {}))
 
             # ErrorProxyNode uses normal parameter serialization now since we create real parameters
             # Only AlterParameterDetailsRequest commands are recorded and replayed
@@ -4726,6 +4736,8 @@ class NodeManager(EngineScoped):
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
+                    include_run_results=request.include_run_results,
+                    run_fed_parameter_names=run_fed_parameter_names,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -5668,6 +5680,8 @@ class NodeManager(EngineScoped):
         create_node_request: CreateNodeRequest,
         *,
         serialize_all_parameter_values: bool = False,
+        include_run_results: bool = True,
+        run_fed_parameter_names: frozenset[str] = frozenset(),
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
 
@@ -5686,6 +5700,8 @@ class NodeManager(EngineScoped):
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Remembers how each value was saved, by identity
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
+            include_run_results (bool): If False, leave out the output value, and the input value of a parameter in run_fed_parameter_names
+            run_fed_parameter_names (frozenset[str]): The parameters whose input value a connection feeds, so a run set it
 
         Returns:
             None (if no value to be serialized) or an IndirectSetParameterValueCommand linking the value to the unique value map
@@ -5696,7 +5712,9 @@ class NodeManager(EngineScoped):
         """
         output_value = None
         internal_value = None
-        if parameter.name in node.parameter_output_values:
+        if not include_run_results and parameter.name in run_fed_parameter_names:
+            return None
+        if include_run_results and parameter.name in node.parameter_output_values:
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
@@ -5763,9 +5781,10 @@ class NodeManager(EngineScoped):
         genuinely failed. Whenever a value was present but could not be recorded (opt-out OR
         genuine failure) the node is marked UNRESOLVED so it re-runs on load and recomputes the
         missing value; downstream consumers would otherwise see None (issue #4994). Only the
-        genuine-failure branch also emits a warning — opt-outs are silent.
+        genuine-failure branch is recorded in the tracker's values_left_out, for a save to warn of.
+        Opt-outs are silent.
 
-        value_kind is "set" or "output" and is used only in the warning text.
+        value_kind is "set" or "output".
         """
         # No value of this kind was set on the node.
         if value is None:
@@ -5797,9 +5816,14 @@ class NodeManager(EngineScoped):
         # Author opted out via serializable=False — silently skip; not a failure.
         if not parameter.serializable:
             return None
-        # Genuine serialization failure — warn and mark unresolved.
-        details = f"Attempted to save the {value_kind} value of parameter '{parameter.name}' on node '{node.name}'. Failed because a '{type(value).__name__}' value has no plain-data form, so the node will run again when the workflow is reopened. To keep the value, register its class with register_value_codec, or set serializable=False on the parameter to stop this warning."
-        logger.warning(details)
+        serialized_parameter_value_tracker.values_left_out.append(
+            ValueLeftOut(
+                node_name=node.name,
+                parameter_name=parameter.name,
+                value_kind=value_kind,
+                type_name=type(value).__name__,
+            )
+        )
         return None
 
     @staticmethod

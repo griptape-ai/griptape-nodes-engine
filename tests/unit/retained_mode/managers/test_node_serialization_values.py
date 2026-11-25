@@ -290,7 +290,7 @@ class TestSerializeOneParameterValueForSave:
         warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
         assert not any("Attempted to save" in message for message in warning_messages)
 
-    def test_genuine_failure_warns_naming_parameter_and_node_and_forces_unresolved(
+    def test_genuine_failure_is_recorded_naming_parameter_and_node_and_forces_unresolved(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         from griptape_nodes.exe_types.node_types import NodeResolutionState
@@ -318,11 +318,13 @@ class TestSerializeOneParameterValueForSave:
 
         assert result is None
         assert create_request.resolution == NodeResolutionState.UNRESOLVED.value
-        warning_messages = [record.message for record in caplog.records if record.levelno == logging.WARNING]
-        assert any(
-            "'troublesome'" in message and "'the_node'" in message and "output value" in message
-            for message in warning_messages
-        )
+        # Serializing is not saving, so it leaves the warning to whatever writes a file.
+        assert not [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(tracker.values_left_out) == 1
+        message = tracker.values_left_out[0].save_warning()
+        assert "'troublesome'" in message
+        assert "'the_node'" in message
+        assert "output value" in message
 
     def test_successful_serialization_returns_a_command_and_leaves_resolution_untouched(self) -> None:
         from griptape_nodes.exe_types.node_types import NodeResolutionState

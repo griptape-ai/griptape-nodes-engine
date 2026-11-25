@@ -421,6 +421,8 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         if not isinstance(serialized_flow_result, SerializeFlowToCommandsResultSuccess):
             logger.error("save_failed_workflow: could not serialize flow; skipping save.")
             return
+        for value_left_out in serialized_flow_result.values_left_out:
+            logger.warning(value_left_out.save_warning())
 
         target_path = await self._resolve_failure_save_path(workflow_name)
         if target_path is None:

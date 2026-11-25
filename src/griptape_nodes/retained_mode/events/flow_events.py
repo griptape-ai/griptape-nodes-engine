@@ -15,7 +15,11 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredReportedMixin,
     WorkflowNotAlteredMixin,
 )
-from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
+from griptape_nodes.retained_mode.events.node_events import (
+    SerializedNodeCommands,
+    SetLockNodeStateRequest,
+    ValueLeftOut,
+)
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.variable_events import CreateVariableRequest
 
@@ -494,17 +498,30 @@ class SerializeFlowToCommandsRequest(RequestPayload, GraphAccessMixin):
         include_create_flow_command (bool): If set to False, this will omit the CreateFlow call from the serialized flow object.
             This can be useful so that the contents of a flow can be deserialized into an existing flow instead of creating a new one and deserializing the nodes into that.
             Copy/paste can make use of this.
+        include_run_results (bool): If set to False, leaves out what a run produced: every node is written as
+            unresolved, without its output values or the input values its connections fed it. What is left is
+            what the user edited.
     """
 
     broadcast_result: bool = False
     flow_name: str | None = None
     include_create_flow_command: bool = True
+    include_run_results: bool = True
 
 
 @dataclass
 @PayloadRegistry.register
 class SerializeFlowToCommandsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The flow's commands.
+
+    Args:
+        serialized_flow_commands: The commands that build the flow.
+        values_left_out: Parameter values the commands could not hold, because they have no plain-data
+            form. A caller that writes the commands to a file warns of each.
+    """
+
     serialized_flow_commands: SerializedFlowCommands
+    values_left_out: list[ValueLeftOut] = field(default_factory=list)
 
 
 @dataclass
@@ -516,7 +533,17 @@ class SerializeFlowToCommandsResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 @dataclass
 @PayloadRegistry.register
 class DeserializeFlowFromCommandsRequest(RequestPayload, GraphAccessMixin):
+    """Build the nodes, connections and values a set of flow commands holds.
+
+    Args:
+        serialized_flow_commands: The commands to build from.
+        existing_nodes: Nodes already in the workflow that the commands' connections may name, by
+            node UUID, mapped to the node's name. The commands build only their own nodes, and
+            connect them to these.
+    """
+
     serialized_flow_commands: SerializedFlowCommands
+    existing_nodes: dict[SerializedNodeCommands.NodeUUID, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -676,12 +703,18 @@ class SetFlowMetadataRequest(RequestPayload, GraphAccessMixin):
     Use when: Updating flow layout information, storing custom flow properties,
     implementing flow management features, saving flow state.
 
+    Args:
+        metadata: Keys to set. Keys it leaves out keep their values.
+        flow_name: Name of the flow to update (None for the current context flow)
+        remove_keys: Keys to remove from the flow's metadata
+
     Results: SetFlowMetadataResultSuccess | SetFlowMetadataResultFailure (flow not found, metadata error)
     """
 
     metadata: dict
     # If None is passed, assumes we're using the Flow in the Current Context
     flow_name: str | None = None
+    remove_keys: list[str] = field(default_factory=list)
 
 
 @dataclass

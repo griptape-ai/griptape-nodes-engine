@@ -168,6 +168,10 @@ Tool calls that build or change a workflow act on one open workflow. A client na
 
 When the workflow a call acts on isn't open, such as after its tab was closed, the call fails with `WorkflowNotOpenResultFailure`. Its `open_workflows` lists the workflows that are open, so you can open one of them with `OpenWorkflowRequest`. A session keeps naming its own workflow after it closes, so every call fails this way until the session opens another, unless the session closed it itself with `CloseWorkflowRequest` or `ClearAllObjectStateRequest`. To close a workflow, send `CloseWorkflowRequest` with its `workflow_id`. It closes that workflow whichever one the header or the session names. A call that acts on a workflow, with neither a header nor a workflow of its session's own, fails with `WorkflowNotNamedResultFailure`, even when exactly one workflow is open in the engine. Send the header, or open a workflow with `OpenWorkflowRequest` first.
 
+## Undo
+
+An agent's changes can be undone one tool call at a time, and an `EventRequestBatch` undoes as one step. Call `UndoRequest` and `RedoRequest` to step back and forward, or set the same `undo_group` on several calls to undo them together. See [Undo and redo](../transports.md#undo-and-redo).
+
 ## Parameter values
 
 Parameter and flow variable values arrive as plain JSON. Values of types JSON lacks arrive as
