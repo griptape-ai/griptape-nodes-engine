@@ -73,16 +73,18 @@ from tests.workflow_context import unsaved_workflow_open
 WINDOWS_MAX_PATH = 260
 
 
+@pytest.fixture
+def setup_workspace(tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
+    """Use a temporary workspace and restore the original path after each test."""
+    original_workspace = engine.config_manager.workspace_path
+    engine.config_manager.workspace_path = tmp_path
+    yield
+    engine.config_manager.workspace_path = original_workspace
+
+
+@pytest.mark.usefixtures("setup_workspace")
 class TestWriteFileRequest:
     """Test WriteFileRequest with various scenarios."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_write_text_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully writing a text file."""
@@ -217,16 +219,9 @@ class TestWriteFileRequest:
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestReadFileRequest:
     """Test ReadFileRequest with failure_reason support."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_read_text_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully reading a text file."""
@@ -392,16 +387,9 @@ class TestReadFileRequestImagePreview:
         assert result.content == self._ONE_PIXEL_PNG
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestCreateFileRequest:
     """Test CreateFileRequest with failure_reason support."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_create_empty_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test creating an empty file."""
@@ -461,16 +449,9 @@ class TestCreateFileRequest:
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestRenameFileRequest:
     """Test RenameFileRequest with failure_reason support."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_rename_file_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully renaming a file."""
@@ -717,16 +698,9 @@ class TestRenameFileRequest:
         assert old_path.read_text() == "Content"
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestListDirectoryRequest:
     """Test ListDirectoryRequest with failure_reason support."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_list_directory_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully listing a directory with sequence grouping disabled."""
@@ -948,15 +922,9 @@ class TestListDirectoryRequest:
         assert str(symlink_path) == str(symlink_dir.absolute())
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestListDirectorySequencesRequest:
     """Test ListDirectorySequencesRequest — sequences-only result."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_returns_only_sequences(self, engine: Engine, tmp_path: Path) -> None:
         """Non-sequence files are absent from the result; sequences are present."""
@@ -1017,15 +985,9 @@ class TestListDirectorySequencesRequest:
         assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestDeduceSequencesFromFileListRequest:
     """Test DeduceSequencesFromFileListRequest — no-I/O sequence detection."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def _write_frames(self, directory: Path, basename: str, ext: str, frames: list[int]) -> list[str]:
         paths = []
@@ -1405,16 +1367,9 @@ class TestTryResolveWindowsSpecialFolder:
         assert result is None
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestExpandPath:
     """Test OSManager._expand_path integration."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Set workspace to tmp_path for tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_expand_path_relative_anchored_on_workspace(
         self,
@@ -1463,18 +1418,11 @@ class TestExpandPath:
         assert result == expected
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestResolveFilePath:
     """Test OSManager.resolve_file_path anchoring behaviour."""
 
     UNSET_VAR_NAME = "GRIPTAPE_UNSET_VAR_FOR_TEST"
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Set workspace to tmp_path for tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     @pytest.mark.parametrize(
         "path_str",
@@ -1522,16 +1470,9 @@ class TestResolveFilePath:
         assert not result.is_relative_to(workspace_path)
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestWindowsLongPathHandling:
     r"""Test Windows long path handling with \\?\ prefix."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     @pytest.fixture
     def long_path(self, tmp_path: Path) -> Path:
@@ -1590,16 +1531,9 @@ class TestWindowsLongPathHandling:
         assert file_path.exists()
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestDeleteFileRequest:
     """Test DeleteFileRequest with various scenarios."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     @pytest.mark.asyncio
     async def test_delete_file_success(self, engine: Engine, tmp_path: Path) -> None:
@@ -1965,16 +1899,9 @@ class TestDeleteFileRequest:
         assert result.outcome == DeletionOutcome.SENT_TO_RECYCLE_BIN
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestGetFileInfoRequest:
     """Test GetFileInfoRequest with various scenarios."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_get_file_info_success(self, engine: Engine, tmp_path: Path) -> None:
         """Test successfully getting file info."""
@@ -2044,16 +1971,9 @@ class TestFileIOFailureReasons:
         assert len(values) == len(set(values))
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestCreateNewFilePolicy:
     """Test CREATE_NEW file policy with auto-incrementing filenames."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        """Automatically set workspace to tmp_path for all tests."""
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_create_new_first_file(self, engine: Engine, tmp_path: Path) -> None:
         """Test CREATE_NEW policy creates file with requested name if available."""
@@ -2272,15 +2192,9 @@ class TestGetDirectorySizeGb:
         assert size_gb == 4096 / (1024**3)
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestGetNextUnusedFilenameRequest:
     """Test GetNextUnusedFilenameRequest preview behavior."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_base_filename_available_returns_unindexed_path(self, engine: Engine, tmp_path: Path) -> None:
         """When the base filename is free, preview returns that path and no index."""
@@ -2350,15 +2264,9 @@ class TestGetNextUnusedFilenameRequest:
         assert legacy_glob == "/anywhere/render_v???.png"
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestGetNextVersionIndexRequest:
     """Test GetNextVersionIndexRequest index-preview behavior."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_required_index_returns_one_when_no_matches(self, engine: Engine, tmp_path: Path) -> None:
         """Required index templates start at index 1 when nothing exists yet."""
@@ -2453,15 +2361,9 @@ class TestGetNextVersionIndexRequest:
         assert result.index == 3  # noqa: PLR2004
 
 
+@pytest.mark.usefixtures("setup_workspace")
 class TestMakeDirectoryRequest:
     """Test MakeDirectoryRequest handler."""
-
-    @pytest.fixture(autouse=True)
-    def setup_workspace(self, tmp_path: Path, engine: Engine) -> Generator[None, None, None]:
-        original_workspace = engine.config_manager.workspace_path
-        engine.config_manager.workspace_path = tmp_path
-        yield
-        engine.config_manager.workspace_path = original_workspace
 
     def test_create_new_directory_success(self, engine: Engine, tmp_path: Path) -> None:
         """Creating a directory that does not yet exist returns success with already_existed=False."""
