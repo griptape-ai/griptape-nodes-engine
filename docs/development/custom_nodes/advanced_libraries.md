@@ -635,7 +635,7 @@ Prefer synthesizing definitions anyway, for two reasons:
 
 ## Examples
 
-Six complete, working libraries. Copy any of the folders into your workspace's
+Seven complete, working libraries. Copy any of the folders into your workspace's
 `libraries` directory, register it through the editor's library settings, and restart the
 engine.
 
@@ -848,3 +848,23 @@ Things to know about this example:
 - **Nodes inside a loop body are not covered.** The event names the canvas node, which only
     receives the last iteration's outputs once the whole loop has finished. During the loop
     the check reads stale outputs.
+
+### Example: a library that blocks a flow from running
+
+A library that refuses to let a flow start at all, toggled by a flag file on disk so you
+can flip pass/fail from a terminal without restarting the engine:
+
+- [`griptape_nodes_library.json`](example_flow_validation_library/griptape_nodes_library.json):
+    manifest declaring the advanced library and no nodes of its own
+- [`advanced_library.py`](example_flow_validation_library/advanced_library.py): implements
+    `validate_flow_before_run`, returning an exception whenever a flag file exists
+
+```sh
+touch /tmp/gtn_flow_validation_should_fail   # the next flow start is blocked
+rm /tmp/gtn_flow_validation_should_fail      # the next flow start succeeds
+```
+
+Run any workflow. With the flag file present, `StartFlowRequest` fails before any node
+runs and `result_details` names the library and the reason. Remove the file and the same
+flow runs normally. Starting a subflow or a loop iteration, or resolving a single node, is
+unaffected either way — this hook only runs for a top-level flow start.
