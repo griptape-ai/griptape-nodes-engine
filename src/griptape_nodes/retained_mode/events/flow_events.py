@@ -12,6 +12,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
     ResultPayloadSuccess,
     WorkflowAlteredMixin,
+    WorkflowAlteredReportedMixin,
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
@@ -560,7 +561,7 @@ class ExtractFlowCommandsFromImageMetadataRequest(RequestPayload, GraphAccessMix
 
 @dataclass(kw_only=True)
 @PayloadRegistry.register
-class ExtractFlowCommandsFromImageMetadataResultSuccess(ResultPayloadSuccess):
+class ExtractFlowCommandsFromImageMetadataResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Flow commands extracted successfully from image metadata.
 
     An image without embedded flow commands is still a success: the image simply
@@ -685,8 +686,11 @@ class SetFlowMetadataRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class SetFlowMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Flow metadata updated successfully."""
+class SetFlowMetadataResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
+    """Flow metadata updated successfully.
+
+    `altered_workflow_state` is False when the flow already had the metadata.
+    """
 
 
 @dataclass

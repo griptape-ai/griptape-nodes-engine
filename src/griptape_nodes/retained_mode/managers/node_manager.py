@@ -3176,7 +3176,10 @@ class NodeManager(EngineScoped):
         # Cool.
         details = f"Successfully set value on Node '{node_name}' Parameter '{request.parameter_name}'."
         result = SetParameterValueResultSuccess(
-            finalized_value=finalized_value, data_type=parameter.type, result_details=details
+            finalized_value=finalized_value,
+            data_type=parameter.type,
+            result_details=details,
+            altered_workflow_state=modified,
         )
         return result
 
@@ -6032,7 +6035,7 @@ class NodeManager(EngineScoped):
             # Get from the current context
             if not workflow.context.has_current_node():
                 details = "Attempted to send message to Node from Current Context. Failed because the Current Context is empty."
-                return SendNodeMessageResultFailure(result_details=details)
+                return SendNodeMessageResultFailure(result_details=details, altered_workflow_state=False)
 
             node = workflow.context.get_current_node()
             node_name = node.name
@@ -6042,7 +6045,7 @@ class NodeManager(EngineScoped):
             node = workflow.objects.get_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to send message to Node '{node_name}', but no such Node was found."
-                return SendNodeMessageResultFailure(result_details=details)
+                return SendNodeMessageResultFailure(result_details=details, altered_workflow_state=False)
 
         # Validate optional_element_name if specified
         if request.optional_element_name is not None:

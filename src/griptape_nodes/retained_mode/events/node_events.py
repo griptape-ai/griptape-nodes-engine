@@ -13,6 +13,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
     ResultPayloadSuccess,
     WorkflowAlteredMixin,
+    WorkflowAlteredReportedMixin,
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -297,7 +298,7 @@ class SetNodeMetadataRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetNodeMetadataResultSuccess(ResultPayloadSuccess):
+class SetNodeMetadataResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Node metadata updated successfully. New metadata stored and available for future requests.
 
     `altered_workflow_state` is False when the request changed no value, or only recorded the size of a
@@ -333,7 +334,7 @@ class BatchSetNodeMetadataRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeMetadataResultSuccess(ResultPayloadSuccess):
+class BatchSetNodeMetadataResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Batch node metadata update completed successfully.
 
     `altered_workflow_state` is True when any node's update altered it, as `SetNodeMetadataResultSuccess` decides.
@@ -425,7 +426,7 @@ class SetLockNodeStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetLockNodeStateResultSuccess(ResultPayloadSuccess):
+class SetLockNodeStateResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Node locked successfully. A saved workflow keeps its lock.
 
     `altered_workflow_state` is False when the node already had the requested lock state.
@@ -461,7 +462,7 @@ class BatchSetNodeLockStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeLockStateResultSuccess(ResultPayloadSuccess):
+class BatchSetNodeLockStateResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Batch node lock state update completed successfully.
 
     `altered_workflow_state` is False when every node already had the requested lock state.
@@ -836,7 +837,7 @@ class SendNodeMessageRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SendNodeMessageResultSuccess(ResultPayloadSuccess):
+class SendNodeMessageResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Node message sent and processed successfully.
 
     Args:
@@ -848,7 +849,7 @@ class SendNodeMessageResultSuccess(ResultPayloadSuccess):
 
 @dataclass
 @PayloadRegistry.register
-class SendNodeMessageResultFailure(ResultPayloadFailure):
+class SendNodeMessageResultFailure(WorkflowAlteredReportedMixin, ResultPayloadFailure):
     """Node message sending failed.
 
     Common causes: node not found, no current context, message handler error,

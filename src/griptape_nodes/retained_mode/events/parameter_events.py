@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
     ResultPayloadSuccess,
     WorkflowAlteredMixin,
+    WorkflowAlteredReportedMixin,
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.connection_events import IncomingConnection, OutgoingConnection
@@ -276,8 +277,10 @@ class SetParameterValueRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetParameterValueResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class SetParameterValueResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Parameter value set successfully. Value may have been processed or converted.
+
+    `altered_workflow_state` is False when the parameter already had the value.
 
     Args:
         finalized_value: The actual value stored after processing

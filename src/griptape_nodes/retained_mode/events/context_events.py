@@ -7,6 +7,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
     ResultPayloadSuccess,
     WorkflowAlteredMixin,
+    WorkflowAlteredReportedMixin,
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
@@ -313,7 +314,7 @@ class EnsureWorkflowAndFlowRequest(RequestPayload, GraphAccessMixin):
 
 @dataclass
 @PayloadRegistry.register
-class EnsureWorkflowAndFlowResultSuccess(ResultPayloadSuccess):
+class EnsureWorkflowAndFlowResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """The workflow and its top-level flow are ready for CreateNode calls that name the workflow.
 
     Reports `altered_workflow_state` when it created the flow of a workflow already open.

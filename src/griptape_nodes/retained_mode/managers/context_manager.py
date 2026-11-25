@@ -768,6 +768,8 @@ class ContextManager(EngineScoped):
             created_workflow=True,
             created_flow=True,
             open_workflow=self.engine.open_workflow_info(workflow),
+            # Opening a workflow is not an edit to it.
+            altered_workflow_state=False,
             result_details=(
                 f"Workflow '{workflow_name}' and Flow '{flow_name}' are ready "
                 "(created_workflow=True, created_flow=True)."
