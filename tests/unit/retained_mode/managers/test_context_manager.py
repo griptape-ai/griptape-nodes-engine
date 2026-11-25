@@ -162,7 +162,7 @@ class TestPushWorkflow:
         """A path with no file behind it opens as an unsaved workflow whose folder is the path's."""
         context_manager = engine.context_manager
 
-        workflow_file = tmp_path.resolve() / "not_written_yet.py"
+        workflow_file = tmp_path / "not_written_yet.py"
         context_manager.push_workflow(file_path=str(workflow_file))
         try:
             workflow = context_manager.get_current_workflow()
@@ -325,7 +325,7 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        workspace = tmp_path.resolve()
+        workspace = tmp_path
         browsed = workspace / "shots" / "sh010"
         browsed.mkdir(parents=True)
         original = config_manager.workspace_path
@@ -355,7 +355,7 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        workspace = tmp_path.resolve()
+        workspace = tmp_path
         original = config_manager.workspace_path
         config_manager.workspace_path = workspace
         try:
@@ -382,7 +382,7 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        workspace = tmp_path.resolve()
+        workspace = tmp_path
         original = config_manager.workspace_path
         config_manager.workspace_path = workspace
         try:
@@ -410,7 +410,7 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        workspace = tmp_path.resolve()
+        workspace = tmp_path
         original = config_manager.workspace_path
         config_manager.workspace_path = workspace
         try:
@@ -439,7 +439,7 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        workspace = tmp_path.resolve()
+        workspace = tmp_path
         original = config_manager.workspace_path
         config_manager.workspace_path = workspace
         try:
@@ -467,7 +467,7 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        workspace = tmp_path.resolve()
+        workspace = tmp_path
         browsed = workspace / "shots" / "sh010"
         browsed.mkdir(parents=True)
         original = config_manager.workspace_path
@@ -529,7 +529,7 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        workspace = tmp_path.resolve()
+        workspace = tmp_path
         not_yet = workspace / "shots" / "sh030"
         original = config_manager.workspace_path
         config_manager.workspace_path = workspace
@@ -866,7 +866,7 @@ class TestRunningANodeForAnotherEngineProcess:
     """An orchestrator and a worker are separate engines: each gives the files it scans ids of its own."""
 
     def test_the_worker_takes_the_orchestrators_id_for_the_file_and_runs_the_node_in_it(self, tmp_path: Path) -> None:
-        workspace = tmp_path.resolve() / "workspace"
+        workspace = tmp_path / "workspace"
         workflow_file = workspace / "shot.py"
         workflow_file.parent.mkdir()
         workflow_file.write_text(
@@ -921,9 +921,9 @@ class TestRunningANodeForAnotherEngineProcess:
         self, tmp_path: Path
     ) -> None:
         """The scan does not find a file outside the workspace, but the worker still runs that workflow's nodes."""
-        workspace = tmp_path.resolve() / "workspace"
+        workspace = tmp_path / "workspace"
         workspace.mkdir()
-        workflow_file = tmp_path.resolve() / "elsewhere" / "shot.py"
+        workflow_file = tmp_path / "elsewhere" / "shot.py"
         workflow_file.parent.mkdir()
         workflow_file.write_text("print('body')\n", encoding="utf-8")
         worker = Engine()

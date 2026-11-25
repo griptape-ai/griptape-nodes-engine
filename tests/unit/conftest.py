@@ -192,8 +192,8 @@ def isolate_engine_logs(tmp_path_factory: pytest.TempPathFactory) -> Generator[P
     with patch.object(engine_dirs, "xdg_state_home", lambda: state_home):
         yield state_home / "griptape_nodes" / "logs"
 
-        # Detach the sinks while the directory still exists: they live on the process-global
-        # logger, so one left behind holds an open file in a directory about to be deleted.
+        # Detach the process-global logger sinks so later tests cannot keep writing
+        # into this test's log directory.
         log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
 
 

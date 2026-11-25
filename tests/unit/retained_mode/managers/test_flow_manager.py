@@ -156,13 +156,10 @@ def empty_flow_commands(engine: Engine) -> SerializedFlowCommands:
 
 
 @pytest.fixture
-def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands, tmp_path: Path) -> Generator[str, None, None]:
+def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands, tmp_path: Path) -> str:
     """A PNG whose FLOW_COMMANDS_KEY payload is flow commands encoded as JSON."""
     path = _image_with_flow_commands_text(json.dumps(encode_commands(empty_flow_commands)), tmp_path)
-    try:
-        yield path
-    finally:
-        Path(path).unlink(missing_ok=True)
+    return path
 
 
 def _a_workflow(engine: Engine) -> WorkflowRuntime:
@@ -245,12 +242,9 @@ class TestExtractFlowCommandsFromImageMetadata:
         self, engine: Engine, text: str, reason: str, tmp_path: Path
     ) -> None:
         path = _image_with_flow_commands_text(text, tmp_path)
-        try:
-            result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
-                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
-            )
-        finally:
-            Path(path).unlink(missing_ok=True)
+        result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
+            ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
+        )
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
         assert reason in str(result.result_details)
@@ -272,7 +266,6 @@ class TestExtractFlowCommandsFromImageMetadata:
 
         (image,) = opened
         assert image.fp is None
-        Path(path).unlink()
 
 
 class TestStartFlowRequestDefaultsToCurrentContext:
