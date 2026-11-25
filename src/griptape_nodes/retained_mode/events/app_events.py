@@ -84,6 +84,7 @@ class OpenWorkflowInfo:
         image: The workflow's thumbnail as its metadata names it: a file name under the
             `save_workflow_thumbnail` situation, or a URL. None when it has none.
         is_template: Whether the workflow is a template.
+        is_griptape_provided: Whether the workflow ships with a library, such as a library's template.
         state: Its unsaved changes and runs.
     """
 
@@ -96,6 +97,7 @@ class OpenWorkflowInfo:
     description: str | None
     image: str | None
     is_template: bool
+    is_griptape_provided: bool
     state: OpenWorkflowState = field(default_factory=OpenWorkflowState)
 
 

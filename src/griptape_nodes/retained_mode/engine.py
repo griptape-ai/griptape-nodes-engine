@@ -887,6 +887,7 @@ class Engine:
             description=entry.metadata.description,
             image=entry.metadata.image,
             is_template=bool(entry.metadata.is_template),
+            is_griptape_provided=bool(entry.metadata.is_griptape_provided),
             state=workflow.state(),
         )
 

@@ -103,16 +103,20 @@ class TestOpenWorkflowInfo:
         assert info.description is None
         assert info.image is None
         assert info.is_template is False
+        assert info.is_griptape_provided is False
 
     def test_reports_the_description_thumbnail_and_template_flag(self, engine: Engine) -> None:
         workflow = _open(engine, "detailed")
 
-        _set_metadata(engine, workflow, description="Makes a cat", image="cat.png", is_template=True)
+        _set_metadata(
+            engine, workflow, description="Makes a cat", image="cat.png", is_template=True, is_griptape_provided=True
+        )
 
         info = engine.open_workflow_info(workflow)
         assert info.description == "Makes a cat"
         assert info.image == "cat.png"
         assert info.is_template is True
+        assert info.is_griptape_provided is True
 
 
 class TestDetailsChangedEvent:
