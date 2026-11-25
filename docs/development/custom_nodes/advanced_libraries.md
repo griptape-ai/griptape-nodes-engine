@@ -483,12 +483,13 @@ hear the startup that loaded its library. Do that work in
 def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None: ...
 ```
 
-Runs once per library, for every library loaded in the process, just before a flow
-starts running — after every node's own `validate_before_workflow_run()` has already run,
-and before the flow's first node executes. `nodes` is every node the run will touch, not
-just the ones your library owns, so this is the place for a rule that only makes sense
-looking at the whole graph: a node count against a license limit, two node types that
-must not appear together, a required node that is missing.
+Runs once per library, for every library loaded in the process, at a fresh, user-initiated
+entry point — starting a flow, or resolving a single node — after every node's own
+`validate_before_workflow_run()` has already run, and before any of the entry point's nodes
+execute. `nodes` is the nodes that entry point is about to run, not just the ones your
+library owns, so this is the place for a rule that only makes sense looking at several
+nodes at once: a node count against a license limit, two node types that must not appear
+together, a required node that is missing. `nodes` includes nodes nested inside groups.
 
 This is the one hook on this page that is **not** notification only. Every other hook —
 most pointedly [`get_execution_event_listeners`](#get_execution_event_listeners), which
@@ -510,18 +511,25 @@ a run that started and then failed.
 
 Constraints on the mechanism:
 
-- **First failure wins.** If one library's call raises, or returns a non-empty list, the
-    engine stops calling further libraries' hooks for that validation pass. It does not
-    collect failures from every library that would have failed.
-- **Keep it quick.** The flow waits for this to return before it can start.
-- **Only a top-level flow start runs it.** A subflow or loop-iteration start (for example a
-    `ForEachGroupNode` body) validates its own nodes without calling library hooks again —
-    the hook's contract is "once, before the top-level flow's first node runs," and by the
-    time a subflow starts, nodes outside it have already run. Resolving a single node
-    (`ResolveNodeRequest`) does not call it either: only that node's own dependency chain is
-    validated, the same way `validate_before_workflow_run()` is. A rule meant to block every
-    run, such as a license limit, still needs the node-level hook as a backstop if it must
-    hold even when a user runs one node at a time.
+- **Every library's hook runs.** A failure doesn't stop the engine from checking the rest —
+    every registered library's hook runs, and every failure is collected, the same way
+    per-node `validate_before_workflow_run()` failures already are. Fixing one library's
+    rejection and re-running isn't needed just to find the next one.
+- **Keep it quick.** The run waits for this to return before it can start.
+- **What `nodes` contains depends on the entry point.** Starting a flow with no node given
+    passes every node in the flow, including nodes nested inside groups (a plain
+    `BaseNodeGroup` or a `SubflowNodeGroup`, any depth) — a `SubflowNodeGroup`'s children live
+    in the group's own `nodes`, and once the group runs, in a separate flow, so they'd
+    otherwise be invisible to a check that only looks at the top-level flow. Starting a flow
+    from a given node passes every node in that node's connected component, which can include
+    upstream nodes that already ran and won't run again. Resolving a single node
+    (`ResolveNodeRequest`) passes only that node's own dependency chain, not the rest of the
+    flow. A `WorkflowNode`'s own subflow is excluded in every case — it's only built once the
+    node starts running, so there's nothing to check beforehand.
+- **Called once per fresh entry point, not per continuation.** A subflow or loop-iteration
+    start (for example a `ForEachGroupNode` body) is an automatic continuation of a run
+    already validated at its entry point, not a new one, so it doesn't call library hooks
+    again.
 
 ## Registering node types without listing them in the manifest
 
@@ -866,5 +874,7 @@ rm /tmp/gtn_flow_validation_should_fail      # the next flow start succeeds
 
 Run any workflow. With the flag file present, `StartFlowRequest` fails before any node
 runs and `result_details` names the library and the reason. Remove the file and the same
-flow runs normally. Starting a subflow or a loop iteration, or resolving a single node, is
-unaffected either way — this hook only runs for a top-level flow start.
+flow runs normally. Resolving a single node (`ResolveNodeRequest`) is blocked the same way.
+Starting a subflow or a loop iteration is unaffected either way — those are automatic
+continuations of a run already validated at its entry point, not fresh entry points of
+their own.

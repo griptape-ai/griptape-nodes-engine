@@ -1774,15 +1774,14 @@ class FlowManager(EngineScoped):
             return start_node
 
         # Run validation before starting the subflow. Library validation hooks are skipped here:
-        # they're contracted to run once, before the top-level flow's first node runs, and a
-        # subflow start happens mid-run, once per loop iteration.
-        validation_result = await self.on_validate_flow_dependencies_request(
-            ValidateFlowDependenciesRequest(
-                flow_name=flow_name,
-                flow_node_name=start_node.name if start_node else None,
-                run_library_validation=False,
-            ),
+        # they run once per fresh, user-initiated entry point (a top-level flow start or a
+        # single-node resolve), and a subflow/loop-iteration start is an automatic continuation
+        # of a run already validated at its entry point, not a new one.
+        validation_result = await self._validate_flow_dependencies(
             workflow,
+            flow_name,
+            start_node.name if start_node else None,
+            run_library_validation=False,
         )
         if validation_result.failed():
             # Extract error details from the failed validation result
@@ -2045,15 +2044,24 @@ class FlowManager(EngineScoped):
     async def on_validate_flow_dependencies_request(
         self, request: ValidateFlowDependenciesRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
-        flow_name = request.flow_name
-        # get the flow name
+        return await self._validate_flow_dependencies(
+            workflow, request.flow_name, request.flow_node_name, run_library_validation=True
+        )
+
+    async def _validate_flow_dependencies(
+        self,
+        workflow: WorkflowRuntime,
+        flow_name: str,
+        flow_node_name: str | None,
+        *,
+        run_library_validation: bool,
+    ) -> ResultPayload:
         try:
             flow = self.get_flow_by_name_in(workflow, flow_name)
         except KeyError as err:
             details = f"Failed to validate flow. Error: {err}"
             return ValidateFlowDependenciesResultFailure(result_details=details)
-        if request.flow_node_name:
-            flow_node_name = request.flow_node_name
+        if flow_node_name:
             flow_node = workflow.objects.get_as_type(flow_node_name, BaseNode)
             if not flow_node:
                 details = f"Provided node with name {flow_node_name} does not exist"
@@ -2069,30 +2077,54 @@ class FlowManager(EngineScoped):
             if exceptions:
                 all_exceptions = all_exceptions + exceptions
 
-        if request.run_library_validation:
-            all_exceptions = all_exceptions + self._run_library_flow_validation_hooks(flow, nodes)
+        if run_library_validation:
+            all_exceptions = all_exceptions + self.run_library_flow_validation_hooks(flow, nodes)
         return ValidateFlowDependenciesResultSuccess(
             validation_succeeded=len(all_exceptions) == 0,
             exceptions=all_exceptions,
             result_details=f"Validated flow dependencies: {len(all_exceptions)} exceptions found",
         )
 
-    def _run_library_flow_validation_hooks(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception]:
-        """Run every loaded library's validate_flow_before_run hook. First failure wins."""
+    def run_library_flow_validation_hooks(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception]:
+        """Run every loaded library's validate_flow_before_run hook, collecting every failure.
+
+        `nodes` is expanded first to include nodes nested inside any group, any depth, since a
+        `SubflowNodeGroup`'s children live in the group's own `nodes` dict rather than in `flow.nodes`
+        or an unexpanded dependency chain. Mirrors `get_involved_node_names`.
+        """
+        expanded_nodes = self._nodes_with_group_children(nodes)
+        all_exceptions: list[Exception] = []
         for library_name in LibraryRegistry.list_libraries():
             advanced_library = LibraryRegistry.get_library(library_name).get_advanced_library()
             if advanced_library is None:
                 continue
             try:
-                library_exceptions = advanced_library.validate_flow_before_run(flow, nodes)
+                library_exceptions = advanced_library.validate_flow_before_run(flow, expanded_nodes)
             except Exception as err:
-                logger.exception("Library '%s' validate_flow_before_run raised an exception", library_name)
-                return [RuntimeError(f"Library '{library_name}' rejected the flow: {err}")]
+                # A raise is a documented way to reject a flow, not necessarily a bug, so this
+                # logs a short warning rather than a full ERROR traceback.
+                logger.warning("Library '%s' validate_flow_before_run raised: %s", library_name, err)
+                all_exceptions.append(err)
+                continue
             if library_exceptions:
-                return [
-                    RuntimeError(f"Library '{library_name}' rejected the flow: {exc}") for exc in library_exceptions
-                ]
-        return []
+                all_exceptions.extend(library_exceptions)
+        return all_exceptions
+
+    @staticmethod
+    def _nodes_with_group_children(nodes: list[BaseNode]) -> list[BaseNode]:
+        """Expand `nodes` to include every node nested inside a group, any depth."""
+        expanded: list[BaseNode] = []
+        to_visit = list(nodes)
+        visited_ids: set[int] = set()
+        while to_visit:
+            node = to_visit.pop()
+            if id(node) in visited_ids:
+                continue
+            visited_ids.add(id(node))
+            expanded.append(node)
+            if isinstance(node, BaseNodeGroup):
+                to_visit.extend(node.nodes.values())
+        return expanded
 
     @handles(ListFlowsInCurrentContextRequest)
     def on_list_flows_in_current_context_request(

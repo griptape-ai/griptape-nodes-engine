@@ -10,6 +10,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import DataNode
+from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -261,6 +262,26 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
 
         assert isinstance(result, ValidateNodeDependenciesResultSuccess), result.result_details
         assert result.exceptions == [problem]
+
+    def test_validating_dependencies_also_runs_library_flow_validation_hooks(self, engine: Engine) -> None:
+        """Resolving a single node is a fresh entry point, so it closes the same gap a full flow start does."""
+        other = _other_workflow_with_connected_nodes(engine)
+        failure = RuntimeError("flow violates a cross-library rule")
+        advanced_library = AdvancedNodeLibrary()
+
+        with (
+            _also_open(engine, other),
+            patch.object(advanced_library, "validate_flow_before_run", return_value=[failure]),
+            patch.object(LibraryRegistry, "list_libraries", return_value=["Failing Library"]),
+            patch.object(LibraryRegistry, "get_library") as mock_get_library,
+        ):
+            mock_get_library.return_value.get_advanced_library.return_value = advanced_library
+            result = engine.node_manager.on_validate_node_dependencies_request(
+                ValidateNodeDependenciesRequest(node_name="target"), other
+            )
+
+        assert isinstance(result, ValidateNodeDependenciesResultSuccess), result.result_details
+        assert result.exceptions == [failure]
 
     @pytest.mark.asyncio
     async def test_deleting_a_node_mid_run_clears_the_run_queue_of_the_workflow_it_is_handed(

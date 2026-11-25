@@ -291,13 +291,18 @@ class AdvancedNodeLibrary:
         return []
 
     def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None:
-        """Validate a whole flow, and every node it will run, before it starts.
+        """Validate a flow, and the nodes about to run, before they start.
 
         Unlike the other hooks on this class, this one can block: a non-empty return, or a
-        raised exception, stops the flow and is reported as a validation failure. First
-        failure wins — one library failing stops the rest from being called. Keep it quick;
-        the flow waits for this to return. Only a top-level flow start calls this — not a
-        subflow/loop-iteration start, and not resolving a single node.
+        raised exception, is reported as a validation failure and stops the run. Every
+        library's hook runs and every failure is collected, so fixing one library's rejection
+        doesn't require a second attempt just to find the next one. Keep it quick; the run
+        waits for this to return.
+
+        Called once per fresh, user-initiated entry point — starting a flow, or resolving a
+        single node — not for an automatic continuation of a run already validated at its
+        entry point (a subflow or loop-iteration start). `nodes` includes nodes nested inside
+        groups, but not a `WorkflowNode`'s subflow, which is only built once it starts running.
         """
 
     def get_app_event_listeners(
