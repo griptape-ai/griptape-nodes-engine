@@ -51,3 +51,22 @@ class TestPngMetadataDriver:
 
         assert b"zTXt" in _chunk_types(png)
         assert PngMetadataDriver().extract_metadata(Image.open(BytesIO(png))) == {"gtn_large": large_text}
+
+
+class TestPngMetadataDriverKeepsExistingText:
+    def test_pillow_route_keeps_unrelated_text_and_replaces_a_repeated_key(self) -> None:
+        # Given an image that already carries text for two keys.
+        source = BytesIO()
+        info = PngImagePlugin.PngInfo()
+        info.add_text("gtn_workflow_name", "OLD")
+        info.add_text("prompt", "a cat")
+        Image.new("RGB", (4, 4)).save(source, format="PNG", pnginfo=info)
+        source.seek(0)
+
+        # When new metadata is injected for one of those keys.
+        with Image.open(source) as image:
+            png = PngMetadataDriver().inject_metadata(image, {"gtn_workflow_name": "NEW"})
+
+        # Then the repeated key is replaced and the other is kept.
+        with Image.open(BytesIO(png)) as result:
+            assert PngMetadataDriver().extract_metadata(result) == {"gtn_workflow_name": "NEW", "prompt": "a cat"}

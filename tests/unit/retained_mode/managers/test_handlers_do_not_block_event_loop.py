@@ -39,6 +39,15 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_gene
     PILThumbnailGenerator,
 )
 
+try:
+    from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.openimageio_thumbnail_generator import (
+        OpenImageIOThumbnailGenerator,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "OpenImageIO":
+        raise
+    OpenImageIOThumbnailGenerator = None
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -49,6 +58,20 @@ _RESPONSIVE_WITHIN_SECONDS = 1.0
 # Only reached if the loop is held, so the test cannot release the step in time.
 _SLOW_STEP_GIVES_UP_SECONDS = 5.0
 _START_TIMEOUT_SECONDS = 10.0
+
+_PREVIEW_GENERATORS = [
+    pytest.param(PILThumbnailGenerator, id="pillow-thumbnail"),
+    pytest.param(PILRoundedPreviewGenerator, id="rounded"),
+]
+_PREVIEW_RENDER_METHODS = [
+    pytest.param(PILThumbnailGenerator, "_encode_thumbnail", id="pillow-thumbnail"),
+    pytest.param(PILRoundedPreviewGenerator, "_render_rounded_preview", id="rounded"),
+]
+if OpenImageIOThumbnailGenerator is not None:
+    _PREVIEW_GENERATORS.append(pytest.param(OpenImageIOThumbnailGenerator, id="oiio-thumbnail"))
+    _PREVIEW_RENDER_METHODS.append(
+        pytest.param(OpenImageIOThumbnailGenerator, "_render_thumbnail", id="oiio-thumbnail")
+    )
 
 
 class _SlowStep:
@@ -297,8 +320,9 @@ class TestConfigWrites:
     def test_config_write_without_a_running_loop_reaches_the_user_config(
         self, engine: Engine, isolate_user_config: Path
     ) -> None:
-        assert engine.config_manager.set_config_value("max_nodes_in_parallel", 7)
+        written = engine.config_manager.set_config_value("max_nodes_in_parallel", 7)
 
+        assert written
         assert _read_max_nodes_in_parallel(isolate_user_config) == 7  # noqa: PLR2004
 
     @pytest.mark.asyncio
@@ -306,8 +330,9 @@ class TestConfigWrites:
         self, engine: Engine, isolate_user_config: Path
     ) -> None:
         """The sync caller blocks the loop thread, so the write must run on a loop of its own."""
-        assert engine.config_manager.set_config_value("max_nodes_in_parallel", 8)
+        written = engine.config_manager.set_config_value("max_nodes_in_parallel", 8)
 
+        assert written
         assert _read_max_nodes_in_parallel(isolate_user_config) == 8  # noqa: PLR2004
 
     def test_config_write_reports_failure_when_the_write_raises(
@@ -370,14 +395,7 @@ def _make_generator(generator_type: type, engine: Engine, source: Path, destinat
 
 class TestPreviewGenerators:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("generator_type", "render_method"),
-        [
-            (PILThumbnailGenerator, "_render_thumbnail"),
-            (PILRoundedPreviewGenerator, "_render_rounded_preview"),
-        ],
-        ids=["thumbnail", "rounded"],
-    )
+    @pytest.mark.parametrize(("generator_type", "render_method"), _PREVIEW_RENDER_METHODS)
     async def test_engine_answers_while_a_preview_is_rendered(
         self,
         engine: Engine,
@@ -390,7 +408,13 @@ class TestPreviewGenerators:
         source.write_bytes(_png_bytes())
         generator = _make_generator(generator_type, engine, source, tmp_path / "previews")
         step = _SlowStep()
-        monkeypatch.setattr(generator, render_method, lambda _image_data: step.run(_png_bytes()))
+        original_render = getattr(generator, render_method)
+
+        def slow_render(*args: Any, **kwargs: Any) -> Any:
+            step.run(None)
+            return original_render(*args, **kwargs)
+
+        monkeypatch.setattr(generator, render_method, slow_render)
 
         generation = asyncio.create_task(generator.attempt_generate_preview())
         try:
@@ -404,9 +428,7 @@ class TestPreviewGenerators:
         assert step.thread_id != threading.get_ident()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "generator_type", [PILThumbnailGenerator, PILRoundedPreviewGenerator], ids=["thumbnail", "rounded"]
-    )
+    @pytest.mark.parametrize("generator_type", _PREVIEW_GENERATORS)
     @pytest.mark.parametrize("mode", ["RGB", "RGBA"])
     async def test_preview_is_still_rendered_from_the_source_image(
         self, engine: Engine, tmp_path: Path, generator_type: type, mode: str
@@ -422,9 +444,7 @@ class TestPreviewGenerators:
             assert preview.height <= 32  # noqa: PLR2004
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "generator_type", [PILThumbnailGenerator, PILRoundedPreviewGenerator], ids=["thumbnail", "rounded"]
-    )
+    @pytest.mark.parametrize("generator_type", _PREVIEW_GENERATORS)
     async def test_preview_write_failure_raises(
         self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generator_type: type
     ) -> None:
@@ -436,8 +456,20 @@ class TestPreviewGenerators:
             msg = "disk unavailable"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(engine.os_manager.writer, "_attempt_atomic_file_write", fail_to_write)
-        monkeypatch.setattr(engine.os_manager.writer, "_attempt_file_write", fail_to_write)
+        if generator_type is PILRoundedPreviewGenerator:
+            monkeypatch.setattr(engine.os_manager.writer, "_attempt_atomic_file_write", fail_to_write)
+            monkeypatch.setattr(engine.os_manager.writer, "_attempt_file_write", fail_to_write)
+            expected_message = "Failed to write preview image"
+        else:
+            destination = tmp_path / "previews"
+            destination.write_text("This file blocks creation of the preview directory.")
+            expected_message = "Attempted to write preview"
 
-        with pytest.raises(OSError, match="Failed to write preview image"):
+        with pytest.raises(OSError, match=expected_message) as error:
             await generator.attempt_generate_preview()
+
+        if generator_type is not PILRoundedPreviewGenerator:
+            destination_path = tmp_path / "previews" / "preview.webp"
+            assert str(error.value).startswith(
+                f"Attempted to write preview '{destination_path}' for '{source}'. Failed due to "
+            )

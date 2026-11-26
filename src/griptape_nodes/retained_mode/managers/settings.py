@@ -818,6 +818,17 @@ class Settings(BaseModel):
         default=True,
         description="Automatically inject workflow metadata into saved files with supported formats",
     )
+    preserve_source_metadata_in_thumbnails: bool = Field(
+        category=STORAGE,
+        default=False,
+        description="Keep source PNG text in PNG thumbnails, including artist notes and source workflow metadata. Current workflow metadata replaces matching keys when automatic injection is enabled.",
+    )
+    max_thumbnail_source_pixels: int = Field(
+        category=SYSTEM_REQUIREMENTS,
+        default=178956970,
+        gt=0,
+        description="Maximum stored source pixels allowed when creating a standard thumbnail. Pillow also enforces its own pixel ceiling; raising this setting beyond that ceiling requires the OpenImageIO backend. Raising the limit can require substantial memory; channel count, bit depth and processing copies also affect memory use.",
+    )
     minimum_disk_space_gb_libraries: float = Field(
         category=SYSTEM_REQUIREMENTS,
         default=10.0,

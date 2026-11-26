@@ -38,6 +38,7 @@ class TestExifMetadataDriver:
     @pytest.mark.parametrize(
         "user_comment",
         ["shot on a phone", '["not", "an", "object"]', "[" * 20000, '{"a":' + "1" * 5000 + "}"],
+        ids=["plain-text", "json-array", "deeply-nested-array", "oversized-integer"],
     )
     def test_inject_replaces_user_comment_that_is_not_a_json_object(self, user_comment: str) -> None:
         written = ExifMetadataDriver().inject_metadata(_image("JPEG", user_comment), {"k1": "v1"})

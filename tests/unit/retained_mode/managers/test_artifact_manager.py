@@ -2,7 +2,7 @@ import json
 import os
 from collections.abc import Generator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 from unittest.mock import Mock, patch
 
 import anyio
@@ -45,11 +45,6 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils import ffmpeg_cache
 from tests.workflow_context import unsaved_workflow_open
-
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
-        PILThumbnailParameters,
-    )
 
 # ==================================================================================
 # CRITICAL WARNING: Config Isolation for Tests
@@ -1789,83 +1784,6 @@ def _make_preview_metadata(*, source_file_size: int, source_file_modified_time: 
 class TestGeneratorValidation:
     """Test generator parameter validation logic."""
 
-    def test_pil_thumbnail_validate_parameters_valid(self) -> None:
-        """Test PILThumbnailGenerator validates correct parameters."""
-        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
-        )
-
-        params = {"max_width": 1024, "max_height": 768}
-        params_model_class = PILThumbnailGenerator.get_parameters()
-        # Should not raise ValidationError
-        params_model_class.model_validate(params)
-
-    def test_pil_thumbnail_validate_parameters_invalid_type(self) -> None:
-        """Test PILThumbnailGenerator rejects invalid types."""
-        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
-        )
-
-        params = {"max_width": "not_a_number", "max_height": 768}
-        params_model_class = PILThumbnailGenerator.get_parameters()
-
-        with pytest.raises(ValidationError) as exc_info:
-            params_model_class.model_validate(params)
-
-        errors = exc_info.value.errors()
-        assert len(errors) >= 1
-        assert any(e["loc"][0] == "max_width" for e in errors)
-
-    def test_pil_thumbnail_validate_parameters_invalid_value(self) -> None:
-        """Test PILThumbnailGenerator rejects negative values."""
-        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
-        )
-
-        params = {"max_width": -100, "max_height": 768}
-        params_model_class = PILThumbnailGenerator.get_parameters()
-
-        with pytest.raises(ValidationError) as exc_info:
-            params_model_class.model_validate(params)
-
-        errors = exc_info.value.errors()
-        assert len(errors) >= 1
-        assert any(e["loc"][0] == "max_width" and "greater_than" in e["type"] for e in errors)
-
-    def test_pil_thumbnail_validate_parameters_missing_key(self) -> None:
-        """Test PILThumbnailGenerator uses defaults for missing parameters."""
-        from typing import cast
-
-        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
-        )
-
-        params = {"max_width": 1024}
-        params_model_class = PILThumbnailGenerator.get_parameters()
-
-        # With Pydantic, fields with defaults are optional - should use default value
-        validated_params = cast("PILThumbnailParameters", params_model_class.model_validate(params))
-        assert validated_params.max_width == 1024  # noqa: PLR2004
-        assert validated_params.max_height == 1024  # Uses default value  # noqa: PLR2004
-
-    def test_pil_thumbnail_validate_parameters_extra_key(self) -> None:
-        """Test PILThumbnailGenerator ignores unknown parameters (backward compatibility)."""
-        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
-        )
-
-        params = {"max_width": 1024, "max_height": 768, "unknown_param": 42}
-        params_model_class = PILThumbnailGenerator.get_parameters()
-
-        # Extra fields are ignored (for backward compatibility with old configs)
-        # See https://github.com/griptape-ai/griptape-nodes-engine/issues/3980
-        validated_params = cast("PILThumbnailParameters", params_model_class.model_validate(params))
-
-        # Only known fields are included in the model
-        assert validated_params.max_width == 1024  # noqa: PLR2004
-        assert validated_params.max_height == 768  # noqa: PLR2004
-        assert not hasattr(validated_params, "unknown_param")
-
     def test_pil_rounded_validate_parameters_valid(self) -> None:
         """Test PILRoundedPreviewGenerator validates correct parameters."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
@@ -1892,26 +1810,6 @@ class TestGeneratorValidation:
         errors = exc_info.value.errors()
         assert len(errors) >= 1
         assert any(e["loc"][0] == "corner_radius_percent" and "greater_than_equal" in e["type"] for e in errors)
-
-    def test_generator_constructor_uses_validation(self, tmp_path: Path) -> None:
-        """Test generator constructors use Pydantic validation and raise ValidationError on invalid params."""
-        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
-        )
-
-        invalid_params = {"max_width": "not_a_number", "max_height": 768}
-
-        source_path = tmp_path / "test.png"
-        dest_dir = tmp_path / "preview"
-
-        with pytest.raises(ValidationError):
-            PILThumbnailGenerator(
-                source_file_location=str(source_path),
-                preview_format="webp",
-                destination_preview_directory=str(dest_dir),
-                destination_preview_file_name="preview.webp",
-                params=invalid_params,
-            )
 
     @pytest.mark.asyncio
     async def test_get_artifact_schemas_structure(self) -> None:
@@ -1993,7 +1891,7 @@ class TestProviderRegistrationConfigLogLevels:
             GetConfigCategoryRequest,
         )
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
         manager = ArtifactManager(engine=Mock())
@@ -2004,7 +1902,7 @@ class TestProviderRegistrationConfigLogLevels:
             return engine.handle_request(request)
 
         manager.engine.handle_request = capture_requests
-        manager._read_generator_config(ImageArtifactProvider, PILThumbnailGenerator)
+        manager._read_generator_config(ImageArtifactProvider, ThumbnailGenerator)
 
         category_requests = [r for r in captured_requests if isinstance(r, GetConfigCategoryRequest)]
         assert len(category_requests) == 1

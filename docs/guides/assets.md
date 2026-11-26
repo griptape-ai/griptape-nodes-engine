@@ -38,6 +38,73 @@ customize all of it.
 
 <!-- screenshot (#5166): the default project's folder layout in a file manager, with inputs and outputs visible -->
 
+## Thumbnail precision
+
+The engine selects its standard thumbnail backend at startup and logs its name at INFO level.
+It uses OpenImageIO when installed and Pillow otherwise; selection remains fixed until restart.
+Install `griptape-nodes-engine[openimageio]` to enable OpenImageIO. App packaging is updated
+separately, so the app's dependency declaration determines whether the extra is installed.
+
+With OpenImageIO, the standard thumbnail generator preserves 16-bit source precision in PNG
+previews. JPEG and WebP previews use 8-bit channels. A preview's format determines whether
+it can retain the source's bit depth. PNG workflow metadata is added without re-encoding
+the pixels, including for ordinary PNG saves. The original file is unchanged.
+
+Standard thumbnails read source bytes through the engine's normal file-read operation.
+OpenImageIO copies them into a private subdirectory of the project's `temp` directory for
+decoding and encoding; Pillow decodes and encodes in memory. Source and preview scratch files are removed after rendering, and the preview bytes
+are saved through the engine's normal file-write operation.
+
+Standard thumbnails check the stored source dimensions before decoding pixels.
+`max_thumbnail_source_pixels` defaults to `178956970`, matching the previous Pillow refusal
+threshold. The setting can lower the limit for either backend. Pillow also enforces its own
+pixel ceiling, so raising this setting above that ceiling requires OpenImageIO. Install
+`griptape-nodes-engine[openimageio]` and restart the engine to select that backend. Increase
+the setting only if your machine has enough memory.
+The limit counts data-window pixels; it does not bound encoded source bytes, channel count,
+bit depth or total processing memory. The source bytes are already buffered before this check.
+
+PNG thumbnails include workflow metadata when `auto_inject_workflow_metadata` is enabled.
+Source PNG text is discarded by default, matching the previous thumbnail behaviour.
+Set `preserve_source_metadata_in_thumbnails` to `true` to keep source text, including artist
+notes and source workflow fields. Retained text uses compression for long values within the
+PNG text-size limit, and Unicode is preserved. Current workflow metadata replaces matching
+keys; source-only fields remain, so a preview can contain both source and current provenance.
+This setting applies only to PNG source text in PNG thumbnails and is independent of
+`auto_inject_workflow_metadata`. Ordinary PNG saves retain their existing metadata policy. If the
+metadata cannot be added, the thumbnail is still saved and the engine logs a warning.
+Thumbnail writes replace the previous preview only after encoding and codec verification
+succeed, so a failed write leaves the previous preview available.
+
+Transparent images are resized with colour weighted by alpha, so hidden colours in fully
+transparent pixels do not add dark or coloured fringes to visible edges.
+
+Grayscale images also get WebP and JPEG previews. WebP retains grayscale transparency;
+JPEG removes transparency after restoring straight colour, without compositing onto a new
+background. PNG retains grayscale channels and transparency. For images
+with more than four channels, PNG and WebP previews use the first four as red, green, blue
+and alpha. JPEG previews use the first three as red, green and blue. Extra channels remain
+in the original file.
+
+### Generator-level format support
+
+With the OpenImageIO backend, node library authors using `ThumbnailGenerator` directly can use
+source extensions from an
+explicit image-plugin allowlist, filtered for installed OpenImageIO input plugins. This includes
+formats such as OpenEXR, Radiance HDR and DPX when their readers are installed.
+
+The built-in Image provider and engine preview requests still accept PNG, JPEG, GIF, BMP,
+WebP, TIFF and TGA. The additional generator formats are not yet available through
+`GeneratePreviewRequest` or `GeneratePreviewFromDefaultsRequest`. Provider registration,
+metadata inspection, permission checks and project-directory routing will be addressed in
+follow-up work under [#6180](https://github.com/griptape-ai/griptape-nodes-engine/issues/6180).
+
+For direct OpenImageIO generator calls, EXR output shows the display window, preserving cropped-render
+placement and proportions. Overscan is excluded, and missing pixels appear black or transparent
+according to the source channels. Scene-linear sources such as EXR and HDR are converted to
+sRGB using the built-in colour configuration. Unsupported colour spaces, such as camera-log
+DPX, retain their pixel values and produce a warning. Original files are unchanged.
+
 ## How the editor previews and downloads files
 
 When the engine needs to show you a file or let you download it, it
