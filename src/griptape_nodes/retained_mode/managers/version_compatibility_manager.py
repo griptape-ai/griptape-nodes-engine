@@ -25,9 +25,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
-from griptape_nodes.retained_mode.managers.fitness_problems.libraries.deprecated_node_warning_problem import (
-    DeprecatedNodeWarningProblem,
-)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.invalid_beta_feature_problem import (
     InvalidBetaFeatureProblem,
 )
@@ -214,24 +211,6 @@ class VersionCompatibilityManager(EngineScoped):
                 self._set_parameter_compatibility_checks.append(check_instance)
                 logger.debug("Registered set parameter version compatibility check: %s", attr_name)
 
-    def _check_library_for_deprecated_nodes(
-        self, library_data: LibrarySchema
-    ) -> list[LibraryVersionCompatibilityIssue]:
-        """Check a library for deprecated nodes."""
-        return [
-            LibraryVersionCompatibilityIssue(
-                problem=DeprecatedNodeWarningProblem(
-                    display_name=node.metadata.display_name,
-                    class_name=node.class_name,
-                    removal_version=node.metadata.deprecation.removal_version,
-                    deprecation_message=node.metadata.deprecation.deprecation_message,
-                ),
-                severity=LibraryManager.LibraryFitness.FLAWED,
-            )
-            for node in library_data.nodes
-            if node.metadata.deprecation is not None
-        ] or []
-
     def _check_library_for_beta_feature_problems(
         self, library_data: LibrarySchema
     ) -> list[LibraryVersionCompatibilityIssue]:
@@ -262,7 +241,6 @@ class VersionCompatibilityManager(EngineScoped):
                 issues = check_instance.check_library(library_data)
                 version_issues.extend(issues)
 
-        version_issues.extend(self._check_library_for_deprecated_nodes(library_data))
         version_issues.extend(self._check_library_for_beta_feature_problems(library_data))
 
         return version_issues

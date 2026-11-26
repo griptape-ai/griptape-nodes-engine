@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
+from griptape_nodes.node_library.library_registry import DeprecatedNodeNotice
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     RequestPayload,
@@ -311,6 +312,8 @@ class LibraryLoadStatus:
         fitness: LibraryFitness value (e.g. "GOOD", "FLAWED", "UNUSABLE").
         disabled: True when the library is disabled in the user's config.
         problems: Collated problem summary, or None when there are none.
+        deprecated_nodes: The nodes the library marks deprecated. Not problems: show them as a
+            notice. Empty when the library didn't load.
     """
 
     library_name: str | None
@@ -319,6 +322,7 @@ class LibraryLoadStatus:
     fitness: str
     disabled: bool
     problems: str | None = None
+    deprecated_nodes: list[DeprecatedNodeNotice] = field(default_factory=list)
 
 
 @dataclass

@@ -147,6 +147,7 @@ class LibraryMetadataLoading(EngineScoped):
                         enabled=True,
                         is_registered=is_library_name_registered(scan_result.library_schema.name),
                         result_details=scan_result.result_details,
+                        deprecated_nodes=scan_result.library_schema.deprecated_nodes(),
                     )
                 # else: Keep the load failure result
 
@@ -316,6 +317,7 @@ class LibraryMetadataLoading(EngineScoped):
             enabled=enabled,
             is_registered=is_library_name_registered(library_data.name),
             result_details=details,
+            deprecated_nodes=library_data.deprecated_nodes(),
         )
 
     async def _aload_library_metadata(

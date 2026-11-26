@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.exe_types.elements.containers import ParameterList
 from griptape_nodes.node_library.library_registry import (
+    DeprecatedNodeNotice,
     LibraryMetadata,
     LibrarySchema,
     NodeMetadata,
@@ -529,6 +530,9 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
                                 next engine start, because this engine has already loaded
                                 packages from the library's environment. Lets a client say so
                                 before the artist confirms.
+        deprecated_nodes: The nodes this library marks deprecated, through `metadata.deprecation` or
+                          their own `lifecycle_stage` of DEPRECATED. Reported here, not in
+                          `problems`, because deprecation isn't a fault: show it as a notice.
     """
 
     library_schema: LibrarySchema
@@ -543,6 +547,7 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
     problems: str | None = None
     execution_env_failure: str | None = None
     reset_requires_restart: bool = False
+    deprecated_nodes: list[DeprecatedNodeNotice] = field(default_factory=list)
 
 
 @dataclass

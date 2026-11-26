@@ -206,6 +206,32 @@ Semantics:
 - **Library-level absence is intentionally distinct from `STABLE`.** A library with no `lifecycle_stage` declaration is "unstated" — consumers should surface that explicitly (`<No lifecycle stage provided by library author>`) rather than silently assume `STABLE`.
 - **Node-level absence means "inherit the library's stage."** A node-level `lifecycle_stage` overrides the library's value.
 
+##### Deprecating a node
+
+To retire a node, keep it in the manifest so saved workflows still open, and add a `deprecation` entry to its `metadata`:
+
+```json
+{
+  "class_name": "SeedanceVideoGeneration",
+  "file_path": "video/seedance_video_generation.py",
+  "metadata": {
+    "category": "video",
+    "description": "Generates a video with the Seedance 1.x models.",
+    "display_name": "Seedance Video Generation",
+    "deprecation": {
+      "deprecation_message": "Use Seedance 2.0 Video Generation instead.",
+      "removal_version": "2.0.0"
+    }
+  }
+}
+```
+
+Both fields are optional. Use the message to name the replacement. The editor shows it in the node's Deprecated badge and on its docs page.
+
+A node-level `lifecycle_stage` of `DEPRECATED` also marks the node deprecated, with no message. Prefer `deprecation`, since it tells artists what to use instead.
+
+The engine sends deprecated nodes in the `deprecated_nodes` list of `LoadLibraryMetadataFromFileResultSuccess`, not in the library's problems. A library whose only issue is deprecated nodes loads as healthy, and the editor shows a notice instead of an error. A node that only inherits a deprecated library's stage isn't listed, because the library's own stage already says so.
+
 #### `model_catalog`
 
 A library-level declaration of the third-party models nodes in the library can use, organized as a `provider → model` registry. Identifiers at both levels are dict keys (the key *is* the stable handle used by node references and admin policies); each entry carries a `display_name` for UI plus optional `terms_url` and `notes`. Each `Model` additionally declares `key_support` (required), an optional `family` grouping tag, and an optional upstream `provider_model_id`.
