@@ -441,6 +441,8 @@ async def _serve(side: WorkerSide, library_names: list[str], worker_engine_id: s
     await engine.abroadcast_app_event(
         AppInitializationComplete(
             is_worker=True,
+            # No library names means this is the general-purpose worker, which loads every library.
+            is_general_purpose_worker=not library_names,
             libraries_to_register=library_names,
         )
     )

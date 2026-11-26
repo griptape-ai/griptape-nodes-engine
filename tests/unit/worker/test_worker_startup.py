@@ -290,7 +290,10 @@ def test_a_worker_that_cannot_adopt_its_engines_project_exits_saying_why(
 @pytest.mark.usefixtures("worker_process_state")
 @pytest.mark.asyncio
 async def test_a_worker_its_engine_accepts_keeps_serving(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Accepted, it waits on its channel rather than exiting."""
+    """Accepted, it waits on its channel rather than exiting.
+
+    Naming no library makes it the general-purpose worker, whose hello reports every library loaded.
+    """
     engine_thread = _listen(monkeypatch, accept=True)
     gone = threading.Event()
     side = WorkerSide(await asyncio.to_thread(WorkerLink, os.environ), on_parent_gone=gone.set)
@@ -299,7 +302,8 @@ async def test_a_worker_its_engine_accepts_keeps_serving(monkeypatch: pytest.Mon
     try:
         engine = await asyncio.to_thread(engine_thread.engine)
         assert await asyncio.to_thread(engine.said_hello.wait, _TIMEOUT_S)
-        assert engine.hellos[0]["loaded"] is False
+        assert engine.hellos[0]["loaded"] is True
+        assert engine.hellos[0]["failure_reason"] is None
         assert not serving.done(), "an accepted worker keeps serving until its channel closes"
     finally:
         serving.cancel()
