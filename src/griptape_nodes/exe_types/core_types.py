@@ -28,6 +28,7 @@ from griptape_nodes.exe_types.elements.parameter import InvalidParameterValueErr
 from griptape_nodes.exe_types.elements.parameter_messages import DeprecationMessage, ParameterMessage
 from griptape_nodes.exe_types.elements.parameter_types import (
     VALID_PARAMETER_RENDER_LOCATIONS,
+    ParameterDeprecation,
     ParameterMode,
     ParameterRenderLocation,
     ParameterType,
@@ -58,6 +59,7 @@ __all__ = [
     "ParameterBase",
     "ParameterButtonGroup",
     "ParameterContainer",
+    "ParameterDeprecation",
     "ParameterDictionary",
     "ParameterGroup",
     "ParameterKeyValuePair",

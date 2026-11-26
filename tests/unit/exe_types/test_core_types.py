@@ -10,6 +10,7 @@ from griptape_nodes.exe_types.core_types import (
     NodeMessagePayload,
     Parameter,
     ParameterButtonGroup,
+    ParameterDeprecation,
     ParameterGroup,
     ParameterList,
     ParameterType,
@@ -553,16 +554,19 @@ class TestParameter:
             input_types=["ImageArtifact"],
             type="ImageArtifact",
             tooltip="Image to describe",
-            deprecation="Use 'images' instead.",
+            deprecation=ParameterDeprecation(replacement="images", deprecation_message="Takes several images now."),
         )
 
-        assert param.to_dict()["deprecation"] == "Use 'images' instead."
+        assert param.to_dict()["deprecation"] == {
+            "deprecation_message": "Takes several images now.",
+            "replacement": "images",
+        }
 
     def test_to_dict_reports_deprecation_set_after_construction(self) -> None:
         param = ParameterList(name="items", input_types=["str"], type="str", tooltip="test")
-        param.deprecation = "Use 'entries' instead."
+        param.deprecation = ParameterDeprecation(replacement="entries")
 
-        assert param.to_dict()["deprecation"] == "Use 'entries' instead."
+        assert param.to_dict()["deprecation"] == {"deprecation_message": None, "replacement": "entries"}
 
     def test_traits_go_in_the_same_order_every_time(self) -> None:
         # A set of traits iterates in an order that varies from one set to the next.

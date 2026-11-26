@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
 from typing import ClassVar, Literal, NamedTuple, get_args
 
@@ -12,6 +13,21 @@ VALID_PARAMETER_RENDER_LOCATIONS: frozenset[str] = frozenset(get_args(ParameterR
 
 
 # Types of Modes provided for Parameters
+@dataclass(frozen=True)
+class ParameterDeprecation:
+    """Marks a parameter kept only so older workflows still load.
+
+    Matches the shape of a node's `deprecation` in its library JSON. Both fields are optional.
+
+    Attributes:
+        deprecation_message: What to tell whoever reads the node's schema, for example why it was replaced.
+        replacement: The name of the parameter on the same node to use instead.
+    """
+
+    deprecation_message: str | None = None
+    replacement: str | None = None
+
+
 class ParameterMode(Enum):
     OUTPUT = auto()
     INPUT = auto()

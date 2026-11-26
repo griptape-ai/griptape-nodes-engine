@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 from griptape_nodes.exe_types.elements.badge import set_initial_badge
 from griptape_nodes.exe_types.elements.base import BaseNodeElement
 from griptape_nodes.exe_types.elements.parameter_types import (
+    ParameterDeprecation,
     ParameterMode,
     ParameterType,
     ParameterTypeBuiltin,
@@ -120,10 +121,10 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
     private: bool = False
     exclude_from_metadata: bool = False
     allow_variable_substitution: bool = True
-    # Set on a parameter kept only so older workflows still load. Holds the message shown to whoever
-    # reads the node's schema (people, MCP clients, the built-in chat), naming what to use instead.
+    # Set on a parameter kept only so older workflows still load, so whoever reads the node's schema
+    # (people, MCP clients, the built-in chat) leaves it out of new work and uses its replacement.
     # Declared by the node class rather than saved, so it is never written into a workflow file.
-    deprecation: str | None = None
+    deprecation: ParameterDeprecation | None = None
     _allowed_modes: set = field(
         default_factory=lambda: {
             ParameterMode.OUTPUT,
@@ -176,7 +177,7 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         private: bool = False,
         exclude_from_metadata: bool = False,
         allow_variable_substitution: bool = True,
-        deprecation: str | None = None,
+        deprecation: ParameterDeprecation | None = None,
         element_id: str | None = None,
         element_type: str | None = None,
         parent_container_name: str | None = None,
@@ -305,7 +306,12 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         our_dict["private"] = self.private
         our_dict["exclude_from_metadata"] = self.exclude_from_metadata
         our_dict["allow_variable_substitution"] = self.allow_variable_substitution
-        our_dict["deprecation"] = self.deprecation
+        our_dict["deprecation"] = None
+        if self.deprecation is not None:
+            our_dict["deprecation"] = {
+                "deprecation_message": self.deprecation.deprecation_message,
+                "replacement": self.deprecation.replacement,
+            }
         our_dict["ui_options"] = self.ui_options
 
         # Let's bundle up the mode details.

@@ -27,7 +27,7 @@ All Parameter attributes:
 - **exclude_from_metadata**: bool (default False) - exclude this parameter's value from plaintext metadata outputs (sidecar JSON and embedded PNG text chunks). The parameter name is still recorded in `parameters_omitted` so the omission is auditable. Use this for parameters that hold sensitive values such as passwords or user-supplied credentials.
 - **parent_container_name**: str|None — assigns this parameter as a child of a `ParameterContainer` (i.e. a `ParameterList` or `ParameterDictionary`). Used for list-like ownership.
 - **parent_element_name**: str|None — nests this parameter under a `ParameterGroup` (a UI grouping element). Used for visual grouping in the node UI.
-- **deprecation**: str|None (default None) - marks a parameter that is kept only so older workflows still load. Set it to a message naming what to use instead. See [Marking a Parameter Deprecated](#marking-a-parameter-deprecated).
+- **deprecation**: ParameterDeprecation|None (default None) - marks a parameter that is kept only so older workflows still load, and names the parameter to use instead. See [Marking a Parameter Deprecated](#marking-a-parameter-deprecated).
 
 ## Parameter Values
 
@@ -617,9 +617,11 @@ handed.
 ## Marking a Parameter Deprecated
 
 When you replace a parameter, you usually can't delete the old one: saved workflows still set values on it and
-connect to it by name. Keep it, and set `deprecation` to a message that names the replacement:
+connect to it by name. Keep it, and set `deprecation` to a `ParameterDeprecation` that names the replacement:
 
 ```python
+from griptape_nodes.exe_types.core_types import Parameter, ParameterDeprecation, ParameterMode
+
 self.add_parameter(
     Parameter(
         name="image",
@@ -628,26 +630,29 @@ self.add_parameter(
         tooltip="Image to describe. Replaced by 'images'.",
         allowed_modes={ParameterMode.INPUT},
         hide=True,
-        deprecation="Use 'images' instead.",
+        deprecation=ParameterDeprecation(replacement="images", deprecation_message="Takes several images now."),
     )
 )
 ```
+
+Both fields are optional. `replacement` is the name of the parameter on the same node to use instead.
+`deprecation_message` says why, or anything else a reader needs.
 
 The helper classes (`ParameterImage`, `ParameterString`, ...) don't take `deprecation` as an argument. Set it
 after construction instead, before adding the parameter:
 
 ```python
 image = ParameterImage(name="image", tooltip="Image to describe. Replaced by 'images'.", hide=True)
-image.deprecation = "Use 'images' instead."
+image.deprecation = ParameterDeprecation(replacement="images")
 self.add_parameter(image)
 ```
 
-`DescribeNodeTypeRequest` reports the message on the parameter's `deprecation` field, so MCP clients and the
-built-in chat can leave deprecated parameters out of new workflows. The message comes from your node's code each
-time the node is created and is never written into a saved workflow, so changing or removing it later is safe.
+`DescribeNodeTypeRequest` reports it on the parameter's `deprecation` field, so MCP clients and the built-in chat
+leave deprecated parameters out of new workflows and use the replacement. It comes from your node's code each time
+the node is created and is never written into a saved workflow, so changing or removing it later is safe.
 
-`deprecation` only labels the parameter. It doesn't hide it in the editor or move existing values and connections
-to the replacement; use `hide=True` for the first, and a lifecycle hook such as `before_value_set` for the second.
+`deprecation` only labels the parameter. To hide it in the editor, use `hide=True`. To move existing values and
+connections to the replacement, use a lifecycle hook such as `before_value_set`.
 To tell artists who open an old workflow, show a `ParameterMessage` as described in
 [Deprecated Model Migration and User Notification](execution_and_lifecycle.md#deprecated-model-migration-and-user-notification).
 For a whole node, set `deprecation` in the node's `metadata` in your library JSON instead.

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterDeprecation, ParameterList, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.node_library.library_declarations import (
@@ -2510,7 +2510,7 @@ class _DescribeNodeTypeProbe(BaseNode):
             input_types=["ImageArtifact"],
             tooltip="Image to describe",
             allowed_modes={ParameterMode.INPUT},
-            deprecation="Use 'images' instead.",
+            deprecation=ParameterDeprecation(replacement="images", deprecation_message="Takes several images now."),
         )
         self.add_parameter(image)
 
@@ -2711,7 +2711,9 @@ class TestDescribeNodeTypeRequest:
 
         assert isinstance(result, DescribeNodeTypeResultSuccess)
         by_name = {param.name: param for param in result.parameters}
-        assert by_name["image"].deprecation == "Use 'images' instead."
+        assert by_name["image"].deprecation == ParameterDeprecation(
+            replacement="images", deprecation_message="Takes several images now."
+        )
         assert by_name["images"].deprecation is None
         assert by_name["prompt"].deprecation is None
 

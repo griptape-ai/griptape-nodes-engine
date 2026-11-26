@@ -6,6 +6,7 @@ from pathlib import Path  # noqa: TC003 - read at runtime by the converter
 from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.exe_types.elements.containers import ParameterList
+from griptape_nodes.exe_types.elements.parameter_types import ParameterDeprecation
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibrarySchema,
@@ -247,8 +248,9 @@ class ParameterDescription:
         max_items: Most items a ParameterList accepts (None if unbounded or not a ParameterList)
         options: The choices a dropdown or multi-select offers, or None when the parameter is
             neither. Read from ui_options, but kept when ui_options are left out.
-        deprecation: Message naming what to use instead, when the parameter is deprecated and kept only so
-            older workflows load (None if the parameter is current). Leave deprecated parameters out of new work.
+        deprecation: Set when the parameter is deprecated and kept only so older workflows load (None if
+            it is current). Leave it out of new work: `replacement` names the parameter to use instead, and
+            `deprecation_message` says why.
     """
 
     name: str
@@ -269,7 +271,7 @@ class ParameterDescription:
     element_type: str
     max_items: int | None
     options: list[DisplayValue] | None = None
-    deprecation: str | None = None
+    deprecation: ParameterDeprecation | None = None
 
     @classmethod
     def from_parameter(cls, param: Parameter) -> ParameterDescription:
@@ -300,7 +302,7 @@ class ParameterDescription:
             element_type=param_dict["element_type"],
             max_items=max_items,
             options=_choices_from_ui_options(param_dict["ui_options"]),
-            deprecation=param_dict["deprecation"],
+            deprecation=param.deprecation,
         )
 
 

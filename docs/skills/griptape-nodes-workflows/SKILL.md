@@ -342,7 +342,7 @@ against stale state.
 - **Discover before wiring.** Always call `DescribeNodeType` for each node type you
     intend to use before guessing parameter names. The cost is 3-5 calls up front but
     saves many round trips fighting typos and assumed-wrong names. Don't wire or set a
-    parameter whose `deprecation` is set; its message names the parameter to use instead.
+    parameter whose `deprecation` is set; use the parameter its `replacement` names instead.
 - **Batch with `EventRequestBatch` once the shape is known.** Anything past the
     discovery phase usually has fixed shape (N creates + M sets + K connects + a
     layout). Wrap them in one `EventRequestBatch` call and pre-name every node you
