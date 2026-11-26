@@ -330,7 +330,7 @@ class TestDetectRetiredNodeDeclarations:
 # ---------- Deprecation replacements ----------
 
 
-def _deprecated_node(display_name: str, *, library: str, node_type: str) -> NodeDefinition:
+def _deprecated_node(display_name: str, *, library: str | None, node_type: str) -> NodeDefinition:
     return NodeDefinition(
         class_name=display_name.replace(" ", ""),
         file_path="node.py",
@@ -339,7 +339,7 @@ def _deprecated_node(display_name: str, *, library: str, node_type: str) -> Node
             description="old node",
             display_name=display_name,
             deprecation=NodeDeprecationMetadata(
-                replacement=NodeDeprecationReplacement(library=library, node_type=node_type)
+                replacements=[NodeDeprecationReplacement(library=library, node_type=node_type)]
             ),
         ),
     )
@@ -359,6 +359,13 @@ class TestDeprecationReplacements:
         problems = find_unresolved_deprecation_replacements(schema, {"Test Library": {"OldNode", "NewNode"}})
 
         assert problems == []
+
+    def test_replacement_without_a_library_is_in_the_deprecated_nodes_library(self) -> None:
+        schema = _make_schema(nodes=[_deprecated_node("Old Node", library=None, node_type="NewNode")])
+
+        assert find_unresolved_deprecation_replacements(schema, {"Test Library": {"OldNode", "NewNode"}}) == []
+        problems = find_unresolved_deprecation_replacements(schema, {"Test Library": {"OldNode"}})
+        assert [problem.replacement_library for problem in problems] == ["Test Library"]  # type: ignore[attr-defined]
 
     def test_missing_node_type_in_a_loaded_library_is_reported(self) -> None:
         schema = _make_schema(nodes=[_deprecated_node("Old Node", library="Other Library", node_type="Gone")])
@@ -399,7 +406,7 @@ class TestDeprecationReplacements:
                     description="old workflow node",
                     display_name="Old Workflow Node",
                     deprecation=NodeDeprecationMetadata(
-                        replacement=NodeDeprecationReplacement(library="Other Library", node_type="Gone")
+                        replacements=[NodeDeprecationReplacement(library="Other Library", node_type="Gone")]
                     ),
                 ),
             )
@@ -421,4 +428,4 @@ class TestDeprecationReplacements:
     def test_manifest_without_a_replacement_still_validates(self) -> None:
         metadata = NodeDeprecationMetadata.model_validate({"deprecation_message": "Use X.", "removal_version": "2.0.0"})
 
-        assert metadata.replacement is None
+        assert metadata.replacements == []

@@ -3,12 +3,8 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
-
-if TYPE_CHECKING:
-    from griptape_nodes.node_library.library_registry import NodeDeprecationReplacement
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +20,6 @@ class DeprecatedNodeWarningProblem(LibraryProblem):
     class_name: str
     removal_version: str | None
     deprecation_message: str | None
-    replacement: NodeDeprecationReplacement | None = None
 
     @classmethod
     def collate_problems_for_display(cls, instances: list[DeprecatedNodeWarningProblem]) -> str:
@@ -42,10 +37,6 @@ class DeprecatedNodeWarningProblem(LibraryProblem):
             message = f"Node '{problem.display_name}' is deprecated and {removal_info}."
             if problem.deprecation_message:
                 message += f" {problem.deprecation_message}"
-            if problem.replacement is not None:
-                message += (
-                    f" Use '{problem.replacement.node_type}' from library '{problem.replacement.library}' instead."
-                )
             return message
 
         # Group by removal version
@@ -84,18 +75,9 @@ class DeprecatedNodeWarningProblem(LibraryProblem):
 
                 if message:
                     output_lines.append(f"    {message}:")
-                    output_lines.extend(f"      - {cls._node_line(node)}" for node in message_nodes)
+                    output_lines.extend(f"      - {node.display_name}" for node in message_nodes)
                 else:
                     # No deprecation message provided
-                    output_lines.extend(f"    - {cls._node_line(node)}" for node in message_nodes)
+                    output_lines.extend(f"    - {node.display_name}" for node in message_nodes)
 
         return "\n".join(output_lines)
-
-    @staticmethod
-    def _node_line(problem: DeprecatedNodeWarningProblem) -> str:
-        if problem.replacement is None:
-            return problem.display_name
-        return (
-            f"{problem.display_name} (use '{problem.replacement.node_type}' "
-            f"from library '{problem.replacement.library}')"
-        )

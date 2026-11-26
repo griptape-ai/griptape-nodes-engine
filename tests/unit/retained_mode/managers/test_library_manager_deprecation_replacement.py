@@ -16,7 +16,6 @@ from griptape_nodes.node_library.library_registry import (
     NodeDeprecationMetadata,
     NodeDeprecationReplacement,
     NodeMetadata,
-    WorkflowNodeDefinition,
 )
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
@@ -26,12 +25,10 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryRequest,
     UnloadLibraryFromRegistryResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
-    DeprecatedNodeWarningProblem,
-    UnresolvedDeprecationReplacementProblem,
-)
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries import UnresolvedDeprecationReplacementProblem
 from griptape_nodes.retained_mode.managers.library.common import LibraryFitness
 from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_DOWNLOAD_KEY, LIBRARIES_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.managers.version_compatibility_manager import _replacement_names
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -62,11 +59,12 @@ def _write_library(
     name: str,
     class_name: str,
     *,
-    replacement: NodeDeprecationReplacement | None = None,
+    display_name: str | None = None,
+    replacements: list[NodeDeprecationReplacement] | None = None,
 ) -> Path:
     deprecation = None
-    if replacement is not None:
-        deprecation = NodeDeprecationMetadata(replacement=replacement)
+    if replacements is not None:
+        deprecation = NodeDeprecationMetadata(replacements=replacements)
     schema = LibrarySchema(
         name=name,
         library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
@@ -83,7 +81,10 @@ def _write_library(
                 class_name=class_name,
                 file_path="node.py",
                 metadata=NodeMetadata(
-                    category="Test", description="test node", display_name=class_name, deprecation=deprecation
+                    category="Test",
+                    description="test node",
+                    display_name=display_name or class_name,
+                    deprecation=deprecation,
                 ),
             )
         ],
@@ -116,7 +117,7 @@ class TestDeprecationReplacementAtLoad:
             tmp_path / "old_lib",
             "Old Library",
             "OldNode",
-            replacement=NodeDeprecationReplacement(library="New Library", node_type="NewNode"),
+            replacements=[NodeDeprecationReplacement(library="New Library", node_type="NewNode")],
         )
         new = _write_library(tmp_path / "new_lib", "New Library", "NewNode")
 
@@ -132,7 +133,7 @@ class TestDeprecationReplacementAtLoad:
             tmp_path / "old_lib",
             "Old Library",
             "OldNode",
-            replacement=NodeDeprecationReplacement(library="New Library", node_type="MissingNode"),
+            replacements=[NodeDeprecationReplacement(library="New Library", node_type="MissingNode")],
         )
         new = _write_library(tmp_path / "new_lib", "New Library", "NewNode")
 
@@ -152,10 +153,6 @@ class TestDeprecationReplacementAtLoad:
         assert collated is not None
         assert "has no node type 'MissingNode'" in str(collated)
         assert "OldNode" in LibraryRegistry.get_library(name="Old Library").get_registered_nodes()
-        deprecation_notices = [p for p in info.problems if isinstance(p, DeprecatedNodeWarningProblem)]
-        assert [p.replacement for p in deprecation_notices] == [
-            NodeDeprecationReplacement(library="New Library", node_type="MissingNode")
-        ]
 
     @pytest.mark.asyncio
     async def test_replacement_in_a_library_that_is_not_loaded_is_a_library_problem(
@@ -165,7 +162,7 @@ class TestDeprecationReplacementAtLoad:
             tmp_path / "old_lib",
             "Old Library",
             "OldNode",
-            replacement=NodeDeprecationReplacement(library="Absent Library", node_type="NewNode"),
+            replacements=[NodeDeprecationReplacement(library="Absent Library", node_type="NewNode")],
         )
 
         await _load(engine, tmp_path, [old])
@@ -183,7 +180,7 @@ class TestDeprecationReplacementAtLoad:
             tmp_path / "old_lib",
             "Old Library",
             "OldNode",
-            replacement=NodeDeprecationReplacement(library="New Library", node_type="NewNode"),
+            replacements=[NodeDeprecationReplacement(library="New Library", node_type="NewNode")],
         )
         new = _write_library(tmp_path / "new_lib", "New Library", "NewNode")
         await _load(engine, tmp_path, [old])
@@ -203,7 +200,7 @@ class TestDeprecationReplacementAtLoad:
             tmp_path / "old_lib",
             "Old Library",
             "OldNode",
-            replacement=NodeDeprecationReplacement(library="New Library", node_type="NewNode"),
+            replacements=[NodeDeprecationReplacement(library="New Library", node_type="NewNode")],
         )
         new = _write_library(tmp_path / "new_lib", "New Library", "NewNode")
         await _load(engine, tmp_path, [old, new])
@@ -224,7 +221,7 @@ class TestDeprecationReplacementAtLoad:
             tmp_path / "old_lib",
             "Old Library",
             "OldNode",
-            replacement=NodeDeprecationReplacement(library="Absent Library", node_type="NewNode"),
+            replacements=[NodeDeprecationReplacement(library="Absent Library", node_type="NewNode")],
         )
         await _load(engine, tmp_path, [old])
 
@@ -242,7 +239,7 @@ class TestDeprecationReplacementAtLoad:
             tmp_path / "old_lib",
             "Old Library",
             "OldNode",
-            replacement=NodeDeprecationReplacement(library="Absent Library", node_type="NewNode"),
+            replacements=[NodeDeprecationReplacement(library="Absent Library", node_type="NewNode")],
         )
         await _load(engine, tmp_path, [])
 
@@ -254,34 +251,64 @@ class TestDeprecationReplacementAtLoad:
         info = engine.library_manager.get_library_info_for_attempted_load(str(old))
         assert len(_replacement_problems(info)) == 1
 
+    @pytest.mark.asyncio
+    async def test_replacement_without_a_library_is_looked_up_in_the_deprecated_nodes_library(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
+        old = _write_library(
+            tmp_path / "old_lib",
+            "Old Library",
+            "OldNode",
+            replacements=[NodeDeprecationReplacement(node_type="MissingNode")],
+        )
 
-class TestDeprecatedWorkflowNodeNotice:
-    def test_deprecated_workflow_node_gets_a_notice_naming_its_replacement(self, engine: Engine) -> None:
-        replacement = NodeDeprecationReplacement(library="New Library", node_type="NewNode")
-        schema = LibrarySchema(
-            name="Old Library",
-            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
-            metadata=LibraryMetadata(
-                author="test", description="manifest", library_version="1.0.0", engine_version="0.98.0", tags=[]
-            ),
-            categories=[],
-            nodes=[],
-            workflow_nodes=[
-                WorkflowNodeDefinition(
-                    node_type="OldWorkflowNode",
-                    workflow_path="old.py",
-                    metadata=NodeMetadata(
-                        category="Test",
-                        description="test node",
-                        display_name="Old Workflow Node",
-                        deprecation=NodeDeprecationMetadata(replacement=replacement),
-                    ),
-                )
+        await _load(engine, tmp_path, [old])
+
+        info = engine.library_manager.get_library_info_for_attempted_load(str(old))
+        assert [(p.replacement_library, p.replacement_library_loaded) for p in _replacement_problems(info)] == [
+            ("Old Library", True)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_each_missing_replacement_is_reported(self, engine: Engine, tmp_path: Path) -> None:
+        old = _write_library(
+            tmp_path / "old_lib",
+            "Old Library",
+            "OldNode",
+            replacements=[
+                NodeDeprecationReplacement(library="New Library", node_type="NewNode"),
+                NodeDeprecationReplacement(library="New Library", node_type="MissingNode"),
+            ],
+        )
+        new = _write_library(tmp_path / "new_lib", "New Library", "NewNode")
+
+        await _load(engine, tmp_path, [old, new])
+
+        info = engine.library_manager.get_library_info_for_attempted_load(str(old))
+        assert [p.replacement_node_type for p in _replacement_problems(info)] == ["MissingNode"]
+
+
+class TestReplacementNames:
+    @pytest.mark.asyncio
+    async def test_replacements_are_named_by_display_name(self, engine: Engine, tmp_path: Path) -> None:
+        old = _write_library(tmp_path / "old_lib", "Old Library", "SameNode", display_name="Same Library Node")
+        new = _write_library(tmp_path / "new_lib", "New Library", "NewNode", display_name="New Node 2.0")
+        await _load(engine, tmp_path, [old, new])
+
+        names = _replacement_names(
+            "Old Library",
+            [
+                NodeDeprecationReplacement(node_type="SameNode"),
+                NodeDeprecationReplacement(library="New Library", node_type="NewNode"),
             ],
         )
 
-        issues = engine.version_compatibility_manager.check_library_version_compatibility(schema)
+        assert names == ["'Same Library Node'", "'New Node 2.0' from library 'New Library'"]
 
-        notices = [issue.problem for issue in issues if isinstance(issue.problem, DeprecatedNodeWarningProblem)]
-        assert [(notice.class_name, notice.replacement) for notice in notices] == [("OldWorkflowNode", replacement)]
-        assert all(issue.severity == LibraryFitness.FLAWED for issue in issues if issue.problem in notices)
+    @pytest.mark.asyncio
+    async def test_unregistered_replacement_falls_back_to_its_node_type(self, engine: Engine, tmp_path: Path) -> None:
+        await _load(engine, tmp_path, [])
+
+        names = _replacement_names("Old Library", [NodeDeprecationReplacement(library="Absent", node_type="Gone")])
+
+        assert names == ["'Gone' from library 'Absent'"]

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import semver
 
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import find_beta_feature_date_issues, parse_library_beta_features
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -41,7 +42,7 @@ from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.node_library.library_registry import LibrarySchema
+    from griptape_nodes.node_library.library_registry import LibrarySchema, NodeDeprecationReplacement
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.parameter_events import (
@@ -137,6 +138,18 @@ class SetParameterVersionCompatibilityCheck(EngineScoped, ABC):
         """
 
 
+def _replacement_names(deprecated_node_library: str, replacements: list[NodeDeprecationReplacement]) -> list[str]:
+    """Name each replacement as a user sees it: its display name, and its library when that differs."""
+    names = []
+    for replacement in replacements:
+        library_name = replacement.library_name(deprecated_node_library)
+        name = f"'{LibraryRegistry.get_node_display_name(library_name, replacement.node_type)}'"
+        if library_name != deprecated_node_library:
+            name = f"{name} from library '{library_name}'"
+        names.append(name)
+    return names
+
+
 class VersionCompatibilityManager(EngineScoped):
     """Manages version compatibility checks for libraries and other components."""
 
@@ -217,24 +230,20 @@ class VersionCompatibilityManager(EngineScoped):
     def _check_library_for_deprecated_nodes(
         self, library_data: LibrarySchema
     ) -> list[LibraryVersionCompatibilityIssue]:
-        """Check a library for deprecated nodes, workflow nodes included."""
-        # A workflow node has no Python class, so its node type stands in for one.
-        node_types_and_metadata = [(node.class_name, node.metadata) for node in library_data.nodes]
-        node_types_and_metadata.extend((node.node_type, node.metadata) for node in library_data.workflow_nodes or [])
+        """Check a library for deprecated nodes."""
         return [
             LibraryVersionCompatibilityIssue(
                 problem=DeprecatedNodeWarningProblem(
-                    display_name=metadata.display_name,
-                    class_name=node_type,
-                    removal_version=metadata.deprecation.removal_version,
-                    deprecation_message=metadata.deprecation.deprecation_message,
-                    replacement=metadata.deprecation.replacement,
+                    display_name=node.metadata.display_name,
+                    class_name=node.class_name,
+                    removal_version=node.metadata.deprecation.removal_version,
+                    deprecation_message=node.metadata.deprecation.deprecation_message,
                 ),
                 severity=LibraryManager.LibraryFitness.FLAWED,
             )
-            for node_type, metadata in node_types_and_metadata
-            if metadata.deprecation is not None
-        ]
+            for node in library_data.nodes
+            if node.metadata.deprecation is not None
+        ] or []
 
     def _check_library_for_beta_feature_problems(
         self, library_data: LibrarySchema
@@ -398,7 +407,7 @@ class VersionCompatibilityManager(EngineScoped):
                         workflow_library_version=workflow_library_version,
                         removal_version=deprecation.removal_version,
                         deprecation_message=deprecation.deprecation_message,
-                        replacement=deprecation.replacement,
+                        replacement_names=_replacement_names(library_name, deprecation.replacements),
                     ),
                     severity=WorkflowStatus.FLAWED,
                 )

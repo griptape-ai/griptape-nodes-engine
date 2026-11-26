@@ -13,8 +13,8 @@ that list is non-empty.
 validation, turning declaration `type` tags that were valid in an older schema
 into targeted migration guidance instead of opaque discriminator errors.
 
-`find_unresolved_deprecation_replacements` checks a deprecated node's
-`deprecation.replacement` against every loaded library. A replacement can live
+`find_unresolved_deprecation_replacements` checks each of a deprecated node's
+`deprecation.replacements` against every loaded library. A replacement can live
 in another library, so it runs once every library has loaded and again whenever
 a library registers or unloads.
 """
@@ -88,7 +88,7 @@ def find_unresolved_deprecation_replacements(
     library_data: LibrarySchema,
     node_types_by_library: Mapping[str, set[str]],
 ) -> list[LibraryProblem]:
-    """Report each deprecated node whose replacement no loaded library provides.
+    """Report each deprecated node's replacement that no loaded library provides.
 
     Args:
         library_data: The library whose deprecated nodes are checked.
@@ -99,20 +99,21 @@ def find_unresolved_deprecation_replacements(
 
     problems: list[LibraryProblem] = []
     for metadata in node_metadata:
-        if metadata.deprecation is None or metadata.deprecation.replacement is None:
+        if metadata.deprecation is None:
             continue
-        replacement = metadata.deprecation.replacement
-        replacement_node_types = node_types_by_library.get(replacement.library)
-        if replacement_node_types is not None and replacement.node_type in replacement_node_types:
-            continue
-        problems.append(
-            UnresolvedDeprecationReplacementProblem(
-                display_name=metadata.display_name,
-                replacement_library=replacement.library,
-                replacement_node_type=replacement.node_type,
-                replacement_library_loaded=replacement_node_types is not None,
+        for replacement in metadata.deprecation.replacements:
+            replacement_library = replacement.library_name(library_data.name)
+            replacement_node_types = node_types_by_library.get(replacement_library)
+            if replacement_node_types is not None and replacement.node_type in replacement_node_types:
+                continue
+            problems.append(
+                UnresolvedDeprecationReplacementProblem(
+                    display_name=metadata.display_name,
+                    replacement_library=replacement_library,
+                    replacement_node_type=replacement.node_type,
+                    replacement_library_loaded=replacement_node_types is not None,
+                )
             )
-        )
     return problems
 
 

@@ -121,7 +121,9 @@ class TestRenderNodeTypes:
 
     def test_deprecated_node_type_names_its_replacement(self) -> None:
         libraries = {
-            "Images": {"OldLoader": self._replaced_metadata(library="Media", node_type="LoadImage")},
+            "Images": {
+                "OldLoader": self._replaced_metadata(NodeDeprecationReplacement(library="Media", node_type="LoadImage"))
+            },
             "Media": {"LoadImage": _metadata("image", "Loads an image")},
         }
 
@@ -129,22 +131,68 @@ class TestRenderNodeTypes:
 
         assert "    - OldLoader (deprecated, use 'LoadImage' from library 'Media' instead): Old loader" in lines
 
+    def test_replacement_without_a_library_is_in_the_deprecated_nodes_library(self) -> None:
+        libraries = {
+            "Images": {
+                "OldLoader": self._replaced_metadata(NodeDeprecationReplacement(node_type="LoadImage")),
+                "LoadImage": _metadata("image", "Loads an image"),
+            }
+        }
+
+        lines = _render_node_types(libraries).splitlines()
+
+        assert "    - OldLoader (deprecated, use 'LoadImage' from library 'Images' instead): Old loader" in lines
+
+    def test_every_listed_replacement_is_named(self) -> None:
+        libraries = {
+            "Video": {
+                "Seedance": self._replaced_metadata(
+                    NodeDeprecationReplacement(node_type="Seedance20"),
+                    NodeDeprecationReplacement(node_type="Seedance25"),
+                    NodeDeprecationReplacement(node_type="NotListed"),
+                ),
+                "Seedance20": _metadata("video", "2.0"),
+                "Seedance25": _metadata("video", "2.5"),
+            }
+        }
+
+        line = _render_node_types(libraries).splitlines()[3]
+
+        assert line == (
+            "    - Seedance (deprecated, use 'Seedance20' from library 'Video' or "
+            "'Seedance25' from library 'Video' instead): Old loader"
+        )
+
+    def test_deprecated_replacement_is_not_named(self) -> None:
+        libraries = {
+            "Images": {
+                "OldLoader": self._replaced_metadata(NodeDeprecationReplacement(node_type="OlderLoader")),
+                "OlderLoader": _metadata("image", "Older loader", deprecated=True),
+            }
+        }
+
+        line = _render_node_types(libraries).splitlines()[3]
+
+        assert line == "    - OldLoader (deprecated, do not use for new work): Old loader"
+
     def test_replacement_that_is_not_listed_is_not_named(self) -> None:
-        libraries = {"Images": {"OldLoader": self._replaced_metadata(library="Media", node_type="LoadImage")}}
+        libraries = {
+            "Images": {
+                "OldLoader": self._replaced_metadata(NodeDeprecationReplacement(library="Media", node_type="LoadImage"))
+            }
+        }
 
         line = _render_node_types(libraries).splitlines()[-1]
 
         assert line == "    - OldLoader (deprecated, do not use for new work): Old loader"
 
     @staticmethod
-    def _replaced_metadata(*, library: str, node_type: str) -> NodeMetadata:
+    def _replaced_metadata(*replacements: NodeDeprecationReplacement) -> NodeMetadata:
         return NodeMetadata(
             category="image",
             description="Old loader",
             display_name="",
-            deprecation=NodeDeprecationMetadata(
-                replacement=NodeDeprecationReplacement(library=library, node_type=node_type)
-            ),
+            deprecation=NodeDeprecationMetadata(replacements=list(replacements)),
         )
 
     def test_long_description_is_cut(self) -> None:

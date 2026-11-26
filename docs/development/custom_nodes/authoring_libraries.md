@@ -190,22 +190,25 @@ workflows keep working, and the editor and agents steer users away from it:
   "deprecation": {
     "deprecation_message": "Superseded by a node that also reads image metadata.",
     "removal_version": "2.0.0",
-    "replacement": { "library": "Griptape Nodes Library", "node_type": "LoadImage" }
+    "replacements": [
+      { "node_type": "LoadImage" },
+      { "library": "Media Library", "node_type": "ReadImageWithMetadata" }
+    ]
   }
 }
 ```
 
-| Field                 | Meaning                                                                                                                                     |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `deprecation_message` | Optional text shown with the deprecation notice, such as why the node is deprecated. The notice names the `replacement` itself.             |
-| `removal_version`     | Optional version in which the node will be removed.                                                                                         |
-| `replacement`         | Optional node to use instead: the `library` name it's registered in and its `node_type` (the class name, or a workflow node's `node_type`). |
+| Field                 | Meaning                                                                                                                                                                                                           |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deprecation_message` | Optional text shown with the deprecation notice, such as why the node is deprecated. The notice names the `replacements` itself.                                                                                  |
+| `removal_version`     | Optional version in which the node will be removed.                                                                                                                                                               |
+| `replacements`        | Optional nodes to use instead. Each gives its `node_type` (the class name, or a workflow node's `node_type`) and, when it's registered in another library, that `library` name. Messages show its `display_name`. |
 
-The replacement can live in another library. Once every library has loaded, and again whenever a
-library is registered or unloaded, the engine checks that the named library is loaded and registers
-that node type. If it doesn't, the deprecated node's
-library gets a problem in Library Management saying which part is missing. The deprecated node still
-loads either way. `replacement` needs library schema `0.16.0`; older engines ignore it.
+A replacement can live in another library. Once every library has loaded, and again whenever a
+library is registered or unloaded, the engine checks that each replacement's library is loaded and
+registers that node type. If it doesn't, the deprecated node's library gets a problem in Library
+Management saying which part is missing. The deprecated node still loads either way.
+`replacements` needs library schema `0.16.0`; older engines ignore it.
 
 ### Library and Node Declarations
 
