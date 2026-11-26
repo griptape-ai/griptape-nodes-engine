@@ -28,12 +28,6 @@ The Sandbox Library can also turn your own saved workflows into
 nodes. See [Turning a workflow into a node](#turning-a-workflow-into-a-node)
 below.
 
-During `gtn init`, you're offered the **Advanced Media Library**
-(diffusion, image generation, video). You can register it then or
-re-run `gtn init` later to add it. See the
-[FAQ](../faq.md#how-do-i-install-the-advanced-media-library-after-initial-setup)
-for that path.
-
 Other libraries — first-party or community — you install yourself
 through the editor.
 
@@ -312,7 +306,6 @@ engines, or just preference — the editor's library actions have
 | Add Library → Install               | `gtn libraries download <git_url>` |
 | Check for updates → install pending | `gtn libraries sync`               |
 | Sync over local edits               | `gtn libraries sync --overwrite`   |
-| Re-register Advanced Media Library  | `gtn init`, answer `y`             |
 
 See [Command Line Interface](../reference/command_line_interface.md) for the
 full reference.
