@@ -5,8 +5,38 @@ from io import StringIO
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.error import MarkedYAMLError, YAMLError
 
-from griptape_nodes.exe_types.core_types import BadgeData, Parameter, ParameterMode, Trait
+from griptape_nodes.exe_types.core_types import BadgeData, InvalidParameterValueError, Parameter, ParameterMode, Trait
+
+_MAPPING_VALUES_PROBLEM = "mapping values are not allowed here"
+
+
+def _colon_in_value_hint(line: str) -> str:
+    block_hint = "put the text on its own indented line after key: |"
+    # Text that already holds a double quote can't be wrapped in one, and prose often holds apostrophes.
+    if '"' in line:
+        return f"To keep the colon, {block_hint}."
+    return f'To keep the colon, wrap the value in quotes (key: "text: more text") or {block_hint}.'
+
+
+def _describe_yaml_error(value: str, error: Exception) -> str:
+    """Describe a YAML parse error in terms an artist can act on: where it is, and how to fix it."""
+    if not isinstance(error, MarkedYAMLError) or error.problem_mark is None:
+        return f"Invalid YAML: {error}"
+
+    line_index = error.problem_mark.line
+    lines = value.splitlines()
+    line = lines[line_index] if line_index < len(lines) else ""
+    location = f"Invalid YAML on line {line_index + 1}"
+    heading = f"{location}: {line.strip()}" if line.strip() else location
+
+    # Several words before the colon read as prose; a lone word is more likely a misplaced key.
+    if error.problem == _MAPPING_VALUES_PROBLEM and " " in line[: error.problem_mark.column].strip():
+        return f"{heading}\n\nA colon followed by a space starts a new key. {_colon_in_value_hint(line)}"
+
+    problem = error.problem or "invalid syntax"
+    return f"{heading}\n\n{problem[0].upper()}{problem[1:]}."
 
 
 class ParameterYaml(Parameter):
@@ -137,7 +167,7 @@ class ParameterYaml(Parameter):
             YAML-formatted string
 
         Raises:
-            ValueError: If the value cannot be represented as valid YAML
+            InvalidParameterValueError: If the value cannot be represented as valid YAML
         """
         if value is None:
             return ""
@@ -147,9 +177,8 @@ class ParameterYaml(Parameter):
             yaml.preserve_quotes = True
             try:
                 yaml.load(value)
-            except Exception as e:
-                msg = f"ParameterYaml: Failed to validate YAML string: {e}. Input: {value[:200]!r}"
-                raise ValueError(msg) from e
+            except (YAMLError, ValueError, RecursionError) as e:
+                raise InvalidParameterValueError(_describe_yaml_error(value, e)) from e
             return value
 
         if isinstance(value, (dict, list)):

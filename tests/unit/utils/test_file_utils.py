@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import anyio
@@ -26,9 +24,6 @@ from griptape_nodes.utils.file_utils import (
     promote_scratch_file,
     promote_scratch_file_async,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
 
 
 class _RaisingDirEntry:
@@ -68,12 +63,6 @@ class _FakeScandir:
 class TestFindFileInDirectory:
     """Test find_file_in_directory function."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
     def test_find_file_when_directory_does_not_exist(self) -> None:
         """Test that None is returned when directory doesn't exist."""
         non_existent = Path("/non/existent/directory")
@@ -81,110 +70,104 @@ class TestFindFileInDirectory:
 
         assert result is None
 
-    def test_find_file_when_path_is_not_directory(self, temp_dir: Path) -> None:
+    def test_find_file_when_path_is_not_directory(self, tmp_path: Path) -> None:
         """Test that None is returned when path is a file, not a directory."""
-        test_file = temp_dir / "test.txt"
+        test_file = tmp_path / "test.txt"
         test_file.write_text("content")
 
         result = find_file_in_directory(test_file, "*.json")
 
         assert result is None
 
-    def test_find_file_when_no_files_match_pattern(self, temp_dir: Path) -> None:
+    def test_find_file_when_no_files_match_pattern(self, tmp_path: Path) -> None:
         """Test that None is returned when no files match the pattern."""
-        (temp_dir / "test.txt").write_text("content")
-        (temp_dir / "another.py").write_text("content")
+        (tmp_path / "test.txt").write_text("content")
+        (tmp_path / "another.py").write_text("content")
 
-        result = find_file_in_directory(temp_dir, "*.json")
+        result = find_file_in_directory(tmp_path, "*.json")
 
         assert result is None
 
-    def test_find_file_returns_first_match_in_root_directory(self, temp_dir: Path) -> None:
+    def test_find_file_returns_first_match_in_root_directory(self, tmp_path: Path) -> None:
         """Test that first matching file is returned from root directory."""
-        expected_file = temp_dir / "config.json"
+        expected_file = tmp_path / "config.json"
         expected_file.write_text("{}")
 
-        result = find_file_in_directory(temp_dir, "config.json")
+        result = find_file_in_directory(tmp_path, "config.json")
 
         assert result == expected_file
 
-    def test_find_file_searches_subdirectories_recursively(self, temp_dir: Path) -> None:
+    def test_find_file_searches_subdirectories_recursively(self, tmp_path: Path) -> None:
         """Test that function searches subdirectories recursively."""
-        subdir = temp_dir / "subdir" / "nested"
+        subdir = tmp_path / "subdir" / "nested"
         subdir.mkdir(parents=True)
         expected_file = subdir / "config.json"
         expected_file.write_text("{}")
 
-        result = find_file_in_directory(temp_dir, "config.json")
+        result = find_file_in_directory(tmp_path, "config.json")
 
         assert result == expected_file
 
-    def test_find_file_matches_glob_pattern(self, temp_dir: Path) -> None:
+    def test_find_file_matches_glob_pattern(self, tmp_path: Path) -> None:
         """Test that function matches files using glob patterns."""
-        expected_file = temp_dir / "my_library.json"
+        expected_file = tmp_path / "my_library.json"
         expected_file.write_text("{}")
-        (temp_dir / "other.txt").write_text("content")
+        (tmp_path / "other.txt").write_text("content")
 
-        result = find_file_in_directory(temp_dir, "*library*.json")
+        result = find_file_in_directory(tmp_path, "*library*.json")
 
         assert result == expected_file
 
-    def test_find_file_logs_warning_when_multiple_matches_found(self, temp_dir: Path) -> None:
+    def test_find_file_logs_warning_when_multiple_matches_found(self, tmp_path: Path) -> None:
         """Test that warning is logged when multiple files match pattern."""
-        file1 = temp_dir / "config1.json"
-        file2 = temp_dir / "config2.json"
+        file1 = tmp_path / "config1.json"
+        file2 = tmp_path / "config2.json"
         file1.write_text("{}")
         file2.write_text("{}")
 
         with patch("griptape_nodes.utils.file_utils.logger") as mock_logger:
-            result = find_file_in_directory(temp_dir, "*.json")
+            result = find_file_in_directory(tmp_path, "*.json")
 
             assert result in [file1, file2]
             mock_logger.warning.assert_called_once()
             warning_call = mock_logger.warning.call_args[0][0]
             assert "multiple files" in warning_call.lower()
 
-    def test_find_file_returns_first_match_when_multiple_found(self, temp_dir: Path) -> None:
+    def test_find_file_returns_first_match_when_multiple_found(self, tmp_path: Path) -> None:
         """Test that first match is returned when multiple files match."""
-        file1 = temp_dir / "a_config.json"
-        file2 = temp_dir / "b_config.json"
+        file1 = tmp_path / "a_config.json"
+        file2 = tmp_path / "b_config.json"
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = find_file_in_directory(temp_dir, "*.json")
+        result = find_file_in_directory(tmp_path, "*.json")
 
         # Should return one of them (first found by os.walk)
         assert result is not None
         assert result.exists()
         assert result.suffix == ".json"
 
-    def test_find_file_matches_character_class_pattern_underscore(self, temp_dir: Path) -> None:
+    def test_find_file_matches_character_class_pattern_underscore(self, tmp_path: Path) -> None:
         """Test that character class pattern matches underscore version."""
-        expected_file = temp_dir / "griptape_nodes_library.json"
+        expected_file = tmp_path / "griptape_nodes_library.json"
         expected_file.write_text("{}")
 
-        result = find_file_in_directory(temp_dir, "griptape[-_]nodes[-_]library.json")
+        result = find_file_in_directory(tmp_path, "griptape[-_]nodes[-_]library.json")
 
         assert result == expected_file
 
-    def test_find_file_matches_character_class_pattern_hyphen(self, temp_dir: Path) -> None:
+    def test_find_file_matches_character_class_pattern_hyphen(self, tmp_path: Path) -> None:
         """Test that character class pattern matches hyphen version."""
-        expected_file = temp_dir / "griptape-nodes-library.json"
+        expected_file = tmp_path / "griptape-nodes-library.json"
         expected_file.write_text("{}")
 
-        result = find_file_in_directory(temp_dir, "griptape[-_]nodes[-_]library.json")
+        result = find_file_in_directory(tmp_path, "griptape[-_]nodes[-_]library.json")
 
         assert result == expected_file
 
 
 class TestFindAllFilesInDirectory:
     """Test find_all_files_in_directory function."""
-
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
 
     def test_find_all_files_when_directory_does_not_exist(self) -> None:
         """Test that empty list is returned when directory doesn't exist."""
@@ -193,94 +176,94 @@ class TestFindAllFilesInDirectory:
 
         assert result == []
 
-    def test_find_all_files_when_path_is_not_directory(self, temp_dir: Path) -> None:
+    def test_find_all_files_when_path_is_not_directory(self, tmp_path: Path) -> None:
         """Test that empty list is returned when path is a file, not a directory."""
-        test_file = temp_dir / "test.txt"
+        test_file = tmp_path / "test.txt"
         test_file.write_text("content")
 
         result = find_all_files_in_directory(test_file, "*.json")
 
         assert result == []
 
-    def test_find_all_files_when_no_files_match_pattern(self, temp_dir: Path) -> None:
+    def test_find_all_files_when_no_files_match_pattern(self, tmp_path: Path) -> None:
         """Test that empty list is returned when no files match the pattern."""
-        (temp_dir / "test.txt").write_text("content")
-        (temp_dir / "another.py").write_text("content")
+        (tmp_path / "test.txt").write_text("content")
+        (tmp_path / "another.py").write_text("content")
 
-        result = find_all_files_in_directory(temp_dir, "*.json")
+        result = find_all_files_in_directory(tmp_path, "*.json")
 
         assert result == []
 
-    def test_find_all_files_returns_single_match(self, temp_dir: Path) -> None:
+    def test_find_all_files_returns_single_match(self, tmp_path: Path) -> None:
         """Test that list with single file is returned when one file matches."""
-        expected_file = temp_dir / "config.json"
+        expected_file = tmp_path / "config.json"
         expected_file.write_text("{}")
-        (temp_dir / "other.txt").write_text("content")
+        (tmp_path / "other.txt").write_text("content")
 
-        result = find_all_files_in_directory(temp_dir, "*.json")
+        result = find_all_files_in_directory(tmp_path, "*.json")
 
         assert len(result) == 1
         assert result[0] == expected_file
 
-    def test_find_all_files_returns_multiple_matches(self, temp_dir: Path) -> None:
+    def test_find_all_files_returns_multiple_matches(self, tmp_path: Path) -> None:
         """Test that all matching files are returned."""
-        file1 = temp_dir / "config1.json"
-        file2 = temp_dir / "config2.json"
-        file3 = temp_dir / "data.json"
+        file1 = tmp_path / "config1.json"
+        file2 = tmp_path / "config2.json"
+        file3 = tmp_path / "data.json"
         file1.write_text("{}")
         file2.write_text("{}")
         file3.write_text("{}")
-        (temp_dir / "other.txt").write_text("content")
+        (tmp_path / "other.txt").write_text("content")
 
-        result = find_all_files_in_directory(temp_dir, "*.json")
+        result = find_all_files_in_directory(tmp_path, "*.json")
 
         assert len(result) == 3  # noqa: PLR2004
         assert set(result) == {file1, file2, file3}
 
-    def test_find_all_files_searches_subdirectories_recursively(self, temp_dir: Path) -> None:
+    def test_find_all_files_searches_subdirectories_recursively(self, tmp_path: Path) -> None:
         """Test that function searches subdirectories recursively."""
-        subdir1 = temp_dir / "sub1"
-        subdir2 = temp_dir / "sub1" / "sub2"
+        subdir1 = tmp_path / "sub1"
+        subdir2 = tmp_path / "sub1" / "sub2"
         subdir1.mkdir()
         subdir2.mkdir()
 
-        file1 = temp_dir / "root.json"
+        file1 = tmp_path / "root.json"
         file2 = subdir1 / "sub1.json"
         file3 = subdir2 / "sub2.json"
         file1.write_text("{}")
         file2.write_text("{}")
         file3.write_text("{}")
 
-        result = find_all_files_in_directory(temp_dir, "*.json")
+        result = find_all_files_in_directory(tmp_path, "*.json")
 
         assert len(result) == 3  # noqa: PLR2004
         assert set(result) == {file1, file2, file3}
 
-    def test_find_all_files_matches_glob_pattern(self, temp_dir: Path) -> None:
+    def test_find_all_files_matches_glob_pattern(self, tmp_path: Path) -> None:
         """Test that function matches files using glob patterns."""
-        file1 = temp_dir / "my_library.json"
-        file2 = temp_dir / "your_library.json"
-        file3 = temp_dir / "config.json"
+        file1 = tmp_path / "my_library.json"
+        file2 = tmp_path / "your_library.json"
+        file3 = tmp_path / "config.json"
         file1.write_text("{}")
         file2.write_text("{}")
         file3.write_text("{}")
 
-        result = find_all_files_in_directory(temp_dir, "*library*.json")
+        result = find_all_files_in_directory(tmp_path, "*library*.json")
 
         assert len(result) == 2  # noqa: PLR2004
         assert set(result) == {file1, file2}
 
-    def test_find_all_files_with_complex_glob_pattern(self, temp_dir: Path) -> None:
+    def test_find_all_files_with_complex_glob_pattern(self, tmp_path: Path) -> None:
         """Test that function handles complex glob patterns."""
-        file1 = temp_dir / "griptape_nodes_library.json"
-        file2 = temp_dir / "griptape-nodes-library.json"
-        file3 = temp_dir / "other_library.json"
+        file1 = tmp_path / "griptape_nodes_library.json"
+        file2 = tmp_path / "griptape-nodes-library.json"
+        file3 = tmp_path / "other_library.json"
         file1.write_text("{}")
         file2.write_text("{}")
         file3.write_text("{}")
 
         # Pattern with character class matches both underscore and hyphen versions
-        result = find_all_files_in_directory(temp_dir, "griptape[-_]nodes[-_]library.json")
+        result = find_all_files_in_directory(tmp_path, "griptape[-_]nodes[-_]library.json")
 
         assert len(result) == 2  # noqa: PLR2004
         assert set(result) == {file1, file2}
@@ -288,12 +271,6 @@ class TestFindAllFilesInDirectory:
 
 class TestAfindFilesRecursive:
     """Test find_files_recursive: the async, depth-bounded finder."""
-
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
 
     @pytest.mark.asyncio
     async def test_when_directory_does_not_exist(self) -> None:
@@ -305,9 +282,9 @@ class TestAfindFilesRecursive:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_when_path_is_not_directory(self, temp_dir: Path) -> None:
+    async def test_when_path_is_not_directory(self, tmp_path: Path) -> None:
         """Empty list is returned when path is a file, not a directory."""
-        test_file = temp_dir / "test.txt"
+        test_file = tmp_path / "test.txt"
         test_file.write_text("content")
 
         result = await find_files_recursive(test_file, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
@@ -315,136 +292,136 @@ class TestAfindFilesRecursive:
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_when_no_files_match_pattern(self, temp_dir: Path) -> None:
+    async def test_when_no_files_match_pattern(self, tmp_path: Path) -> None:
         """Empty list is returned when no files match the pattern."""
-        (temp_dir / "test.txt").write_text("content")
-        (temp_dir / "another.py").write_text("content")
+        (tmp_path / "test.txt").write_text("content")
+        (tmp_path / "another.py").write_text("content")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_returns_sorted_results(self, temp_dir: Path) -> None:
+    async def test_returns_sorted_results(self, tmp_path: Path) -> None:
         """Results are returned in sorted order."""
-        file3 = temp_dir / "zebra.json"
-        file1 = temp_dir / "apple.json"
-        file2 = temp_dir / "banana.json"
+        file3 = tmp_path / "zebra.json"
+        file1 = tmp_path / "apple.json"
+        file2 = tmp_path / "banana.json"
         file3.write_text("{}")
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [file1, file2, file3]
 
     @pytest.mark.asyncio
-    async def test_returns_sorted_results_with_subdirectories(self, temp_dir: Path) -> None:
+    async def test_returns_sorted_results_with_subdirectories(self, tmp_path: Path) -> None:
         """Results from subdirectories are also sorted."""
-        subdir_z = temp_dir / "z_dir"
-        subdir_a = temp_dir / "a_dir"
+        subdir_z = tmp_path / "z_dir"
+        subdir_a = tmp_path / "a_dir"
         subdir_z.mkdir()
         subdir_a.mkdir()
 
         file1 = subdir_a / "config.json"
         file2 = subdir_z / "config.json"
-        file3 = temp_dir / "root.json"
+        file3 = tmp_path / "root.json"
         file1.write_text("{}")
         file2.write_text("{}")
         file3.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [file1, file3, file2]
 
     @pytest.mark.asyncio
-    async def test_skips_hidden_directories_by_default(self, temp_dir: Path) -> None:
+    async def test_skips_hidden_directories_by_default(self, tmp_path: Path) -> None:
         """Hidden directories are skipped by default."""
-        hidden_dir = temp_dir / ".hidden"
+        hidden_dir = tmp_path / ".hidden"
         hidden_dir.mkdir()
         hidden_file = hidden_dir / "config.json"
-        visible_file = temp_dir / "visible.json"
+        visible_file = tmp_path / "visible.json"
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == [visible_file]
 
     @pytest.mark.asyncio
-    async def test_includes_hidden_directories_when_requested(self, temp_dir: Path) -> None:
+    async def test_includes_hidden_directories_when_requested(self, tmp_path: Path) -> None:
         """Hidden directories are included when skip_hidden=False."""
-        hidden_dir = temp_dir / ".hidden"
+        hidden_dir = tmp_path / ".hidden"
         hidden_dir.mkdir()
         hidden_file = hidden_dir / "config.json"
-        visible_file = temp_dir / "visible.json"
+        visible_file = tmp_path / "visible.json"
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, skip_hidden=False)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, skip_hidden=False)
 
         assert set(result) == {hidden_file, visible_file}
 
     @pytest.mark.asyncio
-    async def test_matches_glob_pattern(self, temp_dir: Path) -> None:
+    async def test_matches_glob_pattern(self, tmp_path: Path) -> None:
         """Files are matched using glob patterns."""
-        file1 = temp_dir / "my_library.json"
-        file2 = temp_dir / "your_library.json"
-        (temp_dir / "config.json").write_text("{}")
+        file1 = tmp_path / "my_library.json"
+        file2 = tmp_path / "your_library.json"
+        (tmp_path / "config.json").write_text("{}")
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*library*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+        result = await find_files_recursive(tmp_path, "*library*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert result == sorted([file1, file2])
 
     @pytest.mark.asyncio
-    async def test_depth_zero_setting_scans_only_top_level(self, temp_dir: Path) -> None:
+    async def test_depth_zero_setting_scans_only_top_level(self, tmp_path: Path) -> None:
         """A max_depth of 0 returns only matches directly in the directory."""
-        root_file = temp_dir / "root.json"
-        nested_file = temp_dir / "sub" / "nested.json"
+        root_file = tmp_path / "root.json"
+        nested_file = tmp_path / "sub" / "nested.json"
         nested_file.parent.mkdir()
         root_file.write_text("{}")
         nested_file.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=0)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=0)
 
         assert result == [root_file]
 
     @pytest.mark.asyncio
-    async def test_depth_setting_excludes_files_below_cap(self, temp_dir: Path) -> None:
+    async def test_depth_setting_excludes_files_below_cap(self, tmp_path: Path) -> None:
         """Files at the depth cap are included; deeper files are excluded."""
-        at_cap = temp_dir / "a" / "at_cap.json"
-        below_cap = temp_dir / "a" / "b" / "below_cap.json"
+        at_cap = tmp_path / "a" / "at_cap.json"
+        below_cap = tmp_path / "a" / "b" / "below_cap.json"
         below_cap.parent.mkdir(parents=True)
         at_cap.write_text("{}")
         below_cap.write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=1)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=1)
 
         assert result == [at_cap]
 
     @pytest.mark.asyncio
-    async def test_max_files_limits_results(self, temp_dir: Path) -> None:
+    async def test_max_files_limits_results(self, tmp_path: Path) -> None:
         """At most max_files matches are returned."""
         for name in ["a.json", "b.json", "c.json", "d.json"]:
-            (temp_dir / name).write_text("{}")
+            (tmp_path / name).write_text("{}")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, max_files=2)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, max_files=2)
 
         assert len(result) == 2  # noqa: PLR2004
 
     @pytest.mark.asyncio
-    async def test_follows_symlinked_directories(self, temp_dir: Path) -> None:
+    async def test_follows_symlinked_directories(self, tmp_path: Path) -> None:
         """A symlinked directory is walked, so a workspace can reach content through a link.
 
         Guards against a walk that skips links (os.walk's default), which would silently
         stop discovering libraries or workflows reached that way.
         """
-        real_dir = temp_dir / "real"
+        real_dir = tmp_path / "real"
         real_dir.mkdir()
         (real_dir / "found.json").write_text("{}")
-        scan_root = temp_dir / "root"
+        scan_root = tmp_path / "root"
         scan_root.mkdir()
         (scan_root / "linked").symlink_to(real_dir)
 
@@ -453,37 +430,65 @@ class TestAfindFilesRecursive:
         assert result == [scan_root / "linked" / "found.json"]
 
     @pytest.mark.asyncio
-    async def test_symlink_loop_terminates(self, temp_dir: Path) -> None:
+    async def test_skip_directory_prunes_matching_directories(self, tmp_path: Path) -> None:
+        """A directory the predicate rejects is not searched, nor anything beneath it."""
+        (tmp_path / "keep").mkdir()
+        (tmp_path / "keep" / "a.json").write_text("{}")
+        (tmp_path / "skip" / "nested").mkdir(parents=True)
+        (tmp_path / "skip" / "b.json").write_text("{}")
+        (tmp_path / "skip" / "nested" / "c.json").write_text("{}")
+
+        result = await find_files_recursive(
+            tmp_path,
+            "*.json",
+            max_depth=DEFAULT_MAX_SEARCH_DEPTH,
+            skip_directory=lambda directory: directory.name == "skip",
+        )
+
+        assert result == [tmp_path / "keep" / "a.json"]
+
+    @pytest.mark.asyncio
+    async def test_skip_directory_applies_to_the_search_root(self, tmp_path: Path) -> None:
+        (tmp_path / "a.json").write_text("{}")
+
+        result = await find_files_recursive(
+            tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH, skip_directory=lambda _: True
+        )
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_symlink_loop_terminates(self, tmp_path: Path) -> None:
         """A directory symlink pointing back at an ancestor terminates via the depth cap."""
-        nested = temp_dir / "a"
+        nested = tmp_path / "a"
         nested.mkdir()
         (nested / "f.json").write_text("{}")
-        (nested / "loop").symlink_to(temp_dir)
+        (nested / "loop").symlink_to(tmp_path)
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
         assert nested / "f.json" in result
 
     @pytest.mark.asyncio
-    async def test_broken_symlink_is_skipped(self, temp_dir: Path) -> None:
+    async def test_broken_symlink_is_skipped(self, tmp_path: Path) -> None:
         """A dangling symlink is neither matched nor fatal to the walk."""
-        (temp_dir / "real.json").write_text("{}")
-        (temp_dir / "broken.json").symlink_to(temp_dir / "does_not_exist")
+        (tmp_path / "real.json").write_text("{}")
+        (tmp_path / "broken.json").symlink_to(tmp_path / "does_not_exist")
 
-        result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+        result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
-        assert result == [temp_dir / "real.json"]
+        assert result == [tmp_path / "real.json"]
 
     @pytest.mark.asyncio
-    async def test_unreadable_directory_does_not_abort_walk(self, temp_dir: Path) -> None:
+    async def test_unreadable_directory_does_not_abort_walk(self, tmp_path: Path) -> None:
         """A directory that cannot be listed is skipped, and its siblings still resolve.
 
         Uses a patched scandir rather than chmod so the case is exercised on Windows too,
         where permissions do not deny directory listing the same way.
         """
-        (temp_dir / "sibling").mkdir()
-        (temp_dir / "sibling" / "found.json").write_text("{}")
-        unreadable = temp_dir / "unreadable"
+        (tmp_path / "sibling").mkdir()
+        (tmp_path / "sibling" / "found.json").write_text("{}")
+        unreadable = tmp_path / "unreadable"
         unreadable.mkdir()
         (unreadable / "hidden_by_permissions.json").write_text("{}")
 
@@ -495,19 +500,19 @@ class TestAfindFilesRecursive:
             return real_scandir(path)  # type: ignore[arg-type]
 
         with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_denying_one_dir):
-            result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+            result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
-        assert result == [temp_dir / "sibling" / "found.json"]
+        assert result == [tmp_path / "sibling" / "found.json"]
 
     @pytest.mark.asyncio
-    async def test_unclassifiable_entry_does_not_abort_directory(self, temp_dir: Path) -> None:
+    async def test_unclassifiable_entry_does_not_abort_directory(self, tmp_path: Path) -> None:
         """An entry whose type cannot be determined is skipped, not fatal to its siblings.
 
         Mirrors a macOS protected path, where stat-ing one entry raises while the rest of
         the directory reads fine.
         """
-        (temp_dir / "good.json").write_text("{}")
-        (temp_dir / "protected.json").write_text("{}")
+        (tmp_path / "good.json").write_text("{}")
+        (tmp_path / "protected.json").write_text("{}")
 
         real_scandir = os.scandir
 
@@ -521,12 +526,12 @@ class TestAfindFilesRecursive:
             return _FakeScandir(entries)
 
         with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_with_one_bad_entry):
-            result = await find_files_recursive(temp_dir, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
+            result = await find_files_recursive(tmp_path, "*.json", max_depth=DEFAULT_MAX_SEARCH_DEPTH)
 
-        assert result == [temp_dir / "good.json"]
+        assert result == [tmp_path / "good.json"]
 
     @pytest.mark.asyncio
-    async def test_walk_is_cancellable_between_directories(self, temp_dir: Path) -> None:
+    async def test_walk_is_cancellable_between_directories(self, tmp_path: Path) -> None:
         """Cancelling the walk stops it partway rather than running the whole tree.
 
         The walk offloads one thread hop per directory specifically so a caller can bound
@@ -536,7 +541,7 @@ class TestAfindFilesRecursive:
         """
         expected_total = 20
         for index in range(expected_total):
-            subdir = temp_dir / f"dir{index:02d}"
+            subdir = tmp_path / f"dir{index:02d}"
             subdir.mkdir()
             (subdir / "file.json").write_text("{}")
 
@@ -548,7 +553,7 @@ class TestAfindFilesRecursive:
             max_files=None,
             matches=matches,
         )
-        task = asyncio.create_task(_arecurse_find(temp_dir, 0, params))
+        task = asyncio.create_task(_arecurse_find(tmp_path, 0, params))
         # Let the walk reach its first thread hop, then cancel while it is suspended.
         await asyncio.sleep(0)
         task.cancel()
@@ -559,7 +564,7 @@ class TestAfindFilesRecursive:
         assert len(matches) < expected_total
 
     @pytest.mark.asyncio
-    async def test_cancelling_the_walk_returns_without_awaiting_the_scan(self, temp_dir: Path) -> None:
+    async def test_cancelling_the_walk_returns_without_awaiting_the_scan(self, tmp_path: Path) -> None:
         """Cancellation returns promptly instead of blocking on the in-flight directory scan.
 
         Cancelling at a directory edge is only a real bound if the await also *returns* at
@@ -567,7 +572,7 @@ class TestAfindFilesRecursive:
         discovery for as long as the scan takes, no matter what timeout the caller set, so
         this pins the promptness rather than just the fact that the walk stopped early.
         """
-        (temp_dir / "unreachable.json").write_text("{}")
+        (tmp_path / "unreachable.json").write_text("{}")
         scan_duration_s = 5.0
 
         def hung_scan(*_args: object, **_kwargs: object) -> list[object]:
@@ -583,7 +588,7 @@ class TestAfindFilesRecursive:
         )
 
         with patch("griptape_nodes.utils.file_utils._scan_directory", hung_scan):
-            task = asyncio.create_task(_arecurse_find(temp_dir, 0, params))
+            task = asyncio.create_task(_arecurse_find(tmp_path, 0, params))
             # Let the walk dispatch the scan, so the cancel lands while it is in flight.
             await asyncio.sleep(0.05)
             task.cancel()
@@ -600,39 +605,33 @@ class TestAfindFilesRecursive:
 class TestAtomicWriteBytes:
     """Test atomic_write_bytes function."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    def test_writes_new_file(self, temp_dir: Path) -> None:
+    def test_writes_new_file(self, tmp_path: Path) -> None:
         """A new file is created with the given bytes."""
-        target = temp_dir / "data.bin"
+        target = tmp_path / "data.bin"
         atomic_write_bytes(target, b"hello")
         assert target.read_bytes() == b"hello"
 
-    def test_overwrites_existing_file(self, temp_dir: Path) -> None:
+    def test_overwrites_existing_file(self, tmp_path: Path) -> None:
         """An existing file is replaced with the new contents."""
-        target = temp_dir / "data.bin"
+        target = tmp_path / "data.bin"
         target.write_bytes(b"old")
         atomic_write_bytes(target, b"new")
         assert target.read_bytes() == b"new"
 
-    def test_leaves_no_temp_files_behind(self, temp_dir: Path) -> None:
+    def test_leaves_no_temp_files_behind(self, tmp_path: Path) -> None:
         """The temp file is renamed into place, not left in the directory."""
-        target = temp_dir / "data.bin"
+        target = tmp_path / "data.bin"
         atomic_write_bytes(target, b"payload")
-        assert [p.name for p in temp_dir.iterdir()] == ["data.bin"]
+        assert [p.name for p in tmp_path.iterdir()] == ["data.bin"]
 
-    def test_overwrite_rides_out_transient_rename_denial(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_overwrite_rides_out_transient_rename_denial(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """The headline behavior: a full overwrite survives Windows-style transient denials.
 
         End-to-end through atomic_write_bytes, not the promote helper directly —
         two denials on the rename (a reader holding the destination) and the
         write still lands, with no scratch debris.
         """
-        target = temp_dir / "served.bin"
+        target = tmp_path / "served.bin"
         target.write_bytes(b"old")
 
         real_replace = Path.replace
@@ -648,11 +647,11 @@ class TestAtomicWriteBytes:
         atomic_write_bytes(target, b"new")
 
         assert target.read_bytes() == b"new"
-        assert sorted(p.name for p in temp_dir.iterdir()) == ["served.bin"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["served.bin"]
 
-    def test_failed_rename_removes_temp_and_preserves_original(self, temp_dir: Path) -> None:
+    def test_failed_rename_removes_temp_and_preserves_original(self, tmp_path: Path) -> None:
         """A rename failure cleans up the temp file and leaves the original intact."""
-        target = temp_dir / "data.bin"
+        target = tmp_path / "data.bin"
         target.write_bytes(b"original")
         with (
             patch("griptape_nodes.utils.file_utils.Path.replace", side_effect=OSError("boom")),
@@ -661,11 +660,11 @@ class TestAtomicWriteBytes:
             atomic_write_bytes(target, b"new")
         assert target.read_bytes() == b"original"
         # No stray temp file survives the failure.
-        assert sorted(p.name for p in temp_dir.iterdir()) == ["data.bin"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["data.bin"]
 
-    def test_failed_fsync_removes_temp_and_preserves_original(self, temp_dir: Path) -> None:
+    def test_failed_fsync_removes_temp_and_preserves_original(self, tmp_path: Path) -> None:
         """A write that dies before the rename cleans up and leaves the original intact."""
-        target = temp_dir / "data.bin"
+        target = tmp_path / "data.bin"
         target.write_bytes(b"original")
         with (
             patch("griptape_nodes.utils.file_utils.os.fsync", side_effect=OSError("device error")),
@@ -673,10 +672,10 @@ class TestAtomicWriteBytes:
         ):
             atomic_write_bytes(target, b"new")
         assert target.read_bytes() == b"original"
-        assert sorted(p.name for p in temp_dir.iterdir()) == ["data.bin"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["data.bin"]
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits are not representable on Windows")
-    def test_preserves_existing_file_mode(self, temp_dir: Path) -> None:
+    def test_preserves_existing_file_mode(self, tmp_path: Path) -> None:
         """Overwriting keeps the destination's permissions.
 
         The scratch file is aligned to the destination's exact mode before any
@@ -685,7 +684,7 @@ class TestAtomicWriteBytes:
         """
         import stat
 
-        target = temp_dir / "data.bin"
+        target = tmp_path / "data.bin"
         target.write_bytes(b"original")
         target.chmod(0o604)
 
@@ -695,7 +694,7 @@ class TestAtomicWriteBytes:
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits are not representable on Windows")
     def test_scratch_never_looser_than_strict_destination(
-        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A 0600 destination's content is never on disk at a looser mode, even mid-write.
 
@@ -705,7 +704,7 @@ class TestAtomicWriteBytes:
         """
         import stat
 
-        target = temp_dir / "secrets.env"
+        target = tmp_path / "secrets.env"
         target.write_bytes(b"OPENAI_API_KEY=old")
         target.chmod(0o600)
 
@@ -714,7 +713,7 @@ class TestAtomicWriteBytes:
 
         def spying_fsync(fd: int) -> None:
             observed_modes.extend(
-                stat.S_IMODE(scratch.stat().st_mode) for scratch in temp_dir.glob(".gtn-write-partial-*")
+                stat.S_IMODE(scratch.stat().st_mode) for scratch in tmp_path.glob(".gtn-write-partial-*")
             )
             real_fsync(fd)
 
@@ -727,7 +726,7 @@ class TestAtomicWriteBytes:
         assert stat.S_IMODE(target.stat().st_mode) == 0o600  # noqa: PLR2004
 
     def test_scratch_never_matches_destination_extension_glob(
-        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Mid-write, an extension glob over the directory sees only real records.
 
@@ -735,14 +734,14 @@ class TestAtomicWriteBytes:
         directories this function writes into — the scratch name must never end
         in the destination's own suffix or it reads as a second record.
         """
-        target = temp_dir / "record.json"
+        target = tmp_path / "record.json"
         target.write_bytes(b"{}")
 
         mid_write_glob: list[str] = []
         real_fsync = os.fsync
 
         def spying_fsync(fd: int) -> None:
-            mid_write_glob.extend(p.name for p in temp_dir.glob("*.json"))
+            mid_write_glob.extend(p.name for p in tmp_path.glob("*.json"))
             real_fsync(fd)
 
         monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", spying_fsync)
@@ -754,7 +753,7 @@ class TestAtomicWriteBytes:
         assert mid_write_glob
         assert set(mid_write_glob) == {"record.json"}
 
-    def test_new_file_gets_umask_default_mode(self, temp_dir: Path) -> None:
+    def test_new_file_gets_umask_default_mode(self, tmp_path: Path) -> None:
         """A brand-new file gets the same mode open(mode="w") would have produced."""
         import stat
 
@@ -762,21 +761,21 @@ class TestAtomicWriteBytes:
         os.umask(current_umask)
         expected_mode = 0o666 & ~current_umask
 
-        target = temp_dir / "data.bin"
+        target = tmp_path / "data.bin"
         atomic_write_bytes(target, b"new")
 
         assert stat.S_IMODE(target.stat().st_mode) == expected_mode
 
     @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privileges on Windows")
-    def test_writes_through_symlink_destination(self, temp_dir: Path) -> None:
+    def test_writes_through_symlink_destination(self, tmp_path: Path) -> None:
         """A symlinked destination keeps the link and updates its target.
 
         Matches in-place open(mode="w") semantics; a naive rename would replace
         the link itself with a regular file and leave the target stale.
         """
-        real_target = temp_dir / "real.bin"
+        real_target = tmp_path / "real.bin"
         real_target.write_bytes(b"old")
-        link = temp_dir / "link.bin"
+        link = tmp_path / "link.bin"
         link.symlink_to(real_target)
 
         atomic_write_bytes(link, b"new")
@@ -785,10 +784,10 @@ class TestAtomicWriteBytes:
         assert real_target.read_bytes() == b"new"
 
     @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation needs privileges on Windows")
-    def test_dangling_symlink_creates_target(self, temp_dir: Path) -> None:
+    def test_dangling_symlink_creates_target(self, tmp_path: Path) -> None:
         """Writing to a dangling link creates its target, as open() would."""
-        missing_target = temp_dir / "missing.bin"
-        link = temp_dir / "link.bin"
+        missing_target = tmp_path / "missing.bin"
+        link = tmp_path / "link.bin"
         link.symlink_to(missing_target)
 
         atomic_write_bytes(link, b"new")
@@ -800,17 +799,11 @@ class TestAtomicWriteBytes:
 class TestFsyncDirectoryBestEffort:
     """The directory sync must never fail a write that already completed."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    def test_unopenable_directory_is_swallowed(self, temp_dir: Path) -> None:
+    def test_unopenable_directory_is_swallowed(self, tmp_path: Path) -> None:
         """A directory that cannot be opened for sync is logged and skipped."""
-        _fsync_directory_best_effort(temp_dir / "does-not-exist")
+        _fsync_directory_best_effort(tmp_path / "does-not-exist")
 
-    def test_fsync_failure_is_swallowed(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_fsync_failure_is_swallowed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """An fsync error (unsupported filesystem) is logged and skipped."""
 
         def failing_fsync(_fd: int) -> None:
@@ -819,22 +812,16 @@ class TestFsyncDirectoryBestEffort:
 
         monkeypatch.setattr("griptape_nodes.utils.file_utils.os.fsync", failing_fsync)
 
-        _fsync_directory_best_effort(temp_dir)
+        _fsync_directory_best_effort(tmp_path)
 
 
 class TestPromoteScratchFile:
     """Shared promote: atomic rename that rides out transient Windows denials."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    def test_promotes_onto_destination(self, temp_dir: Path) -> None:
-        scratch = temp_dir / ".scratch.partial"
+    def test_promotes_onto_destination(self, tmp_path: Path) -> None:
+        scratch = tmp_path / ".scratch.partial"
         scratch.write_bytes(b"new")
-        destination = temp_dir / "served.bin"
+        destination = tmp_path / "served.bin"
         destination.write_bytes(b"old")
 
         promote_scratch_file(scratch, destination)
@@ -842,10 +829,10 @@ class TestPromoteScratchFile:
         assert destination.read_bytes() == b"new"
         assert not scratch.exists()
 
-    def test_rides_out_transient_denial(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        scratch = temp_dir / ".scratch.partial"
+    def test_rides_out_transient_denial(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        scratch = tmp_path / ".scratch.partial"
         scratch.write_bytes(b"new")
-        destination = temp_dir / "served.bin"
+        destination = tmp_path / "served.bin"
 
         real_replace = Path.replace
         denials = [PermissionError("held"), PermissionError("held")]
@@ -861,11 +848,11 @@ class TestPromoteScratchFile:
 
         assert destination.read_bytes() == b"new"
 
-    def test_persistent_denial_raises_and_keeps_scratch(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_persistent_denial_raises_and_keeps_scratch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scratch disposal belongs to the caller, so a failed promote must not unlink it."""
-        scratch = temp_dir / ".scratch.partial"
+        scratch = tmp_path / ".scratch.partial"
         scratch.write_bytes(b"new")
-        destination = temp_dir / "served.bin"
+        destination = tmp_path / "served.bin"
 
         def always_denied(_self: Path, _target: str | Path) -> Path:
             msg = "held open"
@@ -879,10 +866,10 @@ class TestPromoteScratchFile:
         assert scratch.exists()
         assert not destination.exists()
 
-    def test_async_form_promotes_and_retries(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        scratch = temp_dir / ".scratch.partial"
+    def test_async_form_promotes_and_retries(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        scratch = tmp_path / ".scratch.partial"
         scratch.write_bytes(b"new")
-        destination = temp_dir / "served.bin"
+        destination = tmp_path / "served.bin"
 
         real_replace = anyio.Path.replace
         denials = [PermissionError("held")]

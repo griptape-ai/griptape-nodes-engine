@@ -6,10 +6,12 @@ import dataclasses
 import json
 import logging
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 from uuid import uuid4
 
+from griptape_nodes.common import failure_trees
 from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
 from griptape_nodes.common.strict_mode import (
     STRICT_MODE,
@@ -28,7 +30,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.execution_events import NodeMetadata
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
-    from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
 from griptape_nodes.drivers.cloud_credentials import resolve_cloud_host
@@ -38,6 +39,7 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
 )
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
+    InvalidParameterValueError,
     Parameter,
     ParameterContainer,
     ParameterGroup,
@@ -52,6 +54,7 @@ from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups import NodeGroupMembershipError, SubflowNodeGroup
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.node_loading import node_loading
+from griptape_nodes.exe_types.node_metadata import without_first_size
 from griptape_nodes.exe_types.node_types import (
     ISOLATED_EXECUTION,
     LOCAL_EXECUTION,
@@ -62,6 +65,7 @@ from griptape_nodes.exe_types.node_types import (
     TransformedParameterValue,
     _values_differ,
     aprocess_scope,
+    connection_feed_scope,
 )
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.exe_types.trait_state import TraitStateEntry
@@ -134,7 +138,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetLibraryMetadataRequest,
     GetLibraryMetadataResultSuccess,
 )
-from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.node_events import (
     AddNodesToNodeGroupRequest,
     AddNodesToNodeGroupResultFailure,
@@ -206,6 +209,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     UnresolveNodeRequest,
     UnresolveNodeResultFailure,
     UnresolveNodeResultSuccess,
+    ValueLeftOut,
 )
 from griptape_nodes.retained_mode.events.object_events import (
     RenameObjectRequest,
@@ -324,6 +328,12 @@ _SETTLED_NODE_STATES = frozenset({NodeState.DONE, NodeState.CANCELED, NodeState.
 _UNCOLLECTED_NODE_STATES = frozenset({NodeState.WAITING, NodeState.QUEUED})
 
 
+# Reference copies shared by a batch of serializations, keyed by node class, library, and node type.
+_ReferenceNodes = dict[tuple[type, Any, Any], BaseNode]
+
+_shared_reference_nodes: ContextVar[_ReferenceNodes | None] = ContextVar("shared_reference_nodes", default=None)
+
+
 @dataclass
 class _FlowCancelOutcome:
     """What deleting a node did to the workflow that was running, if any.
@@ -412,8 +422,14 @@ class _NodeInstantiationDeniedError(Exception):
     Caught by the same handler path that substitutes an Error Proxy for a node
     whose library failed to load, so a denied node surfaces identically: a proxy
     carrying the missing-permission detail, or a failure result when the caller
-    opted out of proxy substitution.
+    opted out of proxy substitution. It keeps the structured `denial` and the resolved
+    library name so the proxy can show every violated rule and name the real library.
     """
+
+    def __init__(self, denial: CheckpointDenial, library_name: str) -> None:
+        super().__init__(denial.reason(separator="\n"))
+        self.denial = denial
+        self.library_name = library_name
 
 
 @dataclass(frozen=True)
@@ -505,16 +521,6 @@ class NodeManager(EngineScoped):
     def handle_flow_rename(self, workflow: WorkflowRuntime, old_name: str, new_name: str) -> None:
         # Find all instances where a node had the old parent and update it to the new one.
         workflow.nodes.rename_flow(old_name, new_name)
-
-    def _current_nodes_or_none(self) -> WorkflowNodes | None:
-        """The current workflow's node bookkeeping, or None for lookups that find nothing without a workflow.
-
-        Only edge methods read through here.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            return None
-        return workflow.nodes
 
     def _cleanup_node_on_failed_deserialization(self, workflow: WorkflowRuntime, node_name: str) -> None:
         """Clean up a node that failed during deserialization.
@@ -691,19 +697,6 @@ class NodeManager(EngineScoped):
         )
 
     @staticmethod
-    def _evaluate_instantiation_checkpoint(
-        *, node_type: str, specific_library_name: str | None, event_manager: EventManager
-    ) -> CheckpointDenial | None:
-        """Ask any registered authorization hook whether this node type may be instantiated."""
-        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
-        return NodeManager._evaluate_node_instantiation_checkpoint(
-            node_type=node_type,
-            node_declarations=library.get_node_metadata(node_type).declarations,
-            library_declarations=library.get_metadata().declarations,
-            event_manager=event_manager,
-        )
-
-    @staticmethod
     def _enforce_instantiation_checkpoint(
         *, node_type: str, specific_library_name: str | None, event_manager: EventManager
     ) -> None:
@@ -711,14 +704,18 @@ class NodeManager(EngineScoped):
 
         Raised rather than returned so a denial joins the Error Proxy substitution
         path in `on_create_node_request`, identical to a node whose library failed
-        to load. The message lists every missing permission.
+        to load. The error carries the whole denial, so every missing permission
+        survives, along with the name of the library the node type resolved to.
         """
-        denial = NodeManager._evaluate_instantiation_checkpoint(
-            node_type=node_type, specific_library_name=specific_library_name, event_manager=event_manager
+        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
+        denial = NodeManager._evaluate_node_instantiation_checkpoint(
+            node_type=node_type,
+            node_declarations=library.get_node_metadata(node_type).declarations,
+            library_declarations=library.get_metadata().declarations,
+            event_manager=event_manager,
         )
         if denial is not None:
-            message = denial.reason(separator="\n")
-            raise _NodeInstantiationDeniedError(message)
+            raise _NodeInstantiationDeniedError(denial, library.get_library_data().name)
 
     @staticmethod
     def evaluate_schema_node_instantiation_denials(
@@ -882,23 +879,27 @@ class NodeManager(EngineScoped):
                     # A policy denial is a recoverable restriction rather than a broken
                     # node, so the proxy carries the denial reason and renders as a warning
                     # instead of surfacing library-load diagnostics as a hard error.
-                    denied_by_policy = isinstance(err, _NodeInstantiationDeniedError)
-                    if denied_by_policy:
-                        failure_reason = str(err)
+                    if isinstance(err, _NodeInstantiationDeniedError):
+                        node = ErrorProxyNode(
+                            name=final_node_name,
+                            original_node_type=request.node_type,
+                            original_library_name=err.library_name,
+                            failure_reason=str(err),
+                            metadata=request.metadata,
+                            denial=err.denial,
+                        )
                     else:
                         failure_reason = self._describe_node_creation_failure(
                             err, node_type=request.node_type, library_name=request.specific_library_name
                         )
-
-                    # Create ErrorProxyNode directly since it needs special initialization
-                    node = ErrorProxyNode(
-                        name=final_node_name,
-                        original_node_type=request.node_type,
-                        original_library_name=request.specific_library_name or "Unknown",
-                        failure_reason=failure_reason,
-                        metadata=request.metadata,
-                        denied_by_policy=denied_by_policy,
-                    )
+                        # Create ErrorProxyNode directly since it needs special initialization
+                        node = ErrorProxyNode(
+                            name=final_node_name,
+                            original_node_type=request.node_type,
+                            original_library_name=request.specific_library_name or "Unknown",
+                            failure_reason=failure_reason,
+                            metadata=request.metadata,
+                        )
 
                     logger.warning(
                         "Created Error Proxy (placeholder) node '%s' to substitute for failed '%s'",
@@ -928,9 +929,12 @@ class NodeManager(EngineScoped):
         with self._loading(node.name, request.specific_library_name) as state_scope:
             node.state = NodeResolutionState(state)
 
-        # See if we want to push this into the context of the current flow.
         if request.set_as_new_context:
-            workflow.context.push_node(node)
+            logger.warning(
+                "CreateNodeRequest for Node '%s' set set_as_new_context, which is deprecated and ignored. "
+                "Name the node on later requests, or send them inside a ContextManager().node() block.",
+                final_node_name,
+            )
 
         # Success message based on whether we used Current Context or explicit flow
         if request.override_parent_flow_name is None:
@@ -1503,18 +1507,18 @@ class NodeManager(EngineScoped):
         # affect it.
         releasable_handle_keys = self._cached_objects_owned_by(node)
 
+        parent_flow_name = workflow.nodes.name_to_parent_flow_name[node_name]
+        try:
+            parent_flow = self.engine.flow_manager.get_flow_by_name_in(workflow, parent_flow_name)
+        except KeyError as err:
+            details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
+            return DeleteNodeResultFailure(result_details=details)
+
+        cancel_outcome = await self.cancel_conditionally(workflow, parent_flow, parent_flow_name, node)
+        if cancel_outcome.failure is not None:
+            return cancel_outcome.failure
+
         with workflow.context.node(node):
-            parent_flow_name = workflow.nodes.name_to_parent_flow_name[node_name]
-            try:
-                parent_flow = self.engine.flow_manager.get_flow_by_name_in(workflow, parent_flow_name)
-            except KeyError as err:
-                details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
-                return DeleteNodeResultFailure(result_details=details)
-
-            cancel_outcome = await self.cancel_conditionally(workflow, parent_flow, parent_flow_name, node)
-            if cancel_outcome.failure is not None:
-                return cancel_outcome.failure
-
             # The node is leaving, so the live DAG has to stop naming it: it is published to the
             # editor as an involved node, iterated on cancel, and checked before a node is allowed
             # to start. Harmless when the run was cancelled above, since teardown clears it anyway.
@@ -1578,10 +1582,6 @@ class NodeManager(EngineScoped):
 
         # Now remove the record keeping
         self._forget_node(workflow, node, parent_flow)
-
-        # If we were part of the Current Context, pop it.
-        if request.node_name is None:
-            workflow.context.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
         # Stopping a run the artist started is not something to do silently. Say it happened, and say
@@ -1761,11 +1761,15 @@ class NodeManager(EngineScoped):
                 result = SetNodeMetadataResultFailure(result_details=details)
                 return result
 
+        before = dict(node.metadata)
         # We can't completely overwrite metadata.
         for key, value in request.metadata.items():
             node.metadata[key] = value
+        for key in request.remove_keys:
+            node.metadata.pop(key, None)
+        altered = without_first_size(before, node.metadata) != before
         details = f"Successfully set metadata for a Node '{node_name}'."
-        result = SetNodeMetadataResultSuccess(result_details=details)
+        result = SetNodeMetadataResultSuccess(result_details=details, altered_workflow_state=altered)
         return result
 
     @handles(BatchSetNodeMetadataRequest)
@@ -1774,6 +1778,7 @@ class NodeManager(EngineScoped):
     ) -> ResultPayload:
         updated_nodes = []
         failed_nodes = {}
+        altered = False
 
         for node_name, metadata_update in request.node_metadata_updates.items():
             # Resolve node name and get node object
@@ -1800,6 +1805,7 @@ class NodeManager(EngineScoped):
 
             if isinstance(result, SetNodeMetadataResultSuccess):
                 updated_nodes.append(actual_node_name)
+                altered = altered or result.altered_workflow_state
             else:
                 failed_nodes[actual_node_name] = result.result_details
 
@@ -1812,6 +1818,7 @@ class NodeManager(EngineScoped):
             updated_nodes=updated_nodes,
             failed_nodes=failed_nodes,
             result_details=f"Successfully updated metadata for {len(updated_nodes)} nodes.",
+            altered_workflow_state=altered,
         )
 
     @handles(ListConnectionsForNodeRequest)
@@ -2358,20 +2365,8 @@ class NodeManager(EngineScoped):
             group_name=new_group.name, node_name=node_name, result_details=details
         )
 
-    def on_remove_parameter_from_node_request(self, request: RemoveParameterFromNodeRequest) -> ResultPayload:
-        """Remove a parameter from a node of the open workflow, outside dispatch.
-
-        Edge method for code that calls the handler directly and is not handed a workflow (node
-        library code); dispatch calls `on_remove_parameter_from_node_request_in_workflow`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{request.node_name}'. Failed because no workflow is open."
-            return RemoveParameterFromNodeResultFailure(result_details=details)
-        return self.on_remove_parameter_from_node_request_in_workflow(request, workflow)
-
     @handles(RemoveParameterFromNodeRequest)
-    def on_remove_parameter_from_node_request_in_workflow(  # noqa: C901, PLR0911, PLR0912, PLR0915
+    def on_remove_parameter_from_node_request(  # noqa: C901, PLR0911, PLR0912, PLR0915
         self, request: RemoveParameterFromNodeRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         node_name = request.node_name
@@ -2707,7 +2702,7 @@ class NodeManager(EngineScoped):
                 source_node = self.get_node_by_name_in(workflow, conn.source_node_name)
                 source_param = source_node.get_parameter_by_name(conn.source_parameter_name)
                 if source_param and not parameter.is_incoming_type_allowed(source_param.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=conn.source_node_name,
                             source_parameter_name=conn.source_parameter_name,
@@ -2726,7 +2721,7 @@ class NodeManager(EngineScoped):
                 target_node = self.get_node_by_name_in(workflow, conn.target_node_name)
                 target_param = target_node.get_parameter_by_name(conn.target_parameter_name)
                 if target_param and not target_param.is_incoming_type_allowed(parameter.output_type):
-                    delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=node_name,
                             source_parameter_name=request.parameter_name,
@@ -2873,22 +2868,9 @@ class NodeManager(EngineScoped):
         details = f"Successfully altered details for ParameterGroup '{request.group_name}' from Node '{node_name}'."
         return AlterParameterGroupDetailsResultSuccess(result_details=details)
 
-    def on_get_parameter_value_request(self, request: GetParameterValueRequest) -> ResultPayload:
-        """Answer `request` for the open workflow, outside dispatch.
-
-        Kept for node libraries that call it directly. Engine code sends the request instead.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = (
-                f"Attempted to get value for Parameter '{request.parameter_name}'. Failed because no workflow is open."
-            )
-            return GetParameterValueResultFailure(result_details=details)
-        return self.on_get_parameter_value_request_in_workflow(request, workflow)
-
     # For C901 (too complex): Need to give customers explicit reasons for failure on each case.
     @handles(GetParameterValueRequest)
-    def on_get_parameter_value_request_in_workflow(
+    def on_get_parameter_value_request(
         self, request: GetParameterValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         node_name = request.node_name
@@ -2946,21 +2928,9 @@ class NodeManager(EngineScoped):
         value: Any
         modified: bool
 
-    def on_set_parameter_value_request(self, request: SetParameterValueRequest) -> ResultPayload:
-        """Set a parameter value on a node of the open workflow, outside dispatch.
-
-        Edge method for code that calls the handler directly and is not handed a workflow (node
-        library code); dispatch calls `on_set_parameter_value_request_in_workflow`.
-        """
-        workflow = self.engine.current_workflow_or_none()
-        if workflow is None:
-            details = f"Attempted to set parameter value for '{request.node_name}.{request.parameter_name}'. Failed because no workflow is open."
-            return SetParameterValueResultFailure(result_details=details)
-        return self.on_set_parameter_value_request_in_workflow(request, workflow)
-
     # added ignoring C901 since this method is overly long because of granular error checking, not actual complexity.
     @handles(SetParameterValueRequest)
-    def on_set_parameter_value_request_in_workflow(
+    def on_set_parameter_value_request(
         self, request: SetParameterValueRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         if not request.initial_setup:
@@ -3126,7 +3096,14 @@ class NodeManager(EngineScoped):
         output_snapshot = dict(node.parameter_output_values) if should_check_output_side_effects else None
 
         try:
-            finalized_value, modified = self._set_and_pass_through_values(request, node)
+            if incoming_node_set:
+                with connection_feed_scope(node):
+                    finalized_value, modified = self._set_and_pass_through_values(request, node)
+            else:
+                finalized_value, modified = self._set_and_pass_through_values(request, node)
+        except InvalidParameterValueError as err:
+            details = f"Couldn't set '{node_name}.{request.parameter_name}'.\n\n{err}"
+            return SetParameterValueResultFailure(result_details=details)
         except Exception as err:
             details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because Exception: {err}"
             return SetParameterValueResultFailure(result_details=details)
@@ -3202,7 +3179,10 @@ class NodeManager(EngineScoped):
         # Cool.
         details = f"Successfully set value on Node '{node_name}' Parameter '{request.parameter_name}'."
         result = SetParameterValueResultSuccess(
-            finalized_value=finalized_value, data_type=parameter.type, result_details=details
+            finalized_value=finalized_value,
+            data_type=parameter.type,
+            result_details=details,
+            altered_workflow_state=modified,
         )
         return result
 
@@ -3410,7 +3390,7 @@ class NodeManager(EngineScoped):
 
         # Iterate through all nodes in this Flow (yes, this restriction still sucks)
         list_nodes_in_flow_request = ListNodesInFlowRequest(flow_name=flow_name)
-        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request_in_workflow(
+        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request(
             list_nodes_in_flow_request, workflow
         )
         if not list_nodes_in_flow_result.succeeded():
@@ -3502,12 +3482,12 @@ class NodeManager(EngineScoped):
         return sorted(owned)
 
     def get_node_by_name(self, name: str) -> BaseNode:
-        """The open workflow's node named `name`.
+        """The node named `name` in the workflow the caller is bound to.
 
         Edge method for code not handed a workflow; engine code calls `get_node_by_name_in`.
 
         Raises:
-            ValueError: No node of that name is in the open workflow, or no workflow is open.
+            ValueError: No node of that name is in the bound workflow, or the caller is bound to none.
         """
         workflow = self.engine.current_workflow_or_none()
         if workflow is None:
@@ -3529,18 +3509,19 @@ class NodeManager(EngineScoped):
         return node
 
     def get_node_parent_flow_by_name(self, node_name: str) -> str:
-        """The name of the flow the open workflow's node belongs to.
+        """The name of the flow the bound workflow's node belongs to.
 
-        Edge method for code not handed a workflow; engine code reads `workflow.nodes.parent_flow_name`.
+        Edge method for `VariableResolver`, which node code calls with no workflow to pass; engine code
+        reads `workflow.nodes.parent_flow_name`.
 
         Raises:
-            KeyError: No node of that name is in the open workflow, or no workflow is open.
+            KeyError: No node of that name is in the bound workflow, or the caller is bound to none.
         """
-        nodes = self._current_nodes_or_none()
-        if nodes is None:
+        workflow = self.engine.current_workflow_or_none()
+        if workflow is None:
             msg = f"Node '{node_name}' could not be found."
             raise KeyError(msg)
-        return nodes.parent_flow_name(node_name)
+        return workflow.nodes.parent_flow_name(node_name)
 
     @handles(ResolveNodeRequest)
     async def on_resolve_from_node_request(  # noqa: PLR0911
@@ -3580,8 +3561,8 @@ class NodeManager(EngineScoped):
         spec = ResolveNodeSpec(request=request, workflow=workflow, flow_name=flow.name, node_name=node.name)
         # A node run while another node's run is in progress joins that run, so the two run side by side.
         if flow_mgr.check_for_existing_running_flow_in(workflow) and workflow.flows.global_single_node_resolution:
-            return await flow_mgr.join_run_in_progress(spec)
-        return await flow_mgr.start_run(spec)
+            return await flow_mgr.join_run_in_progress(workflow, spec)
+        return await flow_mgr.start_run(workflow, spec)
 
     async def execute_resolve_node(  # noqa: C901, PLR0911
         self, workflow: WorkflowRuntime, node: BaseNode, flow: ControlFlow, *, debug_mode: bool
@@ -3639,7 +3620,7 @@ class NodeManager(EngineScoped):
         return ResolveNodeResultSuccess(result_details=details)
 
     @handles(ExecuteNodeRequest)
-    async def on_execute_node_request(  # noqa: C901
+    async def on_execute_node_request(
         self, request: ExecuteNodeRequest, workflow: WorkflowRuntime | None = None
     ) -> ResultPayload:
         """Execute a node. Orchestrator path is lookup-only; worker path is a pure RPC.
@@ -3655,9 +3636,7 @@ class NodeManager(EngineScoped):
         the way a saved workflow loads; it is executed and then discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
-        parameter values. A worker another engine runs first asks that engine
-        whether the lease the node was sent under holds it, and refuses the
-        node if not. A worker opens no workflow, so it is handed none: it loads
+        parameter values. A worker opens no workflow, so it is handed none: it loads
         the copy into the runtime it keeps for the orchestrator's workflow.
 
         If the orchestrator's lookup succeeds and the node's library is owned by
@@ -3669,9 +3648,6 @@ class NodeManager(EngineScoped):
         node = None
         if is_worker:
             library_name = (request.node_metadata or {}).get("library")
-            lease_refusal = await self.engine.worker_manager.lease_refusal(request.node_name, request.lease_id)
-            if lease_refusal is not None:
-                return ExecuteNodeResultFailure(result_details=lease_refusal)
         else:
             if workflow is not None:
                 node = workflow.objects.get_as_type(request.node_name, BaseNode)
@@ -3770,11 +3746,15 @@ class NodeManager(EngineScoped):
                 request.workflow_working_directory,
             )
         except ContextManager.OrchestratorWorkflowError as err:
+            # The workflow could not be adopted here, so the node never ran. It is reported as this node's own failure.
+            adoption_failure_tree = failure_trees.failure_tree_from_exception(request.node_name, err)
             return ExecuteNodeResultFailure(
                 result_details=str(err),
                 exception=err,
-                error=build_node_error_details(request.node_name, err),
-            )
+                error=failure_trees.render_error_details(
+                    adoption_failure_tree, text=str(err), node_name=request.node_name
+                ),
+            ).attach_failure_tree(adoption_failure_tree)
         with self.engine.run_in_worker_workflow(workflow):
             return await self._run_worker_copy_in_workflow(workflow, request)
 
@@ -3801,7 +3781,7 @@ class NodeManager(EngineScoped):
         """Make a flow for one execution's copy, under the worker's own top-level flow. Returns its name."""
         if workflow.objects.get_as_type(_WORKER_COPIES_FLOW_NAME, ControlFlow) is None:
             top_result = workflow.handle_request(
-                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME, set_as_new_context=False)
+                CreateFlowRequest(parent_flow_name=None, flow_name=_WORKER_COPIES_FLOW_NAME)
             )
             if not isinstance(top_result, CreateFlowResultSuccess):
                 details = f"Attempted to prepare node '{node_name}' to run in this process. Failed because {top_result.result_details}"
@@ -3810,7 +3790,6 @@ class NodeManager(EngineScoped):
             CreateFlowRequest(
                 parent_flow_name=_WORKER_COPIES_FLOW_NAME,
                 flow_name=f"{_WORKER_COPIES_FLOW_NAME}_{uuid4().hex}",
-                set_as_new_context=False,
             )
         )
         if not isinstance(flow_result, CreateFlowResultSuccess):
@@ -4004,21 +3983,25 @@ class NodeManager(EngineScoped):
                     # A worker that engine stopped starts again only once the lease holds it.
                     await wm.wait_until_executable(library_name, start_stopped=False)
                     # A worker that could not be started there leaves nothing to lease, and an engine
-                    # that never answered the start would never answer the lease either.
-                    if wm.worker_unavailable_reason(library_name) is None:
-                        lease = await wm.acquire_lease(library_name, request.node_name)
+                    # that never answered the start would never answer the lease either. One refused for
+                    # a reason that may pass, such as capacity, is leased and started again.
+                    if wm.may_start_worker(library_name):
+                        lease = await wm.acquire_lease(workflow, library_name, request.node_name)
                         await wm.wait_until_executable(library_name)
-                worker = library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                worker_engine_id = (
+                    library_manager.workers.get_worker_for_library(library_name) if library_name else None
+                )
             except RuntimeError as err:
                 return ExecuteNodeResultFailure(result_details=str(err), exception=err)
-            if worker is None:
+            if worker_engine_id is None:
                 return None
             preparation_failure = self._prepare_for_worker(node, request)
             if preparation_failure is not None:
                 return preparation_failure
+            lease_id = None
             if lease is not None:
-                request.lease_id = lease.lease_id
-            return await self._execute_node_via_worker(workflow, request, wm, worker)
+                lease_id = lease.lease_id
+            return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id, lease_id=lease_id)
         finally:
             wm.release_after_node(lease)
 
@@ -4041,24 +4024,26 @@ class NodeManager(EngineScoped):
                 f"Failed because {unavailable} Reload your libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker = wm.get_worker_for_key(scope.worker_key)
-        if worker is None:
+        worker_engine_id = wm.get_worker_for_key(scope.worker_key)
+        if worker_engine_id is None:
             details = (
                 f"Attempted to run '{request.node_name}' with the Isolated Execution set on '{scope.owner_name}'. "
                 "Failed because the background process that runs Isolated Execution is not running. Reload your "
                 "libraries, or restart Griptape Nodes, to start it again."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        return await self._execute_node_via_worker(workflow, request, wm, worker)
+        return await self._execute_node_via_worker(workflow, request, wm, worker_engine_id)
 
     async def _execute_node_via_worker(
         self,
         workflow: WorkflowRuntime,
         request: ExecuteNodeRequest,
         wm: WorkerManager,
-        worker: tuple[str, str],
+        worker_engine_id: str,
+        *,
+        lease_id: str | None = None,
     ) -> ResultPayload:
-        """Dispatch ExecuteNodeRequest to a worker and return its result.
+        """Dispatch ExecuteNodeRequest to a worker, under `lease_id` for one another engine runs, and return its result.
 
         The worker loads a copy of the node from the request on every call and
         discards it after aprocess returns; ExecuteNodeRequest is a pure RPC
@@ -4074,7 +4059,6 @@ class NodeManager(EngineScoped):
                 f"its input {', '.join(unsendable)} cannot be sent there."
             )
             return ExecuteNodeResultFailure(result_details=details)
-        worker_engine_id, worker_request_topic = worker
         # Assign the request_id on the payload itself so the worker handler can
         # read it from request.request_id. WorkerManager.route_to_worker will
         # re-use this id on the outer EventRequest and on its pending-future
@@ -4085,19 +4069,11 @@ class NodeManager(EngineScoped):
         target_request_id = request.request_id
         # The same dict is cleared below even if the workflow closes while the node runs.
         orch_worker_requests = workflow.nodes.orch_worker_requests
-        orch_worker_requests[request.node_name] = (
-            target_request_id,
-            worker_engine_id,
-            worker_request_topic,
-        )
+        orch_worker_requests[request.node_name] = (target_request_id, worker_engine_id)
         try:
             event_request = EventRequest(request=request)
             event_request.request_id = target_request_id
-            execute_raw = await wm.route_to_worker(
-                event_request,
-                worker_engine_id,
-                worker_request_topic,
-            )
+            execute_raw = await wm.route_to_worker(event_request, worker_engine_id, lease_id=lease_id)
         except WorkerGoneError as err:
             # A failure, not a cancellation: the resolution machine reaps cancellations as CANCELED,
             # emitting no NodeErrorEvent and logging one unnamed line, so the node would come back
@@ -4114,13 +4090,10 @@ class NodeManager(EngineScoped):
             orch_worker_requests.pop(request.node_name, None)
         result_type_name = execute_raw.get("result_type", "")
         result_data = execute_raw.get("result", {})
-        # Route through cattrs structure (not ``**result_data`` spread)
-        # so the registered exception hook rebuilds ``self.exception``
-        # into a ``ForwardedException`` carrying the worker-side type
-        # name and traceback. A bare spread would leave ``exception``
-        # as the raw {type, message, traceback} dict, breaking the
-        # worker-frame surfacing in
-        # ``NodeExecutor._format_node_failure_message``.
+        # Route through cattrs structure (not ``**result_data`` spread) so the registered exception hook
+        # rebuilds ``self.exception`` into a ``ForwardedException`` carrying the worker-side type name and
+        # traceback. A bare spread would leave ``exception`` as the raw {type, message, traceback} dict,
+        # breaking the worker-frame surfacing in ``format_node_failure_message``.
         if result_type_name == ExecuteNodeResultSuccess.__name__:
             return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
         return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
@@ -4139,14 +4112,10 @@ class NodeManager(EngineScoped):
         entry = workflow.nodes.orch_worker_requests.get(node_name)
         if entry is None:
             return
-        target_request_id, worker_engine_id, worker_request_topic = entry
+        target_request_id, worker_engine_id = entry
         wm = self.engine.worker_manager
         cancel_request = CancelExecuteNodeRequest(target_request_id=target_request_id)
-        await wm.forward_event_to_worker(
-            EventRequest(request=cancel_request),
-            worker_engine_id=worker_engine_id,
-            worker_request_topic=worker_request_topic,
-        )
+        await wm.forward_event_to_worker(EventRequest(request=cancel_request), worker_engine_id=worker_engine_id)
 
     @staticmethod
     def _orchestrator_node_missing(request: ExecuteNodeRequest, workflow: WorkflowRuntime | None) -> str:
@@ -4275,20 +4244,23 @@ class NodeManager(EngineScoped):
                 # run here. Letting it escape would report a node that declined as an engine crash.
                 validation_exceptions = [e]
             if validation_exceptions:
+                declined_failure_tree = failure_trees.failure_leaf_from_validation(node_name, validation_exceptions)
                 return ExecuteNodeResultFailure(
                     result_details=(
                         f"Attempted to execute node '{node_name}'. It declined to run: "
                         f"{'; '.join(str(exception) for exception in validation_exceptions)}"
                     ),
                     validation_exceptions=validation_exceptions,
-                    error=build_node_error_details(node_name, validation_exceptions),
-                )
+                    error=failure_trees.render_error_details(
+                        declined_failure_tree, text=str(validation_exceptions), node_name=node_name
+                    ),
+                ).attach_failure_tree(declined_failure_tree)
 
             try:
                 with aprocess_scope(request.variables, node):
                     await node.aprocess()
             except Exception as e:
-                return self._execution_failure(e, node_name)
+                return self.execution_failure(e, node_name)
             finally:
                 # The scratch marker only means anything while the run is in flight. A parameter
                 # the node still holds here was never torn down, so serialization must treat it
@@ -4317,24 +4289,71 @@ class NodeManager(EngineScoped):
                 f"stays in that process and the next node receives a reference to it."
             )
             return ExecuteNodeResultFailure(result_details=details)
+        set_by_run = node.values_set_by_run
         return ExecuteNodeResultSuccess(
             parameter_output_values=output_values,
+            parameter_values_set_by_run=self._sendable_values_set_by_run(node, set_by_run, output_values),
+            outputs_set_by_run=sorted(set_by_run.keys() & output_values.keys()),
             result_details=f"Node '{node.name}' executed successfully.",
         )
 
-    def _execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
-        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
+    @staticmethod
+    def _sendable_values_set_by_run(
+        node: BaseNode, set_by_run: dict[str, Any], output_values: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The values the node's run set on itself that can leave the worker besides its outputs, warning of the others.
+
+        A value that is also an output travels with the outputs. Other inputs are not cached for egress
+        (see cache_outputs_for_egress), so only plain data travels.
+        """
+        sendable: dict[str, Any] = {}
+        for name, value in set_by_run.items():
+            if name in output_values:
+                continue
+            encoded = try_encode(value)
+            if not isinstance(encoded, Unencodable):
+                sendable[name] = value
+                continue
+            logger.warning(
+                "Attempted to send the value node '%s' set on parameter '%s' while running out of %s's isolated "
+                "process. Failed because %s The node keeps the value it had before the run.",
+                node.name,
+                name,
+                node.metadata.get("library", "its library"),
+                encoded.reason,
+            )
+        return sendable
+
+    def execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
+        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call.
+
+        A halt found under Workflow nodes is reported in the halt's own wording, so the run stops exactly
+        as a halt at the top level does. The failure stays the Workflow node's, so a Workflow node above
+        adds itself to the path instead of starting a new one.
+        """
+        failure_tree = failure_trees.failure_tree_from_exception(node_name, exc)
+        nested_halt_wording = failure_trees.budget_halt_behind_workflow_node(failure_tree)
+        # A budget halt behind Workflow nodes is worded as the halt, while the failure stays the Workflow node's own.
+        if nested_halt_wording is not None:
+            return ExecuteNodeResultFailure(
+                result_details=nested_halt_wording,
+                exception=exc,
+                error=failure_trees.render_error_details(failure_tree, text=str(exc), node_name=node_name),
+            ).attach_failure_tree(failure_tree)
         budget_halt = self._budget_halt_for(exc, node_name)
         if budget_halt is not None:
             # The engine words the halt, so it carries no node-built details.
-            return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=budget_halt)
+            return ExecuteNodeResultFailure(
+                result_details=str(budget_halt),
+                exception=budget_halt,
+            ).attach_failure_tree(failure_trees.failure_tree_from_exception(node_name, exc, budget_halt=budget_halt))
         # The raised exception itself, so its traceback crosses the worker boundary. The details are
         # built here, where the real exception and anything it attached still exist.
         return ExecuteNodeResultFailure(
             result_details=f"Attempted to execute node '{node_name}'. Failed with error: {exc}",
             exception=exc,
-            error=build_node_error_details(node_name, exc),
-        )
+            error=failure_trees.render_error_details(failure_tree, text=str(exc), node_name=node_name),
+        ).attach_failure_tree(failure_tree)
 
     def _budget_halt_for(self, exc: Exception, node_name: str) -> BudgetExceededError | None:
         """Return the halt for a node whose call Griptape Cloud refused over budget, or None.
@@ -4510,7 +4529,7 @@ class NodeManager(EngineScoped):
             workflow: The workflow the group is in
             group_node: The group node to serialize
             unique_uuid_to_values: Shared pool of encoded parameter values, keyed by content
-            serialized_parameter_value_tracker: Tracker for parameter value hashes
+            serialized_parameter_value_tracker: Remembers how each value was saved
             serialize_all_parameter_values: If True, capture every parameter value on the group and
                 on each child, not just the ones the ordinary save condition would record
 
@@ -4697,15 +4716,18 @@ class NodeManager(EngineScoped):
 
                 # Get the creation details for regular nodes
                 metadata_copy = copy.deepcopy(node.metadata)
+                # A node resolved only by a locked pass-through never ran, so it reloads unresolved.
+                if not request.include_run_results or node.resolved_while_locked:
+                    resolution = NodeResolutionState.UNRESOLVED.value
+                else:
+                    resolution = node.state.value
                 # Per live node, never per serialized form -- see the group branch above.
                 create_node_request = CreateNodeRequest(
                     node_type=serialized_node_type,
                     node_name=node_name,
                     specific_library_name=serialized_library_name,
                     metadata=metadata_copy,
-                    # If it is actively resolving, mark as unresolved.
-                    # A node resolved only by a locked pass-through never ran, so it reloads unresolved.
-                    resolution=NodeResolutionState.UNRESOLVED.value if node.resolved_while_locked else node.state.value,
+                    resolution=resolution,
                     initial_setup=True,
                 )
 
@@ -4731,6 +4753,7 @@ class NodeManager(EngineScoped):
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
                     serialize_all_parameter_values=request.serialize_all_parameter_values,
+                    include_run_results=request.include_run_results,
                 )
                 if set_param_value_requests is not None:
                     set_value_commands.extend(set_param_value_requests)
@@ -4762,6 +4785,7 @@ class NodeManager(EngineScoped):
             node_dependencies=node_dependencies,
             lock_node_command=lock_command,
             is_node_group=isinstance(node, SubflowNodeGroup),
+            node_uuid=SerializedNodeCommands.NodeUUID(node_name),
         )
         details = f"Successfully serialized node '{node_name}' into commands."
         result = SerializeNodeToCommandsResultSuccess(
@@ -4777,27 +4801,12 @@ class NodeManager(EngineScoped):
         A saved workflow replays them after creating the node, and a worker applies them to the copy it
         runs, so both rebuild the same shape.
         """
-        # We're going to compare this node instance vs. a canonical one. Rez that one up.
+        # We're going to compare this node instance vs. a canonical one.
         # For ErrorProxyNode, we can't create a reference node, so skip comparison.
-        # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation
-        # detector skips this ephemeral instance's declarative ``add_parameter``
-        # calls (this construction bypasses ``LibraryRegistry.create_node``).
-        #
-        # Carry the node's library and type so the reference resolves the same
-        # library-backed ``__init__`` data the live node did (e.g. a model
-        # dropdown sourced from the ``model_catalog``); otherwise it would look
-        # mutated.
         if isinstance(node, ErrorProxyNode):
             reference_node = None
         else:
-            with LibraryRegistry.constructing_node(throwaway=True):
-                reference_node = type(node)(
-                    name="REFERENCE NODE",
-                    metadata={
-                        "library": node.metadata.get("library"),
-                        "node_type": node.metadata.get("node_type"),
-                    },
-                )
+            reference_node = self._reference_node_for(node)
 
         # Now creation or alteration of all of the elements.
         element_modification_commands = []
@@ -5079,7 +5088,13 @@ class NodeManager(EngineScoped):
         return DeserializeNodeFromCommandsResultSuccess(node_name=node_name, result_details=details)
 
     @handles(SerializeSelectedNodesToCommandsRequest)
-    def on_serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
+    def on_serialize_selected_nodes_to_commands(
+        self, request: SerializeSelectedNodesToCommandsRequest, workflow: WorkflowRuntime
+    ) -> ResultPayload:
+        with self.sharing_reference_nodes():
+            return self._serialize_selected_nodes_to_commands(request, workflow)
+
+    def _serialize_selected_nodes_to_commands(  # noqa: C901, PLR0912, PLR0915
         self, request: SerializeSelectedNodesToCommandsRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """This will take the selected nodes in the Object manager and serialize them into commands."""
@@ -5548,6 +5563,42 @@ class NodeManager(EngineScoped):
             return
         parameter.add_trait(trait)
 
+    @contextmanager
+    def sharing_reference_nodes(self) -> Iterator[None]:
+        """Build each node type's reference copy once for a batch of serializations.
+
+        Serializing a node compares it with a freshly built copy of its type, and building one runs the
+        type's ``__init__``. Nothing changes the copies between the serializations of one save, so every
+        node of a type can be compared with the same copy. Copies are not kept past the batch, because
+        what ``__init__`` builds can depend on engine state that changes, such as the model catalog.
+        """
+        if _shared_reference_nodes.get() is not None:
+            yield
+            return
+        token = _shared_reference_nodes.set({})
+        try:
+            yield
+        finally:
+            _shared_reference_nodes.reset(token)
+
+    def _reference_node_for(self, node: BaseNode) -> BaseNode:
+        library = node.metadata.get("library")
+        node_type = node.metadata.get("node_type")
+        key = (type(node), library, node_type)
+        shared = _shared_reference_nodes.get()
+        if shared is not None and key in shared:
+            return shared[key]
+        # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation detector skips
+        # this ephemeral instance's declarative ``add_parameter`` calls (this construction bypasses
+        # ``LibraryRegistry.create_node``). Carry the node's library and type so the reference
+        # resolves the same library-backed ``__init__`` data the live node did (e.g. a model
+        # dropdown sourced from the ``model_catalog``); otherwise it would look mutated.
+        with LibraryRegistry.constructing_node(throwaway=True):
+            reference_node = type(node)(name="REFERENCE NODE", metadata={"library": library, "node_type": node_type})
+        if shared is not None:
+            shared[key] = reference_node
+        return reference_node
+
     @staticmethod
     def _manage_alter_details(parameter: Parameter, base_node_obj: BaseNode) -> dict:
         base_param = base_node_obj.get_parameter_by_name(parameter.name)
@@ -5599,29 +5650,29 @@ class NodeManager(EngineScoped):
         """Pool ``value``'s encoded form under a hash of its content and return the command that restores it.
 
         Returns None when the value is not to be saved: the parameter opted out, or the value has no
-        plain-data form. The tracker remembers each object's outcome, so a value shared by several
-        parameters is encoded once.
+        plain-data form. The tracker remembers each object's encoding outcome, so a value shared by
+        several parameters is encoded once. It does not remember an opt-out, which is a property of
+        the parameter rather than the value.
         """
-        value_id = id(value)
-        tracker_status = serialized_parameter_value_tracker.get_tracker_state(value_id)
+        tracker_status = serialized_parameter_value_tracker.get_tracker_state(value)
         match tracker_status:
             case SerializedParameterValueTracker.TrackerState.SERIALIZABLE:
-                unique_uuid = serialized_parameter_value_tracker.get_uuid_for_value_hash(value_id)
+                unique_uuid = serialized_parameter_value_tracker.get_uuid_for_value(value)
             case SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE:
                 return None
             case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
-                # Author opt-out, e.g. drivers and file handles.
+                # Author opt-out, e.g. drivers and file handles. It belongs to this parameter, so the
+                # tracker does not keep it: another parameter holding the same object may be saved.
                 if not parameter.serializable:
-                    serialized_parameter_value_tracker.add_as_not_serializable(value_id)
                     return None
                 encoded = try_encode(value)
                 if isinstance(encoded, Unencodable):
                     logger.debug("Not saving '%s' on node '%s': %s", parameter_name, node_name, encoded.reason)
-                    serialized_parameter_value_tracker.add_as_not_serializable(value_id)
+                    serialized_parameter_value_tracker.add_as_not_serializable(value)
                     return None
                 unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(value_key(encoded))
                 unique_parameter_uuid_to_values[unique_uuid] = encoded
-                serialized_parameter_value_tracker.add_as_serializable(value_id, unique_uuid)
+                serialized_parameter_value_tracker.add_as_serializable(value, unique_uuid)
 
         # Serialize it
         set_value_command = SetParameterValueRequest(
@@ -5645,6 +5696,7 @@ class NodeManager(EngineScoped):
         create_node_request: CreateNodeRequest,
         *,
         serialize_all_parameter_values: bool = False,
+        include_run_results: bool = True,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
         """Generates code to save a parameter value for a node in a Griptape workflow.
 
@@ -5660,9 +5712,10 @@ class NodeManager(EngineScoped):
             parameter (Parameter): The parameter object containing metadata
             node (BaseNode): The node object that contains the parameter
             unique_parameter_uuid_to_values (dict[SerializedNodeCommands.UniqueParameterValueUUID, Any]): Dictionary mapping unique value UUIDs to values
-            serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
+            serialized_parameter_value_tracker (SerializedParameterValueTracker): Remembers how each value was saved, by identity
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
+            include_run_results (bool): If False, leave out the output value
 
         Returns:
             None (if no value to be serialized) or an IndirectSetParameterValueCommand linking the value to the unique value map
@@ -5673,7 +5726,7 @@ class NodeManager(EngineScoped):
         """
         output_value = None
         internal_value = None
-        if parameter.name in node.parameter_output_values:
+        if include_run_results and parameter.name in node.parameter_output_values:
             # Output values are more important.
             output_value = node.parameter_output_values[parameter.name]
         # Get the effective value to check if it matches the default
@@ -5740,9 +5793,10 @@ class NodeManager(EngineScoped):
         genuinely failed. Whenever a value was present but could not be recorded (opt-out OR
         genuine failure) the node is marked UNRESOLVED so it re-runs on load and recomputes the
         missing value; downstream consumers would otherwise see None (issue #4994). Only the
-        genuine-failure branch also emits a warning — opt-outs are silent.
+        genuine-failure branch is recorded in the tracker's values_left_out, for a save to warn of.
+        Opt-outs are silent.
 
-        value_kind is "set" or "output" and is used only in the warning text.
+        value_kind is "set" or "output".
         """
         # No value of this kind was set on the node.
         if value is None:
@@ -5774,9 +5828,14 @@ class NodeManager(EngineScoped):
         # Author opted out via serializable=False — silently skip; not a failure.
         if not parameter.serializable:
             return None
-        # Genuine serialization failure — warn and mark unresolved.
-        details = f"Attempted to save the {value_kind} value of parameter '{parameter.name}' on node '{node.name}'. Failed because a '{type(value).__name__}' value has no plain-data form, so the node will run again when the workflow is reopened. To keep the value, register its class with register_value_codec, or set serializable=False on the parameter to stop this warning."
-        logger.warning(details)
+        serialized_parameter_value_tracker.values_left_out.append(
+            ValueLeftOut(
+                node_name=node.name,
+                parameter_name=parameter.name,
+                value_kind=value_kind,
+                type_name=type(value).__name__,
+            )
+        )
         return None
 
     @staticmethod
@@ -5937,12 +5996,14 @@ class NodeManager(EngineScoped):
             except ValueError as err:
                 details = f"Attempted to lock node '{request.node_name}'. Failed because the Node could not be found. Error: {err}"
                 return SetLockNodeStateResultFailure(result_details=details)
+        altered = node.lock != request.lock
         node.lock = request.lock
         self._unresolve_unlocked_node_left_unexecuted(workflow, node)
         return SetLockNodeStateResultSuccess(
             node_name=node_name,
             locked=node.lock,
             result_details=f"Successfully set lock state to {node.lock} for node '{node_name}'.",
+            altered_workflow_state=altered,
         )
 
     @handles(BatchSetNodeLockStateRequest)
@@ -5951,12 +6012,14 @@ class NodeManager(EngineScoped):
     ) -> ResultPayload:
         updated: list[str] = []
         failed: dict[str, str] = {}
+        altered = False
         for name in request.node_names:
             try:
                 node = self.get_node_by_name_in(workflow, name)
             except ValueError as err:
                 failed[name] = f"Node not found. Error: {err}"
                 continue
+            altered = altered or node.lock != request.lock
             node.lock = request.lock
             self._unresolve_unlocked_node_left_unexecuted(workflow, node)
             updated.append(name)
@@ -5971,6 +6034,7 @@ class NodeManager(EngineScoped):
             updated_nodes=updated,
             failed_nodes=failed,
             result_details=details,
+            altered_workflow_state=altered,
         )
 
     def _unresolve_unlocked_node_left_unexecuted(self, workflow: WorkflowRuntime, node: BaseNode) -> None:
@@ -6007,7 +6071,7 @@ class NodeManager(EngineScoped):
             # Get from the current context
             if not workflow.context.has_current_node():
                 details = "Attempted to send message to Node from Current Context. Failed because the Current Context is empty."
-                return SendNodeMessageResultFailure(result_details=details)
+                return SendNodeMessageResultFailure(result_details=details, altered_workflow_state=False)
 
             node = workflow.context.get_current_node()
             node_name = node.name
@@ -6017,7 +6081,7 @@ class NodeManager(EngineScoped):
             node = workflow.objects.get_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to send message to Node '{node_name}', but no such Node was found."
-                return SendNodeMessageResultFailure(result_details=details)
+                return SendNodeMessageResultFailure(result_details=details, altered_workflow_state=False)
 
         # Validate optional_element_name if specified
         if request.optional_element_name is not None:
@@ -6632,9 +6696,7 @@ class NodeManager(EngineScoped):
                 target_node_name=new_node_name,
                 target_parameter_name=incoming_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
-                connection_request, workflow
-            )
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request, workflow)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_incoming.append(incoming_connection)
 
@@ -6645,9 +6707,7 @@ class NodeManager(EngineScoped):
                 target_node_name=outgoing_connection.target_node_name,
                 target_parameter_name=outgoing_connection.target_parameter_name,
             )
-            connection_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
-                connection_request, workflow
-            )
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request, workflow)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_outgoing.append(outgoing_connection)
 

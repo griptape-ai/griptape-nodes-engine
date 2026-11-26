@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, NoReturn, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -132,12 +132,23 @@ class RequestPayload(Payload, ABC):
                 Framework fields (result_details, altered_workflow_state) are always
                 included regardless of what fields specifies. Filtering is skipped
                 entirely on failure results.
+        undo_group: Names the user action a request belongs to, making what it changes undoable.
+                Requests that share a group undo as one step, so a client starts a new group for
+                each user input, such as one drag. A request without one is not an undo step: what
+                it changes is taken back along with the undo step before it, and drops what could be
+                redone. A client reacting to an UndoRequest or RedoRequest, such as by writing back
+                what it measured, sends its requests without a group, and only when they change
+                something.
+        undo_label: Names the action in the undo history, such as "Move 3 nodes". The last label
+                sent in a group wins. Without one, the action is named after its first request.
     """
 
     broadcast_result: bool = True
     request_id: str | None = None
     failure_log_level: int | None = None
     fields: list[str] | None = None
+    undo_group: str | None = None
+    undo_label: str | None = None
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.
@@ -176,12 +187,32 @@ class WorkflowNotAlteredMixin:
     altered_workflow_state: bool = field(default=False, init=False)
 
 
+@dataclass
+class WorkflowAlteredReportedMixin:
+    """Mixin for a ResultPayload whose handler decides whether the workflow was altered.
+
+    The field has no default, so a handler that forgets to decide fails to build the result rather
+    than reporting no change, which would hide the change from whatever tracks edits, such as the
+    unsaved marker.
+    """
+
+    altered_workflow_state: bool = field(kw_only=True)
+
+
 class GraphAccessMixin:
     """Marks a request that reads or changes connections, flows, flow variables, or node group membership.
 
     A node must not send one while it is being created or having its saved state applied (strict-mode
     rule ``graph-access-while-loading``): the graph around a loading node is incomplete, so the answer
     would depend on how the node was loaded.
+    """
+
+
+class RunControlMixin:
+    """Marks a request that runs a workflow, stops a run, or resets what a run produced.
+
+    What it changes, and what the nodes it runs change, is the outcome of a run rather than an edit,
+    so it is never an undo step, nor part of the step that started it.
     """
 
 
@@ -218,20 +249,16 @@ class ResultPayloadSuccess(ResultPayload, ABC):
 class ForwardedException(Exception):  # noqa: N818
     """Placeholder for an exception that crossed the worker boundary.
 
-    The converter's Exception hook emits worker-side exceptions as a
-    ``{type, message, traceback}`` dict, then rebuilds them into a
-    ``ForwardedException`` on the receiving side. The placeholder is
-    still an ``Exception`` (so ``raise ... from result.exception``
-    chains) and carries the worker-side class name and formatted
-    traceback so the orchestrator can show both.
+    The converter's Exception hook emits worker-side exceptions as a ``{type, message, traceback}`` dict, then
+    rebuilds them into a ``ForwardedException`` on the receiving side. The placeholder is still an
+    ``Exception`` (so ``raise ... from result.exception`` chains) and carries the worker-side class name and
+    formatted traceback so the orchestrator can show both.
 
-    ``NodeExecutor._format_node_failure_message`` is the consumer:
-    it reads ``original_type`` for the ``[builtins.ValueError]``
-    prefix on the user-visible ``RuntimeError`` message, and
-    ``original_traceback`` for the ``Worker traceback:`` block.
-    Without these attributes the chained exception would print only
-    ``Type: message`` with no frames, because the placeholder is
-    constructed (not raised) and so its ``__traceback__`` is ``None``.
+    ``format_node_failure_message`` is the consumer: it reads ``original_type`` for the
+    ``[builtins.ValueError]`` prefix on the user-visible ``RuntimeError`` message, and ``original_traceback``
+    for the ``Worker traceback:`` block. Without these attributes the chained exception would print only
+    ``Type: message`` with no frames, because the placeholder is constructed (not raised) and so its
+    ``__traceback__`` is ``None``.
     """
 
     def __init__(
@@ -283,6 +310,19 @@ class AppPayload(Payload):
     pass
 
 
+@runtime_checkable
+class BelongsToBoundWorkflow(Protocol):
+    """An app payload that can belong to the workflow bound when it is queued, such as a node's log line.
+
+    `EventManager` names that workflow on the payload's `AppEvent` when `belongs_to_bound_workflow`
+    says so. Other app payloads belong to no workflow.
+    """
+
+    def belongs_to_bound_workflow(self) -> bool:
+        """Whether this payload belongs to the workflow bound when it is queued."""
+        ...
+
+
 # Type variables for our generic payloads
 P = TypeVar("P", bound=RequestPayload)
 R = TypeVar("R", bound=ResultPayload)
@@ -329,9 +369,14 @@ class EventRequest[P: Payload](BaseEvent):
             handler, and every task it starts, acts on that workflow. An id that names no open
             workflow fails the request with `WorkflowNotOpenResultFailure`, unhandled, unless its
             handler is HOST (`RequestScope`): a HOST request ignores the id and acts on no workflow.
-            Left out, the request acts on the engine's only open workflow, unless another engine
-            sent it: then it acts on no workflow. A payload field named `workflow_id` is something
-            else: the workflow the request is about.
+            Left out, the request acts on the workflow its caller is bound to, such as a run's own
+            workflow, and a WORKFLOW request with no such caller fails with
+            `WorkflowNotNamedResultFailure`. An OPTIONAL_WORKFLOW request acts on none. A request
+            another engine sent acts on no workflow. A payload field named `workflow_id` is
+            something else: the workflow the request is about.
+        origin_engine_id: The engine this request started at, set by the engine relaying it for the
+            receiving engine. Today that engine is a remote worker the sender runs for the receiver,
+            and the receiver answers the request as its own worker's.
     """
 
     request: P
@@ -341,6 +386,7 @@ class EventRequest[P: Payload](BaseEvent):
     # `require_request_sender()`.
     sender: RequestSender | None = None
     open_workflow_id: str | None = None
+    origin_engine_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an EventRequest, inferring the generic type if needed."""
@@ -382,12 +428,14 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events.
 
     Args:
-        open_workflow_id: The open workflow the request acted on: the envelope's `open_workflow_id`
-            when it named one, else the workflow dispatch bound the request to, such as the only
-            open workflow, a run's own workflow, or the workflow a load opened. None when it acted
-            on no workflow. A result payload's own `workflow_id` is something else. For
-            example, `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a
-            Save As is a copy that is not open.
+        open_workflow_id: The open workflow the request ran in: the one the envelope named, or
+            with none named, the workflow its caller was bound to, such as a run's own workflow. None for a request that
+            runs in no workflow, such as a HOST request, which ignores the envelope's id even when
+            it opens or closes a workflow; `WorkflowOpenedEvent` and `WorkflowClosedEvent` tell
+            clients of those. A request refused for the workflow its envelope named echoes that id.
+            A result payload's own `workflow_id` is something else. For example,
+            `SaveWorkflowResultSuccess.workflow_id` names the saved workflow, which for a Save As
+            is a copy that is not open.
         engine_id: The engine that sent the result. A client that reached it through a session
             topic learns from this which engine holds the session. None when the result was built
             outside the engine's dispatch, such as by the MCP server or a bootstrap script.
@@ -463,7 +511,10 @@ RESULT_EVENT_TYPES = frozenset({EventResultSuccess.__name__, EventResultFailure.
 
 # EXECUTION EVENT BASE (this event type is used for the execution of a Griptape Nodes flow)
 class ExecutionEvent[E: ExecutionPayload](BaseEvent):
-    """An event from running a flow. `workflow_id` names the open workflow it belongs to, None for a host event.
+    """An event from running a flow. `open_workflow_id` names the open workflow it belongs to, None for a host event.
+
+    It matches a result envelope's `open_workflow_id`, so a client routes both by one field. Left
+    out, `EventManager` fills it in with the bound workflow when the event is queued.
 
     Build one with `WorkflowRuntime.execution_event` for a run's progress, or `BaseNode.execution_event`
     for an event a node reports about itself, naming the workflow it joined. Both go through
@@ -471,7 +522,7 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     """
 
     payload: E
-    workflow_id: str | None = None
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an ExecutionEvent, inferring the generic type if needed."""
@@ -489,7 +540,10 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
 
 # Events sent as part of the lifecycle of the Griptape Nodes application.
 class AppEvent[A: AppPayload](BaseEvent):
+    """An event about the application. `open_workflow_id` names the open workflow it belongs to, or None."""
+
     payload: A
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an AppEvent, inferring the generic type if needed."""
@@ -521,9 +575,9 @@ class ExecutionGriptapeNodeEvent(BaseEvent):
         return self.wrapped_event.get_request()
 
 
-def build_execution_event(payload: ExecutionPayload, workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
-    """An execution event naming the open workflow `workflow_id` it belongs to, or None for no workflow."""
-    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, workflow_id=workflow_id))
+def build_execution_event(payload: ExecutionPayload, open_workflow_id: str | None) -> ExecutionGriptapeNodeEvent:
+    """An execution event naming the open workflow `open_workflow_id` it belongs to, or None for no workflow."""
+    return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload, open_workflow_id=open_workflow_id))
 
 
 @dataclass
@@ -531,5 +585,5 @@ class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
-    # The workflow of the node that streamed this. See ExecutionEvent.workflow_id.
-    workflow_id: str | None = field(default=None)
+    # The workflow of the node that streamed this. See ExecutionEvent.open_workflow_id.
+    open_workflow_id: str | None = field(default=None)

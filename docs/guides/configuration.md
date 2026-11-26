@@ -158,28 +158,28 @@ A nested setting (one that lives inside an object like `worker`, `agent`, or `li
 GTN_CONFIG_<PARENT>__<SUB_KEY>=<value>
 ```
 
-A double underscore is required rather than a single one because setting names already contain underscores. `GTN_CONFIG_WORKER_HEARTBEAT_TIMEOUT_S` would be ambiguous between a top-level setting named `worker_heartbeat_timeout_s` and `worker.heartbeat_timeout_s`. No setting name contains `__`, so it unambiguously marks where the path descends a level.
+A double underscore is required rather than a single one because setting names already contain underscores. `GTN_CONFIG_WORKER_LIBRARY_LOAD_TIMEOUT_S` would be ambiguous between a top-level setting named `worker_library_load_timeout_s` and `worker.library_load_timeout_s`. No setting name contains `__`, so it unambiguously marks where the path descends a level.
 
 Environment variable overrides have the **highest priority** — they win over user config files, project-adjacent config files, the per-project workspace override, and built-in defaults.
 
 Examples:
 
-| Setting                      | Environment variable                     |
-| ---------------------------- | ---------------------------------------- |
-| `workspace_directory`        | `GTN_CONFIG_WORKSPACE_DIRECTORY`         |
-| `libraries_directory`        | `GTN_CONFIG_LIBRARIES_DIRECTORY`         |
-| `project_file`               | `GTN_CONFIG_PROJECT_FILE`                |
-| `log_level`                  | `GTN_CONFIG_LOG_LEVEL`                   |
-| `storage_backend`            | `GTN_CONFIG_STORAGE_BACKEND`             |
-| `worker.heartbeat_timeout_s` | `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S` |
-| `library.lazy_node_loading`  | `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`  |
-| `agent.system_prompt`        | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`        |
+| Setting                         | Environment variable                        |
+| ------------------------------- | ------------------------------------------- |
+| `workspace_directory`           | `GTN_CONFIG_WORKSPACE_DIRECTORY`            |
+| `libraries_directory`           | `GTN_CONFIG_LIBRARIES_DIRECTORY`            |
+| `project_file`                  | `GTN_CONFIG_PROJECT_FILE`                   |
+| `log_level`                     | `GTN_CONFIG_LOG_LEVEL`                      |
+| `storage_backend`               | `GTN_CONFIG_STORAGE_BACKEND`                |
+| `worker.library_load_timeout_s` | `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S` |
+| `library.lazy_node_loading`     | `GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING`     |
+| `agent.system_prompt`           | `GTN_CONFIG_AGENT__SYSTEM_PROMPT`           |
 
 This is useful for scripted environments, containers, and CI/CD pipelines where you want to inject configuration without modifying any config files:
 
 ```bash
 GTN_CONFIG_PROJECT_FILE=/shared/studio-project.yml gtn
-GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 gtn
+GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S=30 gtn
 GTN_CONFIG_LIBRARY__LAZY_NODE_LOADING=false gtn
 GTN_CONFIG_AGENT__SYSTEM_PROMPT="Answer tersely." gtn
 ```
@@ -204,6 +204,22 @@ GTN_CONFIG_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested layouts
 ```
 
 A value of `0` scans only the top-level directory (no subdirectories).
+
+### Workflow Node Recursion Depth (`max_workflow_recursion_depth`)
+
+A Workflow node runs a saved workflow inside your flow. That saved workflow can contain a Workflow node that points back at itself, directly or through another workflow, as long as something such as a branch stops the recursion. The `max_workflow_recursion_depth` setting limits how many times a workflow may run inside itself. Past that, the run fails with an error that names the workflow and this setting. The default is **10** and the minimum is **1**. In a config file, a whole number below 1 is treated as 1, and a value that isn't a whole number is ignored with a warning and the default is used. In the environment variable, a value below 1 is ignored with a warning and the configured value is used.
+
+The limit counts the levels within one run of the engine. A group or loop set to "Isolated Execution" starts a fresh process each time it runs, so the count starts again at 0 inside it. With the "Isolated Execution in a worker" beta feature on, the count carries through.
+
+Each level runs a full copy of the workflow, so raising the limit a lot costs memory and time. Choose the smallest value your workflow needs.
+
+The setting limits how deep the recursion goes, not how much work it does in total. In a loop set to run all items at once, every iteration at every level starts together, so the work grows with the number of items per loop raised to the power of the depth. Raise the setting carefully when the recursion goes through such loops.
+
+Being a normal setting, it can be set in any config file or overridden with the `GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH` environment variable:
+
+```bash
+GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH=20 gtn   # allow deeper recursion
+```
 
 ## Running a Library's Nodes on Another Computer
 

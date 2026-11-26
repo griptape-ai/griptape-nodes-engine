@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -48,6 +49,9 @@ pytestmark = pytest.mark.timeout(300, method="thread")
 FIXTURE_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "iterative_group_library"
 FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.json"
 FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "iterative_group_nodes.py"
+WORKFLOW_NODE_LOOP_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "workflow_node_loop_library"
+WORKFLOW_NODE_LOOP_LIBRARY_JSON_TEMPLATE = WORKFLOW_NODE_LOOP_LIBRARY_DIR / "griptape_nodes_library.json"
+INNER_LOOP_WORKFLOW_FILE = WORKFLOW_NODE_LOOP_LIBRARY_DIR / "inner_loop_workflow.py"
 WATCHER_LIBRARY_FILE = Path(__file__).parent / "fixtures" / "node_watcher_library" / "node_watcher_library.py"
 # `flow_manager._validate_and_get_multi_node_library_info` resolves the packaged flow's
 # StartFlow/EndFlow endpoints from a library with exactly this name.
@@ -56,6 +60,10 @@ LIBRARY_NAME = "Griptape Nodes Library"
 OUTER_GROUP_NAME = "ForEachGroup"
 INNER_GROUP_NAME = "InnerGroup"
 BODY_NODE_NAME = "Body"
+# The names the nodes have inside `inner_loop_workflow.py`.
+WORKFLOW_BODY_NODE_NAME = "InnerBody"
+WORKFLOW_NODE_NAME = "InnerLoopWorkflowNode"
+WORKFLOW_INNER_FLOW_NAME = "InnerLoop_subflow"
 # `ProbeForEachGroupNode` iterates a fixed three-item list.
 ITEMS_PER_LOOP = 3
 EXECUTION_MODES = ["Run Group Items One at a Time", "Run Group Items All at Once"]
@@ -80,6 +88,27 @@ class RecordedNodeEvents:
 
     def starts_of(self, node_name: str) -> list[NodeStartProcessEvent]:
         return [event for event in self.starts if event.node_name == node_name]
+
+
+@pytest.fixture
+def register_inner_loop_library(
+    tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
+) -> Callable[[str], None]:
+    """Return a function registering the Workflow node library with its inner loop in the given mode."""
+
+    def _register(inner_execution_mode: str) -> None:
+        library_json = materialize_library(
+            tmp_path / "library",
+            template=WORKFLOW_NODE_LOOP_LIBRARY_JSON_TEMPLATE,
+            node_file=WORKFLOW_NODE_LOOP_LIBRARY_DIR / "inner_loop_nodes.py",
+            name=LIBRARY_NAME,
+            extra_files=[FIXTURE_NODE_FILE, INNER_LOOP_WORKFLOW_FILE],
+        )
+        _set_inner_loop_mode(library_json.parent / INNER_LOOP_WORKFLOW_FILE.name, inner_execution_mode)
+        register_result = engine.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+        assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
+
+    return _register
 
 
 @pytest.fixture
@@ -136,6 +165,22 @@ def _wire_loop_body(engine: Engine, group_name: str, body_name: str) -> None:
     """Wire the body so every iteration re-executes it, as a real graph does."""
     _connect(engine, group_name, "on_each", body_name, "exec_in")
     _connect(engine, body_name, "exec_out", group_name, "loop_complete")
+
+
+def _set_inner_loop_mode(workflow_file: Path, execution_mode: str) -> None:
+    """Rewrite the saved workflow so its inner loop runs in `execution_mode`.
+
+    The fixture saves the inner loop One at a Time, with `run_in_order` and `execution_mode` as two
+    separate values, so both are patched together.
+    """
+    run_in_order = execution_mode == EXECUTION_MODES[0]
+    saved = f"'b5bea41b6c623f7c09f1bf24dcae58eb': True, 'b1a67d8b28b9f7e30fb5eb2c18753e39': '{EXECUTION_MODES[0]}'"
+    patched = (
+        f"'b5bea41b6c623f7c09f1bf24dcae58eb': {run_in_order}, 'b1a67d8b28b9f7e30fb5eb2c18753e39': '{execution_mode}'"
+    )
+    source = workflow_file.read_text()
+    assert saved in source, "the fixture workflow no longer saves the inner loop One at a Time"
+    workflow_file.write_text(source.replace(saved, patched))
 
 
 def _set_execution_mode(engine: Engine, group_name: str, execution_mode: str) -> None:
@@ -249,6 +294,58 @@ async def test_nested_loop_body_runs_resolve_to_the_canvas_node(
     assert set(body_parents.values()) == {ITEMS_PER_LOOP}, "each inner run should parent one body run per item"
 
 
+@pytest.mark.parametrize("inner_execution_mode", EXECUTION_MODES)
+@pytest.mark.parametrize("execution_mode", EXECUTION_MODES)
+@pytest.mark.asyncio
+async def test_loop_body_inside_a_workflow_node_is_named_by_that_workflow(
+    engine: Engine,
+    register_inner_loop_library: Callable[[str], None],
+    recorded_node_events: RecordedNodeEvents,
+    execution_mode: str,
+    inner_execution_mode: str,
+) -> None:
+    """A loop body in the workflow behind a Workflow node inside a loop is named like that workflow's other nodes.
+
+    The names and flow are those of the live copy of the workflow, never those of a temporary iteration copy.
+    """
+    register_inner_loop_library(inner_execution_mode)
+    parent_flow = _create_parent_flow(engine, "workflow_node_loop_events_wf")
+    with engine.context_manager.flow(parent_flow):
+        outer_name = _create_node(engine, "ProbeForEachGroupNode", OUTER_GROUP_NAME)
+        workflow_node_name = _create_node(engine, "InnerLoopWorkflow", WORKFLOW_NODE_NAME, parent_group_name=outer_name)
+    _wire_loop_body(engine, outer_name, workflow_node_name)
+    _set_execution_mode(engine, outer_name, execution_mode)
+
+    await _run(engine, parent_flow, outer_name)
+
+    # Running the outer loop one at a time reuses a single import of the workflow, whose body is
+    # `InnerBody`. Running it all at once gives each iteration its own import, and the engine keeps node
+    # names unique, so those bodies are `InnerBody`, `InnerBody_1`, ... Either way each body sends a start
+    # and a finish event per inner iteration, and none of the inner loop's own renamed copies appears
+    # under a name of its own.
+    body_events = [
+        event
+        for event in recorded_node_events.events
+        if re.fullmatch(rf"{WORKFLOW_BODY_NODE_NAME}(_\d+)?", event.node_name)
+    ]
+    body_event_names = Counter(event.node_name for event in body_events)
+    events_per_import = 2 * ITEMS_PER_LOOP
+    if execution_mode == EXECUTION_MODES[0]:
+        expected_event_counts = [events_per_import * ITEMS_PER_LOOP]
+    else:
+        expected_event_counts = [events_per_import] * ITEMS_PER_LOOP
+    assert sorted(body_event_names.values()) == expected_event_counts, (
+        f"the inner loop's body was reported under other names: {body_event_names} "
+        f"({execution_mode}, inner {inner_execution_mode})"
+    )
+    body_flow_names = {event.flow_name for event in body_events}
+    assert all(
+        flow_name is not None and re.fullmatch(rf"{WORKFLOW_INNER_FLOW_NAME}(_\d+)?", flow_name)
+        for flow_name in body_flow_names
+    ), f"the inner loop's body was reported in a flow that is not the workflow's: {body_flow_names}"
+    _assert_every_run_paired_and_succeeded(recorded_node_events)
+
+
 @pytest.mark.asyncio
 async def test_library_listeners_watch_every_node_and_stop_when_it_unloads(
     tmp_path: Path, engine: Engine, materialize_library: Callable[..., Path]
@@ -292,6 +389,8 @@ async def test_library_listeners_watch_every_node_and_stop_when_it_unloads(
     assert isinstance(unload_result, UnloadLibraryFromRegistryResultSuccess), unload_result
     heard_before_unload = len(heard)
     engine.event_manager.put_event(
-        ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=NodeStartProcessEvent(node_name="After")))
+        ExecutionGriptapeNodeEvent(
+            wrapped_event=ExecutionEvent(payload=NodeStartProcessEvent(node_name="After"), open_workflow_id=None)
+        )
     )
     assert len(heard) == heard_before_unload, "a listener kept firing after its library unloaded"

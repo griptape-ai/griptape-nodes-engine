@@ -1,12 +1,14 @@
 # Approvals
 
-Some things the agent can do cost credits or change your project: running a workflow, running a node, generating an image, or using a tool from one of your own MCP servers. The agent stops and asks you before it does any of these, so a question like "how does this node work?" never turns into a workflow run you didn't ask for.
+Some things the agent can do cost credits or change your project: running a workflow, running a node, generating an image, closing a workflow, or using a tool from one of your own MCP servers. The agent stops and asks you before it does any of these, so a question like "how does this node work?" never turns into a workflow run you didn't ask for.
 
 ## What the agent asks about
 
 The agent asks before it:
 
 - runs your workflow, a flow, or a single node
+- closes a workflow, which discards its unsaved changes, or clears everything, which closes every open
+    workflow, including the ones in your other tabs
 - generates an image
 - uses any tool from an MCP server you attached to the conversation (see [MCP Servers](./mcp_servers.md))
 - uses a tool from a library you picked under **Libraries**, unless the library marks the tool as

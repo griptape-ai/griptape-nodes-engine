@@ -77,9 +77,8 @@ built-in ones:
 - **Install Griptape Nodes Diffusers Library** — media generation with
     Diffusers. It wants a powerful machine, and some models need an NVIDIA
     GPU with CUDA.
-- **Install Griptape Cloud Library** — nodes for Griptape Cloud services.
 
-Both are also installable later from **Manage → Library Management**; see
+It is also installable later from **Manage → Library Management**; see
 [Libraries](../libraries.md).
 
 Nothing in this section takes effect until you click **Apply Changes**,

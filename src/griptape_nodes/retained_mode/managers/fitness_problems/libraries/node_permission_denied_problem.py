@@ -21,14 +21,20 @@ class NodePermissionDeniedProblem(LibraryProblem):
 
     @classmethod
     def collate_problems_for_display(cls, instances: list[NodePermissionDeniedProblem]) -> str:
-        """List every denied node type with the reasons it is blocked, de-duplicated in order."""
-        lines: list[str] = []
+        """List every denied node type with its reasons as nested bullets, de-duplicated in order."""
+        entries: list[str] = []
         for problem in instances:
-            reasons = "; ".join(problem.messages) or "Denied by the license policy."
-            entry = f"- {problem.node_type}: {reasons}"
-            if entry not in lines:
-                lines.append(entry)
-        if not lines:
+            reasons: list[str] = []
+            for message in problem.messages:
+                if message not in reasons:
+                    reasons.append(message)
+            if not reasons:
+                reasons = ["Denied by the license policy."]
+            nested = "\n".join(f"  - {reason}" for reason in reasons)
+            entry = f"- {problem.node_type}:\n{nested}"
+            if entry not in entries:
+                entries.append(entry)
+        if not entries:
             return "Some nodes are not permitted by your license."
-        body = "\n".join(lines)
+        body = "\n".join(entries)
         return f"Some nodes are not permitted by your license:\n{body}"

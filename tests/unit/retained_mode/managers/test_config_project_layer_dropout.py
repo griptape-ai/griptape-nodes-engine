@@ -5,7 +5,7 @@ This is the mechanism behind the stale-library report. Three facts combine:
 1. `libraries_to_register` lives at
    `app_events.on_app_initialization_complete.libraries_to_register` -- a *nested*,
    *list-valued* key. `_load_config_from_env_vars` can reach a nested key via a `__`
-   path separator (e.g. `GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S`), but a list-valued
+   path separator (e.g. `GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S`), but a list-valued
    setting has no string representation the `Settings` model accepts, so any value
    supplied for `libraries_to_register` is rejected and dropped. No `GTN_CONFIG_*`
    variable can set or shadow it.
@@ -35,8 +35,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -58,6 +56,7 @@ from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from pathlib import Path
 
     from griptape_nodes.retained_mode.engine import Engine
 
@@ -129,25 +128,26 @@ def _write_library(directory: Path, name: str) -> Path:
 class TestProjectLayerDropoutExposesUserLayer:
     """A cleared project layer promotes the user layer's stale library list."""
 
-    def test_project_layer_hides_a_polluted_user_layer(self, isolate_user_config: Path) -> None:
+    def test_project_layer_hides_a_polluted_user_layer(self, isolate_user_config: Path, tmp_path: Path) -> None:
         """With the project layer loaded, the user layer's stale entries are invisible.
 
         This is why the engine booted correctly and why `gtn self info` looks clean.
         """
         isolate_user_config.write_text(_register_list_config(PREVIOUS_INSTALL_LIBRARIES))
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(_register_list_config(CURRENT_PROJECT_LIBRARIES))
+        project_dir = tmp_path
+        (project_dir / "griptape_nodes_config.json").write_text(_register_list_config(CURRENT_PROJECT_LIBRARIES))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
 
-                # Lists are replaced, not merged, so only the project's entries survive.
-                assert manager.get_config_value(LIBRARIES_TO_REGISTER_KEY) == CURRENT_PROJECT_LIBRARIES
+            # Lists are replaced, not merged, so only the project's entries survive.
+            assert manager.get_config_value(LIBRARIES_TO_REGISTER_KEY) == CURRENT_PROJECT_LIBRARIES
 
-    def test_clearing_the_project_layer_promotes_the_stale_list(self, isolate_user_config: Path) -> None:
+    def test_clearing_the_project_layer_promotes_the_stale_list(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
         """Clearing the project layer and remerging promotes the user layer's list.
 
         `clear_project_layers()` followed by a bare `load_configs()` leaves
@@ -159,26 +159,25 @@ class TestProjectLayerDropoutExposesUserLayer:
         """
         isolate_user_config.write_text(_register_list_config(PREVIOUS_INSTALL_LIBRARIES))
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(_register_list_config(CURRENT_PROJECT_LIBRARIES))
+        project_dir = tmp_path
+        (project_dir / "griptape_nodes_config.json").write_text(_register_list_config(CURRENT_PROJECT_LIBRARIES))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                assert manager.get_config_value(LIBRARIES_TO_REGISTER_KEY) == CURRENT_PROJECT_LIBRARIES
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
+            assert manager.get_config_value(LIBRARIES_TO_REGISTER_KEY) == CURRENT_PROJECT_LIBRARIES
 
-                # project_manager._activate_project: clear_project_layers() then, for a
-                # project with no loaded template, load_configs().
-                manager.clear_project_layers()
-                manager.load_configs()
+            # project_manager._activate_project: clear_project_layers() then, for a
+            # project with no loaded template, load_configs().
+            manager.clear_project_layers()
+            manager.load_configs()
 
-                effective = manager.get_config_value(LIBRARIES_TO_REGISTER_KEY)
+            effective = manager.get_config_value(LIBRARIES_TO_REGISTER_KEY)
 
-                # The previous install's libraries are now what the engine will discover.
-                assert effective == PREVIOUS_INSTALL_LIBRARIES
-                assert any("0.94.0" in entry for entry in effective)
-                assert not any("0.94.0" in entry for entry in CURRENT_PROJECT_LIBRARIES)
+            # The previous install's libraries are now what the engine will discover.
+            assert effective == PREVIOUS_INSTALL_LIBRARIES
+            assert any("0.94.0" in entry for entry in effective)
+            assert not any("0.94.0" in entry for entry in CURRENT_PROJECT_LIBRARIES)
 
     def test_env_vars_cannot_protect_the_register_list(self, isolate_user_config: Path) -> None:
         """The user's GTN_CONFIG_* pins are structurally unable to shadow the nested key.

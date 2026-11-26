@@ -3,16 +3,20 @@ from enum import StrEnum
 from typing import Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
+    ExecutionEvent,
     ExecutionPayload,
     GraphAccessMixin,
+    ProgressEvent,
     RequestPayload,
     ResultDetails,
     ResultPayloadFailure,
     ResultPayloadSuccess,
+    RunControlMixin,
     SkipTheLineMixin,
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.failure_tree import CarriesFailureTree
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue, Value
@@ -32,7 +36,7 @@ class RunIdMixin:
 
 @dataclass
 @PayloadRegistry.register
-class ResolveNodeRequest(RequestPayload, GraphAccessMixin):
+class ResolveNodeRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Resolve (execute) a specific node.
 
     Use when: Running individual nodes, testing node execution, debugging workflows,
@@ -69,7 +73,7 @@ class ResolveNodeResultFailure(RunIdMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowRequest(RequestPayload, GraphAccessMixin):
+class StartFlowRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Start executing a flow.
 
     Use when: Running workflows, beginning automated execution, testing complete flows.
@@ -114,7 +118,7 @@ class StartFlowResultFailure(RunIdMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class StartLocalSubflowRequest(RequestPayload, GraphAccessMixin):
+class StartLocalSubflowRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Start an independent local subflow that runs concurrently with the main flow.
 
     Use when: Running loop iterations or other independent subflows that need their own
@@ -143,13 +147,16 @@ class StartLocalSubflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess)
 
 @dataclass
 @PayloadRegistry.register
-class StartLocalSubflowResultFailure(ResultPayloadFailure):
-    """Local subflow failed to start. Check result_details for error information."""
+class StartLocalSubflowResultFailure(ResultPayloadFailure, CarriesFailureTree):
+    """Local subflow failed to start. Check result_details for error information.
+
+    ``failure_tree`` says what failed inside the subflow, when a node in it did.
+    """
 
 
 @dataclass
 @PayloadRegistry.register
-class StartFlowFromNodeRequest(RequestPayload, GraphAccessMixin):
+class StartFlowFromNodeRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Start executing a flow from a specific node.
 
     Use when: Resuming execution from a particular node, debugging specific parts of a flow,
@@ -190,7 +197,7 @@ class StartFlowFromNodeResultFailure(RunIdMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelFlowRequest(RequestPayload, GraphAccessMixin):
+class CancelFlowRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Cancel a running flow execution.
 
     Use when: Stopping long-running workflows, handling user cancellation,
@@ -221,7 +228,7 @@ class CancelFlowResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelRunRequest(RequestPayload, GraphAccessMixin):
+class CancelRunRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Cancel one run: a waiting run leaves the line without starting, and the run in progress stops.
 
     Use when: withdrawing a run queued behind another, or stopping a particular run. Run ids come
@@ -250,7 +257,7 @@ class CancelRunResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelAllRunsRequest(RequestPayload, GraphAccessMixin):
+class CancelAllRunsRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Cancel every waiting run, then the run in progress, without starting another.
 
     Use when: closing a workflow, or stopping everything a script queued.
@@ -322,7 +329,7 @@ class ListRunsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class UnresolveFlowRequest(RequestPayload, GraphAccessMixin):
+class UnresolveFlowRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     """Reset every node in a flow back to unresolved.
 
     Use when: Clearing cached results so the next run re-executes every node.
@@ -357,7 +364,7 @@ class UnresolveFlowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 # Step In: Execute one resolving step at a time (per parameter)
 @dataclass
 @PayloadRegistry.register
-class SingleExecutionStepRequest(RequestPayload, GraphAccessMixin):
+class SingleExecutionStepRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
@@ -376,7 +383,7 @@ class SingleExecutionStepResultFailure(ResultPayloadFailure):
 # Step Over: Execute one node at a time (execute whole node and move on) IS THIS CONTROL NODE OR ANY NODE?
 @dataclass
 @PayloadRegistry.register
-class SingleNodeStepRequest(RequestPayload, GraphAccessMixin):
+class SingleNodeStepRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
@@ -396,7 +403,7 @@ class SingleNodeStepResultFailure(ResolveNodeResultFailure):
 # Continue
 @dataclass
 @PayloadRegistry.register
-class ContinueExecutionStepRequest(RequestPayload, GraphAccessMixin):
+class ContinueExecutionStepRequest(RequestPayload, GraphAccessMixin, RunControlMixin):
     # Maintaining flow_name for backwards compatibility. Will be removed in https://github.com/griptape-ai/griptape-nodes-engine/issues/1663
     flow_name: str | None = None
 
@@ -721,6 +728,17 @@ class GriptapeEvent(ExecutionPayload):
     value: DisplayValue
 
 
+def progress_to_execution_event(progress: ProgressEvent) -> ExecutionEvent:
+    """The execution event a streamed progress event reaches clients as."""
+    payload = GriptapeEvent(
+        node_name=progress.node_name,
+        parameter_name=progress.parameter_name,
+        type=type(progress).__name__,
+        value=progress.value,
+    )
+    return ExecutionEvent(payload=payload, open_workflow_id=progress.open_workflow_id)
+
+
 class NodeMetadata(TypedDict, total=False):
     """Metadata dict carried on nodes. node_type and library are required; all other keys are optional."""
 
@@ -730,12 +748,16 @@ class NodeMetadata(TypedDict, total=False):
 
 @dataclass
 @PayloadRegistry.register
-class ExecuteNodeRequest(RequestPayload):
+class ExecuteNodeRequest(RequestPayload, RunControlMixin):
     """Execute a node's aprocess() directly with provided parameter values.
 
     Hydrates the node's input parameters, calls aprocess(), and returns outputs.
     Unlike ResolveNodeRequest, this bypasses flow/DAG machinery and executes
     the node's process method directly.
+
+    NodeExecutor sends it only after choosing, by the node's type, to run the node on its own, and
+    a worker receives it from the orchestrator. Groups and loops never get one. Clients run a node with
+    ResolveNodeRequest, which makes that choice.
 
     Handling depends on where the request lands:
 
@@ -786,9 +808,6 @@ class ExecuteNodeRequest(RequestPayload):
             worker's registry entry for the workflow answers. The worker builds its copy of the
             node in that workflow, so a request with no orchestrator_workflow_id fails rather than
             running without one.
-        lease_id: The lease, on the engine that runs the worker, that the node is sent under. A worker
-            another engine runs asks that engine whether the lease holds it before running the node,
-            and refuses a node sent under none. None for a worker on this machine.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -806,24 +825,30 @@ class ExecuteNodeRequest(RequestPayload):
     workflow_file_path: str | None = None
     workflow_working_directory: str | None = None
     element_modification_commands: list[RequestPayload] = field(default_factory=list)
-    lease_id: str | None = None
 
 
 @dataclass
 @PayloadRegistry.register
-class ExecuteNodeResultSuccess(ResultPayloadSuccess):
+class ExecuteNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Successful result from executing a node directly.
 
     Args:
         parameter_output_values: Output parameter values from the node.
+        parameter_values_set_by_run: Values a run in a worker gave the node's own parameters, such as
+            a seed it rolled, so that the engine's copy of the node holds them too. Leaves out those in
+            `outputs_set_by_run`. A value with no plain-data form stays in the worker.
+        outputs_set_by_run: Names in `parameter_output_values` whose value the run also gave the
+            parameter itself, so the engine's copy takes it from there rather than receiving it twice.
     """
 
     parameter_output_values: dict[str, Value] = field(default_factory=dict)
+    parameter_values_set_by_run: dict[str, Value] = field(default_factory=dict)
+    outputs_set_by_run: list[str] = field(default_factory=list)
 
 
 @dataclass
 @PayloadRegistry.register
-class ExecuteNodeResultFailure(ResultPayloadFailure):
+class ExecuteNodeResultFailure(ResultPayloadFailure, CarriesFailureTree):
     """Failed result from executing a node directly.
 
     Args:
@@ -834,6 +859,8 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
         error: The failure in parts for `NodeErrorEvent.error`, built from the node's own exception
             where the node failed, so it is complete even when the node ran in a worker. None when
             the engine wrote `result_details` itself, such as for a worker that stopped responding.
+
+    ``failure_tree`` is the same failure as a `FailureTree`, built where the node failed.
     """
 
     validation_exceptions: list[Exception] | None = None
@@ -842,7 +869,7 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
-class CancelExecuteNodeRequest(RequestPayload, SkipTheLineMixin):
+class CancelExecuteNodeRequest(RequestPayload, SkipTheLineMixin, RunControlMixin):
     """Cancel an in-flight ExecuteNodeRequest on this engine.
 
     Dispatched by the orchestrator to a worker when a user cancels a flow and a

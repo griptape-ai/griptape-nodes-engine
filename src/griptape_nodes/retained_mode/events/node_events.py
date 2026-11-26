@@ -13,6 +13,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
     ResultPayloadSuccess,
     WorkflowAlteredMixin,
+    WorkflowAlteredReportedMixin,
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -65,7 +66,7 @@ class CreateNodeRequest(RequestPayload):
         metadata: Initial metadata for the node (position, display properties)
         resolution: Initial resolution state (defaults to UNRESOLVED)
         initial_setup: Skip setup work when loading from file (defaults to False)
-        set_as_new_context: Set this node as current context after creation (defaults to False)
+        set_as_new_context: Deprecated and ignored. Name the node on later requests instead.
         create_error_proxy_on_failure: Create Error Proxy node if creation fails (defaults to True)
         node_names_to_add: List of existing node names to add to this node after creation (used by SubflowNodeGroup, defaults to None)
         subflow_name: Subflow name for node groups (if None, a fresh one will be created; used by SubflowNodeGroup, defaults to None)
@@ -83,7 +84,6 @@ class CreateNodeRequest(RequestPayload):
     resolution: str = NodeResolutionState.UNRESOLVED.value
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
     initial_setup: bool = False
-    # When True, this Node will be pushed as the current Node within the Current Context.
     set_as_new_context: bool = False
     # When True, create an Error Proxy node if the requested node type fails to create
     create_error_proxy_on_failure: bool = True
@@ -285,8 +285,10 @@ class SetNodeMetadataRequest(RequestPayload):
     saving user preferences. Metadata doesn't affect execution but provides workflow context.
 
     Args:
-        metadata: Dictionary of metadata to set (position, display properties, custom data)
+        metadata: Dictionary of metadata to set (position, display properties, custom data). Keys it
+            leaves out keep their values.
         node_name: Name of the node to update metadata for (None for current context node)
+        remove_keys: Keys to remove from the node's metadata
 
     Results: SetNodeMetadataResultSuccess | SetNodeMetadataResultFailure (node not found, update error)
     """
@@ -294,12 +296,17 @@ class SetNodeMetadataRequest(RequestPayload):
     metadata: dict
     # If None is passed, assumes we're using the Node in the Current Context
     node_name: str | None = None
+    remove_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
 @PayloadRegistry.register
-class SetNodeMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Node metadata updated successfully. New metadata stored and available for future requests."""
+class SetNodeMetadataResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
+    """Node metadata updated successfully. New metadata stored and available for future requests.
+
+    `altered_workflow_state` is False when the request changed no value, or only recorded the size of a
+    node that had none, as the editor does the first time it draws a node.
+    """
 
 
 @dataclass
@@ -330,8 +337,10 @@ class BatchSetNodeMetadataRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeMetadataResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+class BatchSetNodeMetadataResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Batch node metadata update completed successfully.
+
+    `altered_workflow_state` is True when any node's update altered it, as `SetNodeMetadataResultSuccess` decides.
 
     Args:
         updated_nodes: List of node names that were successfully updated
@@ -420,8 +429,11 @@ class SetLockNodeStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetLockNodeStateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Node locked successfully."""
+class SetLockNodeStateResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
+    """Node locked successfully. A saved workflow keeps its lock.
+
+    `altered_workflow_state` is False when the node already had the requested lock state.
+    """
 
     node_name: str
     locked: bool
@@ -453,8 +465,11 @@ class BatchSetNodeLockStateRequest(WorkflowNotAlteredMixin, RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class BatchSetNodeLockStateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Batch node lock state update completed successfully."""
+class BatchSetNodeLockStateResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
+    """Batch node lock state update completed successfully.
+
+    `altered_workflow_state` is False when every node already had the requested lock state.
+    """
 
     updated_nodes: list[str]
     failed_nodes: dict[str, str] = field(default_factory=dict)
@@ -477,10 +492,9 @@ class SerializedNodeCommands:
         create_node_command (CreateNodeRequest): The command to create the node.
         element_modification_commands (list[RequestPayload]): A list of commands to create or modify the elements (including Parameters) of the node.
         node_dependencies (NodeDependencies): Dependencies that this node has on external resources (workflows, files, imports, libraries).
-        node_uuid (NodeUUID): The UUID of this particular node. During deserialization, this UUID will be used to correlate this node's instance
-            with the connections and parameter values necessary. We cannot use node name because Griptape Nodes enforces unique names, and we cannot
-            predict the name that will be selected upon instantiation. Similarly, the same serialized node may be deserialized multiple times, such
-            as during copy/paste or duplicate.
+        node_uuid (NodeUUID): Names this node within the serialization, so its connections and parameter values can refer to it. A serialized
+            node takes the name of the node it was made from, which is unique in its workflow, so the same workflow always serializes the same.
+            It is only a reference: the node a deserialization creates may get another name, such as when pasting a copy next to the original.
     """
 
     # Have to use str instead of the UUID class because it's not JSON serializable >:-/
@@ -508,54 +522,76 @@ class SerializedNodeCommands:
     node_uuid: NodeUUID = field(default_factory=lambda: SerializedNodeCommands.NodeUUID(str(uuid4())))
 
 
+@dataclass(frozen=True)
+class ValueLeftOut:
+    """A parameter value a serialization could not write down, because it has no plain-data form.
+
+    Args:
+        node_name: The node holding the value.
+        parameter_name: The parameter holding the value.
+        value_kind: "set" for a value the parameter was given, "output" for one its node produced.
+        type_name: The name of the value's type.
+    """
+
+    node_name: str
+    parameter_name: str
+    value_kind: str
+    type_name: str
+
+    def save_warning(self) -> str:
+        """What to tell the user when a saved workflow leaves this value out."""
+        return (
+            f"Attempted to save the {self.value_kind} value of parameter '{self.parameter_name}' on node "
+            f"'{self.node_name}'. Failed because a '{self.type_name}' value has no plain-data form, so the node "
+            f"will run again when the workflow is reopened. To keep the value, register its class with "
+            f"register_value_codec, or set serializable=False on the parameter to stop this warning."
+        )
+
+
 @dataclass
 class SerializedParameterValueTracker:
-    """Tracks the serialization state of parameter value hashes.
+    """Remembers how each value met while serializing was saved, so a value several parameters share is encoded once.
 
-    This class manages the relationship between value hashes and their unique UUIDs,
-    indicating whether a value is serializable or not. It allows the addition of both
-    serializable and non-serializable value hashes and provides methods to retrieve
-    the serialization state and unique UUIDs for given value hashes.
+    Values are told apart by identity, and the tracker holds every value it has seen. A value read
+    from a node can be built on each read, such as a list parameter's items, and without the hold it
+    could be freed and its identity reused by another value, which would then be saved as the first.
 
-    Attributes:
-        _value_hash_to_unique_value_uuid (dict[Any, SerializedNodeCommands.UniqueParameterValueUUID]):
-            A dictionary mapping value hashes to their unique UUIDs when they are serializable.
-        _non_serializable_value_hashes (set[Any]):
-            A set of value hashes that are not serializable.
+    It also records each parameter value that could not be written down, for a caller that writes a
+    workflow to a file to warn of.
     """
 
     class TrackerState(Enum):
-        """State of a value hash in the tracker."""
+        """How a value was saved."""
 
         NOT_IN_TRACKER = auto()
         SERIALIZABLE = auto()
         NOT_SERIALIZABLE = auto()
 
-    _value_hash_to_unique_value_uuid: dict[Any, SerializedNodeCommands.UniqueParameterValueUUID] = field(
-        default_factory=dict
-    )
-    _non_serializable_value_hashes: set[Any] = field(default_factory=set)
+    # Keyed by id(value). Each entry holds the value, so the id stays its own.
+    _serializable: dict[int, tuple[Any, SerializedNodeCommands.UniqueParameterValueUUID]] = field(default_factory=dict)
+    _non_serializable: dict[int, Any] = field(default_factory=dict)
+    values_left_out: list[ValueLeftOut] = field(default_factory=list)
 
-    def get_tracker_state(self, value_hash: Any) -> TrackerState:
-        if value_hash in self._non_serializable_value_hashes:
+    def get_tracker_state(self, value: Any) -> TrackerState:
+        if id(value) in self._non_serializable:
             return SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
-        if value_hash in self._value_hash_to_unique_value_uuid:
+        if id(value) in self._serializable:
             return SerializedParameterValueTracker.TrackerState.SERIALIZABLE
         return SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
 
     def add_as_serializable(
-        self, value_hash: Any, unique_value_uuid: SerializedNodeCommands.UniqueParameterValueUUID
+        self, value: Any, unique_value_uuid: SerializedNodeCommands.UniqueParameterValueUUID
     ) -> None:
-        self._value_hash_to_unique_value_uuid[value_hash] = unique_value_uuid
+        self._serializable[id(value)] = (value, unique_value_uuid)
 
-    def add_as_not_serializable(self, value_hash: Any) -> None:
-        self._non_serializable_value_hashes.add(value_hash)
+    def add_as_not_serializable(self, value: Any) -> None:
+        self._non_serializable[id(value)] = value
 
-    def get_uuid_for_value_hash(self, value_hash: Any) -> SerializedNodeCommands.UniqueParameterValueUUID:
-        return self._value_hash_to_unique_value_uuid[value_hash]
+    def get_uuid_for_value(self, value: Any) -> SerializedNodeCommands.UniqueParameterValueUUID:
+        return self._serializable[id(value)][1]
 
     def get_serializable_count(self) -> int:
-        return len(self._value_hash_to_unique_value_uuid)
+        return len(self._serializable)
 
 
 @dataclass
@@ -571,6 +607,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
         unique_parameter_uuid_to_values: Mapping of UUIDs to unique parameter values (modified in-place)
         serialized_parameter_value_tracker: Tracks serialization state of parameter values
         use_pickling: Deprecated and ignored. The value pool always holds encoded values.
+        include_run_results: If False, writes the node as unresolved, without its output values.
 
     Results: SerializeNodeToCommandsResultSuccess (with commands) | SerializeNodeToCommandsResultFailure (serialization error)
     """
@@ -587,6 +624,7 @@ class SerializeNodeToCommandsRequest(RequestPayload):
     serialize_all_parameter_values: bool = False
     # If True, keep subflow_name in group metadata for workflow file generation (defaults to False for copy/paste)
     include_existing_subflow_in_group: bool = False
+    include_run_results: bool = True
 
 
 @dataclass
@@ -834,7 +872,7 @@ class SendNodeMessageRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SendNodeMessageResultSuccess(ResultPayloadSuccess):
+class SendNodeMessageResultSuccess(WorkflowAlteredReportedMixin, ResultPayloadSuccess):
     """Node message sent and processed successfully.
 
     Args:
@@ -846,7 +884,7 @@ class SendNodeMessageResultSuccess(ResultPayloadSuccess):
 
 @dataclass
 @PayloadRegistry.register
-class SendNodeMessageResultFailure(ResultPayloadFailure):
+class SendNodeMessageResultFailure(WorkflowAlteredReportedMixin, ResultPayloadFailure):
     """Node message sending failed.
 
     Common causes: node not found, no current context, message handler error,

@@ -33,7 +33,9 @@ When you choose a different project, Griptape Nodes asks you to confirm. The dia
 
 ![The Switch Project confirmation dialog showing the from and to projects](../../assets/img/projects/projects-gui-switch-confirm.png)
 
-> **Switching reloads the engine.** Your active workflow is closed first (you'll be prompted to save if you have unsaved changes), and the workflow list refreshes to show the new project's workflows. After switching, open a workflow from the new project to keep working.
+> **Switching reloads the engine.** Every open workflow is closed first, including the ones in other tabs, because a project decides where all of them save their files. You'll be prompted to save any with unsaved changes. The workflow list then refreshes to show the new project's workflows. After switching, open a workflow from the new project to keep working.
+>
+> You can't switch while a workflow is running. Wait for the run to finish, or cancel it, then switch.
 
 If the project you're switching to pins specific library versions, a **provisioning preview** appears first so you can review (and approve) any libraries that will be installed or changed before the switch happens.
 

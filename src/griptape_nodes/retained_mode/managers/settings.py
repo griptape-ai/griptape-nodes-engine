@@ -20,8 +20,6 @@ PROJECTS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.projects_t
 REQUIRES_ENGINE_KEY = "app_events.on_app_initialization_complete.requires_engine"
 PROJECT_WORKSPACES_KEY = "project_workspaces"
 EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
-WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
-WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_LIBRARY_LOAD_TIMEOUT_KEY = "worker.library_load_timeout_s"
 WORKER_COMMAND_PREFIX_KEY = "worker.command_prefix"
 DISTRIBUTED_EXECUTION_LIBRARY_ENGINES_KEY = "distributed_execution.library_engines"
@@ -29,6 +27,8 @@ DISTRIBUTED_EXECUTION_RELEASE_WHICH_KEY = "distributed_execution.release.which"
 DISTRIBUTED_EXECUTION_RELEASE_HOW_KEY = "distributed_execution.release.how"
 DISTRIBUTED_EXECUTION_MAX_WORKERS_KEY = "distributed_execution.max_workers"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
+MAX_WORKFLOW_RECURSION_DEPTH_KEY = "max_workflow_recursion_depth"
+DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH = 10
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --
 # agrees on both the key and what a missing value means.
@@ -134,6 +134,33 @@ def coerce_refresh_previews_max_files(value: Any) -> int:
         f"Watching up to {DEFAULT_REFRESH_PREVIEWS_MAX_FILES} files for preview refreshes.",
     )
     return DEFAULT_REFRESH_PREVIEWS_MAX_FILES
+
+
+def coerce_max_workflow_recursion_depth(value: Any) -> int:
+    """The max_workflow_recursion_depth value to use from a config file.
+
+    A whole number below 1 becomes 1, since a low limit was clearly meant. Anything else that is not
+    a whole number of at least 1 becomes the default. Used by the Settings validator and by
+    ConfigManager, which reads the merged config, where raw values are kept. Warns once per bad
+    value instead of failing, so a typo can't reset the rest of the config.
+    """
+    if _is_whole_number_of_at_least_one(value):
+        return value
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        _warn_once(
+            (MAX_WORKFLOW_RECURSION_DEPTH_KEY, repr(value)),
+            f"{MAX_WORKFLOW_RECURSION_DEPTH_KEY} is {value!r}, below its minimum of 1. "
+            "Using 1, so a workflow can run inside itself only once.",
+        )
+        return 1
+
+    _warn_once(
+        (MAX_WORKFLOW_RECURSION_DEPTH_KEY, repr(value)),
+        f"Ignoring {MAX_WORKFLOW_RECURSION_DEPTH_KEY} = {value!r}: expected a whole number of at least 1. "
+        f"Using the default of {DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH}.",
+    )
+    return DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH
 
 
 def _is_whole_number_of_at_least_one(value: Any) -> bool:
@@ -383,26 +410,14 @@ class AppEvents(BaseModel):
 
 
 class WorkerSettings(BaseModel):
-    heartbeat_interval_s: float = Field(
-        default=5.0,
-        description="Interval in seconds between worker heartbeat challenges sent by the orchestrator.",
-    )
-    heartbeat_timeout_s: float = Field(
-        default=15.0,
-        description=(
-            "Seconds without a heartbeat response before a worker is evicted. A worker also shuts "
-            "itself down after this much orchestrator silence, but never sooner than 30 seconds, so "
-            "that an orchestrator too busy to challenge is not mistaken for one that exited."
-        ),
-    )
     library_load_timeout_s: float = Field(
         default=600.0,
         description=(
-            "Seconds a worker may take to load its library. Bounds how long running a node waits "
-            "for its library's worker to finish loading, and how long a project switch waits for "
-            "each worker to adopt it. "
+            "Seconds a worker may take to load its library. Bounds how long a worker this engine "
+            "starts may take to connect to it, how long running a node waits for its library's "
+            "worker to finish loading, and how long a project switch waits for each worker to adopt it. "
             "First-time installs of large libraries (e.g. torch, diffusers) can easily exceed "
-            "two minutes. Does not affect heartbeats; see worker.heartbeat_timeout_s for those."
+            "two minutes."
         ),
     )
     command_prefix: list[str] = Field(
@@ -696,7 +711,7 @@ class Settings(BaseModel):
     ffmpeg_directory: str = Field(
         category=FILE_SYSTEM,
         default="",
-        description="Absolute path to the directory holding the ffmpeg/ffprobe binaries the engine downloads on first use. Unlike the other directory settings, this is never interpreted relative to the workspace: the ffmpeg cache belongs to the machine, not to a workspace, so it is shared across every workspace and project. A relative value is ignored with a warning. Empty (the default) means the `ffmpeg` folder in the engine data directory: `<XDG_DATA_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_DATA_DIR` when that is set. To supply your own binaries instead of downloading, point this at a directory containing `bin/<platform>/` holding ffmpeg, ffprobe, and an empty `installed.crumb` file - static-ffmpeg treats that marker as proof of a completed install, and re-downloads over the binaries whenever it is missing.",
+        description="Absolute path to the directory holding the ffmpeg/ffprobe binaries the engine downloads on first use. Unlike the other directory settings, this is never interpreted relative to the workspace: the ffmpeg cache belongs to the machine, not to a workspace, so it is shared across every workspace and project. A relative value is ignored with a warning. Empty (the default) means the `ffmpeg` folder in the engine data directory: `<XDG_DATA_HOME>/griptape_nodes`, or the path in `GTN_ENGINE_DATA_DIR` when that is set. Which ffmpeg runs: binaries you supplied here win, then ffmpeg and ffprobe on your `PATH`, and only then a download into this directory. Leaving it empty never overrides `PATH`. To supply your own binaries, set this and put ffmpeg, ffprobe, and an empty `installed.crumb` file in its `bin/<platform>/` folder; static-ffmpeg treats that marker as proof of a completed install.",
     )
     app_events: AppEvents = Field(
         category=APPLICATION_EVENTS,
@@ -759,6 +774,32 @@ class Settings(BaseModel):
         default=0,
         description="Maximum number of loop iterations running at a time when a loop runs all items at once. 0 means no limit.",
     )
+    max_workflow_recursion_depth: int = Field(
+        category=EXECUTION,
+        default=DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH,
+        ge=1,
+        description=(
+            "How many times a workflow can run inside itself through its own Workflow node before the engine "
+            "stops it. Each level runs a full copy of the workflow. The count starts again inside a group or "
+            'loop set to "Isolated Execution". In a config file, a whole number below 1 is treated as 1, and '
+            "a value that is not a whole number is ignored with a warning and the default is used."
+        ),
+    )
+
+    @field_validator("max_workflow_recursion_depth", mode="before")
+    @classmethod
+    def validate_max_workflow_recursion_depth(cls, v: Any, info: ValidationInfo) -> Any:
+        """Replace a bad value from a config file with a usable one, so it cannot reset the whole config.
+
+        From a GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH variable the value is left alone, so the field rejects
+        a bad one and the env loader reports the variable and ignores it.
+        """
+        from_env = bool(info.context and info.context.get(FROM_ENV_CONTEXT))
+        # The env loader reports a bad variable by name, so the field must see the raw value and reject it.
+        if from_env:
+            return v
+        return coerce_max_workflow_recursion_depth(v)
+
     worker: WorkerSettings = Field(
         category=EXECUTION,
         default_factory=WorkerSettings,
@@ -776,6 +817,17 @@ class Settings(BaseModel):
         category=STORAGE,
         default=True,
         description="Automatically inject workflow metadata into saved files with supported formats",
+    )
+    preserve_source_metadata_in_thumbnails: bool = Field(
+        category=STORAGE,
+        default=False,
+        description="Keep source PNG text in PNG thumbnails, including artist notes and source workflow metadata. Current workflow metadata replaces matching keys when automatic injection is enabled.",
+    )
+    max_thumbnail_source_pixels: int = Field(
+        category=SYSTEM_REQUIREMENTS,
+        default=178956970,
+        gt=0,
+        description="Maximum stored source pixels allowed when creating a standard thumbnail. Pillow also enforces its own pixel ceiling; raising this setting beyond that ceiling requires the OpenImageIO backend. Raising the limit can require substantial memory; channel count, bit depth and processing copies also affect memory use.",
     )
     minimum_disk_space_gb_libraries: float = Field(
         category=SYSTEM_REQUIREMENTS,

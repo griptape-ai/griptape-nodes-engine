@@ -211,7 +211,7 @@ class TestExceptionWireForm:
     ``original_type`` / message / ``original_traceback`` slots. Both
     halves are load-bearing for the orchestrator-side
     ``[<type>] ... Worker traceback: ...`` rendering in
-    ``NodeExecutor._format_node_failure_message``.
+    ``format_node_failure_message``.
     """
 
     @staticmethod

@@ -10,8 +10,9 @@ without relying on internals. They cover three behavioral clusters:
    execute() raises RuntimeError that carries the node name and the failure
    details, and outputs are not copied back onto the node.
 3. Special-node routing: BaseWhileNodeGroup, BaseIterativeNodeGroup,
-   BaseIterativeEndNode, and SubflowNodeGroup (with LOCAL_EXECUTION) take
-   their dedicated paths and do NOT dispatch an ExecuteNodeRequest.
+   BaseIterativeEndNode, SubflowNodeGroup (with LOCAL_EXECUTION), and
+   WorkflowNode take their dedicated paths and do NOT dispatch an
+   ExecuteNodeRequest.
 """
 
 from typing import Any, cast
@@ -19,8 +20,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
+from griptape_nodes.common.node_executor import NodeExecutor
+from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
+from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups import (
     BaseIterativeNodeGroup,
@@ -28,11 +31,13 @@ from griptape_nodes.exe_types.node_groups import (
     SubflowNodeGroup,
 )
 from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION
+from griptape_nodes.exe_types.workflow_node import WorkflowNode
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
     ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.events.failure_tree import ExecuteNodeFailureError, FailureKind, FailureLeaf
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -248,10 +253,11 @@ class TestExecuteFailureContract:
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
-        with pytest.raises(ExecuteNodeFailedError) as caught:
+        with pytest.raises(ExecuteNodeFailureError) as caught:
             await executor.execute(_in_workflow_of(executor, node))
 
-        assert caught.value.details is built
+        assert isinstance(caught.value.failure_tree, FailureLeaf)
+        assert caught.value.failure_tree.details is built
         assert caught.value.__cause__ is raised
 
     @pytest.mark.asyncio
@@ -263,10 +269,12 @@ class TestExecuteFailureContract:
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
-        with pytest.raises(ExecuteNodeFailedError) as caught:
+        with pytest.raises(ExecuteNodeFailureError) as caught:
             await executor.execute(_in_workflow_of(executor, node))
 
-        assert caught.value.details == NodeErrorDetails(message="no worker is available")
+        assert isinstance(caught.value.failure_tree, FailureLeaf)
+        assert caught.value.failure_tree.kind is FailureKind.ENGINE
+        assert caught.value.failure_tree.details == NodeErrorDetails(message="no worker is available")
         assert caught.value.__cause__ is None
 
 
@@ -340,3 +348,62 @@ class TestExecuteSpecialNodeRouting:
 
         node.aprocess.assert_awaited_once()
         mock_engine.ahandle_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_workflow_node_calls_aprocess_without_dispatch(self) -> None:
+        """A Workflow node runs here, as a local group does, so no ExecuteNodeRequest can send it to a worker."""
+        node = _make_spec_node(WorkflowNode, "Workflow")
+        node.aprocess = AsyncMock()
+
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock()
+        await executor.execute(_in_workflow_of(executor, node))
+
+        node.aprocess.assert_awaited_once()
+        mock_engine.ahandle_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_workflow_node_runs_outside_any_node_run(self) -> None:
+        """Nothing it loads or writes counts as a running node's.
+
+        So strict mode doesn't police the workflow file it imports, and the outputs it copies out
+        keep any variable macro its workflow kept, instead of having it resolved a second time.
+        """
+        node = _make_spec_node(WorkflowNode, "Workflow")
+        seen: dict[str, object] = {}
+
+        async def record_run_markers() -> None:
+            seen["in_aprocess"] = node_types._in_aprocess.get()
+            seen["strict_mode_scope"] = STRICT_MODE.current_scope()
+
+        node.aprocess = AsyncMock(side_effect=record_run_markers)
+
+        executor = _make_executor()
+        await executor.execute(_in_workflow_of(executor, node))
+
+        assert seen == {"in_aprocess": False, "strict_mode_scope": None}
+
+    @pytest.mark.asyncio
+    async def test_workflow_node_failure_is_reported_as_an_execute_node_request_reports_it(self) -> None:
+        """The failure is built by the same NodeManager step, so its message and details match the request path."""
+        node = _make_spec_node(WorkflowNode, "Workflow")
+        raised = RuntimeError("inner node broke")
+        node.aprocess = AsyncMock(side_effect=raised)
+        details = NodeErrorDetails(message="inner node broke", exception_type="builtins.RuntimeError")
+
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.execution_failure.return_value = ExecuteNodeResultFailure(
+            result_details="Attempted to execute node 'Workflow'. Failed with error: inner node broke",
+            exception=raised,
+            error=details,
+        )
+
+        with pytest.raises(ExecuteNodeFailureError) as excinfo:
+            await executor.execute(_in_workflow_of(executor, node))
+
+        mock_engine.node_manager.execution_failure.assert_called_once_with(raised, "Workflow")
+        assert isinstance(excinfo.value.failure_tree, FailureLeaf)
+        assert excinfo.value.failure_tree.details is details
+        assert excinfo.value.__cause__ is raised

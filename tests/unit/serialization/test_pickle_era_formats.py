@@ -97,7 +97,7 @@ def _assert_holder_restored(node: BaseNode, *, skip: frozenset[str] = frozenset(
 
 
 def _restore_from_image(engine: Engine, file_name: str) -> BaseNode:
-    result = engine.handle_request(
+    result = engine.current_workflow().handle_request(
         ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(FIXTURES / file_name), deserialize=True)
     )
     assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess), result

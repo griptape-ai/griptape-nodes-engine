@@ -15,7 +15,9 @@ from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.node_library.workflow_registry import (
     DuplicateWorkflowIdError,
     OpenWorkflowRemovalError,
+    UnknownWorkflowAddressError,
     Workflow,
+    WorkflowAddressError,
     WorkflowMetadata,
     WorkflowPathTakenError,
     WorkflowRegistry,
@@ -671,6 +673,92 @@ class TestWorkflowRegistryOperations:
 
         assert engine.workflow_registry.has_workflow_with_name(workflow.name)
         assert not other.workflow_registry.has_workflow_with_name(workflow.name)
+
+
+class TestResolveAddress:
+    """A request names its workflow by id, by name, or by both when they name the same one."""
+
+    @pytest.fixture
+    def registry(self, tmp_path: Path) -> _WorkflowRegistry:
+        registry = _registry(tmp_path)
+        _workflow_file(tmp_path / "flow.py")
+        _workflow_file(tmp_path / "other.py")
+        registry.register_file("flow.py", _metadata())
+        registry.register_file("other.py", _metadata())
+        return registry
+
+    def test_an_id_names_its_workflow(self, registry: _WorkflowRegistry) -> None:
+        flow = registry.find_by_name("flow")
+        assert flow is not None
+
+        assert registry.resolve_address(workflow_id=flow.workflow_id, workflow_name=None, action="move") is flow
+
+    def test_a_name_names_its_workflow(self, registry: _WorkflowRegistry) -> None:
+        flow = registry.find_by_name("flow")
+
+        assert registry.resolve_address(workflow_id=None, workflow_name="flow", action="move") is flow
+
+    def test_an_unsaved_name_names_its_workflow(self, registry: _WorkflowRegistry) -> None:
+        unsaved = registry.register_unsaved("draft")
+
+        resolved = registry.resolve_address(workflow_id=None, workflow_name=unsaved.name, action="move")
+
+        assert resolved is unsaved
+
+    def test_an_id_and_a_name_that_agree_name_their_workflow(self, registry: _WorkflowRegistry) -> None:
+        flow = registry.find_by_name("flow")
+        assert flow is not None
+
+        resolved = registry.resolve_address(workflow_id=flow.workflow_id, workflow_name="flow", action="move")
+
+        assert resolved is flow
+
+    def test_an_id_and_a_name_of_two_workflows_fail(self, registry: _WorkflowRegistry) -> None:
+        flow = registry.find_by_name("flow")
+        assert flow is not None
+
+        with pytest.raises(WorkflowAddressError, match="belongs to 'flow', not 'other'") as raised:
+            registry.resolve_address(workflow_id=flow.workflow_id, workflow_name="other", action="move")
+
+        assert not isinstance(raised.value, UnknownWorkflowAddressError)
+
+    def test_naming_nothing_fails(self, registry: _WorkflowRegistry) -> None:
+        with pytest.raises(
+            WorkflowAddressError, match=r"Attempted to move a workflow\. Failed because the request names no workflow"
+        ) as raised:
+            registry.resolve_address(workflow_id=None, workflow_name=None, action="move")
+
+        assert not isinstance(raised.value, UnknownWorkflowAddressError)
+
+    def test_an_unknown_id_fails(self, registry: _WorkflowRegistry) -> None:
+        with pytest.raises(
+            UnknownWorkflowAddressError,
+            match=r"Attempted to move workflow '0+'\. Failed because no workflow has that id\.",
+        ):
+            registry.resolve_address(workflow_id="0" * 32, workflow_name=None, action="move")
+
+    def test_an_unknown_name_fails(self, registry: _WorkflowRegistry) -> None:
+        with pytest.raises(UnknownWorkflowAddressError, match="no workflow has that name"):
+            registry.resolve_address(workflow_id=None, workflow_name="gone", action="move")
+
+    def test_a_known_id_with_an_unknown_name_fails_as_a_disagreement(self, registry: _WorkflowRegistry) -> None:
+        flow = registry.find_by_name("flow")
+        assert flow is not None
+
+        with pytest.raises(WorkflowAddressError, match="belongs to 'flow', not 'gone'") as raised:
+            registry.resolve_address(workflow_id=flow.workflow_id, workflow_name="gone", action="move")
+
+        assert not isinstance(raised.value, UnknownWorkflowAddressError)
+
+    def test_an_unknown_id_with_a_known_name_fails_as_a_disagreement(self, registry: _WorkflowRegistry) -> None:
+        with pytest.raises(WorkflowAddressError, match="no workflow has that id, though one has that name") as raised:
+            registry.resolve_address(workflow_id="0" * 32, workflow_name="flow", action="move")
+
+        assert not isinstance(raised.value, UnknownWorkflowAddressError)
+
+    def test_an_unknown_id_and_an_unknown_name_name_nothing(self, registry: _WorkflowRegistry) -> None:
+        with pytest.raises(UnknownWorkflowAddressError, match="no workflow has that id"):
+            registry.resolve_address(workflow_id="0" * 32, workflow_name="gone", action="move")
 
 
 class TestNameKeyedMethods:

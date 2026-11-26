@@ -6,6 +6,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
+    WorkflowAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue
@@ -36,8 +37,10 @@ class RunArbitraryPythonStringRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class RunArbitraryPythonStringResultSuccess(ResultPayloadSuccess):
+class RunArbitraryPythonStringResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     """Python code executed successfully.
+
+    Reports a change to the workflow, since the code can change it in ways no one can tell afterwards.
 
     Args:
         python_output: Stdout from the executed Python code, with ANSI escape codes stripped.
@@ -52,8 +55,10 @@ class RunArbitraryPythonStringResultSuccess(ResultPayloadSuccess):
 
 @dataclass
 @PayloadRegistry.register
-class RunArbitraryPythonStringResultFailure(ResultPayloadFailure):
+class RunArbitraryPythonStringResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
     """Python code execution failed.
+
+    Reports a change to the workflow, since the code can change it before it fails.
 
     Args:
         python_output: Error output from the failed Python code execution

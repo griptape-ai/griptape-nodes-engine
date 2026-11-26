@@ -1,7 +1,5 @@
-import tempfile
 import threading
 import time
-from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -39,12 +37,6 @@ def _route_resolution_through_dispatch(engine: Mock) -> Mock:
 
 class TestStaticFilesManagerSaveStaticFile:
     """Test StaticFilesManager.save_static_file() method with ExistingFilePolicy support."""
-
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
 
     @pytest.fixture
     def mock_config_manager(self) -> Mock:
@@ -1581,6 +1573,21 @@ class TestStaticFilesManagerCloudCredential:
         manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
 
         assert manager._create_cloud_storage_driver(self._BUCKET_ID) is None
+
+    def test_a_renewed_credential_reaches_the_next_upload_through_the_same_driver(
+        self, gtc_config_manager: Mock
+    ) -> None:
+        """A session credential renews, and the driver lives as long as the manager."""
+        secrets: dict[str, str | None] = {
+            "GT_CLOUD_BUCKET_ID": self._BUCKET_ID,
+            "GRIPTAPE_NODES_LICENSE": self._LICENSE,
+        }
+        manager = self._build(gtc_config_manager, secrets)
+        driver = manager.storage_driver
+        secrets["GRIPTAPE_NODES_LICENSE"] = "the renewed session token"
+
+        assert manager.storage_driver is driver
+        assert driver.api_key == "the renewed session token"
 
 
 class TestStaticServerUrlSettlement:

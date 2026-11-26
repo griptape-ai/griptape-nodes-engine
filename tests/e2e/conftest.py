@@ -10,6 +10,7 @@ import pytest
 
 import griptape_nodes.retained_mode.managers.config_manager as config_manager_module
 import griptape_nodes.retained_mode.managers.secrets_manager as secrets_manager_module
+from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.engine import current_engine, reset_root_engine
 from griptape_nodes.retained_mode.events.connection_events import (
@@ -18,6 +19,9 @@ from griptape_nodes.retained_mode.events.connection_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.utils.version_utils import engine_version
+from tests.e2e.node_failure_support import register_fixture_library
+from tests.e2e.stub_cloud_support import stub_cloud  # noqa: F401 (a fixture)
+from tests.worker_processes import no_local_worker_processes  # noqa: F401 (an autouse fixture)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -187,3 +191,26 @@ def connect(engine: Engine) -> Callable[..., None]:
         assert isinstance(result, CreateConnectionResultSuccess), result
 
     return _connect
+
+
+@pytest.fixture
+def failure_output_library(engine: Engine, tmp_path: Path, materialize_library: Callable[..., Path]) -> None:
+    """Register the library of failing nodes in the isolated engine."""
+    register_fixture_library(
+        engine,
+        tmp_path / "failure_output_library",
+        materialize_library,
+        library_dir_name="failure_output_library",
+        node_file_name="failure_output_nodes.py",
+    )
+
+
+@pytest.fixture
+def strict_mode_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep strict mode's own warnings out of the failure text.
+
+    This sets the reporter's private ``_enabled`` flag on purpose: ``GTN_STRICT_MODE_DISABLED`` is only read
+    when the reporter is built, so setting it in a test does nothing. The warnings are repeated per context
+    manager read (the same "used ContextManager" line shows up several times), which is a known upstream issue.
+    """
+    monkeypatch.setattr(STRICT_MODE, "_enabled", False)

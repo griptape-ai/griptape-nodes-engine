@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from griptape_nodes.common import failure_trees
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
@@ -129,25 +130,21 @@ class TestTheHookGatesExecution:
 
 class TestTheFailureReadsAsARefusal:
     def test_the_message_says_it_did_not_run(self) -> None:
-        from griptape_nodes.common.node_executor import NodeExecutor
-
         result = ExecuteNodeResultFailure(
             result_details="whatever the executor put here",
             validation_exceptions=[ValueError("no pipeline connected")],
         )
 
-        message = NodeExecutor._format_node_failure_message("Node 1", result, None)
+        message = failure_trees.format_node_failure_message("Node 1", result, None)
 
         assert "did not run because it failed validation" in message
         assert "no pipeline connected" in message
         assert "execution failed" not in message
 
     def test_a_real_crash_still_reads_as_one(self) -> None:
-        from griptape_nodes.common.node_executor import NodeExecutor
-
         result = ExecuteNodeResultFailure(result_details="boom")
 
-        message = NodeExecutor._format_node_failure_message("Node 1", result, RuntimeError("boom"))
+        message = failure_trees.format_node_failure_message("Node 1", result, RuntimeError("boom"))
 
         assert "execution failed" in message
         assert "failed validation" not in message

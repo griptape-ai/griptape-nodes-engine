@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.109.0"
+version = "0.114.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.16"
@@ -43,10 +43,11 @@ dependencies = [
   "attrs>=25.4.0",
   "fileseq>=3.2.0",
   "pydantic-ai-slim[mcp,openai]>=2.58",
-  "pydantic-ai-harness[skills]>=0.58",
+  "pydantic-ai-harness[skills]>=0.69",
 ]
 
 [project.optional-dependencies]
+openimageio = ["openimageio>=3.2.2.0"]
 profiling = ["austin-dist>=3.7.0"]
 
 [dependency-groups]
@@ -76,6 +77,7 @@ docs = [
   "pymdown-extensions>=10.17",
 ]
 test = [
+  "openimageio>=3.2.2.0",
   "pytest>=8.3.5",
   "pytest-asyncio>=1.1.0",
   "pytest-mock>=3.14.0",
@@ -83,6 +85,7 @@ test = [
   "pytest-cov>=6.0.0",
   "pytest-timeout>=2.4.0",
   "coverage>=7.9.0",
+  "hypothesis>=6.100",
 ]
 
 [build-system]
@@ -103,6 +106,7 @@ core = "sysmon"
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 pythonpath = ["libraries/griptape_nodes_library"]
+markers = ["worker_processes: the test starts real library worker processes (see tests/worker_processes.py)"]
 
 [tool.ruff]
 line-length = 120
@@ -142,6 +146,9 @@ ignore = [
   "CPY001",  # Intentional
 ]
 
+[tool.ruff.lint.pep8-naming]
+ignore-names = ["OpenImageIO"]
+
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "nodes.griptape_nodes_library".msg = "Import from griptape_nodes_library instead of nodes.griptape_nodes_library"
 "libraries.griptape_nodes_library".msg = "Import from griptape_nodes_library instead of libraries.griptape_nodes_library"
@@ -159,6 +166,7 @@ ignore = [
 "src/griptape_nodes/testing/libraries/**" = ["TID251"]
 # These assert the facade's and the WorkflowRegistry shim's own behavior, so they have to name them.
 "tests/unit/retained_mode/test_engine.py" = ["TID251"]
+"tests/unit/retained_mode/test_facade_workflow.py" = ["TID251"]
 "tests/unit/retained_mode/managers/test_griptape_nodes.py" = ["TID251"]
 "tests/unit/node_library/test_workflow_registry.py" = ["TID251"]
 # Asserts the pickle-era reader's own behavior, so it has to build pickles to feed it.
@@ -176,6 +184,9 @@ ignore = [
 # use every argument.
 "docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
 "docs/development/custom_nodes/example_node_timing_library/**" = ["INP001", "ARG002"]
+"docs/development/custom_nodes/example_node_inputs_library/**" = ["INP001", "TID251"]
+"docs/development/custom_nodes/example_node_blocked_terms_library/**" = ["INP001", "TID251"]
+"docs/development/custom_nodes/example_node_output_check_library/**" = ["INP001", "TID251"]
 "docs/development/custom_nodes/example_request_handler_library/**" = [
   "INP001",
   "TID251",

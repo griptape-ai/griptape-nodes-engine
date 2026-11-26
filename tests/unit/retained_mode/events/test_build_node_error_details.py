@@ -8,16 +8,22 @@ exception, and ``NodeError`` attachments that survive the worker boundary.
 
 import json
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
-from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
+from griptape_nodes.common import failure_trees
 from griptape_nodes.exe_types.core_types import NodeError, NodeErrorLink
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events import converters
 from griptape_nodes.retained_mode.events.base_events import ForwardedException
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultFailure, NodeErrorEvent
+from griptape_nodes.retained_mode.events.failure_tree import (
+    ExecuteNodeFailureError,
+    FailureKind,
+    FailureLeaf,
+    FailureTreeError,
+    GroupFailure,
+)
 from griptape_nodes.retained_mode.events.node_error_details import (
     MAX_RESPONSE_BYTES,
     MAX_RESPONSE_DEPTH,
@@ -54,14 +60,13 @@ def _across_worker(result: ExecuteNodeResultFailure) -> ExecuteNodeResultFailure
     return converter.structure(sent, ExecuteNodeResultFailure)
 
 
-def _executor_error(result: ExecuteNodeResultFailure) -> ExecuteNodeFailedError:
+def _executor_error(result: ExecuteNodeResultFailure) -> ExecuteNodeFailureError:
     """The error ``NodeExecutor.execute`` raises for a failed result."""
-    executor = NodeExecutor(engine=MagicMock())
-    return executor._execute_node_failed_error(NODE_NAME, result, result.exception)
+    return failure_trees.execute_node_failure_error_from_result(NODE_NAME, result, result.exception)
 
 
 def _emitted(result: ExecuteNodeResultFailure) -> NodeErrorDetails:
-    return _executor_error(result).details
+    return failure_trees.error_details_from_exception(_executor_error(result), NODE_NAME)
 
 
 def _both_paths(result: ExecuteNodeResultFailure) -> list[NodeErrorDetails]:
@@ -82,7 +87,7 @@ def failed_while_running(engine: Engine) -> Any:
     """Build the result node_manager returns when a node's ``aprocess`` raises."""
 
     def build(exc: Exception) -> ExecuteNodeResultFailure:
-        return engine.node_manager._execution_failure(_raised(exc), NODE_NAME)
+        return engine.node_manager.execution_failure(_raised(exc), NODE_NAME)
 
     return build
 
@@ -119,7 +124,7 @@ class TestMessage:
 
         assert "Attempted to execute node" in str(error)
         assert "execution failed" in str(error)
-        assert error.details.message == "Image is required"
+        assert failure_trees.error_details_from_exception(error, NODE_NAME).message == "Image is required"
 
     def test_only_an_exact_leading_name_prefix_is_removed(self) -> None:
         details = build_node_error_details(NODE_NAME, ValueError(f"Input to {NODE_NAME}: was empty"))
@@ -285,7 +290,7 @@ class TestErrorMessageUnchanged:
 
         error = _executor_error(result)
 
-        assert str(error) == NodeExecutor._format_node_failure_message(NODE_NAME, result, result.exception)
+        assert str(error) == failure_trees.format_node_failure_message(NODE_NAME, result, result.exception)
 
     def test_worker_key_error_keeps_its_quoted_str(self, failed_while_running: Any) -> None:
         original = KeyError("Key 'b' not found")
@@ -444,3 +449,28 @@ class TestEventWireForm:
         rebuilt = converter.structure({"node_name": NODE_NAME, "error_message": "old engine"}, NodeErrorEvent)
 
         assert rebuilt.error is None
+
+
+class TestErrorDerivesFromFailure:
+    def test_a_container_raised_for_the_node_gets_runtime_error_details_with_its_text(
+        self, failed_while_running: Any
+    ) -> None:
+        inner = FailureLeaf(
+            node_name="Child", kind=FailureKind.RAISED, details=NodeErrorDetails(message="child refused")
+        )
+        container = GroupFailure(node_name=NODE_NAME, inner=inner)
+
+        result = failed_while_running(FailureTreeError(container, f"{NODE_NAME}: child refused"))
+
+        assert result.failure_tree is container
+        assert result.error == NodeErrorDetails(message="child refused", exception_type="builtins.RuntimeError")
+
+    def test_error_is_what_render_error_details_gives_for_the_failure(self, failed_while_running: Any) -> None:
+        exc = ValueError("Image is required")
+
+        result = failed_while_running(exc)
+
+        assert result.failure_tree is not None
+        assert result.error == failure_trees.render_error_details(
+            result.failure_tree, text=str(exc), node_name=NODE_NAME
+        )

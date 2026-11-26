@@ -34,7 +34,10 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
     NodeMetadata,
 )
-from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+from griptape_nodes.retained_mode.events.context_events import (
+    EnsureWorkflowAndFlowRequest,
+    EnsureWorkflowAndFlowResultSuccess,
+)
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest, ExecuteNodeResultSuccess
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
@@ -57,6 +60,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
+from tests.workflow_context import bind, the_open_workflow
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -290,7 +294,11 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
     )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
     library.register_new_node_type(_ListNode, NodeMetadata(category="test", description="d", display_name="List"))
-    engine.handle_request(EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow"))
+    opened = engine.handle_request(
+        EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow")
+    )
+    assert isinstance(opened, EnsureWorkflowAndFlowResultSuccess), opened
+    bind(the_open_workflow(engine))
     try:
         yield _LIBRARY_NAME
     finally:
@@ -734,10 +742,10 @@ class TestLockState:
         assert result.serialized_node_commands.create_node_command.resolution == expected_state.value
 
 
-class TestNodeUuidFreshness:
-    """node_uuid identifies one serialization pass, so duplicate/paste needs a new one each time."""
+class TestNodeUuid:
+    """node_uuid names a node within a serialization, so the same workflow always serializes the same."""
 
-    def test_two_serializations_of_same_node_yield_distinct_uuids(self, engine: Engine, library_name: str) -> None:
+    def test_a_node_is_named_by_its_own_name_every_time(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1")
 
         first = engine.node_manager.on_serialize_node_to_commands(
@@ -749,7 +757,8 @@ class TestNodeUuidFreshness:
 
         assert isinstance(first, SerializeNodeToCommandsResultSuccess)
         assert isinstance(second, SerializeNodeToCommandsResultSuccess)
-        assert first.serialized_node_commands.node_uuid != second.serialized_node_commands.node_uuid
+        assert first.serialized_node_commands.node_uuid == node_name
+        assert second.serialized_node_commands.node_uuid == node_name
 
 
 class TestParameterValueSerializationMode:

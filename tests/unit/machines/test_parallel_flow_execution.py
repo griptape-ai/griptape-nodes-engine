@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.common.directed_graph import DirectedGraph
-from griptape_nodes.common.node_executor import ExecuteNodeFailedError
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.connections import Connections, Direction
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
@@ -22,8 +21,10 @@ from griptape_nodes.machines.parallel_resolution import (
     ExecuteDagState,
     ParallelResolutionContext,
     ParallelResolutionMachine,
+    RecordedError,
 )
 from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
+from griptape_nodes.retained_mode.events.failure_tree import ExecuteNodeFailureError, FailureKind, FailureLeaf
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
@@ -248,17 +249,17 @@ class TestFlowManagerDagBuilderIntegration:
 
         engine.current_workflow_or_none.return_value = runtime
         flow_manager = FlowManager(MagicMock(spec=EventManager), engine=engine)
-        flow_manager.global_dag_builder.node_to_reference["node"] = MagicMock()
+        runtime.flows.global_dag_builder.node_to_reference["node"] = MagicMock()
 
         mock_control_flow = MagicMock()
         mock_control_flow.cancel_flow = AsyncMock()
         mock_control_flow.context.flow_name = "test_flow"
-        flow_manager._global_control_flow_machine = mock_control_flow
+        runtime.flows.global_control_flow_machine = mock_control_flow
 
         with patch.object(flow_manager, "_flow_is_running", return_value=True):
-            await flow_manager._cancel_run(flow_manager._current_flows())
+            await flow_manager._cancel_run(runtime.flows)
 
-        assert flow_manager.global_dag_builder.node_to_reference == {}
+        assert runtime.flows.global_dag_builder.node_to_reference == {}
 
     def test_dag_builder_prevents_duplicate_node_addition_after_clear(self) -> None:
         """Test that DAG builder prevents duplicate node addition and allows re-addition after clear."""
@@ -510,7 +511,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         else would ever move it, because the run finishes here.
         """
         context, node = self._context_with_real_node_mid_flight()
-        context.error_message = "boom"
+        context.recorded_error = RecordedError(message="boom")
 
         state = await ErrorState.on_update(context)
 
@@ -539,7 +540,7 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
     async def test_a_cancelled_run_also_gives_its_nodes_back(self) -> None:
         """Cancelling is not resolving either, and a clean cancel must not strand the node."""
         context, node = self._context_with_real_node_mid_flight()
-        context.error_message = None  # a user-initiated cancel, not an exception
+        context.recorded_error = None  # a user-initiated cancel, not an exception
 
         state = await ErrorState.on_update(context)
 
@@ -633,7 +634,8 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert task not in context.task_to_node
         assert dag_node.node_state == NodeState.ERRORED
         assert context.workflow_state == WorkflowState.ERRORED
-        assert context.error_message == "Node 'n' encountered a problem: boom"
+        assert context.recorded_error is not None
+        assert context.recorded_error.message == "Node 'n' encountered a problem: boom"
 
     @pytest.mark.asyncio
     async def test_errored_task_sends_the_node_error_in_parts(self) -> None:
@@ -662,7 +664,8 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
 
         async def _boom() -> None:
             details = NodeErrorDetails(message="Key 'b' not found", exception_type="builtins.KeyError")
-            raise ExecuteNodeFailedError(flattened, details=details) from raised
+            failure_tree = FailureLeaf(node_name="n", kind=FailureKind.RAISED, details=details)
+            raise ExecuteNodeFailureError(failure_tree, flattened) from raised
 
         task = asyncio.ensure_future(_boom())
         await asyncio.sleep(0)
@@ -679,8 +682,9 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert payload.error is not None
         assert payload.error.message == "Key 'b' not found"
         assert payload.error.exception_type == "builtins.KeyError"
-        # ExecuteNodeFailedError already names the node, so the run's message adds no second prefix.
-        assert context.error_message == flattened
+        # ExecuteNodeFailureError already names the node, so the run's message adds no second prefix.
+        assert context.recorded_error is not None
+        assert context.recorded_error.message == flattened
 
 
 class TestLockedNodeIsNeverQueuedOrExecuted:

@@ -167,6 +167,12 @@ the node's input values onto the Start Flow nodes, runs it, and copies the End F
 as the node's outputs. The subflow is reused for later runs in the same session and is never written
 into a saved workflow, so your users' files carry the node, not a copy of the workflow behind it.
 
+A workflow may contain a Workflow node that points back to itself, directly or through another
+workflow. It only recurses when that node actually runs, so put it behind a branch that stops the
+recursion. Beyond `max_workflow_recursion_depth` levels the run fails, counting levels within one engine
+process, so a group or loop set to "Isolated Execution" restarts the count. See
+[Workflow Node Recursion Depth](../../guides/configuration.md#workflow-node-recursion-depth-max_workflow_recursion_depth).
+
 **Save the workflow from the editor before shipping it.** The parameter shape is read out of the
 metadata header at the top of the workflow file, which the editor writes on save. A workflow with no
 saved shape (no Start Flow and End Flow nodes, or a hand-written file with no header) is reported as
@@ -277,6 +283,14 @@ self._model_access = ModelAccessComponent(
 ```
 
 Each key is accepted wherever a value is assigned, including workflow load, and migrated to its mapped choice. Keys are never offered in the dropdown, so retiring a model means moving it from `model_choices` into `deprecated_values` pointed at its replacement. Every mapped value must be one of `model_choices`, and no key may already be a choice; either mistake raises when the node is constructed. If the model you are retiring was also the `default_model`, point `default_model` at its replacement in the same edit -- `default_model` must always name a current choice, never a retired key, and the component raises if it does not.
+
+A saved workflow also stores the dropdown it was saved with. When such a workflow is opened, `ModelAccessComponent` checks whether that stored dropdown still lists a model that is now a `deprecated_values` key and lists nothing that is neither a current choice nor a `deprecated_values` key. If so, the component rebuilds the dropdown from the node's current `model_choices`, so a retired model disappears without any repair code in the node. The engine logs a warning that names the retired models, the node shows a "Model list updated" message that names them too (it hides again when the model is next assigned), and the stored selection moves to its `deprecated_values` replacement. The component adds that message to the node itself, in a hidden `ParameterMessage` named `<parameter name>_model_list_updated`. The workflow file is not rewritten until the artist saves it. Do not add a converter of your own for this. A retired model therefore has to be moved into `deprecated_values` for the repair to recognise it. A dropdown your node fills on purpose (for example a third-party provider's list) is left alone as long as it names at least one model outside your `model_choices` and `deprecated_values` keys.
+
+Any other saved value outside `model_choices` is replaced with the first choice when the workflow loads. If your node's list used to be open-ended, for example fetched from the provider, you can't map every value it may have saved. Pass `keep_unlisted_values=True` to store such a value as saved instead: the parameter shows a "Model Not Available" badge naming it, and the existing selection gate -- `query_for_denial` / `raise_if_denied` / `selection_denial` / `raise_if_selection_denied` -- reports it by name, so the run fails naming that model instead of quietly using another. You don't call anything extra from `validate_before_workflow_run` or `process` beyond what you already call for license denials. If you build your own message around `denial.reason()`, such as "Model 'x' is not permitted. ...", call `selection_denial_message()` instead: it returns the whole sentence, with that license wording only when the denial is a license one.
+
+The dropdown still offers only `model_choices`, and a `deprecated_values` key still migrates to its replacement.
+
+If your node removes the `Options` trait (for example while a driver is connected) and later restores it, call `reinstall_options()`. It replaces any `Options` trait already on the parameter, so you do not need to remove it first.
 
 ##### `model_usage`
 
@@ -565,6 +579,8 @@ uv sync
 - Backward compatible with pip installation
 
 ## Documentation Patterns for Node Libraries
+
+A library can ship docs that the editor shows in its Docs panel. See [Writing Docs for Your Library](library_documentation.md). The patterns below are for the README.
 
 ### Comprehensive README Structure
 

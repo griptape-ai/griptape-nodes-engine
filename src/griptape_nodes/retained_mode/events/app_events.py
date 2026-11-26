@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
@@ -36,6 +36,38 @@ class OrganizationInfo:
     name: str
 
 
+class WorkflowRunState(StrEnum):
+    """Whether an open workflow has a run in progress."""
+
+    IDLE = "idle"
+    # Includes a debug run paused at a breakpoint, which still holds the workflow's line.
+    RUNNING = "running"
+
+
+@dataclass(frozen=True)
+class OpenWorkflowState:
+    """What an open workflow is doing, as `OpenWorkflowInfo` reports it and `WorkflowStateChangedEvent` announces.
+
+    Args:
+        has_unsaved_changes: Whether a request changed the workflow since it opened or its own file
+            was last written. A Save As that leaves the workflow on its original file keeps it.
+        run_state: Whether a run of the workflow is in progress.
+        queued_run_count: Runs waiting for the run in progress to end.
+        last_run_error: Why the latest run failed, or None when none failed. Cleared when the next run
+            starts, and left None by a run that succeeded or was cancelled.
+        undo_label: What `UndoRequest` would take back, such as "Set Parameter Value", or None when
+            there is nothing to undo.
+        redo_label: What `RedoRequest` would put back, or None when there is nothing to redo.
+    """
+
+    has_unsaved_changes: bool = False
+    run_state: WorkflowRunState = WorkflowRunState.IDLE
+    queued_run_count: int = 0
+    last_run_error: str | None = None
+    undo_label: str | None = None
+    redo_label: str | None = None
+
+
 @dataclass
 class OpenWorkflowInfo:
     """A workflow the engine has open, as the heartbeat reports it.
@@ -43,14 +75,40 @@ class OpenWorkflowInfo:
     Args:
         workflow_id: The workflow's id, which a request envelope's `open_workflow_id` names.
         name: The workflow's name.
-        workflow_file_path: Path to the workflow file (None while it is unsaved).
+        display_name: The name to show for the workflow, such as on an editor tab. Not unique. Never
+            empty: a workflow with no name shows its file name, or "Untitled" while unsaved.
+        workflow_file_path: Path to the workflow file. None exactly while the workflow is unsaved.
+        is_saved: Whether the workflow has a file, for clients that are not sent its path.
         has_active_flow: Whether the workflow has a current flow.
+        description: The workflow's description, or None when it has none.
+        image: The workflow's thumbnail as its metadata names it: a file name under the
+            `save_workflow_thumbnail` situation, or a URL. None when it has none.
+        is_template: Whether the workflow is a template.
+        state: Its unsaved changes and runs.
     """
 
     workflow_id: str
     name: str
+    display_name: str
     workflow_file_path: str | None
+    is_saved: bool
     has_active_flow: bool
+    description: str | None
+    image: str | None
+    is_template: bool
+    state: OpenWorkflowState = field(default_factory=OpenWorkflowState)
+
+
+@runtime_checkable
+class ReportsOpenWorkflow(Protocol):
+    """A result that reports the workflow open after its request. Post-dispatch hooks run bound to it.
+
+    Args:
+        open_workflow: The workflow open after the request: the one it opened, used, or moved to.
+            None when there is none.
+    """
+
+    open_workflow: OpenWorkflowInfo | None
 
 
 @dataclass
@@ -82,7 +140,7 @@ class AppStartSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppStartSessionResultSuccess(ResultPayloadSuccess):
+class AppStartSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session started successfully.
 
     Args:
@@ -113,13 +171,24 @@ class AppGetSessionRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class AppGetSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Session information retrieved successfully.
+    """Session information retrieved successfully, with the state of the engine holding it.
+
+    A client takes this as its snapshot of the engine when it connects to the session, and again
+    when the session heartbeat reports a new run id, since discovery may not list that engine.
 
     Args:
         session_id: Current session identifier (None if no active session)
+        engine_version: Current engine version string
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
     """
 
     session_id: str | None
+    engine_version: str
+    engine_run_id: str
+    engine_os: str
+    is_initializing: bool
 
 
 @dataclass
@@ -152,6 +221,74 @@ class AppInitializationComplete(AppPayload):
     # URL of the static file server the host process runs for this workspace. The engine serves
     # nothing itself, so when unset it assumes the host's default address (see StaticFilesManager).
     static_server_base_url: str | None = None
+    # `Engine.engine_run_id` of the engine that sent the event. The event goes out once, at startup,
+    # so a client that stays connected while the engine restarts (one on a relay) sees the restart
+    # without waiting for a heartbeat. A client whose own connection dropped never receives it and
+    # reads the heartbeat instead. The host process forwards a worker's copy too (`is_worker` True)
+    # carrying the worker's own id, so clients read it only when `is_worker` is False.
+    engine_run_id: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowOpenedEvent(AppPayload):
+    """A workflow opened. Every client gets it, whichever client, script or library opened the workflow.
+
+    A request that loads a file into the workflow it opens sends this once the file has built the
+    graph, so a client can read it right away. Until then, `ListOpenWorkflowsRequest` and the
+    heartbeat already list the workflow. A build that fails closes it without a
+    `WorkflowClosedEvent`, unless closing it fails, which leaves it open and sends this event.
+
+    Args:
+        open_workflow: The workflow that opened.
+    """
+
+    open_workflow: OpenWorkflowInfo
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowClosedEvent(AppPayload):
+    """An open workflow closed. Requests that name its id now fail with `WorkflowNotOpenResultFailure`.
+
+    Sent only for a workflow that had a `WorkflowOpenedEvent`.
+
+    Args:
+        workflow_id: Id of the workflow that closed, as `ListOpenWorkflowsRequest` lists it.
+    """
+
+    workflow_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowStateChangedEvent(AppPayload):
+    """An open workflow's unsaved changes or runs changed. Every client gets it, whichever client made the change.
+
+    Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries its state.
+
+    Args:
+        workflow_id: Id of the workflow, as `ListOpenWorkflowsRequest` lists it.
+        state: Its state now.
+    """
+
+    workflow_id: str
+    state: OpenWorkflowState
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowDetailsChangedEvent(AppPayload):
+    """What clients are told of an open workflow, other than its state, changed. Every client gets it.
+
+    Sent for a change to its name, file, description, thumbnail, template flag or whether it has a flow,
+    whichever request made it. Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries them.
+
+    Args:
+        open_workflow: The workflow as it is now.
+    """
+
+    open_workflow: OpenWorkflowInfo
 
 
 @dataclass
@@ -244,7 +381,7 @@ class LibraryLoadedNotification(AppPayload):
 
     Raised by the process that owns the library's record, so listeners including the GUI can update
     their view of library health. For a library whose nodes execute in a worker that process is the
-    orchestrator, once it has accepted the worker's ``ReportLibraryLoadedRequest``.
+    orchestrator, once it has accepted the worker's load report.
 
     Args:
         library_name: Name of the library that was loaded.
@@ -259,29 +396,6 @@ class LibraryLoadedNotification(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
-class ReportLibraryLoadedRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by a worker to the orchestrator to report how a library loaded in the worker.
-
-    It is what releases anything waiting to route execution to that worker.
-
-    ``SkipTheLineMixin`` because the orchestrator may be executing a node when this arrives, and that
-    node can itself be waiting on this very report through ``WorkerManager.wait_until_executable``.
-    Queued behind execution, the report that ends the wait cannot be handled until the wait ends.
-
-    Args:
-        library_name: Name of the library that finished loading in the worker.
-        fitness: Final fitness value (LibraryManager.LibraryFitness string).
-        problem_details: Human-readable summary of problems, or None if there are none.
-    """
-
-    library_name: str
-    fitness: str
-    problem_details: str | None = None
-    broadcast_result: bool = field(default=False, kw_only=True)
-
-
-@dataclass
-@PayloadRegistry.register
 class ReportLibraryLoadedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The orchestrator recorded the worker's load outcome."""
 
@@ -290,23 +404,6 @@ class ReportLibraryLoadedResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class ReportLibraryLoadedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The orchestrator had no record of the library the worker reported on."""
-
-
-@dataclass
-@PayloadRegistry.register
-class ReportGeneralPurposeWorkerReadyRequest(RequestPayload, SkipTheLineMixin):
-    """Sent by a general-purpose worker to the orchestrator once it has loaded its libraries.
-
-    A worker registers before it loads anything, so registration alone does not mean it can create
-    the nodes routed to it. A library worker reports each library it serves through
-    ``ReportLibraryLoadedRequest``; a general-purpose worker serves none of them, so it reports
-    once, for itself.
-
-    ``SkipTheLineMixin`` for the same reason as ``ReportLibraryLoadedRequest``: a node already
-    executing on the orchestrator can be waiting on this report.
-    """
-
-    broadcast_result: bool = field(default=False, kw_only=True)
 
 
 @dataclass
@@ -394,7 +491,7 @@ class GetEngineVersionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class GetEngineVersionResultSuccess(ResultPayloadSuccess):
+class GetEngineVersionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Engine version retrieved successfully.
 
     Args:
@@ -428,7 +525,7 @@ class AppEndSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppEndSessionResultSuccess(ResultPayloadSuccess):
+class AppEndSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session ended successfully.
 
     Args:
@@ -461,7 +558,7 @@ class AppJoinSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppJoinSessionResultSuccess(ResultPayloadSuccess):
+class AppJoinSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     session_id: str
 
 
@@ -481,7 +578,7 @@ class AppLeaveSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppLeaveSessionResultSuccess(ResultPayloadSuccess):
+class AppLeaveSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The client is no longer listed; leaving when never listed succeeds too."""
 
 
@@ -499,8 +596,21 @@ class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 
 @dataclass
 @PayloadRegistry.register
-class SessionHeartbeatResultSuccess(ResultPayloadSuccess):
-    """Session heartbeat successful. Session is active and responsive."""
+class SessionHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Session heartbeat successful. Session is active and responsive.
+
+    Also carries the engine state that changes while a client stays connected. A new run id means
+    the engine restarted, and the client takes a fresh `AppGetSessionRequest` snapshot.
+
+    Args:
+        session_id: The engine's active session. A client that sees another one has lost its own.
+        engine_run_id: Id minted when this engine started, never saved. A new value means the engine restarted.
+        is_initializing: Whether the engine is loading libraries and workflows, at startup or on a library reload
+    """
+
+    session_id: str
+    engine_run_id: str
+    is_initializing: bool
 
 
 @dataclass
@@ -513,6 +623,9 @@ class SessionHeartbeatResultFailure(ResultPayloadFailure):
 @PayloadRegistry.register
 class EngineHeartbeatRequest(RequestPayload, SkipTheLineMixin):
     """Request clients can use to discover active engines and their status.
+
+    A client connected to a session follows the engine with `AppGetSessionRequest` and
+    `SessionHeartbeatRequest` instead, since discovery may not list that engine.
 
     Attributes:
         heartbeat_id: Unique identifier for the heartbeat request, used to correlate requests and responses.
@@ -534,7 +647,7 @@ class SessionClient:
 
 @dataclass
 @PayloadRegistry.register
-class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
+class EngineHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Engine heartbeat successful with comprehensive status information.
 
     Args:
@@ -549,10 +662,9 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         instance_region: Cloud instance region (None if not applicable)
         instance_provider: Cloud provider name (None if not applicable)
         deployment_type: Type of deployment (None if not applicable)
-        current_workflow: Name of the workflow opened last (None if none is open)
-        current_workflow_id: Id of the workflow opened last (None if none is open)
-        workflow_file_path: Path to that workflow's file (None if none, or while it is unsaved)
-        has_active_flow: Whether that workflow has a current flow
+        current_workflow: Name of the open workflow when exactly one is open, else None
+        workflow_file_path: Path to that workflow's file (None if there is none, or while it is unsaved)
+        has_active_flow: Whether that workflow has a current flow (False if there is none)
         open_workflows: Every workflow the engine has open, in the order they were opened
         engine_name: Human-readable engine name
         engine_os: Platform StrEnum value where the engine is running (windows, darwin, linux)
@@ -601,10 +713,7 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # Entries leave when the host is displaced or the session ends; nothing expires them, so a
     # host that crashed stays listed until then. Defaulted for backward compatibility.
     clients: list[SessionClient] = field(default_factory=list)
-    # Id of the workflow opened last (None if none). Defaulted for backward compatibility.
-    current_workflow_id: str | None = None
-    # Every open workflow, oldest first; the last is the one the `current_*` fields describe.
-    # Defaulted for backward compatibility.
+    # Every open workflow, oldest first. Defaulted for backward compatibility.
     open_workflows: list[OpenWorkflowInfo] = field(default_factory=list)
     # Changes on every engine restart, unlike session_id. None from an engine too old to report it.
     engine_run_id: str | None = None

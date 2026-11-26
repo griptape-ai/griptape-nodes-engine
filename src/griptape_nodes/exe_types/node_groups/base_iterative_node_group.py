@@ -18,7 +18,10 @@ from griptape_nodes.exe_types.node_groups.subflow_node_group import (
     RIGHT_PARAMETERS_KEY,
     SubflowNodeGroup,
 )
+from griptape_nodes.exe_types.param_types.parameter_bool import ParameterBool
+from griptape_nodes.exe_types.param_types.parameter_int import ParameterInt
 from griptape_nodes.traits.options import Options
+from griptape_nodes.utils.list_utils import flatten_list
 
 # Execution mode choices and their corresponding boolean values (True = run in order)
 EXECUTION_MODE_ONE_AT_A_TIME = "Run Group Items One at a Time"
@@ -88,6 +91,7 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
                 tooltip="Fires once after every iteration has finished. Wire the next node's control input here.",
                 display_name="On Complete",
             ),
+            inner_control_ports=False,
         )
         self.exec_in = self.control_in
         self.exec_out = self.control_out
@@ -184,6 +188,9 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
             name=IterationControlParam.BREAK_LOOP.value,
         )
         self.break_loop.ui_options = {"display_name": "Break Out of Loop"}
+        # A member's control wire crossing the loop's boundary is carried inside by On Each / Loop Complete.
+        self.inner_entry = self.on_each
+        self.inner_exit = self.loop_complete
         self.add_parameter(self.break_loop)
 
         self.results = Parameter(
@@ -193,6 +200,28 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
             allowed_modes={ParameterMode.OUTPUT},
         )
         self.add_parameter(self.results)
+
+        self.flatten_results = ParameterBool(
+            name="flatten_results",
+            tooltip="When an iteration adds a list, put its items into Results instead of the list itself.",
+            default_value=False,
+            allowed_modes={ParameterMode.PROPERTY},
+            display_name="Flatten Results",
+        )
+        self.add_parameter(self.flatten_results)
+
+        self.flatten_depth = ParameterInt(
+            name="flatten_depth",
+            tooltip="How many levels of nesting to flatten. 0 flattens every level.",
+            default_value=0,
+            min_val=0,
+            allowed_modes={ParameterMode.PROPERTY},
+            display_name="Flatten Depth",
+            hide=True,
+        )
+        self.add_parameter(self.flatten_depth)
+        self.add_parameter_to_group_settings(self.flatten_results)
+        self.add_parameter_to_group_settings(self.flatten_depth)
 
         # Track right parameters for UI layout
         for parameter_name in (
@@ -228,6 +257,11 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
                 # Hide controls when running in parallel (not supported)
                 self.hide_parameter_by_name(self.skip_iteration.name)
                 self.hide_parameter_by_name(self.break_loop.name)
+        elif parameter == self.flatten_results:
+            if value:
+                self.show_parameter_by_name(self.flatten_depth.name)
+            else:
+                self.hide_parameter_by_name(self.flatten_depth.name)
 
     def get_next_control_output(self) -> Parameter | None:
         # Say which port the chain continues from once every iteration has finished, rather than
@@ -281,7 +315,11 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
         # replaces _results_list via `= []` rather than clearing in-place, so shared
         # item references are safe. deepcopy was breaking websocket payload deduplication
         # by creating new object identities for every item on every broadcast.
-        self.parameter_output_values["results"] = list(self._results_list)
+        if self.get_parameter_value(self.flatten_results.name):
+            depth = max(self.get_parameter_value(self.flatten_depth.name) or 0, 0)
+            self.parameter_output_values["results"] = flatten_list(self._results_list, depth)
+        else:
+            self.parameter_output_values["results"] = list(self._results_list)
 
     def reset_for_workflow_run(self) -> None:
         """Reset state for a fresh workflow run."""

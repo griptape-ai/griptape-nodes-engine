@@ -102,6 +102,8 @@ async def test_resolving_a_node_after_a_loop_whose_body_reads_an_outside_node(
         resolve_result = await engine.ahandle_request(ResolveNodeRequest(node_name=after_name))
 
     assert isinstance(resolve_result, ResolveNodeResultSuccess), resolve_result
-    assert not engine.flow_manager.check_for_existing_running_flow(), "The flow is still marked as running."
+    assert not engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()), (
+        "The flow is still marked as running."
+    )
     after_node = engine.node_manager.get_node_by_name(after_name)
     assert after_node.parameter_output_values["result"] == ["item-0", "item-1", "item-2"]

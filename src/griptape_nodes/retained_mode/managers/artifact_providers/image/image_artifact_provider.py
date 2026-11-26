@@ -12,6 +12,7 @@ from PIL import Image, ImageOps
 from griptape_nodes.drivers.image_metadata.image_metadata_driver_registry import (
     ImageMetadataDriverRegistry,
 )
+from griptape_nodes.files.media_variables import MediaInfo
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import collect_workflow_metadata
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
@@ -38,6 +39,14 @@ class ImageArtifactMetadata(BaseArtifactMetadata):
     channels: int
     color_space: str
     file_size: int
+
+    def to_media_info(self) -> MediaInfo:
+        return MediaInfo(
+            width=self.width,
+            height=self.height,
+            channels=self.channels,
+            color_space=self.color_space,
+        )
 
 
 class ImageArtifactProvider(BaseArtifactProvider):
@@ -132,10 +141,10 @@ class ImageArtifactProvider(BaseArtifactProvider):
         """Get default preview generator classes."""
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
             PILRoundedPreviewGenerator,
-            PILThumbnailGenerator,
+            ThumbnailGenerator,
         )
 
-        return [PILThumbnailGenerator, PILRoundedPreviewGenerator]
+        return [ThumbnailGenerator, PILRoundedPreviewGenerator]
 
     @classmethod
     def detect_format(cls, data: bytes) -> str | None:  # noqa: PLR0911
@@ -189,23 +198,29 @@ class ImageArtifactProvider(BaseArtifactProvider):
             logger.warning("Cannot inject metadata: empty data")
             return data
 
-        try:
-            pil_image = Image.open(BytesIO(data))
-        except Exception as e:
-            logger.warning("Attempted to open image data for %s. Failed because: %s", file_name, e)
-            return data
+        with BytesIO(data) as source:
+            try:
+                pil_image = Image.open(source)
+            except (OSError, ValueError, Image.DecompressionBombError) as e:
+                logger.warning("Attempted to open image data for %s. Failed because: %s", file_name, e)
+                return data
+            with pil_image:
+                image_format = pil_image.format
 
-        if pil_image.format is None:
+        if image_format is None:
             logger.warning("Could not detect image format from data")
             return data
 
-        driver = ImageMetadataDriverRegistry.get_driver_for_format(pil_image.format)
+        driver = ImageMetadataDriverRegistry.get_driver_for_format(image_format)
         if driver is None:
-            logger.warning("No metadata driver found for format: %s", pil_image.format)
+            logger.warning("No metadata driver found for format: %s", image_format)
             return data
 
+        # Registered custom drivers can raise their own exceptions. Metadata is best-effort:
+        # keep the original content on any driver failure, without hiding process-control errors.
         try:
-            return driver.inject_metadata(pil_image, metadata)
+            encoded = driver.inject_metadata_into_bytes(data, metadata)
         except Exception as e:
             logger.warning("Attempted to inject metadata into %s. Failed because: %s", file_name, e)
             return data
+        return encoded

@@ -16,6 +16,7 @@ import pytest
 from griptape_nodes.machines.dag_builder import DagNode, NodeState
 from griptape_nodes.machines.parallel_resolution import ErrorState, ExecuteDagState
 from griptape_nodes.retained_mode.events.execution_events import NodeErrorEvent
+from griptape_nodes.retained_mode.events.failure_tree import FailureKind, FailureLeaf
 from tests.unit.machines.scheduler_stubs import machine_running_one_node, node_stub
 
 if TYPE_CHECKING:
@@ -110,6 +111,27 @@ class TestValidationRunsOffTheEventLoop:
         events = [call.args[0].wrapped_event.payload for call in put_event.call_args_list]
         errors = [event for event in events if isinstance(event, NodeErrorEvent)]
         assert [injected.name] == [event.node_name for event in errors]
+
+        release.set()
+        held_node_execution.set()
+        await asyncio.wait_for(driver, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_validation_records_a_validation_failure_for_the_node(
+        self, held_node_execution: asyncio.Event, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(ExecuteDagState, "publish_resolved_node", AsyncMock())
+        machine, release, _dag_builder = machine_running_one_node(max_nodes_in_parallel=2)
+        injected = node_stub("injected")
+        injected.validate_before_node_run = MagicMock(return_value=[ValueError("'Prompt' is empty.")])
+
+        driver = asyncio.create_task(machine.resolve_node())
+        machine.inject_node(injected)
+        await _until(lambda: machine.current_state is ErrorState, "the failed validation never stopped the run")
+
+        failure_tree = machine.get_error_failure_tree()
+        assert isinstance(failure_tree, FailureLeaf)
+        assert (failure_tree.node_name, failure_tree.kind) == ("injected", FailureKind.VALIDATION)
 
         release.set()
         held_node_execution.set()

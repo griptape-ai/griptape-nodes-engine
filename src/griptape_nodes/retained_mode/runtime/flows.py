@@ -27,6 +27,9 @@ class WorkflowFlows:
         self._workflow = workflow
         self.name_to_parent_name: dict[str, str | None] = {}
         self.flow_to_referenced_workflow_name: dict[ControlFlow, str] = {}
+        # Loop iteration flow name -> the flow holding the loop that runs it. Held in
+        # memory only.
+        self.iteration_flow_to_owner_flow_name: dict[str, str] = {}
         self.connections = Connections()
 
         self.global_flow_queue: Queue[QueueItem] = Queue()
@@ -45,6 +48,11 @@ class WorkflowFlows:
         self.driving = False
         # True while cancel_all_runs_in awaits the run in progress, so a run submitted meanwhile waits to be turned away.
         self.cancelling_all = False
+
+    @property
+    def workflow(self) -> WorkflowRuntime | None:
+        """The workflow these flows belong to, or None for a line of runs that belongs to no workflow."""
+        return self._workflow
 
     def execution_event(self, payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
         """An execution event about a run here, naming the workflow it belongs to, or none."""

@@ -9,6 +9,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ from griptape_nodes.common.sequences import (
 from griptape_nodes.common.sequences.scan import (
     scan_sequences_from_filenames,
 )
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 from griptape_nodes.files import os_utils
 from griptape_nodes.files.drivers.base64_file_driver import Base64FileDriver
 from griptape_nodes.files.drivers.data_uri_file_driver import DataUriFileDriver
@@ -266,6 +268,8 @@ class OSManager(EngineScoped):
     def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None):
         super().__init__(engine)
         self.indexed_filenames = IndexedFilenames(engine)
+        # The Griptape Cloud file driver this manager registered, if any.
+        self._cloud_file_driver: GriptapeCloudFileDriver | None = None
         if event_manager is not None:
             event_manager.register_request_handlers(self)
             self.sequences = FileSequences(event_manager, engine=engine)
@@ -283,9 +287,10 @@ class OSManager(EngineScoped):
         FileDriverRegistry.register(HttpFileDriver())
         FileDriverRegistry.register(DataUriFileDriver())
 
-        cloud_driver = GriptapeCloudFileDriver.create_from_env()
+        cloud_driver = GriptapeCloudFileDriver.create_from_env(resolve_cloud_credential(self.engine.secrets_manager))
         if cloud_driver:
             FileDriverRegistry.register(cloud_driver)
+            self._cloud_file_driver = cloud_driver
 
         FileDriverRegistry.register(Base64FileDriver())
         FileDriverRegistry.register(LocalFileDriver())
@@ -1236,6 +1241,10 @@ class OSManager(EngineScoped):
         try:
             # Get appropriate driver
             driver = FileDriverRegistry.get_driver(location)
+            cloud_driver = self._cloud_file_driver
+            if cloud_driver is not None and driver is cloud_driver:
+                # A session credential renews, so each read sends the current one.
+                cloud_driver.api_key = resolve_cloud_credential(self.engine.secrets_manager)
 
             # Driver validates and reads
             content = await driver.read(location, timeout=120.0)
@@ -1904,7 +1913,7 @@ class OSManager(EngineScoped):
         )
 
     @handles(RenameFileRequest)
-    def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911, C901
+    def on_rename_file_request(self, request: RenameFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, C901
         """Handle a request to rename a file or directory."""
         # Resolve and validate paths
         try:
@@ -1925,8 +1934,18 @@ class OSManager(EngineScoped):
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details=msg)
 
         # Check if new path already exists
-        if new_path.exists():
+        if new_path.exists() and not request.overwrite:
             msg = f"Destination path already exists: {new_path}"
+            return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+
+        # A destination that contains the source would be moved aside along with it
+        if request.overwrite and new_path in old_path.parents:
+            msg = f"Attempted to replace {new_path} with {old_path}. Failed because {old_path} is inside {new_path}."
+            return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+
+        # A symlink moved onto its own target would replace the target with a link to itself
+        if request.overwrite and old_path.is_symlink() and self._is_same_file(old_path, new_path):
+            msg = f"Attempted to replace {new_path} with {old_path}. Failed because {old_path} is a link to {new_path}."
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
 
         # Check workspace constraints for both paths
@@ -1949,7 +1968,10 @@ class OSManager(EngineScoped):
 
         # Perform the rename operation
         try:
-            old_path.rename(new_path)
+            if request.overwrite and os.path.lexists(new_path):
+                self._replace_path(old_path, new_path)
+            else:
+                old_path.rename(new_path)
         except PermissionError as e:
             msg = f"Permission denied renaming {old_path} to {new_path}: {e}"
             return RenameFileResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
@@ -2038,6 +2060,61 @@ class OSManager(EngineScoped):
             bytes_copied=bytes_copied,
             result_details=f"File copied successfully: {source_path} -> {destination_path}",
         )
+
+    @staticmethod
+    def _is_same_file(first: Path, second: Path) -> bool:
+        """Whether both paths, following symlinks, lead to the same file. False if either can't be reached."""
+        try:
+            return os.path.samestat(first.stat(), second.stat())
+        except OSError:
+            return False
+
+    @staticmethod
+    def _replace_path(old_path: Path, new_path: Path) -> None:
+        """Move old_path onto new_path, replacing what is already there.
+
+        A file onto a file uses Path.replace, which swaps them in one step. It can't put a
+        directory onto an existing path on every platform, so when either side is a directory the
+        destination is renamed to a backup beside it, the source is renamed into place, and the
+        backup is deleted. If the source can't be moved, the backup is renamed back.
+
+        Symlinks are moved as links, never followed.
+        """
+        if os.path.samestat(old_path.lstat(), new_path.lstat()):
+            # Two spellings of one entry, such as a case-only rename on a case-insensitive filesystem.
+            # Moving it aside would move the source too, so rename it as is.
+            old_path.rename(new_path)
+            return
+
+        old_is_dir = old_path.is_dir() and not old_path.is_symlink()
+        new_is_dir = new_path.is_dir() and not new_path.is_symlink()
+        if not old_is_dir and not new_is_dir:
+            old_path.replace(new_path)
+            return
+
+        backup_path = new_path.with_name(f".gtn-replace-{uuid.uuid4().hex[:12]}")
+        new_path.rename(backup_path)
+        try:
+            old_path.rename(new_path)
+        except OSError:
+            try:
+                backup_path.rename(new_path)
+            except OSError as restore_error:
+                msg = f"Could not move {old_path} into place, and could not restore {new_path}; it was kept at {backup_path}: {restore_error}"
+                raise OSError(msg) from restore_error
+            raise
+
+        try:
+            if not new_is_dir:
+                backup_path.unlink()
+            elif OSManager.is_windows():
+                shutil.rmtree(backup_path, onexc=OSManager.remove_readonly)
+            else:
+                shutil.rmtree(backup_path)
+        except OSError as e:
+            logger.warning(
+                "Renamed %s to %s, but could not delete the replaced copy at %s: %s", old_path, new_path, backup_path, e
+            )
 
     @staticmethod
     def remove_readonly(func, path, excinfo) -> None:  # noqa: ANN001, ARG004

@@ -11,7 +11,7 @@ from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from enum import StrEnum, auto
+from enum import Enum, StrEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ExecutionPayload, ResultPayload
+    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
     from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
 logger = logging.getLogger("griptape_nodes")
@@ -139,6 +140,19 @@ _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=F
 # records a result needs the identity as well: a running node can set a value on a *different*
 # node, and on that node the value is an ordinary authored one, not something it produced.
 _running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
+
+# The node taking in a value through an incoming connection, while it sets that value and what its
+# hooks derive from it (see `connection_feed_scope`).
+_fed_node: ContextVar[BaseNode | None] = ContextVar("_node_types_fed_node", default=None)
+
+
+class _ValueOrigin(Enum):
+    """Where a parameter's value came from, when it wasn't an edit."""
+
+    # This node's own run set it.
+    RUN = "run"
+    # It came in through an incoming connection, or the node derived it from one as it came in.
+    CONNECTION = "connection"
 
 
 @functools.cache
@@ -224,6 +238,20 @@ def aprocess_scope(
         _in_aprocess.reset(token)
         _running_node.reset(node_token)
         VariableResolver.reset_cache(cache_token)
+
+
+@contextmanager
+def connection_feed_scope(node: BaseNode) -> Iterator[None]:
+    """Mark the enclosed block as ``node`` taking in a value through an incoming connection.
+
+    What ``node`` sets on itself meanwhile, the value and what its hooks derive from it, came from the
+    connection, not an edit (see `BaseNode.parameters_set_by_run_or_connection`).
+    """
+    token = _fed_node.set(node)
+    try:
+        yield
+    finally:
+        _fed_node.reset(token)
 
 
 class ImportDependency(NamedTuple):
@@ -369,11 +397,16 @@ class BaseNode(ABC):
     # True when the node reads RESOLVED only because a run passed through it while it was locked,
     # not because it executed. Unlocking such a node unresolves it so the next run executes it.
     resolved_while_locked: bool = False
+    # What each `{...}` template on this node rendered to when it last started running, or None if it
+    # has not run in this session. See `validate_before_workflow_run`.
+    _templates_at_last_run: dict[str, Any] | None = None
     _cancellation_requested: threading.Event  # Event indicating if cancellation has been requested for this node
     _inputs_to_reset_after_execution: set[str]  # Input values a connection teardown deferred until this node finishes
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
     _parameters_added_after_construction: set[str]
     _parameters_added_during_execution: set[str]
+    # Where each parameter's value came from, when it wasn't an edit, until an edit sets it.
+    _value_origins: dict[str, _ValueOrigin]
     _engine: Engine | None
 
     @property
@@ -402,6 +435,29 @@ class BaseNode(ABC):
         why this is narrower than ``parameters_added_after_construction``.
         """
         return self._parameters_added_during_execution
+
+    @property
+    def values_set_by_run(self) -> dict[str, Any]:
+        """The values this node's own run gave its parameters, which nothing has set since.
+
+        Such as a seed a node rolls while it runs. They are what the run computed with, so they
+        travel back from a worker with the run's outputs (see `take_values_set_by_run`).
+        """
+        return {
+            name: self.parameter_values[name]
+            for name, origin in self._value_origins.items()
+            if origin is _ValueOrigin.RUN and name in self.parameter_values
+        }
+
+    @property
+    def parameters_set_by_run_or_connection(self) -> frozenset[str]:
+        """The parameters whose value no edit set since a run or a connection did.
+
+        This node's own run set it, such as a seed it rolled or the status it reported, or it came in
+        through a connection, with what the node derived from it as it did, such as a preview. An undo
+        leaves these out of what it compares, as results rather than changes.
+        """
+        return frozenset(self._value_origins)
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -461,6 +517,7 @@ class BaseNode(ABC):
         self._deferred_inputs_were_reset = False
         self._parameters_added_after_construction = set()
         self._parameters_added_during_execution = set()
+        self._value_origins = {}
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -590,6 +647,10 @@ class BaseNode(ABC):
     def _set_workflow(self, workflow: WorkflowRuntime) -> None:
         """Record the workflow whose objects this node joined. Only the ObjectManager calls this."""
         self._workflow = workflow
+        # Objects put from `__init__` had no workflow to belong to until now, so closing it releases them.
+        self.engine.resource_manager.tag_untagged_objects_for_workflow(
+            owner=self.local_objects.owner, source=self.local_object_source, workflow=workflow
+        )
 
     def _handle_request_in_workflow(self, request: RequestPayload) -> ResultPayload:
         """Send `request` through the workflow this node joined.
@@ -1150,20 +1211,13 @@ class BaseNode(ABC):
         return None
 
     def get_parameter_by_name(self, param_name: str) -> Parameter | None:
-        for parameter in self.parameters:
-            if param_name == parameter.name:
-                return parameter
-        return None
+        return self.root_ui_element.find_element_by_type_and_name(Parameter, param_name)
 
     def get_element_by_name_and_type(
         self, elem_name: str, element_type: type[BaseNodeElement] | None = None
     ) -> BaseNodeElement | None:
         find_type = element_type if element_type is not None else BaseNodeElement
-        element_items = self.root_ui_element.find_elements_by_type(find_type)
-        for element_item in element_items:
-            if elem_name == element_item.name:
-                return element_item
-        return None
+        return self.root_ui_element.find_element_by_type_and_name(find_type, elem_name)
 
     def set_parameter_value(
         self,
@@ -1223,6 +1277,7 @@ class BaseNode(ABC):
                 # ACTUALLY SET THE NEW VALUE
                 self.parameter_values[param_name] = final_value
                 self._also_record_as_result(parameter, final_value)
+                self._record_who_set(parameter)
 
                 # Allow custom node logic to respond after it's been set.
                 # A connected list's hook sees the list the node now reads, its rows' items included.
@@ -1235,6 +1290,7 @@ class BaseNode(ABC):
         else:
             self.parameter_values[param_name] = candidate_value
             self._also_record_as_result(parameter, candidate_value)
+            self._record_who_set(parameter)
         if parameter.parent_container_name is not None:
             container = self.get_parameter_by_name(parameter.parent_container_name)
             if isinstance(container, ParameterContainer):
@@ -1288,6 +1344,33 @@ class BaseNode(ABC):
             and ParameterMode.OUTPUT in parameter.allowed_modes
         ):
             self.parameter_output_values[parameter.name] = value
+
+    def _record_who_set(self, parameter: Parameter) -> None:
+        """Record where `parameter`'s value came from, for `values_set_by_run` and `parameters_set_by_run_or_connection`.
+
+        The run's window is the same as `_also_record_as_result`'s: this node's body running. A
+        connection's is this node taking in a value through it (`connection_feed_scope`). A value set
+        any other way, such as by an edit or loading the workflow, is an edit. A container's child is
+        left out, as there: its container travels for it.
+        """
+        if parameter.parent_container_name is None:
+            if _running_node.get() is self:
+                self._value_origins[parameter.name] = _ValueOrigin.RUN
+                return
+            if _fed_node.get() is self:
+                self._value_origins[parameter.name] = _ValueOrigin.CONNECTION
+                return
+        self._value_origins.pop(parameter.name, None)
+
+    def take_values_set_by_run(self, values: dict[str, Any]) -> None:
+        """Take the values a run of this node set on its parameters where it ran, such as in a worker.
+
+        Written straight in, as the run's outputs are: the node's value hooks already ran where the
+        node ran, and running them again here would treat the run's value as an edit.
+        """
+        for name, value in values.items():
+            self.parameter_values[name] = value
+            self._value_origins[name] = _ValueOrigin.RUN
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]
@@ -1482,21 +1565,30 @@ class BaseNode(ABC):
 
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
-        """Runs before the entire workflow is run."""
-        if VariableResolver.is_substitution_enabled(self.engine, self._workflow):
-            for param in self.parameters:
-                if not param.allow_variable_substitution:
-                    continue
-                value = self.parameter_values.get(param.name, param.default_value)
-                if VariableResolver.contains_variable_macro(value):
-                    self.make_node_unresolved(
-                        current_states_to_trigger_change_event={
-                            NodeResolutionState.RESOLVED,
-                            NodeResolutionState.RESOLVING,
-                        }
-                    )
-                    break
+        """Runs before the entire workflow is run.
+
+        A RESOLVED node whose `{...}` templates would now render differently from when it last ran
+        is stale, and so is everything downstream of it: a variable changed, the project changed, or
+        substitution was switched off. Comparing what the templates render to, rather than tracking
+        every way a variable can change, makes the answer the same whichever way it changed.
+        """
+        if self.lock or self.state != NodeResolutionState.RESOLVED:
+            return None
+        if not self._template_values():
+            return None
+        variables = VariableResolver.get_variables_without_memoizing(self.engine, self._workflow, self.name)
+        if self._templates_at_last_run == self._render_templates(variables):
+            return None
+        self.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
+        self._require_workflow().flows.connections.unresolve_future_nodes(self)
         return None
+
+    def record_templates_for_run(self, variables: dict[str, str | int] | None) -> None:
+        """Remember what this node's `{...}` templates render to with the variables it is about to run with.
+
+        `variables` is None when substitution is off, so the templates render as written.
+        """
+        self._templates_at_last_run = self._render_templates(variables)
 
     def validate_before_node_run(self) -> list[Exception] | None:
         """Runs on the ORCHESTRATOR, immediately before this node is dispatched.
@@ -1529,8 +1621,8 @@ class BaseNode(ABC):
 
         Inspection only: read a tensor's shape, confirm a model is already loaded. Building the thing
         being checked is what this hook exists to stop. It runs synchronously on the executing process's
-        event loop, so a slow check on a worker leaves the orchestrator's heartbeat challenges
-        unanswered and the worker is evicted mid-run.
+        event loop, so a slow check on a worker holds up everything else that worker is asked to do,
+        including cancelling the node.
 
         Not a substitute for the other two hooks. This one cannot run before the flow starts, and it
         sees a transient node with no connections, so a question about the graph has no answer here.
@@ -1828,7 +1920,10 @@ class BaseNode(ABC):
         # Publish the event up!
         self.engine.event_manager.put_event(
             ProgressEvent(
-                value=value, node_name=self.name, parameter_name=parameter_name, workflow_id=self._event_workflow_id()
+                value=value,
+                node_name=self.name,
+                parameter_name=parameter_name,
+                open_workflow_id=self._event_workflow_id(),
             )
         )
 
@@ -2056,9 +2151,7 @@ class BaseNode(ABC):
         between the run and the copy-back and the write goes through -- but the
         alternatives are worse: seeding one dict for a whole copy-back loop would hand
         one flow's variables to a node in another (see the no-per-flow-key note on
-        ``get_variables_if_enabled``), and ``_resolve_variables_for_node`` cannot be
-        swapped in as-is because it returns ``{}`` where this returns ``None``, and
-        those two invert the guard.
+        ``get_variables_if_enabled``).
         """
         # get_variables_without_memoizing, not get_variables_if_enabled: this runs
         # outside aprocess_scope(), where the latter's memo write has no reset token
@@ -2067,6 +2160,30 @@ class BaseNode(ABC):
         if variables is None:
             return True
         return VariableResolver.would_substitute(raw_value, variables)
+
+    def _render_templates(self, variables: dict[str, str | int] | None) -> dict[str, Any]:
+        """Each `{...}` template on this node as substitution would render it with `variables`.
+
+        None renders a template as written, which is what a run does with substitution off.
+        """
+        rendered = {}
+        for name, template in self._template_values().items():
+            if variables is None:
+                rendered[name] = template
+            else:
+                rendered[name] = VariableResolver.resolve_value(template, variables, self.name)
+        return rendered
+
+    def _template_values(self) -> dict[str, Any]:
+        """The stored value of every parameter that substitution applies to and that holds a `{...}` token."""
+        templates = {}
+        for param in self.parameters:
+            if not param.allow_variable_substitution:
+                continue
+            value = self.parameter_values.get(param.name, param.default_value)
+            if VariableResolver.contains_variable_macro(value):
+                templates[param.name] = value
+        return templates
 
     def _variable_template_to_preserve(self, parameter_name: str, output_value: Any) -> _PreservedTemplate | None:
         """Return the stored {VAR} template that must survive `output_value`.
@@ -2796,7 +2913,7 @@ class EndNode(BaseNode):
         else:
             details = status_prefix
 
-        self.status_component.set_execution_result(was_successful=was_successful, result_details=details)
+        self.status_component.set_was_successful(was_successful=was_successful)
 
         # Update all values to use the output value
         for param in self.parameters:
@@ -2805,6 +2922,11 @@ class EndNode(BaseNode):
                 # stays the key it already is instead of being resolved and parked a second time.
                 value = self._get_raw_parameter_value(param.name)
                 self.parameter_output_values[param.name] = value
+
+        # The message is this node's output, which publishing writes. The result_details input keeps
+        # what the flow supplied, so the next run does not read this run's message as its details.
+        self.publish_update_to_parameter("result_details", details)
+
         entry_parameter = self._entry_control_parameter
         # Update which control parameter to flag as the output value.
         if entry_parameter is not None:
@@ -2825,10 +2947,14 @@ class ErrorProxyNode(BaseNode):
     and values are assigned to maintain workflow structure.
 
     A node denied by an authorization policy is a recoverable restriction rather than a broken node,
-    so `denied_by_policy` substitutes a warning treatment for the hard-error one and explains the
+    so a node given a `denial` substitutes a warning treatment for the hard-error one and explains the
     cause as a permission gate instead of a load failure. The engine stays policy-agnostic: the
-    specific reason text arrives in `failure_reason` from whatever hook denied the node.
+    reasons arrive in `denial` from whatever hook denied the node. They render as one bullet per
+    distinct reason and travel to the editor, in full, as the `permission_denial` UI option of the
+    message element. `failure_reason` is the reason shown when the `denial` lists no failures.
     """
+
+    PERMISSION_DENIAL_UI_OPTION = "permission_denial"
 
     def __init__(  # noqa: PLR0913
         self,
@@ -2838,14 +2964,14 @@ class ErrorProxyNode(BaseNode):
         failure_reason: str,
         metadata: dict[Any, Any] | None = None,
         *,
-        denied_by_policy: bool = False,
+        denial: CheckpointDenial | None = None,
     ) -> None:
         super().__init__(name, metadata)
 
         self.original_node_type = original_node_type
         self.original_library_name = original_library_name
         self.failure_reason = failure_reason
-        self.denied_by_policy = denied_by_policy
+        self.denial = denial
 
         # The owning library/node type are normally injected into metadata by
         # LibraryRegistry.create_node, but a proxy is created precisely because that
@@ -2865,24 +2991,25 @@ class ErrorProxyNode(BaseNode):
         # message emphasize that distinction; the editor renders both the variant and the markdown.
         self._error_message = ParameterMessage(
             name="error_proxy_message",
-            variant="warning" if denied_by_policy else "error",
+            variant="warning" if self.denied_by_policy else "error",
             value="",  # Will be set by _update_error_message
-            markdown=denied_by_policy,
+            markdown=self.denied_by_policy,
         )
+        if self.denial is not None:
+            self._error_message.update_ui_options_key(
+                self.PERMISSION_DENIAL_UI_OPTION, self._permission_denial_payload()
+            )
         self.add_node_element(self._error_message)
         self._update_error_message()
+
+    @property
+    def denied_by_policy(self) -> bool:
+        return self.denial is not None
 
     def _get_base_error_message(self) -> str:
         """Generate the base error message for this ErrorProxyNode."""
         if self.denied_by_policy:
-            return (
-                f"**Permission denied**\n\n"
-                f"You don't have permission to use the **{self.original_node_type}** node from the "
-                f"**{self.original_library_name}** library, so this placeholder is holding its spot.\n\n"
-                f"{self.failure_reason}\n\n"
-                f"Your original node will be restored automatically once permission is granted. "
-                f"Contact your administrator if you need this capability enabled."
-            )
+            return f"**Permission denied**\n\n{self._permission_denied_body()}"
         return (
             f"This placeholder stands in for the '{self.original_node_type}' node "
             f"from the '{self.original_library_name}' library, which could not be loaded.\n\n"
@@ -2999,6 +3126,8 @@ class ErrorProxyNode(BaseNode):
 
     def validate_before_node_run(self) -> list[Exception] | None:
         """Prevent ErrorProxy nodes from running - validate at node level only."""
+        if self.denied_by_policy:
+            return [RuntimeError(f"Cannot run node '{self.name}': {self._permission_denied_body()}")]
         error_msg = (
             f"Cannot run node '{self.name}': This is a placeholder node put in place to preserve your workflow until the breaking issue is fixed.\n\n"
             f"The original '{self.original_node_type}' from library '{self.original_library_name}' failed to load due to this technical issue:\n\n"
@@ -3006,6 +3135,47 @@ class ErrorProxyNode(BaseNode):
             f"Once you resolve the issue above, reload this workflow and the placeholder will be automatically replaced with the original node."
         )
         return [RuntimeError(error_msg)]
+
+    def _permission_denied_body(self) -> str:
+        """The explanation, reasons, and restore advice shared by the placeholder message and the run-time error."""
+        return (
+            f"You don't have permission to use the **{self.original_node_type}** node from the "
+            f"**{self.original_library_name}** library, so this placeholder is holding its spot.\n\n"
+            f"{self._denial_reasons_markdown()}\n\n"
+            f"Once permission is granted, reload this workflow and the placeholder will be automatically "
+            f"replaced with the original node. Contact your administrator if you need this capability enabled."
+        )
+
+    def _denial_reasons_markdown(self) -> str:
+        """One bullet per distinct denial detail, in order, falling back to `failure_reason`."""
+        if self.denial is None:
+            return self.failure_reason
+        details: list[str] = []
+        for failure in self.denial.failures:
+            if failure.detail not in details:
+                details.append(failure.detail)
+        if not details:
+            return self.failure_reason
+        return "\n".join(f"- {detail}" for detail in details)
+
+    def _permission_denial_payload(self) -> dict[str, Any]:
+        """The structured denial the editor renders in place of the markdown fallback."""
+        failures: list[dict[str, str | None]] = []
+        if self.denial is not None:
+            for failure in self.denial.failures:
+                entry = {
+                    "detail": failure.detail,
+                    "capability": failure.capability,
+                    "advice": failure.advice,
+                    "source": failure.source,
+                }
+                if entry not in failures:
+                    failures.append(entry)
+        return {
+            "node_type": self.original_node_type,
+            "library_name": self.original_library_name,
+            "failures": failures,
+        }
 
     def record_initialization_request(self, request: RequestPayload) -> None:
         """Record an initialization request for replay during serialization.

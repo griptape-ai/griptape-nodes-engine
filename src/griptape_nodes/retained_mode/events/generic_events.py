@@ -1,5 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from griptape_nodes.retained_mode.events.app_events import OpenWorkflowInfo
 from griptape_nodes.retained_mode.events.base_events import (
     ResultPayloadFailure,
     WorkflowNotAlteredMixin,
@@ -27,9 +28,14 @@ class WorkflowNotOpenResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     """The request's envelope named a workflow the engine doesn't have open, so it was not handled.
 
     The one failure for every request whose envelope `open_workflow_id` names no open workflow,
-    whatever the request, so a client can tell it apart and reopen the workflow or refresh what is
-    open. HOST requests (`RequestScope`) ignore the id, so they never fail with it.
+    whatever the request, so a client can tell it apart and reopen the workflow or pick another.
+    HOST requests (`RequestScope`) ignore the id, so they never fail with it.
+
+    Args:
+        open_workflows: Every workflow the engine has open, as ListOpenWorkflowsRequest lists them.
     """
+
+    open_workflows: list[OpenWorkflowInfo] = field(default_factory=list)
 
 
 @dataclass
@@ -38,7 +44,7 @@ class WorkflowNotNamedResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailur
     """The request names no workflow it can act on, so it was not handled.
 
     The one failure for every request that acts on a workflow (`RequestScope.WORKFLOW`) but names
-    none, or names nothing while none or several are open, and for a request in
-    `ONLY_OPEN_UNTIL_CLIENTS_NAME` that names nothing while several are open. A client subscribed to the request's own failure type
-    still receives it: the result envelope carries `request_type`, and the bridge routes on that.
+    none, whether or not a workflow is open. A client subscribed to the request's own
+    failure type still receives it: the result envelope carries `request_type`, and the bridge routes
+    on that.
     """

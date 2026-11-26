@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.managers.external_environment import (  # noqa
 from griptape_nodes.retained_mode.runtime.read_observer import install_workflow_read_observer  # noqa: E402
 from griptape_nodes.utils import engine_dirs  # noqa: E402
 from tests.unit.host_workflow_reads import HostWorkflowRead, HostWorkflowReadRecorder  # noqa: E402
+from tests.worker_processes import no_local_worker_processes  # noqa: E402, F401 (an autouse fixture)
 
 # The redirect must be in place before the first test module is imported, earlier than any
 # fixture can run: `agent_manager` and `servers.mcp` build a `ConfigManager` at module
@@ -95,7 +96,7 @@ def own_log_files_in_real_log_directory() -> list[str]:
 
 
 @pytest.fixture(autouse=True)
-def isolate_user_config() -> Generator[Path, None, None]:
+def isolate_user_config(tmp_path_factory: pytest.TempPathFactory) -> Generator[Path, None, None]:
     """Isolate the user config file during tests to prevent pollution of the real config."""
     import griptape_nodes.retained_mode.managers.config_manager as config_manager_module
 
@@ -103,18 +104,19 @@ def isolate_user_config() -> Generator[Path, None, None]:
     reset_root_engine()
 
     # Create a temporary directory for the test config
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_config_path = Path(temp_dir) / "griptape_nodes_config.json"
+    # Keep autouse state separate from tests that inspect every entry in tmp_path.
+    temp_dir = tmp_path_factory.mktemp("user-config")
+    temp_config_path = temp_dir / "griptape_nodes_config.json"
 
-        # Initialize with an empty config
-        temp_config_path.write_text(json.dumps({}, indent=2))
+    # Initialize with an empty config
+    temp_config_path.write_text(json.dumps({}, indent=2))
 
-        # Patch the USER_CONFIG_PATH constant to point to our temp file
-        with patch.object(config_manager_module, "USER_CONFIG_PATH", temp_config_path):
-            yield temp_config_path
+    # Patch the USER_CONFIG_PATH constant to point to our temp file
+    with patch.object(config_manager_module, "USER_CONFIG_PATH", temp_config_path):
+        yield temp_config_path
 
-            # Drop it again so the next test doesn't inherit this one's object graph.
-            reset_root_engine()
+        # Drop it again so the next test doesn't inherit this one's object graph.
+        reset_root_engine()
 
 
 _EXTERNAL_ENVIRONMENT_VARS = (
@@ -124,6 +126,9 @@ _EXTERNAL_ENVIRONMENT_VARS = (
     "GTN_CONFIG_WORKER__COMMAND_PREFIX",
     "GTN_CONFIG_LIBRARY__SANDBOX_ENABLED",
 )
+
+
+_BETA_FEATURES_ENV_PREFIX = "GTN_CONFIG_BETA_FEATURES__"
 
 
 @pytest.fixture(autouse=True)
@@ -148,6 +153,20 @@ def isolate_external_environment() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def isolate_beta_feature_environment() -> Generator[None, None, None]:
+    """Clear the `GTN_CONFIG_BETA_FEATURES__` variables a developer sets to try engine beta features.
+
+    The user config is already isolated, so this leaves each test on the features' defaults unless
+    it sets them. Saved and restored by hand for the reason `isolate_external_environment` gives.
+    """
+    saved = {name: os.environ.pop(name) for name in list(os.environ) if name.startswith(_BETA_FEATURES_ENV_PREFIX)}
+    yield
+    for name in [name for name in os.environ if name.startswith(_BETA_FEATURES_ENV_PREFIX)]:
+        os.environ.pop(name)
+    os.environ.update(saved)
+
+
+@pytest.fixture(autouse=True)
 def reset_beta_feature_warnings() -> None:
     """Forget which bad beta feature values were already warned about.
 
@@ -158,7 +177,7 @@ def reset_beta_feature_warnings() -> None:
 
 
 @pytest.fixture(autouse=True)
-def isolate_engine_logs() -> Generator[Path, None, None]:
+def isolate_engine_logs(tmp_path_factory: pytest.TempPathFactory) -> Generator[Path, None, None]:
     """Give each test its own engine log directory.
 
     ``logging.log_to_file`` is on by default, so every engine a test builds attaches a rotating
@@ -168,14 +187,14 @@ def isolate_engine_logs() -> Generator[Path, None, None]:
     ``xdg_state_home`` is the seam rather than ``default_log_directory``, which tests import
     directly and would otherwise compare a temporary directory against the real one.
     """
-    with tempfile.TemporaryDirectory() as temp_dir:
-        state_home = Path(temp_dir)
-        with patch.object(engine_dirs, "xdg_state_home", lambda: state_home):
-            yield state_home / "griptape_nodes" / "logs"
+    # Keep autouse state separate from tests that inspect every entry in tmp_path.
+    state_home = tmp_path_factory.mktemp("engine-state")
+    with patch.object(engine_dirs, "xdg_state_home", lambda: state_home):
+        yield state_home / "griptape_nodes" / "logs"
 
-            # Detach the sinks while the directory still exists: they live on the process-global
-            # logger, so one left behind holds an open file in a directory about to be deleted.
-            log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
+        # Detach the process-global logger sinks so later tests cannot keep writing
+        # into this test's log directory.
+        log_capture.configure_diagnostic_logging(buffer_lines=0, log_to_file=False)
 
 
 @pytest.fixture(autouse=True)

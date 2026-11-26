@@ -77,16 +77,19 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import (
     DEFAULT_LIBRARIES_DIRECTORY,
+    DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH,
     DISCOVERY_MAX_DEPTH_KEY,
     FROM_ENV_CONTEXT,
     LIBRARIES_DIRECTORY_KEY,
     LOG_DIRECTORY_KEY,
     LOG_RETENTION_DAYS_KEY,
     LOG_TO_FILE_KEY,
+    MAX_WORKFLOW_RECURSION_DEPTH_KEY,
     SESSION_LOG_BUFFER_LINES_KEY,
     WORKFLOWS_TO_REGISTER_KEY,
     LogLevel,
     Settings,
+    coerce_max_workflow_recursion_depth,
 )
 from griptape_nodes.retained_mode.request_handlers import handles
 from griptape_nodes.utils.dict_utils import drop_blank_values, get_dot_value, merge_dicts, set_dot_value
@@ -114,7 +117,7 @@ DEFAULT_LIBRARIES_ROOT_ENV_VAR = "GTN_DEFAULT_LIBRARIES_ROOT"
 
 # Prefix marking an environment variable as a config input, and the separator that splits the
 # remainder into a nested key path. A single underscore cannot serve as the separator because
-# setting names contain underscores themselves (`storage_backend`), so `WORKER_HEARTBEAT_TIMEOUT_S`
+# setting names contain underscores themselves (`storage_backend`), so `WORKER_LIBRARY_LOAD_TIMEOUT_S`
 # would be ambiguous.
 ENV_VAR_PREFIX = "GTN_CONFIG_"
 ENV_VAR_PATH_SEPARATOR = "__"
@@ -132,7 +135,7 @@ class EnvVarOverride(NamedTuple):
 class EnvVarLayer(NamedTuple):
     """The env-var layer's merged contents plus the variable each key came from.
 
-    `var_names` is keyed by key segments (`("worker", "heartbeat_timeout_s")`) so provenance can
+    `var_names` is keyed by key segments (`("worker", "library_load_timeout_s")`) so provenance can
     name the variable exactly as it is spelled. `raw_values` keeps each variable's uncoerced
     string, for a debug report that should show what was set rather than what it became.
     """
@@ -305,8 +308,8 @@ class ConfigManager(EngineScoped):
 
     Environment variables starting with GTN_CONFIG_ are converted to config keys by removing the prefix
     and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}), with a double
-    underscore separating nested keys (GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 becomes
-    {"worker": {"heartbeat_timeout_s": 30.0}}). That flow is input-only: nothing here writes a
+    underscore separating nested keys (GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S=30 becomes
+    {"worker": {"library_load_timeout_s": 30.0}}). That flow is input-only: nothing here writes a
     GTN_CONFIG_ variable back out.
 
     The one variable this manager PUBLISHES is GTN_DEFAULT_LIBRARIES_ROOT, written once at
@@ -631,6 +634,21 @@ class ConfigManager(EngineScoped):
         """
         return self.get_config_value(DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int)
 
+    @property
+    def max_workflow_recursion_depth(self) -> int:
+        """Get how many times a workflow may appear inside itself before an import is refused.
+
+        Overridable via the `GTN_CONFIG_MAX_WORKFLOW_RECURSION_DEPTH` env var; falls back to
+        DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH when unset. Read without `cast_type`, which raises on a
+        non-number: `Settings` accepts a bad value from a config file so the rest of the config is kept, and
+        the merged config keeps it raw, so this applies the same rule as the `Settings` validator.
+
+        Returns:
+            The `max_workflow_recursion_depth` setting.
+        """
+        depth = self.get_config_value(MAX_WORKFLOW_RECURSION_DEPTH_KEY, default=DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH)
+        return coerce_max_workflow_recursion_depth(depth)
+
     def value_source(self, key: str) -> ConfigValueSource:
         """Return which config layer currently supplies `key`'s effective value.
 
@@ -675,11 +693,11 @@ class ConfigManager(EngineScoped):
 
         Walks up to the nearest recorded ancestor, so a leaf under a subtree that one variable set
         names that variable. None when no ancestor is recorded, which is a `path` shallower than
-        any variable: asking who owns `worker` when only `worker.heartbeat_timeout_s` is set names
+        any variable: asking who owns `worker` when only `worker.library_load_timeout_s` is set names
         no single variable.
 
         Args:
-            path: Key segments from the config root, e.g. ("worker", "heartbeat_timeout_s").
+            path: Key segments from the config root, e.g. ("worker", "library_load_timeout_s").
         """
         for depth in range(len(path), 0, -1):
             name = self._env_var_names.get(path[:depth])
@@ -886,7 +904,7 @@ class ConfigManager(EngineScoped):
         GTN_CONFIG_STORAGE_BACKEND=gtc becomes {"storage_backend": "gtc"}
 
         A double underscore separates nested keys, so
-        GTN_CONFIG_WORKER__HEARTBEAT_TIMEOUT_S=30 becomes {"worker": {"heartbeat_timeout_s": 30.0}}.
+        GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S=30 becomes {"worker": {"library_load_timeout_s": 30.0}}.
         Because the whole name is lowercased, this only reaches settings whose keys are lowercase:
         case-sensitive trees such as `nodes.<Library>.<SECRET>` stay config-file-only.
 
@@ -998,7 +1016,7 @@ class ConfigManager(EngineScoped):
         A key the schema does not declare survives validation but not the dump, because a nested
         model ignores sub-keys it does not know. Free-form keys never reach that state: an entry in a
         mapping-valued setting and a path riding Settings' `extra="allow"` are both retained through
-        the dump. So an absent key means the path names nothing, as `worker.heartbeat_timeout` does
+        the dump. So an absent key means the path names nothing, as `worker.library_load_timeout` does
         by dropping the `_s`.
 
         Args:
@@ -1066,7 +1084,7 @@ class ConfigManager(EngineScoped):
     def _report_dotted_keys(self, contents: dict, path: Path) -> None:
         """Warn about top-level keys written in dotted form, once per file and key.
 
-        A flat `"worker.heartbeat_timeout_s"` key merges in beside the real `worker` object and is
+        A flat `"worker.library_load_timeout_s"` key merges in beside the real `worker` object and is
         never read, since `get_dot_value` descends by segment. `Settings` allows extra keys, so
         validation can't catch it. Only top-level keys are checked: deeper mapping keys, such as
         `project_workspaces` paths, may legitimately contain dots.
@@ -1309,15 +1327,19 @@ class ConfigManager(EngineScoped):
         self._libraries_root_override = None
         self.load_configs()
 
-    def delete_user_workflow(self, workflow_file_name: str) -> None:
+    def delete_user_workflow(self, workflow_file_name: str) -> bool:
+        """Remove a workflow file from the workflows the user config registers. False if the config could not be written."""
         default_workflows = self.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
-        if default_workflows:
-            default_workflows = [
-                saved_workflow
-                for saved_workflow in default_workflows
-                if (saved_workflow.lower() != workflow_file_name.lower())
-            ]
-            self.set_config_value(WORKFLOWS_TO_REGISTER_KEY, default_workflows)
+        if not default_workflows:
+            return True
+        remaining_workflows = [
+            saved_workflow
+            for saved_workflow in default_workflows
+            if (saved_workflow.lower() != workflow_file_name.lower())
+        ]
+        if len(remaining_workflows) == len(default_workflows):
+            return True
+        return self.set_config_value(WORKFLOWS_TO_REGISTER_KEY, remaining_workflows)
 
     def get_full_path(self, relative_path: str) -> Path:
         """Get a full path by combining the base path with a relative path.

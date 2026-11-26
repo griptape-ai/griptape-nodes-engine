@@ -175,7 +175,7 @@ target_node.parameter_output_values[target_param_name] = param_value
 if target_node.should_preserve_stored_template(target_param_name, param_value):
     self._unresolve_future_nodes_for_skipped_write(target_node, target_param_name)
 else:
-    self.engine.node_manager.on_set_parameter_value_request(SetParameterValueRequest(..., value=param_value))
+    self.engine.node_manager.on_set_parameter_value_request(SetParameterValueRequest(..., value=param_value), workflow)
 target_node.parameter_output_values[target_param_name] = param_value
 ```
 

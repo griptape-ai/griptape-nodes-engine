@@ -11,7 +11,6 @@ import pytest
 
 from griptape_nodes.common.loop_body_scope import LoopBodyScope, entered_loop_body_scope
 from griptape_nodes.common.node_executor import (
-    ExecuteNodeFailedError,
     NodeExecutor,
     current_executing_node_name,
     current_node_execution_id,
@@ -31,6 +30,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     NodeProcessOutcome,
     NodeStartProcessEvent,
 )
+from griptape_nodes.retained_mode.events.failure_tree import ExecuteNodeFailureError
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -228,12 +228,12 @@ class TestOutcome:
             return_value=ExecuteNodeResultFailure(result_details="boom", exception=KeyError("b"), error=built)
         )
 
-        with pytest.raises(ExecuteNodeFailedError) as caught:
+        with pytest.raises(ExecuteNodeFailureError) as caught:
             await executor.execute(_in_workflow_of(executor, _make_node(name="Broken")))
 
         finish = _start_and_finish(executor).finish
         assert finish.outcome == NodeProcessOutcome.FAILED
-        assert finish.error is built
+        assert finish.error == built
         assert finish.error_message == str(caught.value)
 
     @pytest.mark.asyncio
@@ -244,7 +244,7 @@ class TestOutcome:
             return_value=ExecuteNodeResultFailure(result_details="no worker is available")
         )
 
-        with pytest.raises(ExecuteNodeFailedError):
+        with pytest.raises(ExecuteNodeFailureError):
             await executor.execute(_in_workflow_of(executor, _make_node(name="Broken")))
 
         finish = _start_and_finish(executor).finish

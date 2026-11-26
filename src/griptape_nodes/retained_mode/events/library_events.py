@@ -1357,7 +1357,7 @@ class InstallLibraryDependenciesRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class InstallLibraryDependenciesResultSuccess(ResultPayloadSuccess):
+class InstallLibraryDependenciesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Library dependencies installed successfully.
 
     Args:

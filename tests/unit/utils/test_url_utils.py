@@ -220,9 +220,7 @@ class TestUriToPath:
     def test_windows_file_uri(self) -> None:
         """Test conversion of Windows file URIs."""
         result = uri_to_path("file:///C:/Windows/path/file.txt")
-        assert isinstance(result, Path)
-        # On Unix, this will keep the C: as part of the path
-        # On Windows, it will properly parse as C:\Windows\path\file.txt
+        assert result.as_posix() == "C:/Windows/path/file.txt"
 
     def test_uri_with_spaces(self) -> None:
         """Test URIs with URL-encoded spaces."""
@@ -237,12 +235,6 @@ class TestUriToPath:
         assert isinstance(result, Path)
         # Use as_posix() for cross-platform comparison
         assert result.as_posix() == "/path/with spaces and & symbols.txt"
-
-    def test_returns_path_object(self) -> None:
-        """Test that the function returns a Path object."""
-        result = uri_to_path("file:///any/path")
-        assert isinstance(result, Path)
-        assert hasattr(result, "exists")  # Verify it's a Path with Path methods
 
     def test_windows_drive_letter_path_preserved(self) -> None:
         """Windows drive letters must not be treated as URI schemes."""

@@ -10,18 +10,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.exe_types.node_types import BaseNode, Connection
-from griptape_nodes.retained_mode.events.connection_events import (
-    CreateConnectionRequest,
-    CreateConnectionResultFailure,
-    DeleteConnectionRequest,
-    DeleteConnectionResultFailure,
-)
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelAllRunsRequest,
     CancelRunRequest,
     ListRunsRequest,
-    StartLocalSubflowRequest,
-    StartLocalSubflowResultFailure,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -34,11 +26,10 @@ from griptape_nodes.retained_mode.events.flow_events import (
     ListFlowsInCurrentContextRequest,
     ListFlowsInFlowRequest,
     ListNodesInFlowRequest,
-    ListNodesInFlowResultFailure,
-    ListNodesInFlowResultSuccess,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.generic_events import WorkflowNotNamedResultFailure
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
@@ -71,12 +62,8 @@ def _open_workflow(engine: Engine) -> WorkflowRuntime:
 
 # They answer with no workflow, and use the one they are handed.
 _OPTIONAL_WORKFLOW_REQUESTS = {
-    GetTopLevelFlowRequest,
     ListFlowsInFlowRequest,
     ExtractFlowCommandsFromImageMetadataRequest,
-    CancelRunRequest,
-    CancelAllRunsRequest,
-    ListRunsRequest,
 }
 
 
@@ -107,7 +94,7 @@ class TestFlowManagerScopes:
 
 
 class TestTopLevelFlowWithNoEnvelopeId:
-    """The editor names no workflow yet, and reads `flow_name=None` as "nothing is loaded"."""
+    """It acts on a workflow, so it answers for the only open one, as a saved workflow file run as a script asks."""
 
     def test_answers_for_the_only_open_workflow(self, engine: Engine) -> None:
         _open_workflow(engine)
@@ -118,18 +105,17 @@ class TestTopLevelFlowWithNoEnvelopeId:
         assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
         assert result.flow_name == flow_name
 
-    def test_answers_none_with_nothing_open(self, engine: Engine) -> None:
+    def test_fails_with_nothing_open(self, engine: Engine) -> None:
         result = engine.event_manager.handle_request(GetTopLevelFlowRequest()).result
 
-        assert isinstance(result, GetTopLevelFlowResultSuccess), result.result_details
-        assert result.flow_name is None
+        assert isinstance(result, WorkflowNotNamedResultFailure)
 
 
-class TestCancelWithNoEnvelopeId:
-    """Cancelling binds the open workflow it falls back to: nodes' own cancellation reads the binding."""
+class TestCancelBinding:
+    """Cancelling binds the workflow it names: nodes' own cancellation reads the binding."""
 
     @pytest.mark.asyncio
-    async def test_cancelling_every_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+    async def test_cancelling_every_run_binds_the_named_workflow(self, engine: Engine) -> None:
         workflow = _open_workflow(engine)
         seen: list[WorkflowRuntime | None] = []
 
@@ -137,13 +123,17 @@ class TestCancelWithNoEnvelopeId:
             seen.append(engine.current_workflow_or_none())
 
         with patch.object(engine.flow_manager, "cancel_all_runs_in", cancel_all_runs_in):
-            result = (await engine.event_manager.ahandle_request(CancelAllRunsRequest())).result
+            result = (
+                await engine.event_manager.ahandle_request(
+                    CancelAllRunsRequest(), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+                )
+            ).result
 
         assert result.succeeded(), result.result_details
         assert seen == [workflow]
 
     @pytest.mark.asyncio
-    async def test_cancelling_a_run_binds_the_only_open_workflow(self, engine: Engine) -> None:
+    async def test_cancelling_a_run_binds_the_named_workflow(self, engine: Engine) -> None:
         workflow = _open_workflow(engine)
         seen: list[WorkflowRuntime | None] = []
 
@@ -152,10 +142,39 @@ class TestCancelWithNoEnvelopeId:
             return True
 
         with patch.object(engine.flow_manager, "cancel_run_in", cancel_run_in):
-            result = (await engine.event_manager.ahandle_request(CancelRunRequest(run_id="run"))).result
+            result = (
+                await engine.event_manager.ahandle_request(
+                    CancelRunRequest(run_id="run"), result_context=ResultContext(open_workflow_id=workflow.workflow_id)
+                )
+            ).result
 
         assert result.succeeded(), result.result_details
         assert seen == [workflow]
+
+    @pytest.mark.asyncio
+    async def test_cancelling_with_no_workflow_named_cancels_the_only_open_ones_runs(self, engine: Engine) -> None:
+        """It acts on a workflow, so naming none acts on the only open one."""
+        workflow = _open_workflow(engine)
+        cancelled: list[WorkflowRuntime] = []
+
+        async def cancel_all_runs_in(target: WorkflowRuntime) -> None:
+            cancelled.append(target)
+
+        with patch.object(engine.flow_manager, "cancel_all_runs_in", cancel_all_runs_in):
+            result = (await engine.event_manager.ahandle_request(CancelAllRunsRequest())).result
+
+        assert result.succeeded(), result.result_details
+        assert cancelled == [workflow]
+
+    @pytest.mark.parametrize(
+        "request_payload", [CancelAllRunsRequest(), CancelRunRequest(run_id="run"), ListRunsRequest()]
+    )
+    def test_run_requests_naming_no_workflow_fail_with_nothing_open(
+        self, engine: Engine, request_payload: RequestPayload
+    ) -> None:
+        result = engine.event_manager.handle_request(request_payload).result
+
+        assert isinstance(result, WorkflowNotNamedResultFailure)
 
 
 class TestHandlersActOnTheWorkflowTheyAreHanded:
@@ -305,14 +324,13 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
     async def test_edge_methods_report_failure_with_no_workflow_open(self, engine: Engine) -> None:
         flow_manager = engine.flow_manager
 
-        assert not flow_manager.check_for_existing_running_flow()
         with pytest.raises(KeyError, match="doesn't exist"):
             flow_manager.get_flow_by_name("canvas")
 
     @pytest.mark.parametrize(
         "edge",
         [
-            lambda c: c.fm.get_all_connected_nodes(c.node),
+            lambda c: c.fm.get_connections(),
         ],
     )
     def test_connection_edge_methods_with_no_workflow_open_raise(self, engine: Engine, edge: Any) -> None:
@@ -327,101 +345,3 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
 
         with pytest.raises(NoOpenWorkflowError):
             edge(SimpleNamespace(fm=engine.flow_manager, flow=flow, node=node, param=param))
-
-
-def _connection_request(request_type: type) -> Any:
-    return request_type(
-        source_parameter_name="out", target_parameter_name="in", source_node_name="a", target_node_name="b"
-    )
-
-
-class TestHandlersCalledDirectly:
-    """Engine, `exe_types` and node library code call these by name with only a request, so those calls keep working."""
-
-    @pytest.mark.parametrize(
-        ("handler_name", "request_type"),
-        [
-            ("on_create_connection_request", CreateConnectionRequest),
-            ("on_delete_connection_request", DeleteConnectionRequest),
-        ],
-    )
-    def test_a_connection_handler_called_with_only_a_request_acts_on_the_open_workflow(
-        self, engine: Engine, handler_name: str, request_type: type
-    ) -> None:
-        _open_workflow(engine)
-        flow_manager = engine.flow_manager
-        request = _connection_request(request_type)
-
-        with patch.object(flow_manager, f"{handler_name}_in_workflow", return_value=MagicMock()) as handler:
-            returned = getattr(flow_manager, handler_name)(request)
-
-        handler.assert_called_once_with(request, engine.current_workflow())
-        assert returned is handler.return_value
-
-    def test_deleting_a_connection_with_only_a_request_runs_the_handler(self, engine: Engine) -> None:
-        _open_workflow(engine)
-
-        result = engine.flow_manager.on_delete_connection_request(_connection_request(DeleteConnectionRequest))
-
-        assert isinstance(result, DeleteConnectionResultFailure)
-        assert "'a'" in str(result.result_details)
-
-    @pytest.mark.asyncio
-    async def test_start_local_subflow_called_with_only_a_request_acts_on_the_open_workflow(
-        self, engine: Engine
-    ) -> None:
-        _open_workflow(engine)
-        flow_manager = engine.flow_manager
-        request = StartLocalSubflowRequest(flow_name="subflow")
-
-        with patch.object(
-            flow_manager, "on_start_local_subflow_request_in_workflow", return_value=MagicMock()
-        ) as handler:
-            returned = await flow_manager.on_start_local_subflow_request(request)
-
-        handler.assert_awaited_once_with(request, engine.current_workflow())
-        assert returned is handler.return_value
-
-    @pytest.mark.asyncio
-    async def test_handlers_called_with_only_a_request_fail_with_no_workflow_open(self, engine: Engine) -> None:
-        flow_manager = engine.flow_manager
-
-        created = flow_manager.on_create_connection_request(_connection_request(CreateConnectionRequest))
-        deleted = flow_manager.on_delete_connection_request(_connection_request(DeleteConnectionRequest))
-        started = await flow_manager.on_start_local_subflow_request(StartLocalSubflowRequest(flow_name="subflow"))
-
-        assert isinstance(created, CreateConnectionResultFailure)
-        assert isinstance(deleted, DeleteConnectionResultFailure)
-        assert isinstance(started, StartLocalSubflowResultFailure)
-
-    def test_get_top_level_flow_takes_only_a_request(self, engine: Engine) -> None:
-        _open_workflow(engine)
-        flow_name = _create_canvas(engine)
-
-        result = engine.flow_manager.on_get_top_level_flow_request(GetTopLevelFlowRequest())
-
-        assert isinstance(result, GetTopLevelFlowResultSuccess)
-        assert result.flow_name == flow_name
-
-    def test_get_top_level_flow_finds_none_with_no_workflow_open(self, engine: Engine) -> None:
-        result = engine.flow_manager.on_get_top_level_flow_request(GetTopLevelFlowRequest())
-
-        assert isinstance(result, GetTopLevelFlowResultSuccess)
-        assert result.flow_name is None
-
-    def test_list_nodes_in_flow_takes_only_a_request(self, engine: Engine) -> None:
-        _open_workflow(engine)
-        flow_name = _create_canvas(engine)
-        with engine.context_manager.flow(flow_name):
-            created = engine.handle_request(CreateNodeRequest(node_type="Note", node_name="note"))
-        assert isinstance(created, CreateNodeResultSuccess)
-
-        result = engine.flow_manager.on_list_nodes_in_flow_request(ListNodesInFlowRequest(flow_name=flow_name))
-
-        assert isinstance(result, ListNodesInFlowResultSuccess)
-        assert result.node_names == [created.node_name]
-
-    def test_list_nodes_in_flow_fails_with_no_workflow_open(self, engine: Engine) -> None:
-        result = engine.flow_manager.on_list_nodes_in_flow_request(ListNodesInFlowRequest(flow_name="canvas"))
-
-        assert isinstance(result, ListNodesInFlowResultFailure)

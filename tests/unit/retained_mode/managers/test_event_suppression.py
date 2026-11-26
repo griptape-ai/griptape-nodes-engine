@@ -111,7 +111,7 @@ class TestShouldSuppressEventMatching:
         """The pre-existing branch: ExecutionEvent names its payload `payload`, not `result`."""
         event_manager = EventManager()
         event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"))
+            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"), open_workflow_id=None)
         )
         with EventSuppressionContext(event_manager, {CurrentControlNodeEvent}):
             assert event_manager.should_suppress_event(event) is True
@@ -119,7 +119,7 @@ class TestShouldSuppressEventMatching:
     def test_does_not_match_an_unlisted_execution_payload(self) -> None:
         event_manager = EventManager()
         event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"))
+            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"), open_workflow_id=None)
         )
         with EventSuppressionContext(event_manager, {NodeResolvedEvent}):
             assert event_manager.should_suppress_event(event) is False
@@ -164,6 +164,7 @@ class TestSuppressionWindowLifetime:
                 finalized_value=1,
                 data_type="int",
                 result_details="Set parameter value.",
+                altered_workflow_state=True,
             ),
         )
 
@@ -307,6 +308,24 @@ class TestSuppressionIsScopedToItsCaller:
         with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
             assert await nested_handler() is True
 
+    @pytest.mark.asyncio
+    async def test_a_task_spawned_inside_the_block_is_suppressed_only_until_it_exits(self) -> None:
+        """Such as a node that fills in a dropdown a few seconds after an undo rebuilt it."""
+        event_manager = EventManager()
+        block_exited = asyncio.Event()
+
+        async def outlives_the_block() -> list[bool]:
+            inside = event_manager.should_suppress_event(_create_node_result_event())
+            await block_exited.wait()
+            return [inside, event_manager.should_suppress_event(_create_node_result_event())]
+
+        with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
+            task = asyncio.create_task(outlives_the_block())
+            await asyncio.sleep(0)
+        block_exited.set()
+
+        assert await task == [True, False]
+
 
 class TestSuppressionSetReachability:
     """The executor's suppression sets stay split by transport: execution payloads vs request results."""
@@ -353,7 +372,7 @@ class TestSuppressionSetReachability:
         event_manager.initialize_queue(queue)
 
         execution_event = ExecutionGriptapeNodeEvent(
-            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"))
+            wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name="Blur"), open_workflow_id=None)
         )
         with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
             event_manager.put_event(execution_event)

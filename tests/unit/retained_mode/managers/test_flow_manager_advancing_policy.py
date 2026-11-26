@@ -2,7 +2,7 @@
 
 A continuously running flow is one long drive held by whoever started it, so a
 step or continue request arriving mid-drive cannot advance the machine without
-corrupting its task bookkeeping. FlowManager checks `execution_is_advancing()`
+corrupting its task bookkeeping. FlowManager checks `execution_is_advancing_in()`
 and declines to drive.
 
 Pausing is the exception: `single_execution_step` is the only path that pauses a
@@ -32,7 +32,7 @@ def _flow_manager_with_advancing_machine() -> _AdvancingRun:
     machine = MagicMock()
     machine.is_advancing = True
     machine.resolution_machine.is_advancing = True
-    flow_manager._global_control_flow_machine = machine
+    flow_manager.engine.current_workflow().flows.global_control_flow_machine = machine
 
     return _AdvancingRun(flow_manager=flow_manager, machine=machine)
 
@@ -48,18 +48,18 @@ def _flow_manager_with_open_workflow() -> FlowManager:
 class TestExecutionIsAdvancing:
     def test_reports_false_with_no_machine(self) -> None:
         flow_manager = _flow_manager_with_open_workflow()
-        assert flow_manager.execution_is_advancing() is False
+        assert flow_manager.execution_is_advancing_in(flow_manager.engine.current_workflow()) is False
 
     def test_reports_true_when_only_the_resolution_machine_is_advancing(self) -> None:
         flow_manager, machine = _flow_manager_with_advancing_machine()
         machine.is_advancing = False
-        assert flow_manager.execution_is_advancing() is True
+        assert flow_manager.execution_is_advancing_in(flow_manager.engine.current_workflow()) is True
 
     def test_reports_false_when_nothing_is_advancing(self) -> None:
         flow_manager, machine = _flow_manager_with_advancing_machine()
         machine.is_advancing = False
         machine.resolution_machine.is_advancing = False
-        assert flow_manager.execution_is_advancing() is False
+        assert flow_manager.execution_is_advancing_in(flow_manager.engine.current_workflow()) is False
 
 
 class TestStepRequestsDeclineToDoubleDrive:

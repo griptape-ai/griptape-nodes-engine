@@ -41,7 +41,6 @@ Options:
 - `--storage-backend` - Set the storage backend (`local` or `gtc`) without being prompted
 - `--bucket-name` - Name for the bucket (existing or new) to use when `--storage-backend gtc` is set
 - `--register-diffusers-library` / `--no-register-diffusers-library` - Install (or skip) the Griptape Nodes Diffusers Library
-- `--register-griptape-cloud-library` / `--no-register-griptape-cloud-library` - Install (or skip) the Griptape Cloud Library
 - `--no-interactive` - Run init without any prompts, using only the flags and defaults provided
 - `--hf-token` - Set the Hugging Face token used for downloading gated models
 - `--config key=value` - Set an arbitrary configuration value; repeat the flag to set several (e.g. `--config log_level=DEBUG --config workspace_directory=/tmp`)

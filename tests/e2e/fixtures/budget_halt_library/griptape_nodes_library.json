@@ -50,6 +50,24 @@
         "description": "a Griptape Cloud driver raising a refusal it cannot attribute to a node",
         "display_name": "Driver Halt"
       }
+    },
+    {
+      "class_name": "NamedHaltNode",
+      "file_path": "budget_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "raises a refusal that already names this node",
+        "display_name": "Named Halt"
+      }
+    },
+    {
+      "class_name": "WrappedHaltNode",
+      "file_path": "budget_nodes.py",
+      "metadata": {
+        "category": "test",
+        "description": "wraps a refusal in an exception of its own",
+        "display_name": "Wrapped Halt"
+      }
     }
   ]
 }

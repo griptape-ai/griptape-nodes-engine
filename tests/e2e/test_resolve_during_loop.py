@@ -125,5 +125,7 @@ async def test_resolving_downstream_of_a_running_loop_completes(
     loop_results = end_node.parameter_output_values["results"]
     assert len(loop_results) == LOOP_ITERATIONS, "the loop did not collect every iteration"
     assert sink.get_parameter_value("items") == loop_results, "the sink ran before the loop's results existed"
-    assert not engine.flow_manager.global_dag_builder.node_to_reference, "the run left nodes in the DAG"
-    assert not engine.flow_manager.check_for_existing_running_flow(), "the run never finished"
+    assert not engine.current_workflow().flows.global_dag_builder.node_to_reference, "the run left nodes in the DAG"
+    assert not engine.flow_manager.check_for_existing_running_flow_in(engine.current_workflow()), (
+        "the run never finished"
+    )

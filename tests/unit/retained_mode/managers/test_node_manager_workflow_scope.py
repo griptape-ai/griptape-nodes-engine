@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
-from griptape_nodes.exe_types.node_types import BaseNode, DataNode
+from griptape_nodes.exe_types.node_types import DataNode
 from griptape_nodes.node_library.library_registry import LibraryMetadata, LibraryRegistry, LibrarySchema, NodeMetadata
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
@@ -33,20 +33,13 @@ from griptape_nodes.retained_mode.events.node_events import (
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     ConversionConfig,
-    GetParameterValueRequest,
-    GetParameterValueResultFailure,
-    GetParameterValueResultSuccess,
     MigrateParameterRequest,
     MigrateParameterResultSuccess,
-    RemoveParameterFromNodeRequest,
-    RemoveParameterFromNodeResultFailure,
-    RemoveParameterFromNodeResultSuccess,
     RenameParameterRequest,
     RenameParameterResultFailure,
     ReorderParameterListItemRequest,
     ReorderParameterListItemResultFailure,
     SetParameterValueRequest,
-    SetParameterValueResultFailure,
     SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.validation_events import (
@@ -58,6 +51,7 @@ from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.request_handlers import RequestScope, handled_request_types
 from griptape_nodes.retained_mode.runtime.binding import NO_WORKFLOW, bound_workflow
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+from tests.workflow_context import unbind
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -243,7 +237,7 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
         other = _other_workflow_with_connected_nodes(engine)
 
         with _also_open(engine, other):
-            result = engine.node_manager.on_set_parameter_value_request_in_workflow(
+            result = engine.node_manager.on_set_parameter_value_request(
                 SetParameterValueRequest(parameter_name="value", value="hi", node_name="source"), other
             )
 
@@ -299,7 +293,6 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
             other,
         )
         assert isinstance(created, CreateNodeResultSuccess), created.result_details
-        other.context.push_flow(engine.flow_manager.get_flow_by_name_in(other, "elsewhere"))
         conversion = ConversionConfig(
             library=_LIBRARY_NAME,
             node_type="_ValueNode",
@@ -308,7 +301,8 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
             offset_x=-300,
         )
 
-        with _also_open(engine, other):
+        elsewhere = engine.flow_manager.get_flow_by_name_in(other, "elsewhere")
+        with _also_open(engine, other), other.context.flow(elsewhere):
             result = engine.node_manager.on_migrate_parameter_request(
                 MigrateParameterRequest(
                     source_node_name="target",
@@ -393,20 +387,19 @@ class TestHandlersActOnTheWorkflowTheyAreHanded:
         assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
 
     @pytest.mark.asyncio
-    async def test_an_unbound_request_runs_the_node_of_the_only_open_workflow(self, engine: Engine) -> None:
-        """As the MCP server sends it: no envelope id and no binding."""
+    async def test_an_unbound_request_finds_no_node_while_one_is_open(self, engine: Engine) -> None:
+        """As an MCP client that names no workflow sends it: no envelope id and no binding."""
         workflow = _open_workflow(engine)
         node_name = _create_node(engine, _create_canvas(engine), "node")
-        seen: list[WorkflowRuntime | None] = []
-
-        def process(_node: BaseNode) -> None:
-            seen.append(engine.current_workflow_or_none())
+        unbind(workflow)
+        process = MagicMock()
 
         with patch.object(_ValueNode, "process", process):
             result = await engine.ahandle_request(ExecuteNodeRequest(node_name=node_name, parameter_values={}))
 
-        assert isinstance(result, ExecuteNodeResultSuccess), result.result_details
-        assert seen == [workflow]
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "named no workflow" in str(result.result_details)
+        process.assert_not_called()
 
     @pytest.mark.parametrize(
         ("request_payload", "failure_type"),
@@ -455,7 +448,7 @@ class TestExecuteNodeForwardedToAWorker:
 
         with (
             patch.object(engine.worker_manager, "wait_until_executable", AsyncMock()),
-            patch.object(engine.library_manager.workers, "get_worker_for_library", return_value=("worker", "topic")),
+            patch.object(engine.library_manager.workers, "get_worker_for_library", return_value="worker"),
             patch.object(engine.worker_manager, "route_to_worker", route_to_worker),
         ):
             await engine.event_manager.ahandle_request(
@@ -530,106 +523,3 @@ class TestEdgeMethodsDelegateWithTheOpenWorkflow:
     def test_get_node_by_name_fails_with_no_workflow_open(self, engine: Engine) -> None:
         with pytest.raises(ValueError, match="not found"):
             engine.node_manager.get_node_by_name("node")
-
-
-class TestHandlersNodeLibrariesCallDirectly:
-    """Engine, `exe_types` and node library code call these by name with only a request, so those calls keep working."""
-
-    @pytest.mark.parametrize(
-        ("handler_name", "request_payload"),
-        [
-            (
-                "on_set_parameter_value_request",
-                SetParameterValueRequest(parameter_name="value", value="hi", node_name="node"),
-            ),
-            (
-                "on_remove_parameter_from_node_request",
-                RemoveParameterFromNodeRequest(parameter_name="value", node_name="node"),
-            ),
-            ("on_get_parameter_value_request", GetParameterValueRequest(parameter_name="value", node_name="node")),
-        ],
-    )
-    def test_a_handler_called_with_only_a_request_acts_on_the_open_workflow(
-        self, engine: Engine, handler_name: str, request_payload: Any
-    ) -> None:
-        _open_workflow(engine)
-        node_manager = engine.node_manager
-
-        with patch.object(node_manager, f"{handler_name}_in_workflow", return_value=MagicMock()) as handler:
-            returned = getattr(node_manager, handler_name)(request=request_payload)
-
-        handler.assert_called_once_with(request_payload, engine.current_workflow())
-        assert returned is handler.return_value
-
-    def _workflow_with_a_node(self, engine: Engine) -> str:
-        _open_workflow(engine)
-        flow_name = _create_canvas(engine)
-        node_name = _create_node(engine, flow_name, "node")
-        set_result = engine.handle_request(
-            SetParameterValueRequest(parameter_name="value", value="hi", node_name=node_name)
-        )
-        assert set_result.succeeded(), set_result.result_details
-        return node_name
-
-    def test_get_parameter_value_takes_only_a_request(self, engine: Engine) -> None:
-        node_name = self._workflow_with_a_node(engine)
-
-        result = engine.node_manager.on_get_parameter_value_request(
-            GetParameterValueRequest(parameter_name="value", node_name=node_name)
-        )
-
-        assert isinstance(result, GetParameterValueResultSuccess)
-        assert result.value == "hi"
-
-    def test_get_parameter_value_takes_the_request_by_keyword(self, engine: Engine) -> None:
-        node_name = self._workflow_with_a_node(engine)
-
-        result = engine.node_manager.on_get_parameter_value_request(
-            request=GetParameterValueRequest(parameter_name="value", node_name=node_name)
-        )
-
-        assert isinstance(result, GetParameterValueResultSuccess)
-        assert result.value == "hi"
-
-    def test_set_parameter_value_takes_only_a_request(self, engine: Engine) -> None:
-        node_name = self._workflow_with_a_node(engine)
-
-        result = engine.node_manager.on_set_parameter_value_request(
-            SetParameterValueRequest(parameter_name="value", value="bye", node_name=node_name)
-        )
-
-        assert isinstance(result, SetParameterValueResultSuccess), result.result_details
-        assert engine.node_manager.get_node_by_name(node_name).get_parameter_value("value") == "bye"
-
-    def test_remove_parameter_from_node_takes_the_request_by_keyword(self, engine: Engine) -> None:
-        node_name = self._workflow_with_a_node(engine)
-        node = engine.node_manager.get_node_by_name(node_name)
-        node.add_parameter(Parameter(name="extra", tooltip="Removable", type="str", user_defined=True))
-
-        result = engine.node_manager.on_remove_parameter_from_node_request(
-            request=RemoveParameterFromNodeRequest(parameter_name="extra", node_name=node_name)
-        )
-
-        assert isinstance(result, RemoveParameterFromNodeResultSuccess), result.result_details
-        assert node.get_parameter_by_name("extra") is None
-
-    def test_handlers_called_with_only_a_request_fail_with_no_workflow_open(self, engine: Engine) -> None:
-        node_manager = engine.node_manager
-
-        set_result = node_manager.on_set_parameter_value_request(
-            SetParameterValueRequest(parameter_name="value", value="hi", node_name="node")
-        )
-        removed = node_manager.on_remove_parameter_from_node_request(
-            RemoveParameterFromNodeRequest(parameter_name="value", node_name="node")
-        )
-
-        assert isinstance(set_result, SetParameterValueResultFailure)
-        assert isinstance(removed, RemoveParameterFromNodeResultFailure)
-
-    def test_get_parameter_value_fails_with_no_workflow_open(self, engine: Engine) -> None:
-        result = engine.node_manager.on_get_parameter_value_request(
-            GetParameterValueRequest(parameter_name="value", node_name="node")
-        )
-
-        assert isinstance(result, GetParameterValueResultFailure)
-        assert "no workflow is open" in str(result.result_details)

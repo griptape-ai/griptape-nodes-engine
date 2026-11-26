@@ -71,12 +71,20 @@ running concurrently. A **Testing Mode** toggle in settings lets you run just
 one chosen index while you're wiring up the loop body, instead of the whole
 list.
 
+**Flatten Results** (in the group's settings) changes what happens when an
+iteration adds a list to **results**. Off by default, **results** is a list
+of lists, one per iteration. Turn it on and the items from each list go
+straight into **results**, in order, so you get one flat list. **Flatten
+Depth** sets how many levels of nesting to flatten. The default of 0 flattens
+every level. Text and dictionaries are never split apart, so they stay whole
+items.
+
 ### For Loop Group
 
 Same shape as ForEach, but iterates over a numeric range instead of a list —
 **start**, **end**, **step**, and an **Include end value** toggle to control
 whether the range is inclusive. It shares the same **Execution Mode**,
-**results**, **skip**, and **break** machinery as ForEach.
+**results**, **skip**, **break**, and **Flatten Results** machinery as ForEach.
 
 ### Retry Group
 

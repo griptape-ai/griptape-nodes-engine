@@ -27,6 +27,11 @@ from griptape_nodes.retained_mode.events.connection_events import (
     DeleteConnectionRequest,
     DeleteConnectionResultSuccess,
 )
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartLocalSubflowRequest,
+    StartLocalSubflowResultFailure,
+)
+from griptape_nodes.retained_mode.events.failure_tree import FailureTreeError, GroupFailure
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     CreateFlowResultSuccess,
@@ -84,7 +89,11 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
     the group, allowing it to seamlessly integrate into the DAG structure.
     """
 
-    _proxy_param_to_connections: dict[str, int]
+    # The proxy parameters this group made for connections into and out of it, which it removes once
+    # no connection runs through them.
+    _proxy_parameter_names: set[str]
+    # The proxy parameters whose two connections this group is making, which it keeps meanwhile.
+    _proxy_parameters_being_wired: set[str]
 
     def __init__(
         self,
@@ -92,6 +101,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         metadata: dict[Any, Any] | None = None,
         control_in: ControlParameterInput | None = None,
         control_out: ControlParameterOutput | None = None,
+        *,
+        inner_control_ports: bool = True,
     ) -> None:
         """Build the group with one entry port and one exit port.
 
@@ -102,6 +113,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 entry means something more specific passes its own labelled port, as ControlNode's
                 ``input_control_name`` does, rather than adding a second pair.
             control_out: The exit port. Defaults to ``group_exec_out`` ("Flow Out").
+            inner_control_ports: Whether to add On Start / Group Complete, the ports a member's control
+                wire uses inside the group. A group with its own inner control ports (a loop's On Each /
+                Loop Complete) or whose inner control inputs mean something else (a retry's Done /
+                Continue) passes False and sets ``inner_entry`` / ``inner_exit`` itself, or leaves them None.
         """
         super().__init__(name, metadata)
         self._dedupe_side_parameter_metadata()
@@ -121,6 +136,25 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.control_out = control_out
         self.add_parameter(self.control_out)
         self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.control_out.name)
+        # Inside the group, a member's control wire runs from inner_entry and into inner_exit; outside,
+        # the same wire meets control_in / control_out (see _connect_control_wire_through_group).
+        self.inner_entry: ControlParameterOutput | None = None
+        self.inner_exit: ControlParameterInput | None = None
+        if inner_control_ports:
+            self.inner_entry = ControlParameterOutput(
+                name="on_start",
+                display_name="On Start",
+                tooltip="Fires when the group starts. Connect it to the first node inside the group.",
+            )
+            self.add_parameter(self.inner_entry)
+            self._register_side_parameter(LEFT_PARAMETERS_KEY, self.inner_entry.name)
+            self.inner_exit = ControlParameterInput(
+                name="group_complete",
+                display_name="Group Complete",
+                tooltip="Connect the last node inside the group here.",
+            )
+            self.add_parameter(self.inner_exit)
+            self._register_side_parameter(RIGHT_PARAMETERS_KEY, self.inner_exit.name)
         self.execution_environment = Parameter(
             name="execution_environment",
             tooltip="Environment that the group should execute in",
@@ -130,8 +164,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             traits={Options(choices=get_library_names_with_publish_handlers(self.engine))},
         )
         self.add_parameter(self.execution_environment)
-        # Track mapping from proxy parameter name to (original_node, original_param_name)
-        self._proxy_param_to_connections = {}
+        self._proxy_parameter_names = set()
+        self._proxy_parameters_being_wired = set()
         if "execution_environment" not in self.metadata:
             self.metadata["execution_environment"] = {}
         self.metadata["execution_environment"]["Griptape Nodes Library"] = {
@@ -148,6 +182,70 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         # Add subprocess execution status component for real-time GUI updates
         self._add_subflow_execution_parameters()
+
+    @property
+    def _entry_wire_owner(self) -> tuple[str, str] | None:
+        """Which member's inner leg the outer control_in wire was drawn for.
+
+        (member_node_name, member_param_name), or None when the port carries no such wire (either
+        nothing has crossed the boundary yet, or the port is a loop's own Start Loop, wired directly
+        by the artist rather than by _connect_control_wire_through_group). Release and absorb read
+        this to decide whether the outer wire is theirs to move; a group's own permanent port is
+        never touched based on wire count alone. See _connect_control_wire_through_group.
+
+        Backed by self.metadata rather than a plain attribute, so it survives save/reopen: a fresh
+        Python object is built from saved metadata, and a plain attribute would always come back
+        None, silently reverting the "ungroup restores wiring" behavior this exists to provide.
+        """
+        owner = self.metadata.get("entry_wire_owner")
+        return tuple(owner) if owner is not None else None
+
+    @_entry_wire_owner.setter
+    def _entry_wire_owner(self, value: tuple[str, str] | None) -> None:
+        if value is None:
+            self.metadata.pop("entry_wire_owner", None)
+        else:
+            self.metadata["entry_wire_owner"] = list(value)
+
+    @property
+    def _exit_wire_owner(self) -> tuple[str, str] | None:
+        """Which member's inner leg the outer control_out wire was drawn for.
+
+        Same shape as _entry_wire_owner, for the exit side: see that property for the full
+        explanation of what is stored and why it is metadata-backed.
+        """
+        owner = self.metadata.get("exit_wire_owner")
+        return tuple(owner) if owner is not None else None
+
+    @_exit_wire_owner.setter
+    def _exit_wire_owner(self, value: tuple[str, str] | None) -> None:
+        if value is None:
+            self.metadata.pop("exit_wire_owner", None)
+        else:
+            self.metadata["exit_wire_owner"] = list(value)
+
+    def handle_child_node_rename(self, old_name: str, new_name: str) -> None:
+        """Keep a recorded wire owner pointing at a direct member after it is renamed.
+
+        _entry_wire_owner / _exit_wire_owner store (node_name, param_name) tuples, so a rename of
+        the member either one names would otherwise leave it stale -- release/absorb would then
+        fail to recognize the port as that member's. node_manager only calls a renamed node's
+        direct parent_group, and these tuples only ever reference a direct member of this group
+        (set from old_connection.target_node / old_connection.source_node in
+        _connect_control_wire_through_group, which is always a direct member), so no walk through
+        enclosing groups is needed here.
+
+        Args:
+            old_name: The child node's name before the rename
+            new_name: The child node's name after the rename
+        """
+        super().handle_child_node_rename(old_name, new_name)
+        entry_owner = self._entry_wire_owner
+        if entry_owner is not None and entry_owner[0] == old_name:
+            self._entry_wire_owner = (new_name, entry_owner[1])
+        exit_owner = self._exit_wire_owner
+        if exit_owner is not None and exit_owner[0] == old_name:
+            self._exit_wire_owner = (new_name, exit_owner[1])
 
     def _create_subflow(self) -> None:
         """Create the dedicated subflow that will hold this NodeGroup's nodes.
@@ -169,7 +267,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         request = CreateFlowRequest(
             flow_name=subflow_name,
             parent_flow_name=self._get_subflow_parent_flow_name(),
-            set_as_new_context=False,
             metadata=subflow_metadata,
         )
         result = self._handle_request_in_workflow(request)
@@ -383,9 +480,17 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             is_incoming: True if this is an incoming connection to the group
 
         Returns:
-            The newly created proxy parameter
+            A newly created proxy parameter for a data wire. For a control wire this is instead
+            self.control_in / self.control_out, the group's own pre-existing port -- every caller
+            must check for that (see the two call sites below) before treating the result as a
+            disposable proxy it owns a refcount on.
         """
-        # Clone the parameter with the new name
+        # A control wire crossing the boundary moves onto the group's own entry or exit port: the
+        # executor enters the group through control_in and continues from control_out, so a separate
+        # proxy would leave whatever is wired downstream unreached, and it would draw as a second
+        # Flow In / Flow Out. The wire then belongs to the group (see create_connections_for_proxy).
+        if isinstance(original_param, ControlParameter):
+            return self.control_in if is_incoming else self.control_out
 
         input_types = None
         output_type = None
@@ -422,6 +527,249 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self._register_side_parameter(side_key, proxy_param.name)
 
         return proxy_param
+
+    def get_next_control_output(self) -> Parameter | None:
+        # The exit port, stated outright: inner_entry is a control output too, so the base's
+        # first-control-output scan would depend on the order the ports were added in.
+        return self.control_out
+
+    def resolve_inner_entry_node(self) -> tuple[str | None, str | None]:
+        """Return (entry_node_name, entry_param_name) from the inner entry's connection, or (None, None).
+
+        The inner entry is On Each on a loop, On Start on a plain group, or nothing at all on a
+        group whose inner control inputs mean something else (a while-group's Done / Continue):
+        self.inner_entry is None there, and this falls back to implicit child-discovery the same way
+        an unconnected inner entry does.
+
+        Public (not an underscored helper) because NodeExecutor calls it too, to resolve the entry
+        node when publishing or packaging this group's subflow -- the proxy-hop-walking below is
+        not something a second call site should re-derive.
+        """
+        workflow = self._require_workflow()
+        if self.inner_entry is None:
+            return None, None
+        connections = workflow.flows.connections
+        # Use self.inner_entry.name instead of a literal so renames stay in sync.
+        # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
+        on_each_conns = connections.outgoing_index.get(self.name, {}).get(self.inner_entry.name, [])
+        if not on_each_conns:
+            return None, None
+        first_conn = connections.connections[on_each_conns[0]]
+        if first_conn.target_node.name == self.name:
+            # on_each is a proxy port on the group boundary. When the user wires on_each → a child node,
+            # two hops are stored: group→proxy (boundary edge) then proxy→child (internal edge).
+            # Follow both to find the actual entry node inside the group.
+            proxy_param = first_conn.target_parameter
+            proxy_conns = connections.outgoing_index.get(self.name, {}).get(proxy_param.name, [])
+            if proxy_conns:
+                # Control outputs are single-target, so index 0 is the only connection.
+                internal_conn = connections.connections[proxy_conns[0]]
+                if internal_conn.is_node_group_internal:
+                    return internal_conn.target_node.name, internal_conn.target_parameter.name
+            return None, None
+        return first_conn.target_node.name, first_conn.target_parameter.name
+
+    def _connect_control_wire_through_group(self, old_connection: Connection, *, is_incoming: bool) -> None:
+        """Re-draw a member's control wire that crosses the boundary as an outer leg and an inner leg.
+
+        Outside, the wire meets the group's own entry or exit port. Inside, it runs from inner_entry to
+        the member, or from the member to inner_exit. Each port carries one direction, so the inner leg
+        records which member the wire belongs to. A group without inner control ports gets the outer
+        leg only. Drawing the inner leg here is also what makes the outer leg this member's: release
+        and absorb only ever move the outer wire for the member recorded in _entry_wire_owner /
+        _exit_wire_owner, which this is the one place that sets.
+
+        inner_entry and control_out are both single-target ports, so drawing either leg when it is
+        already wired to a different member would silently delete that wire. A second pre-wired node
+        joining an already-populated group skips exactly that at-risk leg instead -- the member simply
+        falls back to implicit entry discovery (entry side) or stays off the group's exit port
+        (exit side), the same structural limit as two members both leading to the exit. The other leg
+        of the pair is never at risk: control_in is an input and inner_exit is an input, and neither
+        is single-target.
+
+        inner_exit specifically allows fan-in: every joiner on the exit side still gets its own inner
+        leg drawn into it, even when the port is already wired, because inner_exit is multi-target.
+        What that joiner must not get is the outer wire's ownership -- _exit_wire_owner only ever
+        transfers to the join that also won control_out (exit_already_wired is False), the same
+        condition that gates whether the outer leg itself gets drawn. A later joiner's inner leg must
+        never silently displace the real owner's claim on the outer wire, or release/absorb will later
+        look for an owner who no longer has the wire and leave it stranded on the group instead of
+        following whoever is actually left.
+
+        Goes through _create_connection, which raises if a connection could not be made, rather than
+        building CreateConnectionRequest objects and discarding the result: a failed connection must
+        not leave an owner recorded for a wire that does not exist. Ownership is set only once the
+        leg it names has actually been drawn, never ahead of the call that draws it.
+
+        Args:
+            old_connection: The member's connection that crossed the boundary, already deleted
+            is_incoming: True if the wire came into the group
+
+        Raises:
+            RuntimeError: If either leg could not be connected
+        """
+        connections = self._require_workflow().flows.connections
+        if is_incoming:
+            self._create_connection(
+                old_connection.source_node.name,
+                old_connection.source_parameter.name,
+                self.name,
+                self.control_in.name,
+            )
+            entry_already_wired = self.inner_entry is not None and connections.get_outgoing_connections_from_parameter(
+                self, self.inner_entry
+            )
+            if self.inner_entry is not None and not entry_already_wired:
+                self._create_connection(
+                    self.name,
+                    self.inner_entry.name,
+                    old_connection.target_node.name,
+                    old_connection.target_parameter.name,
+                    is_node_group_internal=True,
+                )
+                self._entry_wire_owner = (old_connection.target_node.name, old_connection.target_parameter.name)
+        else:
+            exit_already_wired = connections.get_outgoing_connections_from_parameter(self, self.control_out)
+            if not exit_already_wired:
+                self._create_connection(
+                    self.name,
+                    self.control_out.name,
+                    old_connection.target_node.name,
+                    old_connection.target_parameter.name,
+                )
+            if self.inner_exit is not None:
+                self._create_connection(
+                    old_connection.source_node.name,
+                    old_connection.source_parameter.name,
+                    self.name,
+                    self.inner_exit.name,
+                    is_node_group_internal=True,
+                )
+                if not exit_already_wired:
+                    self._exit_wire_owner = (old_connection.source_node.name, old_connection.source_parameter.name)
+
+    def _delete_connection(self, source: str, source_param: str, target: str, target_param: str) -> None:
+        # Goes through _handle_request_in_workflow, not a direct call to the manager's handler
+        # method, so the result is dispatched through Engine.handle_request and broadcast to
+        # connected clients -- a direct call creates the real connection change but never tells
+        # anyone it happened. See create_connections_for_proxy, which uses the same dispatch.
+        request = DeleteConnectionRequest(
+            source_parameter_name=source_param,
+            target_parameter_name=target_param,
+            source_node_name=source,
+            target_node_name=target,
+        )
+        result = self._handle_request_in_workflow(request)
+        if result.failed():
+            msg = f"{self.name}: Failed to delete connection from {source}.{source_param} to {target}.{target_param}: {result.result_details}"
+            raise RuntimeError(msg)
+
+    def _create_connection(
+        self, source: str, source_param: str, target: str, target_param: str, *, is_node_group_internal: bool = False
+    ) -> None:
+        # See the comment in _delete_connection: same dispatch, same reason.
+        request = CreateConnectionRequest(
+            source_parameter_name=source_param,
+            target_parameter_name=target_param,
+            source_node_name=source,
+            target_node_name=target,
+            is_node_group_internal=is_node_group_internal,
+        )
+        result = self._handle_request_in_workflow(request)
+        if result.failed():
+            msg = f"{self.name}: Failed to create connection from {source}.{source_param} to {target}.{target_param}: {result.result_details}"
+            raise RuntimeError(msg)
+
+    def _release_control_entry(self, member: BaseNode, member_param: str, connections: Connections) -> None:
+        """A member leaves: drop its On Start leg, and wire it straight to the group's caller if it owned it.
+
+        The group's entry port is only the departing member's to take if this is the member
+        _connect_control_wire_through_group drew it for — never from how many wires happen to sit on
+        the port, which on a loop is the loop's own trigger and has nothing to do with any one member.
+        """
+        if self.inner_entry is None:
+            return
+        self._delete_connection(self.name, self.inner_entry.name, member.name, member_param)
+        if self._entry_wire_owner != (member.name, member_param):
+            return
+        self._entry_wire_owner = None
+        outer = connections.get_incoming_connections_to_parameter(self, self.control_in)
+        if len(outer) != 1:
+            return
+        caller = outer[0]
+        self._delete_connection(caller.source_node.name, caller.source_parameter.name, self.name, self.control_in.name)
+        self._create_connection(caller.source_node.name, caller.source_parameter.name, member.name, member_param)
+
+    def _release_control_exit(self, member: BaseNode, member_param: str, connections: Connections) -> None:
+        """A member leaves: drop its Group Complete leg, and wire it straight to the group's successor if it owned it.
+
+        The group's exit port is only the departing member's to take if this is the member
+        _connect_control_wire_through_group drew it for — never from how many wires happen to sit on
+        the port, which on a loop is the loop's own completion signal and has nothing to do with any
+        one member.
+        """
+        if self.inner_exit is None:
+            return
+        self._delete_connection(member.name, member_param, self.name, self.inner_exit.name)
+        if self._exit_wire_owner != (member.name, member_param):
+            return
+        self._exit_wire_owner = None
+        if connections.get_incoming_connections_to_parameter(self, self.inner_exit):
+            return
+        outer = connections.get_outgoing_connections_from_parameter(self, self.control_out)
+        if len(outer) != 1:
+            return
+        successor = outer[0]
+        self._delete_connection(
+            self.name, self.control_out.name, successor.target_node.name, successor.target_parameter.name
+        )
+        self._create_connection(member.name, member_param, successor.target_node.name, successor.target_parameter.name)
+
+    def _absorb_control_entry(self, node: BaseNode, node_param: str, connections: Connections) -> None:
+        """The group's caller joins it: its wire into the entry port now goes straight to the member it led to.
+
+        Only the owned inner leg moves: an unowned one is the artist's own wiring of a loop's Start
+        Loop / On Each, not a pass-through this method is free to rewrite.
+        """
+        entered = []
+        if self.inner_entry is not None and self._entry_wire_owner is not None:
+            entered = connections.get_outgoing_connections_from_parameter(self, self.inner_entry)
+        self._delete_connection(node.name, node_param, self.name, self.control_in.name)
+        if connections.get_incoming_connections_to_parameter(self, self.control_in):
+            # Other callers still enter through the group, so the inner leg stays for them.
+            for leg in entered:
+                self._create_connection(node.name, node_param, leg.target_node.name, leg.target_parameter.name)
+            return
+        for leg in entered:
+            self._delete_connection(
+                self.name, leg.source_parameter.name, leg.target_node.name, leg.target_parameter.name
+            )
+            self._create_connection(node.name, node_param, leg.target_node.name, leg.target_parameter.name)
+        if entered:
+            self._entry_wire_owner = None
+
+    def _absorb_control_exit(self, node: BaseNode, node_param: str, connections: Connections) -> None:
+        """The group's successor joins it: the member that led to the exit port now goes straight to it.
+
+        Only the owned inner leg moves: inner_exit can carry other members' own wires too, and an
+        unowned leg is the artist's own wiring of a loop's Loop Complete, not a pass-through this
+        method is free to rewrite.
+        """
+        exited = []
+        if self.inner_exit is not None and self._exit_wire_owner is not None:
+            exited = [
+                connection
+                for connection in connections.get_incoming_connections_to_parameter(self, self.inner_exit)
+                if (connection.source_node.name, connection.source_parameter.name) == self._exit_wire_owner
+            ]
+        self._delete_connection(self.name, self.control_out.name, node.name, node_param)
+        for leg in exited:
+            self._delete_connection(
+                leg.source_node.name, leg.source_parameter.name, self.name, leg.target_parameter.name
+            )
+            self._create_connection(leg.source_node.name, leg.source_parameter.name, node.name, node_param)
+        if exited:
+            self._exit_wire_owner = None
 
     def get_all_nodes(self) -> dict[str, BaseNode]:
         """Collect this group's members and every node nested beneath them, at any depth.
@@ -486,14 +834,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             target_node_name=old_connection.target_node.name,
             is_node_group_internal=is_incoming,
         )
-        # Store the mapping from proxy parameter to original node/parameter
-        # only increment by 1, even though we're making two connections.
-        if proxy_parameter.name not in self._proxy_param_to_connections:
-            self._proxy_param_to_connections[proxy_parameter.name] = 2
-        else:
-            self._proxy_param_to_connections[proxy_parameter.name] += 2
-        self._handle_request_in_workflow(create_first_connection)
-        self._handle_request_in_workflow(create_second_connection)
+        # _create_proxy_parameter_for_connection returns the group's own control_in / control_out for
+        # a control wire, not a disposable proxy: a future caller that skips this check would track
+        # the port as a proxy below, and _cleanup_proxy_parameter would delete it off the node once
+        # no connection ran through it.
+        if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
+            self._connect_control_wire_through_group(old_connection, is_incoming=is_incoming)
+            return
+        self._wire_proxy(proxy_parameter, create_first_connection, create_second_connection)
 
     def unmap_node_connections(self, node: BaseNode, connections: Connections) -> None:  # noqa: C901
         """Remove tracking of an external connection, restore original connection, and clean up proxy parameter.
@@ -511,10 +859,13 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         for parameter_name, outgoing_connection_list in outgoing_connections.items():
             for outgoing_connection in outgoing_connection_list:
                 proxy_parameter = outgoing_connection.target_parameter
+                if proxy_parameter is self.inner_exit:
+                    self._release_control_exit(node, parameter_name, connections)
+                    continue
                 # get old connections first, since this will delete the proxy
                 remap_connections = connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
@@ -529,7 +880,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections from the proxy parameter
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
@@ -548,10 +899,13 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         for parameter_name, incoming_connection_list in incoming_connections.items():
             for incoming_connection in incoming_connection_list:
                 proxy_parameter = incoming_connection.source_parameter
+                if proxy_parameter is self.inner_entry:
+                    self._release_control_entry(node, parameter_name, connections)
+                    continue
                 # Get the incoming connections to the proxy parameter
                 remap_connections = connections.get_incoming_connections_to_parameter(self, proxy_parameter)
                 # Delete the internal connection
-                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
@@ -566,7 +920,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Now create the new connection! We need to get the connections to the proxy parameter
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
@@ -579,25 +933,53 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                         msg = f"{self.name}: Failed to create direct incoming connection from {connection.source_node.name}.{connection.source_parameter.name} to {node.name}.{parameter_name}: {create_result.result_details}"
                         raise RuntimeError(msg)
 
+    def _wire_proxy(
+        self,
+        proxy_parameter: Parameter,
+        create_first_connection: CreateConnectionRequest,
+        create_second_connection: CreateConnectionRequest,
+    ) -> None:
+        """Connect ``proxy_parameter`` on both sides, keeping it until both connections are made.
+
+        A connection that crosses another group's boundary too is remapped by that group as it is
+        made, which deletes it. Until the second connection is made, nothing would run through the
+        proxy, and `_cleanup_proxy_parameter` would remove it.
+        """
+        self._proxy_parameter_names.add(proxy_parameter.name)
+        self._proxy_parameters_being_wired.add(proxy_parameter.name)
+        try:
+            self._handle_request_in_workflow(create_first_connection)
+            self._handle_request_in_workflow(create_second_connection)
+        finally:
+            self._proxy_parameters_being_wired.discard(proxy_parameter.name)
+
     def _cleanup_proxy_parameter(self, proxy_parameter: Parameter, metadata_key: str) -> None:
-        """Clean up proxy parameter if it has no more connections.
+        """Remove a proxy parameter this group made once no connection runs through it.
+
+        Asks the connections that remain rather than counting them, so a connection made straight to
+        the proxy keeps it as well as one the group made.
 
         Args:
             proxy_parameter: The proxy parameter to potentially clean up
             metadata_key: The metadata key ('left_parameters' or 'right_parameters')
         """
-        if proxy_parameter.name not in self._proxy_param_to_connections:
+        if (
+            proxy_parameter.name not in self._proxy_parameter_names
+            or proxy_parameter.name in self._proxy_parameters_being_wired
+        ):
             return
-
-        self._proxy_param_to_connections[proxy_parameter.name] -= 1
-        if self._proxy_param_to_connections[proxy_parameter.name] == 0:
-            self.engine.node_manager.on_remove_parameter_from_node_request_in_workflow(
-                RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name),
-                self._require_workflow(),
-            )
-            del self._proxy_param_to_connections[proxy_parameter.name]
-            if metadata_key in self.metadata and proxy_parameter.name in self.metadata[metadata_key]:
-                self.metadata[metadata_key].remove(proxy_parameter.name)
+        connections = self._require_workflow().flows.connections
+        if connections.get_incoming_connections_to_parameter(
+            self, proxy_parameter
+        ) or connections.get_outgoing_connections_from_parameter(self, proxy_parameter):
+            return
+        self.engine.node_manager.on_remove_parameter_from_node_request(
+            RemoveParameterFromNodeRequest(node_name=self.name, parameter_name=proxy_parameter.name),
+            self._require_workflow(),
+        )
+        self._proxy_parameter_names.discard(proxy_parameter.name)
+        if metadata_key in self.metadata and proxy_parameter.name in self.metadata[metadata_key]:
+            self.metadata[metadata_key].remove(proxy_parameter.name)
 
     def _refresh_proxy_serializable(self, proxy_parameter: Parameter) -> None:
         """Save a proxy's value only if every inner parameter connected to it saves its own.
@@ -626,6 +1008,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         for parameter_name, outgoing_connection_list in outgoing_connections.items():
             for outgoing_connection in outgoing_connection_list:
                 proxy_parameter = outgoing_connection.target_parameter
+                if proxy_parameter is self.control_in:
+                    self._absorb_control_entry(node, parameter_name, connections)
+                    continue
                 remap_connections = connections.get_outgoing_connections_from_parameter(self, proxy_parameter)
 
                 # Check if proxy has other incoming connections besides this one
@@ -637,7 +1022,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from this node to proxy
-                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=parameter_name,
                         target_parameter_name=proxy_parameter.name,
@@ -652,7 +1037,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from this node to target nodes
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=parameter_name,
                             target_parameter_name=connection.target_parameter.name,
@@ -668,7 +1053,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete outgoing connections from proxy and clean up if no other incoming connections exist
                 if not other_incoming_exists:
                     for connection in remap_connections:
-                        delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                        delete_result = self.engine.flow_manager.on_delete_connection_request(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=connection.target_parameter.name,
@@ -694,6 +1079,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         for parameter_name, incoming_connection_list in incoming_connections.items():
             for incoming_connection in incoming_connection_list:
                 proxy_parameter = incoming_connection.source_parameter
+                if proxy_parameter is self.control_out:
+                    self._absorb_control_exit(node, parameter_name, connections)
+                    continue
                 remap_connections = connections.get_incoming_connections_to_parameter(self, proxy_parameter)
 
                 # Check if proxy has other outgoing connections besides this one
@@ -705,7 +1093,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 )
 
                 # Delete the connection from proxy to this node
-                delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                delete_result = self.engine.flow_manager.on_delete_connection_request(
                     DeleteConnectionRequest(
                         source_parameter_name=proxy_parameter.name,
                         target_parameter_name=parameter_name,
@@ -720,7 +1108,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
                 # Create direct connections from source nodes to this node
                 for connection in remap_connections:
-                    create_result = self.engine.flow_manager.on_create_connection_request_in_workflow(
+                    create_result = self.engine.flow_manager.on_create_connection_request(
                         CreateConnectionRequest(
                             source_parameter_name=connection.source_parameter.name,
                             target_parameter_name=parameter_name,
@@ -736,7 +1124,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 # Only delete incoming connections to proxy and clean up if no other outgoing connections exist
                 if not other_outgoing_exists:
                     for connection in remap_connections:
-                        delete_result = self.engine.flow_manager.on_delete_connection_request_in_workflow(
+                        delete_result = self.engine.flow_manager.on_delete_connection_request(
                             DeleteConnectionRequest(
                                 source_parameter_name=connection.source_parameter.name,
                                 target_parameter_name=proxy_parameter.name,
@@ -855,6 +1243,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         """
         # Pull in companions this group does not already hold, so a Start/End pair joins together.
         nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=False)
+        # A node already here has nothing to move and no wires to remap: it is confirmed as a member,
+        # not re-added. The editor re-sends every member after creating a group or loading a workflow.
+        already_members = [node for node in nodes if node.parent_group is self]
+        nodes = [node for node in nodes if node.parent_group is not self]
+        if not nodes:
+            return already_members
 
         # Reject impossible nesting and secure the subflow BEFORE touching any membership state:
         # both can fail, and a half-applied add leaves the group and its members disagreeing about
@@ -891,7 +1285,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.remap_to_internal(nodes, connections)
         self._map_external_connections_for_nodes(nodes, connections, node_names_in_group)
 
-        return nodes
+        return already_members + nodes
 
     def _expand_with_tethered_nodes(self, nodes: list[BaseNode], *, companion_must_be_member: bool) -> list[BaseNode]:
         """Expand a node list with its tethered companions, so a Start/End pair is never split.
@@ -1285,14 +1679,13 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             is_node_group_internal=is_incoming,
         )
 
-        # Track connections for cleanup
-        if proxy_parameter.name not in self._proxy_param_to_connections:
-            self._proxy_param_to_connections[proxy_parameter.name] = 2
-        else:
-            self._proxy_param_to_connections[proxy_parameter.name] += 2
-
-        self._handle_request_in_workflow(create_first_connection)
-        self._handle_request_in_workflow(create_second_connection)
+        # Same check as in create_connections_for_proxy above, and for the same reason: this proxy
+        # may actually be the group's own control_in / control_out, which must never be tracked
+        # as a disposable proxy below.
+        if proxy_parameter is self.control_in or proxy_parameter is self.control_out:
+            self._connect_control_wire_through_group(old_connection, is_incoming=is_incoming)
+            return
+        self._wire_proxy(proxy_parameter, create_first_connection, create_second_connection)
 
     def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Move nodes back out to this group's own flow and stop claiming them.
@@ -1361,23 +1754,23 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         Can be called by concrete subclasses in their aprocess() implementation.
         """
-        from griptape_nodes.retained_mode.events.execution_events import (
-            StartLocalSubflowRequest,
-            StartLocalSubflowResultFailure,
-        )
-
         subflow = self.metadata.get("subflow_name")
         if subflow is not None and isinstance(subflow, str):
-            result = await self.engine.flow_manager.on_start_local_subflow_request_in_workflow(
-                StartLocalSubflowRequest(flow_name=subflow), self._require_workflow()
+            entry_node_name, _entry_param_name = self.resolve_inner_entry_node()
+            result = await self.engine.flow_manager.on_start_local_subflow_request(
+                StartLocalSubflowRequest(flow_name=subflow, start_node=entry_node_name), self._require_workflow()
             )
 
             if isinstance(result, StartLocalSubflowResultFailure):
                 # Clear partial outputs to prevent inconsistent state
                 self.parameter_output_values.clear()
                 # Re-raise the error message directly without wrapping
-                msg = result.result_details
-                raise RuntimeError(msg)
+                msg = str(result.result_details)
+                # When the subflow said which node failed, the group wraps that failure; otherwise the group itself is
+                # recorded as the node that failed.
+                if result.failure_tree is None:
+                    raise RuntimeError(msg)
+                raise FailureTreeError(GroupFailure(node_name=self.name, inner=result.failure_tree), msg)
 
         self._propagate_output_values_from_internal_nodes()
 

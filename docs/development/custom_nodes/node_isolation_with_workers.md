@@ -284,11 +284,11 @@ again.
 
 ## Configuration, secrets, and the current project propagate automatically
 
-The orchestrator broadcasts `ReloadConfigRequest` and
-`RefreshSecretsRequest` to every registered worker after a
-successful config or secret mutation. Each worker re-reads the
-shared on-disk files and updates its in-memory view. You do not need
-to wire this up; it happens automatically.
+The orchestrator broadcasts `ReloadConfigRequest` to every registered
+worker after a successful config mutation, and each worker re-reads
+the shared config file. A worker reads every secret from the
+orchestrator, so it always sees the current value. You do not need to
+wire this up; it happens automatically.
 
 The active **project** propagates the same way. A worker boots like
 the orchestrator: it re-derives the current project from the same
@@ -312,16 +312,28 @@ You do not need to wire any of this up. A worker never persists the
 project choice back to the shared config; the orchestrator is the
 single source of truth.
 
-A subtle point: operator-set OS environment variables (e.g., a
-container-injected `OPENAI_API_KEY`) are preserved across **refresh
-broadcasts** and **explicit deletes**. The worker's refresh re-reads
-the `.env` file but does not overwrite an operator-set value, and
-deleting a secret from the file does not pop a colliding OS env
-var.
+### Secrets and Griptape Cloud credentials
 
-`set_secret(...)` is the one path that does override an OS-set
-value, because it represents the user's stated intent. The engine
-logs a `WARNING` so the asymmetry is visible.
+- Read a secret with `GriptapeNodes.SecretsManager().get_secret(...)`. In a
+    worker it asks the orchestrator, which answers by its own precedence.
+- Get a Griptape Cloud credential from `resolve_cloud_credential` and pass
+    it to the driver yourself. In a worker it returns the credential the
+    orchestrator gives the worker.
+- Don't read `GRIPTAPE_NODES_LICENSE` or `GT_CLOUD_API_KEY` from
+    `os.environ`. They're empty in a worker. Griptape's Cloud drivers read
+    `GT_CLOUD_API_KEY` from `os.environ` when you don't pass `api_key`, so
+    always pass it.
+- Setting a secret from a worker fails. Set it on the orchestrator.
+
+```python
+from griptape.drivers.prompt.griptape_cloud import GriptapeCloudPromptDriver
+
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+api_key = resolve_cloud_credential(GriptapeNodes.SecretsManager())
+driver = GriptapeCloudPromptDriver(model="gpt-4.1", api_key=api_key)
+```
 
 ## Checklist
 

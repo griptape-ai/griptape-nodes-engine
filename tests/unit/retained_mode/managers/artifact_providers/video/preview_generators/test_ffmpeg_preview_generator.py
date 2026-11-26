@@ -3,8 +3,6 @@
 import asyncio
 import json
 import subprocess
-import tempfile
-from collections.abc import Generator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,10 +34,9 @@ async def _entry_names(directory: str) -> set[str]:
 
 
 @pytest.fixture
-def temp_test_video() -> Generator[str, None, None]:
+def temp_test_video(tmp_path: Path) -> str:
     """Create a temporary ProRes MOV test video using ffmpeg."""
-    with tempfile.NamedTemporaryFile(suffix=".mov", delete=False) as f:
-        temp_path = f.name
+    temp_path = str(tmp_path / "temp_test_video.mov")
 
     subprocess.run(  # noqa: S603
         [
@@ -58,18 +55,13 @@ def temp_test_video() -> Generator[str, None, None]:
         check=False,
     )
 
-    yield temp_path
-
-    temp_file = Path(temp_path)
-    if temp_file.exists():
-        temp_file.unlink()
+    return temp_path
 
 
 @pytest.fixture
-def temp_prores_video_with_extra_streams() -> Generator[str, None, None]:
+def temp_prores_video_with_extra_streams(tmp_path: Path) -> str:
     """Create a 10-bit 4:2:2 ProRes MOV carrying 5.1 audio and a timecode track."""
-    with tempfile.NamedTemporaryFile(suffix=".mov", delete=False) as f:
-        temp_path = f.name
+    temp_path = str(tmp_path / "temp_prores_video_with_extra_streams.mov")
 
     subprocess.run(  # noqa: S603
         [
@@ -102,29 +94,23 @@ def temp_prores_video_with_extra_streams() -> Generator[str, None, None]:
         check=False,
     )
 
-    yield temp_path
-
-    temp_file = Path(temp_path)
-    if temp_file.exists():
-        temp_file.unlink()
+    return temp_path
 
 
 @pytest.fixture
-def temp_output_dir() -> Generator[str, None, None]:
+def temp_output_dir(tmp_path: Path) -> str:
     """Create temporary output directory."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    return str(output_dir)
 
 
 @pytest.fixture
-def dummy_source_path() -> Generator[str, None, None]:
+def dummy_source_path(tmp_path: Path) -> str:
     """Create a dummy source path for parameter validation tests."""
-    with tempfile.NamedTemporaryFile(suffix=".mov", delete=False) as f:
-        temp_path = f.name
-    yield temp_path
-    temp_file = Path(temp_path)
-    if temp_file.exists():
-        temp_file.unlink()
+    temp_path = str(tmp_path / "dummy_source_path.mov")
+    Path(temp_path).touch()
+    return temp_path
 
 
 class TestFFmpegPreviewGeneratorParameters:

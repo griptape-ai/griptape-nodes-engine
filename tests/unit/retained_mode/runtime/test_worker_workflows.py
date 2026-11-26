@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -26,7 +26,7 @@ class _OrchestratorThatRecordsRequests:
     def __init__(self) -> None:
         self.forwarded: list[EventRequest] = []
 
-    async def request_from_worker(self, *, event_request: EventRequest, **_: Any) -> dict:
+    async def request_from_worker(self, event_request: EventRequest) -> dict:
         self.forwarded.append(event_request)
         msg = "recorded"
         raise RuntimeError(msg)
@@ -36,8 +36,6 @@ async def _forward_a_request(engine: Engine) -> EventRequest:
     orchestrator = _OrchestratorThatRecordsRequests()
     engine.event_manager.configure_worker_forwarding(
         request_client=orchestrator,  # type: ignore[arg-type]
-        orchestrator_request_topic="orchestrator",
-        worker_response_topic="worker",
         websocket_event_loop=asyncio.get_running_loop(),
     )
     with pytest.raises(RuntimeError, match="recorded"):
@@ -57,7 +55,7 @@ class TestWorkerWorkflows:
         assert not engine.context_manager.has_current_workflow()
         assert engine.current_workflow_or_none() is None
         # The heartbeat reports what is open.
-        assert engine._get_current_workflow_info()["current_workflow_id"] is None
+        assert engine._get_current_workflow_info()["open_workflows"] == []
         with engine.run_in_worker_workflow(workflow):
             assert engine.context_manager.get_current_workflow_id() == PEER_ID
             with pytest.raises(engine.context_manager.WorkflowAlreadyOpenError):

@@ -110,3 +110,24 @@ class TestChoicesDefault:
 
         assert param.ui_options["simple_dropdown"] == ["new"]
         assert "simple_dropdown" not in param.authored_ui_options()
+
+
+class TestKeepUnlistedChoices:
+    def test_keeps_unknown_value(self) -> None:
+        param = _parameter_with(Options(choices=CHOICES, keep_unlisted=True))
+
+        assert _convert(param, "chartreuse") == "chartreuse"
+
+    def test_accepts_unknown_value(self) -> None:
+        param = _parameter_with(Options(choices=CHOICES, keep_unlisted=True))
+
+        _validate(param, "chartreuse")
+
+    def test_offers_no_custom_entry(self) -> None:
+        options = Options(choices=CHOICES, keep_unlisted=True)
+
+        assert "allow_custom" not in options.ui_options_for_trait()
+
+    def test_is_not_saved(self) -> None:
+        """The node sets it, so a saved workflow must not turn it on or off."""
+        assert "keep_unlisted" not in Options(choices=CHOICES, keep_unlisted=True).to_state()

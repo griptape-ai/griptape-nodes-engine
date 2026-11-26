@@ -1,6 +1,7 @@
 """Base class for image metadata injection and extraction drivers."""
 
 from abc import ABC, abstractmethod
+from io import BytesIO
 
 from PIL import Image
 
@@ -41,6 +42,17 @@ class BaseImageMetadataDriver(ABC):
             Exception: On metadata injection failures
         """
         ...
+
+    def inject_metadata_into_bytes(self, data: bytes, metadata: dict[str, str]) -> bytes:
+        """Inject metadata into encoded image bytes.
+
+        The default opens the image with Pillow and delegates to `inject_metadata`, so
+        existing custom drivers need no changes. Drivers can override this hook to avoid
+        decoding and re-encoding pixels. The source image and buffer are closed on failure
+        as well as success; the returned bytes must not depend on either resource.
+        """
+        with BytesIO(data) as source, Image.open(source) as pil_image:
+            return self.inject_metadata(pil_image, metadata)
 
     @abstractmethod
     def extract_metadata(self, pil_image: Image.Image) -> dict[str, str]:

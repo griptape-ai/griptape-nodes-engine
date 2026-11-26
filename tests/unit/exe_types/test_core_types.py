@@ -15,6 +15,9 @@ from griptape_nodes.exe_types.core_types import (
     ParameterType,
     Trait,
 )
+from griptape_nodes.exe_types.elements.parameter import diff_parameters
+from griptape_nodes.traits.options import Options
+from griptape_nodes.traits.slider import Slider
 
 # No badge by default; elements send badge: null until set_badge() is called.
 NO_BADGE = None
@@ -257,6 +260,23 @@ class TestBaseNodeElement:
     def test_find_elements_by_type(self, ui_element: BaseNodeElement, element_type: type, num_expected: int) -> None:
         elements = ui_element.find_elements_by_type(element_type)
         assert len(elements) == num_expected
+
+    def test_find_element_by_type_and_name_returns_the_first_in_tree_order(self) -> None:
+        with BaseNodeElement() as root:
+            with ParameterGroup(name="shared"):
+                first = _make_param("shared")
+            second = _make_param("shared")
+
+        assert root.find_element_by_type_and_name(Parameter, "shared") is first
+        assert root.find_elements_by_type(Parameter) == [first, second]
+
+    def test_find_element_by_type_and_name_skips_other_types(self) -> None:
+        with BaseNodeElement() as root:
+            ParameterGroup(name="shared")
+            parameter = _make_param("shared")
+
+        assert root.find_element_by_type_and_name(Parameter, "shared") is parameter
+        assert root.find_element_by_type_and_name(Parameter, "missing") is None
 
     def test_remove_child(self, ui_element: BaseNodeElement) -> None:
         element_to_remove = ui_element.find_element_by_id("leaf1")
@@ -543,6 +563,61 @@ class TestParameter:
         param.deprecation = "Use 'entries' instead."
 
         assert param.to_dict()["deprecation"] == "Use 'entries' instead."
+
+    def test_traits_go_in_the_same_order_every_time(self) -> None:
+        # A set of traits iterates in an order that varies from one set to the next.
+        orders = {
+            tuple(
+                type(trait).__name__
+                for trait in _make_param(
+                    traits={Slider(min_val=0, max_val=1), Options(choices=["a"])}
+                ).find_elements_by_type(Trait)
+            )
+            for _ in range(20)
+        }
+
+        assert orders == {("Options", "Slider")}
+
+    def test_traits_of_one_kind_go_in_the_same_order_every_time(self) -> None:
+        orders = {
+            tuple(
+                tuple(trait.choices)
+                for trait in _make_param(
+                    traits={Options(choices=["a"]), Options(choices=["b"]), Options(choices=["c"])}
+                ).find_elements_by_type(Options)
+            )
+            for _ in range(20)
+        }
+
+        assert orders == {(("a",), ("b",), ("c",))}
+
+
+class TestDiffParameters:
+    def test_traits_in_another_order_are_no_difference(self) -> None:
+        """A parameter's traits are a set, so two builds of one node can list them in either order."""
+        built = _make_param()
+        built.add_trait(Slider(min_val=0, max_val=10))
+        built.add_trait(Options(choices=["a"]))
+        current = _make_param()
+        current.add_trait(Options(choices=["a"]))
+        current.add_trait(Slider(min_val=0, max_val=10))
+
+        assert "traits" not in diff_parameters(built, current)
+
+    def test_a_changed_trait_in_another_order_is_still_a_difference(self) -> None:
+        built = _make_param()
+        built.add_trait(Slider(min_val=0, max_val=10))
+        built.add_trait(Options(choices=["a"]))
+        current = _make_param()
+        current.add_trait(Options(choices=["a"]))
+        current.add_trait(Slider(min_val=0, max_val=5))
+
+        diff = diff_parameters(built, current)
+
+        assert diff["traits"] == [
+            {"trait_name": "Options", "trait_module": "griptape_nodes.traits.options", "trait_state": {}},
+            {"trait_name": "Slider", "trait_module": "griptape_nodes.traits.slider", "trait_state": {"max_val": 5}},
+        ]
 
 
 def _make_param(name: str = "test_param", **kwargs) -> Parameter:

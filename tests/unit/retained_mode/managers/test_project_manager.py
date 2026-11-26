@@ -52,7 +52,6 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectManager
-from griptape_nodes.retained_mode.runtime.binding import WorkflowNotNamedError
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 
@@ -5364,11 +5363,10 @@ class TestProjectManagerProjectWorkspaces:
     @pytest.mark.asyncio
     async def test_project_workspaces_overrides_workspace(self, tmp_path: Path) -> None:
         """Test that a matching project_workspaces entry calls set_workspace_override with the mapped value."""
-        import tempfile
-
         project_file = tmp_path / "project.yml"
         project_file.touch()
-        workspace_dir = Path(tempfile.mkdtemp())
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
 
         mock_config = Mock()
         mock_config.project_config = {}
@@ -5390,11 +5388,10 @@ class TestProjectManagerProjectWorkspaces:
     @pytest.mark.asyncio
     async def test_project_workspaces_key_resolved_before_lookup(self, tmp_path: Path) -> None:
         """Test that project_workspaces keys are resolved before matching, so symlinks and relative paths work."""
-        import tempfile
-
         project_file = tmp_path / "project.yml"
         project_file.touch()
-        workspace_dir = Path(tempfile.mkdtemp())
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
 
         mock_config = Mock()
         mock_config.project_config = {}
@@ -6236,12 +6233,12 @@ class TestProjectManagerProjectWorkspaces:
         failure = SetCurrentProjectResultFailure(result_details="engine_version mismatch")
         calls: list[str] = []
 
-        async def fake_activate(project_id: str) -> _ProjectActivationOutcome:
+        async def fake_activate(project_id: str, *, restoring_previous: bool = False) -> _ProjectActivationOutcome:  # noqa: ARG001
             calls.append(project_id)
             # First call (the requested target) fails; the rollback to previous succeeds.
             if len(calls) == 1:
-                return _ProjectActivationOutcome(failure=failure, workspace_changed=False)
-            return _ProjectActivationOutcome(failure=None, workspace_changed=False)
+                return _ProjectActivationOutcome(failure=failure, closed_workflows=False)
+            return _ProjectActivationOutcome(failure=None, closed_workflows=False)
 
         with patch.object(pm, "_activate_project", side_effect=fake_activate):
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(target_file)))
@@ -6288,12 +6285,12 @@ class TestProjectManagerProjectWorkspaces:
         failure = SetCurrentProjectResultFailure(result_details="boot failure")
         calls: list[str] = []
 
-        async def fake_activate(project_id: str) -> _ProjectActivationOutcome:
+        async def fake_activate(project_id: str, *, restoring_previous: bool = False) -> _ProjectActivationOutcome:  # noqa: ARG001
             calls.append(project_id)
             # First call (the requested target) fails; the rollback to the rest state succeeds.
             if len(calls) == 1:
-                return _ProjectActivationOutcome(failure=failure, workspace_changed=False)
-            return _ProjectActivationOutcome(failure=None, workspace_changed=False)
+                return _ProjectActivationOutcome(failure=failure, closed_workflows=False)
+            return _ProjectActivationOutcome(failure=None, closed_workflows=False)
 
         with patch.object(pm, "_activate_project", side_effect=fake_activate):
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(target_file)))
@@ -7309,20 +7306,13 @@ class TestProjectEnvironmentVariableRecursion:
             os.environ.pop("A", None)
             os.environ.pop("B", None)
 
-    @pytest.mark.parametrize(
-        "open_workflows",
-        [
-            pytest.param(lambda: _HANDED_WORKFLOW, id="one open"),
-            pytest.param(Mock(side_effect=WorkflowNotNamedError("2 workflows are open")), id="several open"),
-        ],
-    )
-    def test_env_values_never_resolve_for_an_open_workflow(self, open_workflows: Any) -> None:
+    def test_env_values_never_resolve_for_an_open_workflow(self) -> None:
         """Environment values apply to the whole engine, so one using `{workflow_dir}` is skipped, never resolved."""
         pm = self._make_pm_with_template(environment={"ASSETS": "{workflow_dir}/assets", "PLAIN": "{workspace_dir}/x"})
         assert pm._current_project_id is not None
         project_info = pm._successfully_loaded_project_templates[pm._current_project_id]
         mock_engine = MagicMock()
-        mock_engine.only_open_workflow_or_none.side_effect = open_workflows
+        mock_engine.only_open_workflow_or_none.side_effect = lambda: _HANDED_WORKFLOW
         with patch.object(pm, "_engine", mock_engine):
             resolved = pm._resolve_project_env_values(project_info.template, project_info)
 
@@ -11463,7 +11453,7 @@ class TestProjectActivationAuthorizationCheckpoint:
         # project. The consumer allows it (returns None), so activation proceeds.
         checkpoint = cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint
         checkpoint.return_value = None
-        outcome = _ProjectActivationOutcome(failure=None, workspace_changed=False)
+        outcome = _ProjectActivationOutcome(failure=None, closed_workflows=False)
         with patch.object(project_manager, "_activate_project", new=AsyncMock(return_value=outcome)):
             result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
 

@@ -13,6 +13,7 @@ from griptape_nodes.common.manifests.manifest import (
     ModelProviderManifestEntry,
     ProjectTemplateManifestEntry,
 )
+from griptape_nodes.drivers.cloud_models import ENGINE_MODEL_CATALOG
 from griptape_nodes.node_library.library_declarations import ModelCatalogLibraryProperty
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -170,18 +171,22 @@ class ManifestManager(EngineScoped):
     async def _build_model_catalog_entries(
         self, library_names: list[str]
     ) -> tuple[list[ModelProviderManifestEntry], list[ModelManifestEntry]]:
-        """Aggregate the model catalog declared across the registered libraries.
+        """Aggregate the engine's own model catalog with the one declared across the registered libraries.
 
-        Each library may declare a ``ModelCatalogLibraryProperty`` (providers ->
-        models). Providers are deduplicated by ``provider_id`` and models by
-        ``model_id`` (first declaration wins), so the manifest carries one entry
-        per handle even when several libraries declare overlapping catalogs. A
-        library whose metadata cannot be resolved is skipped with a warning
-        rather than failing the whole manifest. Entries are sorted by id for
-        stable output.
+        The engine catalog (`ENGINE_MODEL_CATALOG`: chat/image models, plus
+        `ollama` / `lmstudio` / `custom_endpoint`) is added first, so it wins
+        first-declaration-wins dedup and the manifest shows its metadata for a
+        key a library also declares. Each library may then declare its own
+        ``ModelCatalogLibraryProperty`` (providers -> models). Providers are
+        deduplicated by ``provider_id`` and models by ``model_id``, so the
+        manifest carries one entry per handle even when several catalogs
+        overlap. A library whose metadata cannot be resolved is skipped with a
+        warning rather than failing the whole manifest. Entries are sorted by
+        id for stable output.
         """
         providers: dict[str, ModelProviderManifestEntry] = {}
         models: dict[str, ModelManifestEntry] = {}
+        self._add_catalog_entries(ENGINE_MODEL_CATALOG, providers, models)
         for name in library_names:
             metadata_result = await self.engine.ahandle_request(
                 GetLibraryMetadataRequest(library=name, broadcast_result=False)
@@ -196,29 +201,38 @@ class ManifestManager(EngineScoped):
             for declaration in metadata_result.metadata.declarations:
                 if not isinstance(declaration, ModelCatalogLibraryProperty):
                     continue
-                for provider_id, provider in declaration.providers.items():
-                    providers.setdefault(
-                        provider_id,
-                        ModelProviderManifestEntry(
-                            provider_id=provider_id,
-                            display_name=provider.display_name,
-                            terms_url=provider.terms_url,
-                        ),
-                    )
-                    for model_id, model in provider.models.items():
-                        models.setdefault(
-                            model_id,
-                            ModelManifestEntry(
-                                model_id=model_id,
-                                provider_id=provider_id,
-                                display_name=model.display_name,
-                                family=model.family,
-                                terms_url=model.terms_url,
-                            ),
-                        )
+                self._add_catalog_entries(declaration, providers, models)
         sorted_providers = [providers[key] for key in sorted(providers)]
         sorted_models = [models[key] for key in sorted(models)]
         return sorted_providers, sorted_models
+
+    @staticmethod
+    def _add_catalog_entries(
+        catalog: ModelCatalogLibraryProperty,
+        providers: dict[str, ModelProviderManifestEntry],
+        models: dict[str, ModelManifestEntry],
+    ) -> None:
+        """Add one catalog's providers and models into the running manifest dicts, first-declaration-wins."""
+        for provider_id, provider in catalog.providers.items():
+            providers.setdefault(
+                provider_id,
+                ModelProviderManifestEntry(
+                    provider_id=provider_id,
+                    display_name=provider.display_name,
+                    terms_url=provider.terms_url,
+                ),
+            )
+            for model_id, model in provider.models.items():
+                models.setdefault(
+                    model_id,
+                    ModelManifestEntry(
+                        model_id=model_id,
+                        provider_id=provider_id,
+                        display_name=model.display_name,
+                        family=model.family,
+                        terms_url=model.terms_url,
+                    ),
+                )
 
     def _build_project_template_entries(
         self, project_infos: list[ProjectTemplateInfo]

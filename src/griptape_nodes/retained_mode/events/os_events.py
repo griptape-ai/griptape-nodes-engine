@@ -654,6 +654,10 @@ class RenameFileRequest(RequestPayload):
         old_path: Current path of the file/directory to rename
         new_path: New path for the file/directory
         workspace_only: If True, constrain to workspace directory
+        overwrite: If True, replace whatever already exists at new_path. A file onto a file is
+            replaced in one step. When either side is a directory, the existing destination is
+            moved aside and only deleted once the rename succeeds, or put back if it fails.
+            If False, the request fails when new_path exists.
 
     Results: RenameFileResultSuccess | RenameFileResultFailure
     """
@@ -661,6 +665,7 @@ class RenameFileRequest(RequestPayload):
     old_path: str
     new_path: str
     workspace_only: bool | None = True
+    overwrite: bool = False
 
 
 @dataclass
