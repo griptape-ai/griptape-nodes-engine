@@ -28,6 +28,7 @@ from griptape_nodes.retained_mode.events.failure_tree import (
     LoopFailure,
     LoopReason,
     WorkflowNodeFailure,
+    WorkflowRecursionLimitError,
 )
 from griptape_nodes.retained_mode.events.node_error_details import (
     NodeErrorDetails,
@@ -37,10 +38,19 @@ from griptape_nodes.retained_mode.events.node_error_details import (
 from griptape_nodes.utils.budget_refusal import BUDGET_EXCEEDED_TYPE_NAME, BudgetExceededError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    import asyncio
+    from collections.abc import Iterator, Mapping, Sequence
 
 # How many distinct failure reasons a loop error message names before deferring to the log.
 MAX_REPORTED_ITERATION_FAILURES = 5
+
+# What a loop says about the iterations it cancelled when one ended it early.
+_CANCELLED_ITERATION_DETAIL = (
+    "Stopped because another iteration ran a workflow nested deeper than `max_workflow_recursion_depth` allows."
+)
+
+# A loop stops at the first iteration whose failure has one of these kinds.
+_EARLY_TERMINATION_KINDS = frozenset({FailureKind.RECURSION_LIMIT})
 
 # How many individual iteration numbers to name before switching to "(+N more)". Only reached when
 # the failed iterations are not a contiguous run, which is already summarised as "first-last".
@@ -116,13 +126,19 @@ def failure_tree_from_exception(
 ) -> FailureTree:
     """Classify the exception a node raised.
 
-    ``budget_halt`` is the halt the caller recognised behind the exception, if any.
+    ``budget_halt`` is the halt the caller recognised behind the exception, if any. A workflow refused
+    for nesting too deeply is a ``RECURSION_LIMIT`` leaf, which ends a loop early.
     """
     # The caller already recognised a budget halt behind this exception, so the leaf is the engine's wording of that
     # halt, not the exception's own text.
     if budget_halt is not None:
         details = build_engine_error_details(node_name, str(budget_halt), budget_halt)
         return FailureLeaf(node_name=node_name, kind=FailureKind.BUDGET_HALT, details=details)
+    # A workflow refused for nesting too deeply would be refused again on every later iteration, so it ends its
+    # loop early instead of being an ordinary raise.
+    if isinstance(exc, WorkflowRecursionLimitError):
+        details = build_node_error_details(node_name, exc)
+        return FailureLeaf(node_name=node_name, kind=FailureKind.RECURSION_LIMIT, details=details)
     if isinstance(exc, FailureTreeError) and exc.failure_tree.node_name == node_name:
         return exc.failure_tree
     # A FailureTreeError for another node is just text to this one, as a plain RuntimeError would be.
@@ -184,17 +200,77 @@ def execute_node_failure_error_from_result(
 
 
 def loop_failure_from_iterations(
-    loop_name: str, total_iterations: int, iteration_failures: list[IterationFailure]
+    loop_name: str,
+    total_iterations: int,
+    iteration_failures: list[IterationFailure],
+    iterations_run: int | None = None,
 ) -> LoopFailure:
-    """The failure of a loop that lost iterations, with one reason per distinct detail text."""
-    summary = _summarize_reasons(iteration_failures, MAX_REPORTED_ITERATION_FAILURES)
+    """The failure of a loop that lost iterations, with one reason per distinct detail text.
+
+    The failure that ended the loop early and the iterations cancelled because of it each go in their own
+    field. Every other failure shares the capped ``reasons``. ``iterations_run`` is given when a one-at-a-time loop
+    stopped early.
+
+    ``iteration_failures`` must be in iteration order. These follow the order each failure first appears in it:
+    the order of ``reasons`` and which of them the cap keeps, which early termination text gets the field of its
+    own, the failure each reason carries, and the log lines built from the same list. ``render_loop_message``
+    sorts all the reasons by first iteration itself, so its order does not depend on this.
+    """
+    cancelled = [failure for failure in iteration_failures if _is_cancelled(failure)]
+    early = [failure for failure in iteration_failures if _is_early_termination(failure)]
+    early_groups = _reason_groups(early)
+    # Only the first early termination text has a field of its own. Everything else, including a later
+    # early termination with a different text, shares the one cap on the reasons.
+    first_early: list[IterationFailure] = []
+    if early_groups:
+        first_early = early_groups[0].failures
+    # An iteration is left out here when it was cancelled or is already held in the early termination field, so no
+    # iteration is reported twice.
+    rest = [
+        failure
+        for failure in iteration_failures
+        if not _is_cancelled(failure) and all(failure is not other for other in first_early)
+    ]
+    summary = _summarize_reasons(rest, MAX_REPORTED_ITERATION_FAILURES)
+    reasons = _loop_reasons(summary.reported)
     return LoopFailure(
         node_name=loop_name,
-        reasons=_loop_reasons(summary),
+        reasons=reasons,
         total_iterations=total_iterations,
         failed_iterations=len(iteration_failures),
         omitted_reasons=summary.omitted_reasons,
         omitted_iterations=summary.omitted_iterations,
+        early_termination=_first_or_none(_loop_reasons(early_groups[:1])),
+        cancelled=_first_or_none(_loop_reasons(_reason_groups(cancelled))),
+        iterations_run=iterations_run,
+    )
+
+
+def loop_failure_from_while_iteration(
+    loop_name: str, iterations_run: int, iteration_failure: IterationFailure
+) -> LoopFailure:
+    """The failure of a while group that stopped at an iteration that ended it early.
+
+    A while group never meant to run a fixed number of iterations, so the totals are unset and the
+    iteration is the group's only reason.
+    """
+    reason = _loop_reasons(_reason_groups([iteration_failure]))[0]
+    return LoopFailure(
+        node_name=loop_name,
+        reasons=(),
+        total_iterations=None,
+        failed_iterations=None,
+        early_termination=reason,
+        iterations_run=iterations_run,
+    )
+
+
+def iteration_failure_from_cancellation(loop_name: str, iteration_index: int) -> IterationFailure:
+    """An iteration that was cancelled because another iteration ended its loop early."""
+    details = build_engine_error_details(loop_name, _CANCELLED_ITERATION_DETAIL, None)
+    failure_tree = FailureLeaf(node_name=loop_name, kind=FailureKind.CANCELLED, details=details)
+    return IterationFailure(
+        iteration_index=iteration_index, detail=_CANCELLED_ITERATION_DETAIL, failure_tree=failure_tree
     )
 
 
@@ -212,11 +288,13 @@ def renamed(failure_tree: FailureTree, names: Mapping[str, str]) -> FailureTree:
     if isinstance(failure_tree, GroupFailure):
         return replace(failure_tree, node_name=node_name, inner=renamed(failure_tree.inner, names))
     if isinstance(failure_tree, LoopFailure):
-        reasons = tuple(
-            replace(reason, failure_tree=_renamed_or_none(reason.failure_tree, names))
-            for reason in failure_tree.reasons
+        return replace(
+            failure_tree,
+            node_name=node_name,
+            reasons=tuple(_renamed_reason(reason, names) for reason in failure_tree.reasons),
+            early_termination=_renamed_optional_reason(failure_tree.early_termination, names),
+            cancelled=_renamed_optional_reason(failure_tree.cancelled, names),
         )
-        return replace(failure_tree, node_name=node_name, reasons=reasons)
     assert_never(failure_tree)
 
 
@@ -250,7 +328,6 @@ def render_error_details(failure_tree: FailureTree, *, text: str, node_name: str
     already has its details.
     """
     match failure_tree:
-        # A leaf already has its details, so a copy is returned rather than text-only details built from ``text``.
         case FailureLeaf():
             return copy.deepcopy(failure_tree.details)
         case WorkflowNodeFailure():
@@ -359,17 +436,33 @@ def render_loop_message(loop: LoopFailure) -> str:
     """Compose the RuntimeError message for a loop that lost iterations.
 
     This lands on the artist's node via the execution machine, so it leads with what was attempted and how
-    much was lost, then names the iterations and their reasons.
+    much was lost, then names the iterations and their reasons. A loop that stopped early says how many
+    iterations it never started, so they are not mistaken for ones that ran and passed.
+
+    The reasons are shown in the order each first appeared, whichever field they are held in. A while group
+    has no fixed number of iterations, so it says which iteration ended it and why.
     """
+    # A while group has no fixed number of iterations to count, so it says which iteration ended it instead.
+    if loop.total_iterations is None or loop.failed_iterations is None:
+        return _while_group_message(loop)
     summary = (
         f"Attempted to run all {loop.total_iterations} iterations of loop '{loop.node_name}'. "
         f"Failed because {loop.failed_iterations} of them did not finish."
     )
+    not_run = _iterations_not_run(loop.total_iterations, loop.iterations_run)
+    # The sentence says "iteration" for one that never started and "N iterations" for several.
+    if not_run == 1:
+        summary = f"{summary} The remaining iteration was not run."
+    elif not_run > 1:
+        summary = f"{summary} The remaining {not_run} iterations were not run."
+    all_reasons = _all_reasons(loop)
+    shown = all_reasons[:MAX_REPORTED_ITERATION_FAILURES]
+    left_out = all_reasons[MAX_REPORTED_ITERATION_FAILURES:]
     detail_lines = _loop_lines(
-        loop.reasons,
+        shown,
         total_iterations=loop.total_iterations,
-        omitted_reasons=loop.omitted_reasons,
-        omitted_iterations=loop.omitted_iterations,
+        omitted_reasons=loop.omitted_reasons + len(left_out),
+        omitted_iterations=loop.omitted_iterations + sum(_iteration_count(reason) for reason in left_out),
     )
     if not detail_lines:
         return summary
@@ -394,11 +487,55 @@ def format_iteration_failure_lines(
     """
     summary = _summarize_reasons(iteration_failures, max_lines)
     return _loop_lines(
-        _loop_reasons(summary),
+        _loop_reasons(summary.reported),
         total_iterations=total_iterations,
         omitted_reasons=summary.omitted_reasons,
         omitted_iterations=summary.omitted_iterations,
     )
+
+
+# --- Queries ---
+
+
+def has_early_termination(failure_tree: FailureTree) -> bool:
+    """Whether the failure ends the loop it happened in early, by itself or through what it holds.
+
+    A loop answers from its own ``early_termination`` and is not searched, so a walk stays linear.
+    """
+    match failure_tree:
+        case LoopFailure():
+            # The loop's own field already answers for everything inside it, so the walk stays linear.
+            return failure_tree.early_termination is not None
+        case WorkflowNodeFailure() | GroupFailure():
+            # A Workflow node or group fails because of what is inside it, so it ends the loop early only if that does.
+            return has_early_termination(failure_tree.inner)
+        case FailureLeaf():
+            return failure_tree.kind in _EARLY_TERMINATION_KINDS
+        case _:
+            assert_never(failure_tree)
+
+
+def iterations_run_before_early_termination(iteration_failures: list[IterationFailure]) -> int | None:
+    """How many iterations a one-at-a-time loop got through when it stopped early, else None."""
+    if not iteration_failures:
+        return None
+    last_failure = iteration_failures[-1]
+    # A loop that stops early stops at the failure that ended it, so only the last failure can be that one.
+    if last_failure.failure_tree is None or not has_early_termination(last_failure.failure_tree):
+        return None
+    return last_failure.iteration_index + 1
+
+
+def task_hit_early_termination(task: asyncio.Future[IterationOutcome]) -> bool:
+    """Whether a finished iteration task failed in a way that ends its loop early."""
+    # Checked before result(), which raises for a cancelled or failed task. cancelled() comes first because
+    # exception() raises on a cancelled task too.
+    if task.cancelled() or task.exception() is not None:
+        return False
+    outcome = task.result()
+    if outcome.failure_tree is None:
+        return False
+    return has_early_termination(outcome.failure_tree)
 
 
 # --- Helpers ---
@@ -421,13 +558,17 @@ class _ReasonSummary(NamedTuple):
 
 def _summarize_reasons(iteration_failures: list[IterationFailure], max_reasons: int) -> _ReasonSummary:
     """The first ``max_reasons`` distinct reasons, in the order they first appear, and what is left over."""
-    groups = [_ReasonGroup(detail, failures) for detail, failures in _group_by_detail(iteration_failures).items()]
+    groups = _reason_groups(iteration_failures)
     unreported = groups[max_reasons:]
     return _ReasonSummary(
         reported=groups[:max_reasons],
         omitted_reasons=len(unreported),
         omitted_iterations=sum(len(group.failures) for group in unreported),
     )
+
+
+def _reason_groups(iteration_failures: list[IterationFailure]) -> list[_ReasonGroup]:
+    return [_ReasonGroup(detail, failures) for detail, failures in _group_by_detail(iteration_failures).items()]
 
 
 def _group_by_detail(iteration_failures: list[IterationFailure]) -> dict[str, list[IterationFailure]]:
@@ -438,10 +579,21 @@ def _group_by_detail(iteration_failures: list[IterationFailure]) -> dict[str, li
     return groups
 
 
-def _loop_reasons(summary: _ReasonSummary) -> tuple[LoopReason, ...]:
-    """One reason per reported group, naming its iterations from 1 and carrying its first iteration's failure."""
+def _is_cancelled(iteration_failure: IterationFailure) -> bool:
+    failure_tree = iteration_failure.failure_tree
+    return isinstance(failure_tree, FailureLeaf) and failure_tree.kind is FailureKind.CANCELLED
+
+
+def _is_early_termination(iteration_failure: IterationFailure) -> bool:
+    if iteration_failure.failure_tree is None:
+        return False
+    return has_early_termination(iteration_failure.failure_tree)
+
+
+def _loop_reasons(groups: list[_ReasonGroup]) -> tuple[LoopReason, ...]:
+    """One reason per group, naming its iterations from 1 and carrying its first iteration's failure."""
     reasons = []
-    for group in summary.reported:
+    for group in groups:
         numbers = sorted(failure.iteration_index + 1 for failure in group.failures)
         reasons.append(
             LoopReason(
@@ -461,6 +613,52 @@ def _first_failure_tree(failures: list[IterationFailure]) -> FailureTree | None:
     return None
 
 
+def _first_or_none(reasons: tuple[LoopReason, ...]) -> LoopReason | None:
+    if not reasons:
+        return None
+    return reasons[0]
+
+
+def _first_iteration(reason: LoopReason) -> int:
+    return reason.iterations[0].first
+
+
+def _iteration_count(reason: LoopReason) -> int:
+    return sum(iteration_range.last - iteration_range.first + 1 for iteration_range in reason.iterations)
+
+
+def _iterations_not_run(total_iterations: int, iterations_run: int | None) -> int:
+    # Without a count, no iteration is reported as not run: either the loop did not stop early, or it ran its
+    # iterations all at once and reports the ones it stopped as cancelled instead.
+    if iterations_run is None:
+        return 0
+    return max(total_iterations - iterations_run, 0)
+
+
+def _all_reasons(loop: LoopFailure) -> list[LoopReason]:
+    """Every reason a loop holds, in the order each first appeared."""
+    reasons = list(loop.reasons)
+    # The early termination is held apart from ``reasons``, so it is added to get every reason.
+    if loop.early_termination is not None:
+        reasons.append(loop.early_termination)
+    # The cancelled iterations are held apart from ``reasons`` too.
+    if loop.cancelled is not None:
+        reasons.append(loop.cancelled)
+    return sorted(reasons, key=_first_iteration)
+
+
+def _while_group_message(loop: LoopFailure) -> str:
+    # Only a while group has no fixed number of iterations, and its LoopFailure is built only when it ended early, so
+    # both are set. Anything else is a bug in the caller.
+    if loop.early_termination is None or loop.iterations_run is None:
+        msg = "a loop without a fixed number of iterations only fails by ending early"
+        raise AssertionError(msg)
+    return (
+        f"Attempted to run iteration {loop.iterations_run} of while group '{loop.node_name}'. "
+        f"Failed because {loop.early_termination.detail}"
+    )
+
+
 def _ranges_of(sorted_numbers: list[int]) -> tuple[IterationRange, ...]:
     """Collapse ascending iteration numbers into runs of consecutive ones."""
     ranges: list[IterationRange] = []
@@ -473,7 +671,7 @@ def _ranges_of(sorted_numbers: list[int]) -> tuple[IterationRange, ...]:
 
 
 def _loop_lines(
-    reasons: tuple[LoopReason, ...],
+    reasons: Sequence[LoopReason],
     *,
     total_iterations: int | None,
     omitted_reasons: int,
@@ -542,6 +740,9 @@ def _failure_path(failure_tree: FailureTree) -> list[FailureTree]:
     whose iterations failed for exactly one reason that says what failed. It ends at a leaf, and at a
     loop whose iterations failed for several reasons or for one that says nothing more, because no one
     node explains such a loop.
+
+    A loop that was ended early is explained by what ended it, however many other reasons it holds, so
+    the path continues through its early termination.
     """
     path = [failure_tree]
     current = failure_tree
@@ -554,14 +755,17 @@ def _failure_path(failure_tree: FailureTree) -> list[FailureTree]:
 
 
 def _reported_child(failure_tree: FailureTree) -> FailureTree | None:
-    # A leaf has nothing inside it. A Workflow node or group fails because of its inner failure. A loop is explained
-    # by its reason when it has exactly one.
+    # A leaf has nothing inside it. A Workflow node or group fails because of its inner
+    # failure. A loop is explained by what ended it early, otherwise by its reason when it has exactly one.
     match failure_tree:
         case FailureLeaf():
             return None
         case WorkflowNodeFailure() | GroupFailure():
             return failure_tree.inner
         case LoopFailure():
+            # What ended the loop early explains it, however many other reasons it holds.
+            if failure_tree.early_termination is not None:
+                return failure_tree.early_termination.failure_tree
             # A single reason says which failure explains the loop. With several, no one node does, so the path ends at
             # the loop.
             if len(failure_tree.reasons) == 1:
@@ -572,7 +776,11 @@ def _reported_child(failure_tree: FailureTree) -> FailureTree | None:
 
 
 def _workflow_depth(path: list[FailureTree]) -> int:
-    """How many Workflow nodes a path of failures passes through."""
+    """How many Workflow nodes a path of failures passes through.
+
+    A leaf named after a Workflow node, such as the refusal to load that node's workflow, is not a
+    Workflow node that ran, so it is not counted.
+    """
     return sum(1 for step in path if isinstance(step, WorkflowNodeFailure))
 
 
@@ -616,10 +824,16 @@ def _format_path(names: list[str]) -> str:
     return FAILED_NODE_PATH_SEPARATOR.join(shown)
 
 
-def _renamed_or_none(failure_tree: FailureTree | None, names: Mapping[str, str]) -> FailureTree | None:
-    if failure_tree is None:
+def _renamed_reason(reason: LoopReason, names: Mapping[str, str]) -> LoopReason:
+    if reason.failure_tree is None:
+        return reason
+    return replace(reason, failure_tree=renamed(reason.failure_tree, names))
+
+
+def _renamed_optional_reason(reason: LoopReason | None, names: Mapping[str, str]) -> LoopReason | None:
+    if reason is None:
         return None
-    return renamed(failure_tree, names)
+    return _renamed_reason(reason, names)
 
 
 def _as_plain_exception(exc: BaseException) -> BaseException:

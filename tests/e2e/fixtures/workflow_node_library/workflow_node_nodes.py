@@ -1,10 +1,10 @@
 """Fixture nodes for the workflow-backed node e2e test.
 
 Provides the Start Flow / End Flow pair and a transform node that ``shout_workflow.py`` wires
-together, plus ``CountdownNode``, a branching node that the countdown fixtures use to stop their
-nesting, ``FailingNode``, which always raises, ``IndexFailingNode``, which raises a different
-error for even and odd indexes, and ``FixtureGroupNode``, a group that runs its members. The
-library JSON declares ``shout_workflow.py`` in its ``workflow_nodes`` list, so
+together, plus ``CountdownNode``, a branching node that ``countdown_workflow.py`` uses to stop
+its own recursion, ``FailingNode``, which always raises, ``IndexFailingNode``, which raises a
+different error for even and odd indexes, and ``FixtureGroupNode``, a group that runs its
+members. The library JSON declares ``shout_workflow.py`` in its ``workflow_nodes`` list, so
 registering this library also produces a ``ShoutWorkflow`` node type generated from the workflow
 file.
 """

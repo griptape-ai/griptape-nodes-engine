@@ -41,6 +41,7 @@ from griptape_nodes.retained_mode.events.failure_tree import (
     FailureLeaf,
     FailureTreeError,
     WorkflowNodeFailure,
+    WorkflowRecursionLimitError,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -702,6 +703,25 @@ class TestAprocessSubflowFailure:
         workflow_node._collect_outputs.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_a_refused_workflow_node_inside_is_the_node_that_failed_and_adds_no_depth(
+        self, workflow_node: Mock
+    ) -> None:
+        early = FailureLeaf(
+            node_name="Inner", kind=FailureKind.RECURSION_LIMIT, details=NodeErrorDetails(message="too deep")
+        )
+        self.run_with(
+            workflow_node, StartLocalSubflowResultFailure(result_details="did not finish").attach_failure_tree(early)
+        )
+
+        with pytest.raises(FailureTreeError) as raised:
+            await WorkflowNode.aprocess(workflow_node)
+
+        assert raised.value.failure_tree == WorkflowNodeFailure(node_name="Outer", inner=early)
+        assert str(raised.value) == (
+            "Attempted to run the workflow behind node 'Outer'. Failed because node 'Inner' inside it failed: too deep"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_failure_that_names_no_node_is_reported_by_its_text(self, workflow_node: Mock) -> None:
         self.run_with(workflow_node, StartLocalSubflowResultFailure(result_details="could not start"))
 
@@ -762,6 +782,29 @@ class TestLoadSubflowImportFailure:
             await WorkflowNode._load_subflow(workflow_node)
 
         assert not isinstance(raised.value, FailureTreeError)
+
+    @pytest.mark.asyncio
+    async def test_a_recursion_refusal_is_an_early_termination_named_after_the_node(self, workflow_node: Mock) -> None:
+        refusal = WorkflowRecursionLimitError("too deep")
+        workflow_node._ahandle_request_in_workflow.return_value = ImportWorkflowAsReferencedSubFlowResultFailure(
+            result_details="too deep", exception=refusal
+        )
+
+        with pytest.raises(FailureTreeError) as raised:
+            await WorkflowNode._load_subflow(workflow_node)
+
+        assert raised.value.failure_tree == FailureLeaf(
+            node_name="Outer",
+            kind=FailureKind.RECURSION_LIMIT,
+            details=NodeErrorDetails(
+                message="too deep",
+                exception_type="griptape_nodes.retained_mode.events.failure_tree.WorkflowRecursionLimitError",
+            ),
+        )
+        assert str(raised.value) == (
+            "Attempted to load the workflow behind node 'Outer'. "
+            "Failed because the workflow could not be loaded: too deep"
+        )
 
     @pytest.mark.asyncio
     async def test_the_import_request_does_not_log_the_failure_the_node_reports(self, workflow_node: Mock) -> None:
