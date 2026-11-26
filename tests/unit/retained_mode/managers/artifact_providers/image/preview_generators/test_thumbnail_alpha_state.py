@@ -22,7 +22,9 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     RegisterArtifactProviderResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import MacroPath
-from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import ImageArtifactProvider
+from griptape_nodes.retained_mode.managers.artifact_providers.image.openimageio_artifact_provider import (
+    OpenImageIOArtifactProvider,
+)
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.openimageio_thumbnail_generator import (
     OpenImageIOThumbnailGenerator as ThumbnailGenerator,
 )
@@ -52,7 +54,7 @@ async def test_associated_tiff_preview_has_straight_colour(  # noqa: PLR0913, PL
     source = tmp_path / "associated.tiff"
     written = image.write(str(source), datatype, "tiff")
     assert written
-    registration = engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
+    registration = engine.handle_request(RegisterArtifactProviderRequest(provider_class=OpenImageIOArtifactProvider))
     assert isinstance(registration, RegisterArtifactProviderResultSuccess)
     engine.config_manager.set_config_value("auto_inject_workflow_metadata", False)
 

@@ -40,7 +40,8 @@ customize all of it.
 
 ## Thumbnail precision
 
-The engine selects its standard thumbnail backend at startup and logs its name at INFO level.
+The engine selects its standard thumbnail backend at startup and logs the image provider variant
+at INFO level when it first creates the provider.
 It uses OpenImageIO when installed and Pillow otherwise; selection remains fixed until restart.
 Install `griptape-nodes-engine[openimageio]` to enable OpenImageIO. App packaging is updated
 separately, so the app's dependency declaration determines whether the extra is installed.
@@ -88,9 +89,8 @@ in the original file.
 
 ### Generator-level format support
 
-With the OpenImageIO backend, node library authors using `ThumbnailGenerator` directly can use
-source extensions from an
-explicit image-plugin allowlist, filtered for installed OpenImageIO input plugins. This includes
+Node library authors using `OpenImageIOThumbnailGenerator` directly can use source extensions
+from an explicit image-plugin allowlist, filtered for installed OpenImageIO input plugins. This includes
 formats such as OpenEXR, Radiance HDR and DPX when their readers are installed.
 
 The built-in Image provider and engine preview requests still accept PNG, JPEG, GIF, BMP,

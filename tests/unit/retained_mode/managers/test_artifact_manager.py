@@ -1890,8 +1890,8 @@ class TestProviderRegistrationConfigLogLevels:
         from griptape_nodes.retained_mode.events.config_events import (
             GetConfigCategoryRequest,
         )
-        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
-            ThumbnailGenerator,
+        from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
+            PILThumbnailGenerator,
         )
 
         manager = ArtifactManager(engine=Mock())
@@ -1902,7 +1902,7 @@ class TestProviderRegistrationConfigLogLevels:
             return engine.handle_request(request)
 
         manager.engine.handle_request = capture_requests
-        manager._read_generator_config(ImageArtifactProvider, ThumbnailGenerator)
+        manager._read_generator_config(ImageArtifactProvider, PILThumbnailGenerator)
 
         category_requests = [r for r in captured_requests if isinstance(r, GetConfigCategoryRequest)]
         assert len(category_requests) == 1

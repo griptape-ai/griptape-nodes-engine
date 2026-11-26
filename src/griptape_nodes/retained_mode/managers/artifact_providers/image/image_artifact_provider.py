@@ -50,11 +50,7 @@ class ImageArtifactMetadata(BaseArtifactMetadata):
 
 
 class ImageArtifactProvider(BaseArtifactProvider):
-    """Provider for image artifacts.
-
-    Instance attributes may hold heavyweight image processing dependencies
-    (e.g., PIL/Pillow) that are loaded lazily when the provider is instantiated.
-    """
+    """Provider for image artifacts using Pillow for standard thumbnails and source metadata."""
 
     def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
         """Initialize the image artifact provider.
@@ -64,6 +60,8 @@ class ImageArtifactProvider(BaseArtifactProvider):
             engine: The engine this provider belongs to
         """
         super().__init__(registry, engine)
+        logger.info("Loaded Image artifact provider: Pillow")
+
 
     @classmethod
     def get_friendly_name(cls) -> str:
@@ -139,12 +137,13 @@ class ImageArtifactProvider(BaseArtifactProvider):
     @classmethod
     def get_default_preview_generators(cls) -> list[type[BaseArtifactPreviewGenerator]]:
         """Get default preview generator classes."""
+        # Project templates import this provider, and the generators import events that depend on those templates.
         from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators import (
             PILRoundedPreviewGenerator,
-            ThumbnailGenerator,
+            PILThumbnailGenerator,
         )
 
-        return [ThumbnailGenerator, PILRoundedPreviewGenerator]
+        return [PILThumbnailGenerator, PILRoundedPreviewGenerator]
 
     @classmethod
     def detect_format(cls, data: bytes) -> str | None:  # noqa: PLR0911

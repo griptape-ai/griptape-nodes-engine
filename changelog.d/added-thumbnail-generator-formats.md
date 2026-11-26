@@ -1,4 +1,4 @@
-- Direct `ThumbnailGenerator` calls using OpenImageIO accept additional formats, including EXR,
+- Direct `OpenImageIOThumbnailGenerator` calls accept additional formats, including EXR,
   HDR and DPX, when their OpenImageIO readers are installed; engine preview requests retain their
   existing formats.
   See [generator-level support](docs/guides/assets.md#generator-level-format-support).

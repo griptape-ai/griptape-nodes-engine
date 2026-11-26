@@ -2,17 +2,22 @@
 
 ## Thumbnail generator imports
 
-Use `ThumbnailGenerator` and `ThumbnailParameters` from `preview_generators.thumbnail_generator`
-for automatic backend selection. `PILThumbnailGenerator` remains available in
-`preview_generators.pil_thumbnail_generator` for callers that explicitly require Pillow.
-Replace imports of `PILThumbnailParameters` with the shared `ThumbnailParameters`. Both modules live under
-`griptape_nodes.retained_mode.managers.artifact_providers.image`.
+Startup registers the built-in `Image` provider with the standard thumbnail backend for the
+installed engine. Use `GeneratePreviewRequest` or `GeneratePreviewFromDefaultsRequest` with
+`Image` for automatic selection.
+
+For direct generator calls, import `PILThumbnailGenerator` from
+`preview_generators.pil_thumbnail_generator` or `OpenImageIOThumbnailGenerator` from
+`preview_generators.openimageio_thumbnail_generator`. Replace imports of
+`PILThumbnailParameters` with `ThumbnailParameters` from `preview_generators.thumbnail_parameters`.
+These modules live under `griptape_nodes.retained_mode.managers.artifact_providers.image`.
 
 The generator's friendly name remains "Standard Thumbnail Generation", so existing preview
 settings keep the same configuration key. OpenImageIO is optional: install
 `griptape-nodes-engine[openimageio]` to prefer it, or use a plain engine installation for Pillow.
-The engine logs the selected backend at startup. Pillow retains its existing format and
-16-bit colour decoding limitations; PNG metadata injection still preserves encoded pixels.
+The engine logs the image provider variant when it first creates the provider. Pillow retains its
+existing format and 16-bit colour decoding limitations; PNG metadata injection still preserves
+encoded pixels.
 
 ## Flow and node context belongs to the caller
 
