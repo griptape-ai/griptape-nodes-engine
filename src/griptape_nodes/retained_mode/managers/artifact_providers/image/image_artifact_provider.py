@@ -71,23 +71,6 @@ class ImageArtifactProvider(BaseArtifactProvider):
     # brand sits at offset 8-12, which is the longest header we inspect).
     _SNIFF_MIN_HEADER_BYTES: ClassVar[int] = 12
 
-    # Maps PIL image mode to (channels, color_space) for metadata reporting
-    _PIL_MODE_INFO: ClassVar[dict[str, tuple[int, str]]] = {
-        "L": (1, "Grayscale"),
-        "P": (1, "Palette"),
-        "RGB": (3, "RGB"),
-        "RGBA": (4, "RGBA"),
-        "CMYK": (4, "CMYK"),
-        "YCbCr": (3, "YCbCr"),
-        "LAB": (3, "LAB"),
-        "HSV": (3, "HSV"),
-        "I": (1, "Grayscale"),
-        "F": (1, "Grayscale"),
-        "LA": (2, "Grayscale+Alpha"),
-        "RGBa": (4, "RGBA"),  # spellchecker:disable-line
-        "RGBX": (4, "RGB"),
-    }
-
     @classmethod
     def get_supported_formats(cls) -> set[str]:
         return pillow.get_supported_source_formats()
@@ -98,11 +81,6 @@ class ImageArtifactProvider(BaseArtifactProvider):
         return file_extension.lstrip(".").lower() in cls.get_supported_formats()
 
     @classmethod
-    def get_mode_info(cls, mode: str) -> tuple[int, str]:
-        """Return (channels, color_space) for a PIL image mode, with a sensible fallback."""
-        return cls._PIL_MODE_INFO.get(mode, (3, mode))
-
-    @classmethod
     def get_artifact_metadata(cls, source_path: str) -> ImageArtifactMetadata | None:
         """Extract original image metadata via PIL's lazy header read (no full decode)."""
         try:
@@ -110,7 +88,7 @@ class ImageArtifactProvider(BaseArtifactProvider):
             with Image.open(path) as raw_img:
                 img = ImageOps.exif_transpose(raw_img)
                 width, height = img.size
-                channels, color_space = cls.get_mode_info(img.mode)
+                channels, color_space = pillow.get_mode_info(img.mode)
                 return ImageArtifactMetadata(
                     width=width,
                     height=height,
