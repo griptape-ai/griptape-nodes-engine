@@ -87,19 +87,19 @@ with more than four channels, PNG and WebP previews use the first four as red, g
 and alpha. JPEG previews use the first three as red, green and blue. Extra channels remain
 in the original file.
 
-### Generator-level format support
+### Standard thumbnail source formats
 
-Node library authors using `OpenImageIOThumbnailGenerator` directly can use source extensions
-from an explicit image-plugin allowlist, filtered for installed OpenImageIO input plugins. This includes
-formats such as OpenEXR, Radiance HDR and DPX when their readers are installed.
+With OpenImageIO installed, `GeneratePreviewRequest` and `GeneratePreviewFromDefaultsRequest`
+can generate standard thumbnails from formats such as OpenEXR, Radiance HDR and DPX when the
+corresponding readers are installed. The built-in `Image` provider and direct calls to
+`OpenImageIOThumbnailGenerator` use the same list of supported source extensions. Pillow standard
+thumbnails continue to support PNG, JPEG, GIF, BMP, WebP, TIFF and TGA.
 
-The built-in Image provider and engine preview requests still accept PNG, JPEG, GIF, BMP,
-WebP, TIFF and TGA. The additional generator formats are not yet available through
-`GeneratePreviewRequest` or `GeneratePreviewFromDefaultsRequest`. Provider registration,
-metadata inspection, permission checks and project-directory routing will be addressed in
-follow-up work under [#6180](https://github.com/griptape-ai/griptape-nodes-engine/issues/6180).
+Project directory routing, source metadata reading and Rounded Image Preview Generation keep
+their existing support. Follow-up work is tracked in
+[#6180](https://github.com/griptape-ai/griptape-nodes-engine/issues/6180).
 
-For direct OpenImageIO generator calls, EXR output shows the display window, preserving cropped-render
+For OpenImageIO standard thumbnails, EXR output shows the display window, preserving cropped-render
 placement and proportions. Overscan is excluded, and missing pixels appear black or transparent
 according to the source channels. Scene-linear sources such as EXR and HDR are converted to
 sRGB using the built-in colour configuration. Unsupported colour spaces, such as camera-log

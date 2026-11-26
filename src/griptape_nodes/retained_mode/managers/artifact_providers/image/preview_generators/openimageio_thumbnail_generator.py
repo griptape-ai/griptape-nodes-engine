@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from functools import cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
@@ -12,6 +11,7 @@ import OpenImageIO as oiio
 
 from griptape_nodes.drivers.image_metadata.png_chunks import read_png_text, rewrite_png_text_bytes
 from griptape_nodes.files.path_utils import canonicalize_for_io
+from griptape_nodes.retained_mode.managers.artifact_providers.image._backends import openimageio
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_parameters import (
@@ -22,32 +22,6 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_gene
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.thumbnail_parameters import (
     ThumbnailParameters,
-)
-
-SUPPORTED_SOURCE_PLUGINS = frozenset(
-    {
-        "bmp",
-        "cineon",
-        "dds",
-        "dpx",
-        "fits",
-        "gif",
-        "hdr",
-        "ico",
-        "jpeg",
-        "jpeg2000",
-        "jpegxl",
-        "openexr",
-        "png",
-        "pnm",
-        "psd",
-        "rla",
-        "sgi",
-        "softimage",
-        "targa",
-        "tiff",
-        "webp",
-    }
 )
 
 logger = logging.getLogger("griptape_nodes")
@@ -95,22 +69,7 @@ class OpenImageIOThumbnailGenerator(BaseThumbnailGenerator):
     @classmethod
     def get_supported_source_formats(cls) -> set[str]:
         """Source formats this generator can process."""
-        return set(cls._get_supported_source_formats())
-
-    @classmethod
-    @cache
-    def _get_supported_source_formats(cls) -> frozenset[str]:
-        """Discover installed input plugins once per generator class."""
-        extensions: set[str] = set()
-        for plugin in oiio.get_string_attribute("extension_list").split(";"):
-            format_name, _, format_extensions = plugin.partition(":")
-            if format_name not in SUPPORTED_SOURCE_PLUGINS:
-                continue
-            if oiio.ImageInput.create(format_name) is None:
-                oiio.geterror()
-                continue
-            extensions.update(format_extensions.split(","))
-        return frozenset(extensions)
+        return openimageio.get_supported_source_formats()
 
     @classmethod
     def get_supported_preview_formats(cls) -> set[str]:

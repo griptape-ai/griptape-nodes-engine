@@ -8,6 +8,7 @@ from PIL import Image, PngImagePlugin, UnidentifiedImageError
 from pytest_mock import MockerFixture
 
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import ImageArtifactProvider
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.pil_thumbnail_generator import (
     PILThumbnailGenerator,
 )
@@ -39,17 +40,9 @@ def test_standard_generator_contract(engine: Engine) -> None:
     assert generator.get_parameters() is ThumbnailParameters
     assert generator.params.max_width == 1024  # noqa: PLR2004 - Public default.
     assert generator.params.max_height == 1024  # noqa: PLR2004 - Public default.
-    assert generator.get_supported_source_formats() == {
-        "png",
-        "jpg",
-        "jpeg",
-        "gif",
-        "bmp",
-        "webp",
-        "tiff",
-        "tif",
-        "tga",
-    }
+    expected_source_formats = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "tga"}
+    assert ImageArtifactProvider.get_supported_formats() == expected_source_formats
+    assert generator.get_supported_source_formats() == expected_source_formats
     assert generator.get_supported_preview_formats() == {"png", "jpg", "webp"}
 
 

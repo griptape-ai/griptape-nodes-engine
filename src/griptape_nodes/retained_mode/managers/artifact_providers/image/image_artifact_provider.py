@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
     BaseArtifactMetadata,
     BaseArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image._backends import pillow
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.engine import Engine
@@ -62,7 +63,6 @@ class ImageArtifactProvider(BaseArtifactProvider):
         super().__init__(registry, engine)
         logger.info("Loaded Image artifact provider: Pillow")
 
-
     @classmethod
     def get_friendly_name(cls) -> str:
         return "Image"
@@ -90,7 +90,7 @@ class ImageArtifactProvider(BaseArtifactProvider):
 
     @classmethod
     def get_supported_formats(cls) -> set[str]:
-        return {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "tga"}
+        return pillow.get_supported_source_formats()
 
     @classmethod
     def supports_file_extension(cls, file_extension: str) -> bool:

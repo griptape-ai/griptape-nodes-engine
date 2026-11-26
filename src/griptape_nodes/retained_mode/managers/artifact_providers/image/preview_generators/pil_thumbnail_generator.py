@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from PIL import Image, ImageOps, PngImagePlugin
 
 from griptape_nodes.drivers.image_metadata.png_chunks import rewrite_png_text_bytes
+from griptape_nodes.retained_mode.managers.artifact_providers.image._backends import pillow
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.thumbnail_generator_base import (
     BaseThumbnailGenerator,
 )
@@ -107,7 +108,7 @@ class PILThumbnailGenerator(BaseThumbnailGenerator):
     @classmethod
     def get_supported_source_formats(cls) -> set[str]:
         """Return the nine ordinary image extensions supported by the original generator."""
-        return {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "tga"}
+        return pillow.get_supported_source_formats()
 
     @classmethod
     def get_supported_preview_formats(cls) -> set[str]:

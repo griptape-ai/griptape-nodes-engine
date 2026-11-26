@@ -14,9 +14,25 @@ except ModuleNotFoundError as error:
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
 
+from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.retained_mode.engine import Engine
+from griptape_nodes.retained_mode.events.artifact_events import (
+    GeneratePreviewRequest,
+    GeneratePreviewResultSuccess,
+    GetArtifactProviderDetailsRequest,
+    GetArtifactProviderDetailsResultSuccess,
+    GetPreviewGeneratorDetailsRequest,
+    GetPreviewGeneratorDetailsResultSuccess,
+    RegisterArtifactProviderRequest,
+    RegisterArtifactProviderResultSuccess,
+)
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, WriteFileRequest, WriteFileResultFailure
+from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.managers.artifact_providers.image._backends import openimageio
+from griptape_nodes.retained_mode.managers.artifact_providers.image.openimageio_artifact_provider import (
+    OpenImageIOArtifactProvider,
+)
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.openimageio_thumbnail_generator import (
     EXIF_ORIENTATION_FLIP_HORIZONTAL,
     EXIF_ORIENTATION_FLIP_VERTICAL,
@@ -39,7 +55,7 @@ class TestThumbnailGeneratorSourceFormats:
     """Discover readable formats from the installed OpenImageIO plugins."""
 
     def test_source_formats_follow_available_input_plugins(self, mocker: MockerFixture) -> None:
-        ThumbnailGenerator._get_supported_source_formats.cache_clear()
+        openimageio._discover_source_formats.cache_clear()
         mocker.patch.object(
             oiio,
             "get_string_attribute",
@@ -51,15 +67,19 @@ class TestThumbnailGeneratorSourceFormats:
         try:
             formats = ThumbnailGenerator.get_supported_source_formats()
             assert formats == {"png", "exr", "sxr"}
+            provider_formats = OpenImageIOArtifactProvider.get_supported_formats()
+            assert provider_formats == formats
             formats.clear()
+            provider_formats.clear()
             assert ThumbnailGenerator.get_supported_source_formats() == {"png", "exr", "sxr"}
+            assert OpenImageIOArtifactProvider.get_supported_formats() == {"png", "exr", "sxr"}
             assert create_input.call_args_list == [
                 mocker.call("png"),
                 mocker.call("openexr"),
                 mocker.call("jpegxl"),
             ]
         finally:
-            ThumbnailGenerator._get_supported_source_formats.cache_clear()
+            openimageio._discover_source_formats.cache_clear()
 
     def test_source_formats_exclude_unapproved_plugins(self) -> None:
         excluded_extensions = {"null", "nul", "term", "iff", "z", "zfile"}
@@ -70,6 +90,49 @@ class TestThumbnailGeneratorSourceFormats:
         previous_formats = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif", "tga"}
 
         assert previous_formats <= ThumbnailGenerator.get_supported_source_formats()
+
+
+@pytest.mark.asyncio
+async def test_registered_image_provider_previews_exr(engine: Engine, tmp_path: Path) -> None:
+    """The standard preview request accepts EXR and reports matching source formats."""
+    # Given an EXR and the registered OpenImageIO provider.
+    source = tmp_path / "source.exr"
+    image = oiio.ImageBuf(oiio.ImageSpec(8, 4, 3, oiio.HALF))
+    filled = oiio.ImageBufAlgo.fill(image, (0.25, 0.5, 0.75))
+    assert filled
+    written = image.write(str(source), oiio.HALF, "openexr")
+    assert written
+    registration = await engine.ahandle_request(
+        RegisterArtifactProviderRequest(provider_class=OpenImageIOArtifactProvider)
+    )
+    assert isinstance(registration, RegisterArtifactProviderResultSuccess)
+
+    # When clients query capabilities and request a standard preview.
+    provider = await engine.ahandle_request(GetArtifactProviderDetailsRequest(friendly_name="Image"))
+    generator = await engine.ahandle_request(
+        GetPreviewGeneratorDetailsRequest(
+            provider_friendly_name="Image", preview_generator_friendly_name="Standard Thumbnail Generation"
+        )
+    )
+    result = await engine.ahandle_request(
+        GeneratePreviewRequest(
+            macro_path=MacroPath(ParsedMacro(str(source)), {}), artifact_provider_name="Image", format="png"
+        )
+    )
+
+    # Then both details agree and the preview contains a readable PNG.
+    assert isinstance(provider, GetArtifactProviderDetailsResultSuccess)
+    assert isinstance(generator, GetPreviewGeneratorDetailsResultSuccess)
+    assert "exr" in provider.supported_formats
+    assert provider.supported_formats == generator.supported_source_formats
+    assert isinstance(result, GeneratePreviewResultSuccess), result
+    assert isinstance(result.paths_to_preview, str)
+    preview_path = anyio.Path(result.paths_to_preview)
+    content = await preview_path.read_bytes()
+    assert content.startswith(b"\x89PNG\r\n\x1a\n")
+    preview = oiio.ImageBuf(result.paths_to_preview)
+    read = preview.read(force=True)
+    assert read
 
 
 class TestThumbnailGeneratorParameterValidation:
