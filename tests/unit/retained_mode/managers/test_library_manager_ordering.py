@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -15,7 +14,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable
 
     from griptape_nodes.retained_mode.engine import Engine
 
@@ -47,21 +46,15 @@ def _register_only_config(libraries: object) -> Callable[..., object]:
 class TestLibraryManagerDeterministicOrdering:
     """Test that library loading maintains deterministic order."""
 
-    @pytest.fixture
-    def temp_dir(self) -> Generator[Path, None, None]:
-        """Create a temporary directory for testing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir).resolve()
-
     @pytest.mark.asyncio
-    async def test_discover_library_files_preserves_config_order(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_discover_library_files_preserves_config_order(self, engine: Engine, tmp_path: Path) -> None:
         """Test that discover_library_files preserves the order from libraries_to_register."""
         library_manager = engine.library_manager
 
         # Create library files in different directories (to have distinct paths)
-        lib_z = temp_dir / "z_lib" / "griptape_nodes_library.json"
-        lib_a = temp_dir / "a_lib" / "griptape_nodes_library.json"
-        lib_m = temp_dir / "m_lib" / "griptape_nodes_library.json"
+        lib_z = tmp_path / "z_lib" / "griptape_nodes_library.json"
+        lib_a = tmp_path / "a_lib" / "griptape_nodes_library.json"
+        lib_m = tmp_path / "m_lib" / "griptape_nodes_library.json"
         lib_z.parent.mkdir()
         lib_a.parent.mkdir()
         lib_m.parent.mkdir()
@@ -85,13 +78,13 @@ class TestLibraryManagerDeterministicOrdering:
 
     @pytest.mark.asyncio
     async def test_discover_library_files_handles_directories_deterministically(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Test that files discovered from directories are sorted deterministically."""
         library_manager = engine.library_manager
 
         # Create subdirectories with library files (each needs the standard library filename)
-        lib_dir = temp_dir / "libraries"
+        lib_dir = tmp_path / "libraries"
         zebra_dir = lib_dir / "zebra"
         apple_dir = lib_dir / "apple"
         banana_dir = lib_dir / "banana"
@@ -119,19 +112,19 @@ class TestLibraryManagerDeterministicOrdering:
 
     @pytest.mark.asyncio
     async def test_discover_library_files_mixed_files_and_directories_preserves_order(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Test that mixing direct files and directories preserves config order."""
         library_manager = engine.library_manager
 
         # Create direct library file in its own directory
-        direct_dir = temp_dir / "direct"
+        direct_dir = tmp_path / "direct"
         direct_dir.mkdir()
         direct_lib = direct_dir / "griptape_nodes_library.json"
         direct_lib.write_text("{}")
 
         # Create directory with library files in subdirectories
-        lib_dir = temp_dir / "libraries"
+        lib_dir = tmp_path / "libraries"
         b_dir = lib_dir / "b_lib"
         a_dir = lib_dir / "a_lib"
         b_dir.mkdir(parents=True)
@@ -142,7 +135,7 @@ class TestLibraryManagerDeterministicOrdering:
         dir_lib_a.write_text("{}")
 
         # Create another direct library file
-        another_dir = temp_dir / "another"
+        another_dir = tmp_path / "another"
         another_dir.mkdir()
         another_direct = another_dir / "griptape_nodes_library.json"
         another_direct.write_text("{}")
@@ -164,13 +157,13 @@ class TestLibraryManagerDeterministicOrdering:
 
     @pytest.mark.asyncio
     async def test_discover_library_files_deduplicates_preserving_first_occurrence(
-        self, engine: Engine, temp_dir: Path
+        self, engine: Engine, tmp_path: Path
     ) -> None:
         """Test that duplicate libraries are removed, preserving first occurrence."""
         library_manager = engine.library_manager
 
         # Create library file
-        lib_dir = temp_dir / "mylib"
+        lib_dir = tmp_path / "mylib"
         lib_dir.mkdir()
         lib = lib_dir / "griptape_nodes_library.json"
         lib.write_text("{}")
@@ -186,13 +179,13 @@ class TestLibraryManagerDeterministicOrdering:
             assert len(result) == 1
 
     @pytest.mark.asyncio
-    async def test_discover_libraries_request_returns_list_in_order(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_discover_libraries_request_returns_list_in_order(self, engine: Engine, tmp_path: Path) -> None:
         """Test that discover_libraries_request returns libraries as a list in order."""
         library_manager = engine.library_manager
 
         # Create library files in separate directories
-        z_dir = temp_dir / "z_lib"
-        a_dir = temp_dir / "a_lib"
+        z_dir = tmp_path / "z_lib"
+        a_dir = tmp_path / "a_lib"
         z_dir.mkdir()
         a_dir.mkdir()
         lib1 = z_dir / "griptape_nodes_library.json"
@@ -215,14 +208,14 @@ class TestLibraryManagerDeterministicOrdering:
             assert discovered_paths == [lib1, lib2]
 
     @pytest.mark.asyncio
-    async def test_discover_libraries_request_deterministic_across_calls(self, engine: Engine, temp_dir: Path) -> None:
+    async def test_discover_libraries_request_deterministic_across_calls(self, engine: Engine, tmp_path: Path) -> None:
         """Test that multiple calls return the same order."""
         library_manager = engine.library_manager
 
         # Create multiple library files with random-ish names in separate directories
         libs = []
         for name in ["z", "a", "m", "q", "b"]:
-            lib_dir = temp_dir / f"{name}_lib"
+            lib_dir = tmp_path / f"{name}_lib"
             lib_dir.mkdir()
             lib = lib_dir / "griptape_nodes_library.json"
             lib.write_text("{}")

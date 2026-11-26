@@ -1,10 +1,7 @@
 """Tests for PILRoundedPreviewGenerator."""
 
-import tempfile
-from collections.abc import Generator
 from pathlib import Path
 
-import anyio
 import pytest
 from PIL import Image
 from pydantic import ValidationError
@@ -15,44 +12,33 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_gene
 
 
 @pytest.fixture
-def temp_test_image() -> Generator[str, None, None]:
+def temp_test_image(tmp_path: Path) -> str:
     """Create a temporary test image."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        # Create a simple red 200x100 image
-        img = Image.new("RGB", (200, 100), color="red")
-        img.save(f, format="PNG")
-        temp_path = f.name
+    temp_path = str(tmp_path / "temp_test_image.png")
+    # Create a simple red 200x100 image
+    img = Image.new("RGB", (200, 100), color="red")
+    img.save(temp_path, format="PNG")
 
-    yield temp_path
-
-    # Cleanup
-    temp_file = Path(temp_path)
-    if temp_file.exists():
-        temp_file.unlink()
+    return temp_path
 
 
 @pytest.fixture
-def temp_transparent_image() -> Generator[str, None, None]:
+def temp_transparent_image(tmp_path: Path) -> str:
     """Create a temporary test image with transparency."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        # Create RGBA image with semi-transparent red
-        img = Image.new("RGBA", (200, 100), color=(255, 0, 0, 128))
-        img.save(f, format="PNG")
-        temp_path = f.name
+    temp_path = str(tmp_path / "temp_transparent_image.png")
+    # Create RGBA image with semi-transparent red
+    img = Image.new("RGBA", (200, 100), color=(255, 0, 0, 128))
+    img.save(temp_path, format="PNG")
 
-    yield temp_path
-
-    # Cleanup
-    temp_file = Path(temp_path)
-    if temp_file.exists():
-        temp_file.unlink()
+    return temp_path
 
 
 @pytest.fixture
-def temp_output_dir() -> Generator[str, None, None]:
+def temp_output_dir(tmp_path: Path) -> str:
     """Create temporary output directory."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    return str(output_dir)
 
 
 class TestPILRoundedPreviewGeneratorParameters:
@@ -384,33 +370,27 @@ class TestPILRoundedPreviewGeneratorGeneration:
             assert img.height == 50  # noqa: PLR2004
 
     @pytest.mark.asyncio
-    async def test_small_image(self, temp_output_dir: str) -> None:
+    async def test_small_image(self, temp_output_dir: str, tmp_path: Path) -> None:
         """Test with very small image."""
         # Create tiny 10x10 image
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tiny_img = Image.new("RGB", (10, 10), color="blue")
-            tiny_img.save(f, format="PNG")
-            tiny_path = f.name
+        temp_path = str(tmp_path / "test_small_image.png")
+        tiny_img = Image.new("RGB", (10, 10), color="blue")
+        tiny_img.save(temp_path, format="PNG")
 
-        try:
-            generator = PILRoundedPreviewGenerator(
-                source_file_location=tiny_path,
-                preview_format="png",
-                destination_preview_directory=temp_output_dir,
-                destination_preview_file_name="output.png",
-                params={"max_width": 100, "max_height": 100, "corner_radius_percent": 0.5},
-            )
+        generator = PILRoundedPreviewGenerator(
+            source_file_location=temp_path,
+            preview_format="png",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.png",
+            params={"max_width": 100, "max_height": 100, "corner_radius_percent": 0.5},
+        )
 
-            result_filename = await generator.attempt_generate_preview()
+        result_filename = await generator.attempt_generate_preview()
 
-            output_path = Path(temp_output_dir) / result_filename
-            assert output_path.exists()
+        output_path = Path(temp_output_dir) / result_filename
+        assert output_path.exists()
 
-            with Image.open(output_path) as img:
-                # Small image should remain 10x10
-                assert img.width == 10  # noqa: PLR2004
-                assert img.height == 10  # noqa: PLR2004
-        finally:
-            tiny_file = anyio.Path(tiny_path)
-            if await tiny_file.exists():
-                await tiny_file.unlink()
+        with Image.open(output_path) as img:
+            # Small image should remain 10x10
+            assert img.width == 10  # noqa: PLR2004
+            assert img.height == 10  # noqa: PLR2004

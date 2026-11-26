@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -292,45 +291,42 @@ class TestIsGitRepository:
 
         assert result is False
 
-    def test_is_git_repository_returns_false_when_path_is_not_directory(self) -> None:
+    def test_is_git_repository_returns_false_when_path_is_not_directory(self, tmp_path: Path) -> None:
         """Test that False is returned when path is a file."""
-        with tempfile.NamedTemporaryFile() as tmp:
-            result = is_git_repository(Path(tmp.name))
+        file_path = tmp_path / "file.txt"
+        file_path.touch()
+        result = is_git_repository(file_path)
+        assert result is False
 
-            assert result is False
-
-    def test_is_git_repository_returns_false_when_not_git_repo(self) -> None:
+    def test_is_git_repository_returns_false_when_not_git_repo(self, tmp_path: Path) -> None:
         """Test that False is returned when directory is not a git repository."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = is_git_repository(Path(tmpdir))
+        result = is_git_repository(tmp_path)
 
-            assert result is False
+        assert result is False
 
-    def test_is_git_repository_returns_true_when_git_repo(self) -> None:
+    def test_is_git_repository_returns_true_when_git_repo(self, tmp_path: Path) -> None:
         """Test that True is returned for valid git repository."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a .git directory to simulate a git repository
-            git_dir = Path(tmpdir) / ".git"
-            git_dir.mkdir()
+        # Create a .git directory to simulate a git repository
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
 
-            result = is_git_repository(Path(tmpdir))
+        result = is_git_repository(tmp_path)
 
-            assert result is True
+        assert result is True
 
-    def test_is_git_repository_returns_true_when_parent_is_git_repo(self) -> None:
+    def test_is_git_repository_returns_true_when_parent_is_git_repo(self, tmp_path: Path) -> None:
         """Test that True is returned when parent directory is a git repository."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create a .git directory in the parent to simulate a git repository
-            git_dir = Path(tmpdir) / ".git"
-            git_dir.mkdir()
+        # Create a .git directory in the parent to simulate a git repository
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
 
-            # Create a subdirectory (like a library folder in a monorepo)
-            subdir = Path(tmpdir) / "library-name"
-            subdir.mkdir()
+        # Create a subdirectory (like a library folder in a monorepo)
+        subdir = tmp_path / "library-name"
+        subdir.mkdir()
 
-            result = is_git_repository(subdir)
+        result = is_git_repository(subdir)
 
-            assert result is True
+        assert result is True
 
 
 class TestParseCommitDatetime:

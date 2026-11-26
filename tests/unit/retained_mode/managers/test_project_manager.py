@@ -5363,11 +5363,10 @@ class TestProjectManagerProjectWorkspaces:
     @pytest.mark.asyncio
     async def test_project_workspaces_overrides_workspace(self, tmp_path: Path) -> None:
         """Test that a matching project_workspaces entry calls set_workspace_override with the mapped value."""
-        import tempfile
-
         project_file = tmp_path / "project.yml"
         project_file.touch()
-        workspace_dir = Path(tempfile.mkdtemp())
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
 
         mock_config = Mock()
         mock_config.project_config = {}
@@ -5389,11 +5388,10 @@ class TestProjectManagerProjectWorkspaces:
     @pytest.mark.asyncio
     async def test_project_workspaces_key_resolved_before_lookup(self, tmp_path: Path) -> None:
         """Test that project_workspaces keys are resolved before matching, so symlinks and relative paths work."""
-        import tempfile
-
         project_file = tmp_path / "project.yml"
         project_file.touch()
-        workspace_dir = Path(tempfile.mkdtemp())
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
 
         mock_config = Mock()
         mock_config.project_config = {}

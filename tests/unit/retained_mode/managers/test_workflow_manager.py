@@ -995,8 +995,11 @@ class TestWorkflowManager:
             # Still unsaved — no disk file materialized.
             assert workflow.file_path is None
 
-    def test_first_save_uses_display_name_when_requested_name_is_unsaved_key(self, engine: Engine) -> None:
+    def test_first_save_uses_display_name_when_requested_name_is_unsaved_key(
+        self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """First save of an unsaved workflow derives the filename from metadata.name, not the synthetic key."""
+        monkeypatch.setattr(engine.config_manager, "workspace_path", tmp_path)
         from griptape_nodes.retained_mode.events.flow_events import (
             GetTopLevelFlowResultSuccess,
             SerializedFlowCommands,
@@ -5300,6 +5303,10 @@ class TestSaveWorkflowDisplayNameFallback:
     ``_save_workflow_file_inline`` to capture the ``display_name`` argument
     that the chain produced.
     """
+
+    @pytest.fixture(autouse=True)
+    def isolate_workspace(self, engine: Engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(engine.config_manager, "workspace_path", tmp_path)
 
     @staticmethod
     def _capture_display_name(
