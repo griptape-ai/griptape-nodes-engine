@@ -86,7 +86,7 @@ asyncio.run(main())
 """
     env = os.environ.copy()
     env["GTN_CONFIG_WORKSPACE_DIRECTORY"] = str(tmp_path)
-    env["PYTHONPATH"] = str(Path(__file__).parents[7] / "src")
+    env["PYTHONPATH"] = str(Path(__file__).parents[6] / "src")
     result = subprocess.run(  # noqa: S603 - Fixed local interpreter and test script.
         [sys.executable, "-c", script, str(tmp_path), backend], capture_output=True, text=True, env=env, check=False
     )
@@ -99,7 +99,7 @@ def test_broken_openimageio_import_is_not_hidden_by_fallback(tmp_path: Path) -> 
     package.write_text("raise ImportError('native library failed to load')\n", encoding="utf-8")
     env = os.environ.copy()
     env["GTN_CONFIG_WORKSPACE_DIRECTORY"] = str(tmp_path)
-    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(Path(__file__).parents[7] / "src")])
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path), str(Path(__file__).parents[6] / "src")])
     script = """
 import asyncio
 from griptape_nodes.retained_mode.engine import Engine

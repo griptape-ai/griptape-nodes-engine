@@ -95,9 +95,11 @@ corresponding readers are installed. The built-in `Image` provider and direct ca
 `OpenImageIOThumbnailGenerator` use the same list of supported source extensions. Pillow standard
 thumbnails continue to support PNG, JPEG, GIF, BMP, WebP, TIFF and TGA.
 
-Project directory routing, source metadata reading and Rounded Image Preview Generation keep
-their existing support. Follow-up work is tracked in
-[#6180](https://github.com/griptape-ai/griptape-nodes-engine/issues/6180).
+The OpenImageIO provider reads source metadata from the first image header. Preview metadata
+reports a cropped EXR's display window dimensions and accounts for image orientation. It reports
+OpenImageIO's colour-space tag, or `Unknown` when the tag is absent. Project directory routing
+and Rounded Image Preview Generation keep their existing format support. Follow-up work is
+tracked in [#6180](https://github.com/griptape-ai/griptape-nodes-engine/issues/6180).
 
 For OpenImageIO standard thumbnails, EXR output shows the display window, preserving cropped-render
 placement and proportions. Overscan is excluded, and missing pixels appear black or transparent

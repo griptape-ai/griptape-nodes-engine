@@ -108,7 +108,7 @@ async def test_preview_request_text_policy(  # noqa: PLR0913 - Independent polic
     if not bound:
         fields = {"gtn_saved_at": "current_time"}
     mocker.patch(
-        "griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider.collect_workflow_metadata",
+        "griptape_nodes.retained_mode.managers.artifact_providers.image.base_image_artifact_provider.collect_workflow_metadata",
         return_value=fields,
     )
     request = GeneratePreviewRequest(

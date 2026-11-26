@@ -38,22 +38,6 @@ GRAYSCALE_ALPHA_CHANNEL_NAMES = ("Y", "A")
 RGB_CHANNEL_NAMES = ("R", "G", "B")
 RGBA_CHANNEL_NAMES = (*RGB_CHANNEL_NAMES, "A")
 
-EXIF_ORIENTATION_NORMAL = 1
-EXIF_ORIENTATION_FLIP_HORIZONTAL = 2
-EXIF_ORIENTATION_ROTATE_180 = 3
-EXIF_ORIENTATION_FLIP_VERTICAL = 4
-EXIF_ORIENTATION_TRANSPOSE = 5
-EXIF_ORIENTATION_ROTATE_90_CLOCKWISE = 6
-EXIF_ORIENTATION_TRANSVERSE = 7
-EXIF_ORIENTATION_ROTATE_90_COUNTERCLOCKWISE = 8
-
-AXIS_SWAPPING_ORIENTATIONS = (
-    EXIF_ORIENTATION_TRANSPOSE,
-    EXIF_ORIENTATION_ROTATE_90_CLOCKWISE,
-    EXIF_ORIENTATION_TRANSVERSE,
-    EXIF_ORIENTATION_ROTATE_90_COUNTERCLOCKWISE,
-)
-
 
 class OpenImageIOThumbnailGenerator(BaseThumbnailGenerator):
     """Thumbnail generator with dimension constraints.
@@ -173,7 +157,7 @@ class OpenImageIOThumbnailGenerator(BaseThumbnailGenerator):
         spec = image.spec()
         max_width, max_height = self.params.max_width, self.params.max_height
         # Fit the unrotated image against swapped bounds when reorientation swaps axes.
-        if spec.get_int_attribute("Orientation", EXIF_ORIENTATION_NORMAL) in AXIS_SWAPPING_ORIENTATIONS:
+        if openimageio.orientation_swaps_axes(spec):
             max_width, max_height = max_height, max_width
         scale = min(1, max_width / spec.full_width, max_height / spec.full_height)
         width = max(1, round(spec.full_width * scale))

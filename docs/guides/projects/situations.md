@@ -274,6 +274,9 @@ It saves `render_1920x1080.png`, `render_1920x1080_24fps.mp4`, and `render.txt`.
 Things to know:
 
 - The values come from the file's contents, not its name. If a node saves a PNG under a `.jpg` name, the PNG's size is used.
+- With OpenImageIO, `{media.color_space}` uses the reader's colour-space tag, such as
+    `srgb_rec709_scene`, or `Unknown` when the tag is absent. Pillow reports image modes such as
+    `RGB` and `RGBA`. The engine must recognise the file format before filling in these variables.
 - The project page shows a warning for a `media.` name that isn't in the table. The project still loads, and the misspelled variable has no value.
 - Nodes can't supply their own `media.` values. The prefix is reserved for what the engine reads from the file.
 - In a file sequence, each frame is read as it's saved, so `media.` variables work in the frame's file name. They have no value in the sequence's folder name, because the folder is chosen before any frame exists.

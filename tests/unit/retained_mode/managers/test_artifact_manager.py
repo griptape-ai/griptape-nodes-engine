@@ -101,6 +101,22 @@ def unsaved_workflow(engine: Engine) -> Generator[None, None, None]:
         yield
 
 
+class TestArtifactManagerProviderForWrite:
+    """Tests for ArtifactManager.provider_for_write."""
+
+    def test_returns_none_for_unknown_extension(self, engine: Engine) -> None:
+        assert engine.artifact_manager.provider_for_write("archive.xyz_unknown") is None
+
+    def test_returns_none_for_empty_extension(self, engine: Engine) -> None:
+        assert engine.artifact_manager.provider_for_write("no_extension_file") is None
+
+    def test_returns_the_image_provider_for_png(self, engine: Engine) -> None:
+        registration = engine.handle_request(RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider))
+
+        assert isinstance(registration, RegisterArtifactProviderResultSuccess)
+        assert isinstance(engine.artifact_manager.provider_for_write("output.png"), ImageArtifactProvider)
+
+
 class TestArtifactManager:
     """Test ArtifactManager functionality."""
 

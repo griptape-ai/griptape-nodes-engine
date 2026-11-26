@@ -1,3 +1,4 @@
+import json
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -30,10 +31,7 @@ from griptape_nodes.retained_mode.events.base_events import RequestPayload, Resu
 from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, WriteFileRequest, WriteFileResultFailure
 from griptape_nodes.retained_mode.events.project_events import MacroPath
 from griptape_nodes.retained_mode.managers.artifact_providers.image._backends import openimageio
-from griptape_nodes.retained_mode.managers.artifact_providers.image.openimageio_artifact_provider import (
-    OpenImageIOArtifactProvider,
-)
-from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.openimageio_thumbnail_generator import (
+from griptape_nodes.retained_mode.managers.artifact_providers.image._backends.openimageio import (
     EXIF_ORIENTATION_FLIP_HORIZONTAL,
     EXIF_ORIENTATION_FLIP_VERTICAL,
     EXIF_ORIENTATION_NORMAL,
@@ -42,6 +40,9 @@ from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_gene
     EXIF_ORIENTATION_ROTATE_180,
     EXIF_ORIENTATION_TRANSPOSE,
     EXIF_ORIENTATION_TRANSVERSE,
+)
+from griptape_nodes.retained_mode.managers.artifact_providers.image.openimageio_artifact_provider import (
+    OpenImageIOArtifactProvider,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.openimageio_thumbnail_generator import (
     OpenImageIOThumbnailGenerator as ThumbnailGenerator,
@@ -97,7 +98,13 @@ async def test_registered_image_provider_previews_exr(engine: Engine, tmp_path: 
     """The standard preview request accepts EXR and reports matching source formats."""
     # Given an EXR and the registered OpenImageIO provider.
     source = tmp_path / "source.exr"
-    image = oiio.ImageBuf(oiio.ImageSpec(8, 4, 3, oiio.HALF))
+    spec = oiio.ImageSpec(8, 4, 3, oiio.HALF)
+    spec.x = 1
+    spec.y = 2
+    spec.full_width = 16
+    spec.full_height = 12
+    spec.attribute("oiio:ColorSpace", "lin_rec709_scene")
+    image = oiio.ImageBuf(spec)
     filled = oiio.ImageBufAlgo.fill(image, (0.25, 0.5, 0.75))
     assert filled
     written = image.write(str(source), oiio.HALF, "openexr")
@@ -116,7 +123,10 @@ async def test_registered_image_provider_previews_exr(engine: Engine, tmp_path: 
     )
     result = await engine.ahandle_request(
         GeneratePreviewRequest(
-            macro_path=MacroPath(ParsedMacro(str(source)), {}), artifact_provider_name="Image", format="png"
+            macro_path=MacroPath(ParsedMacro(str(source)), {}),
+            artifact_provider_name="Image",
+            format="png",
+            generate_preview_metadata_json=True,
         )
     )
 
@@ -133,6 +143,25 @@ async def test_registered_image_provider_previews_exr(engine: Engine, tmp_path: 
     preview = oiio.ImageBuf(result.paths_to_preview)
     read = preview.read(force=True)
     assert read
+
+    sidecar = preview_path.with_name(f"{source.name}.json")
+    sidecar_content = await sidecar.read_text(encoding="utf-8")
+    source_stat = await anyio.Path(source).stat()
+    assert json.loads(sidecar_content)["artifact_metadata"] == {
+        "width": 16,
+        "height": 12,
+        "format": "EXR",
+        "channels": 3,
+        "color_space": "lin_rec709_scene",
+        "file_size": source_stat.st_size,
+    }
+    media_info = OpenImageIOArtifactProvider.get_media_info(str(source))
+    assert (media_info.width, media_info.height, media_info.channels, media_info.color_space) == (
+        16,
+        12,
+        3,
+        "lin_rec709_scene",
+    )
 
 
 class TestThumbnailGeneratorParameterValidation:

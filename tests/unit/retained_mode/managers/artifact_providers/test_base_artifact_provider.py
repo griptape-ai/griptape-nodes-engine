@@ -15,6 +15,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
     BaseArtifactMetadata,
     BaseArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
 
@@ -32,6 +33,22 @@ class _NonPreviewProvider(BaseArtifactProvider):
     @classmethod
     def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
         return None
+
+
+class TestBaseArtifactProviderDefaults:
+    """A provider that overrides neither hook embeds nothing and leaves the bytes alone."""
+
+    def test_collects_no_metadata(self) -> None:
+        assert _NonPreviewProvider(registry=ProviderRegistry()).collect_metadata_for_write("clip.mp3", None) == {}
+
+    def test_returns_data_unchanged(self) -> None:
+        data = b"audio bytes"
+
+        result = _NonPreviewProvider(registry=ProviderRegistry()).prepare_content_for_write(
+            data, "clip.mp3", {"k": "v"}
+        )
+
+        assert result is data
 
 
 class TestBaseProviderPreviewContract:

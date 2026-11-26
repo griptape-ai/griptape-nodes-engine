@@ -6,7 +6,9 @@ import logging
 from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.managers.artifact_providers.image._backends import openimageio
-from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import ImageArtifactProvider
+from griptape_nodes.retained_mode.managers.artifact_providers.image.base_image_artifact_provider import (
+    BaseImageArtifactProvider,
+)
 from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.openimageio_thumbnail_generator import (
     OpenImageIOThumbnailGenerator,
 )
@@ -20,12 +22,15 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
+    from griptape_nodes.retained_mode.managers.artifact_providers.image.base_image_artifact_provider import (
+        ImageArtifactMetadata,
+    )
 
 logger = logging.getLogger("griptape_nodes")
 
 
-class OpenImageIOArtifactProvider(ImageArtifactProvider):
-    """Use OpenImageIO for standard thumbnails while retaining Pillow source metadata."""
+class OpenImageIOArtifactProvider(BaseImageArtifactProvider):
+    """Use OpenImageIO for standard thumbnails and source metadata."""
 
     def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
         super().__init__(registry, engine)
@@ -34,6 +39,10 @@ class OpenImageIOArtifactProvider(ImageArtifactProvider):
     @classmethod
     def get_supported_formats(cls) -> set[str]:
         return openimageio.get_supported_source_formats()
+
+    @classmethod
+    def get_artifact_metadata(cls, source_path: str) -> ImageArtifactMetadata | None:
+        return openimageio.read_artifact_metadata(source_path)
 
     @classmethod
     def get_default_preview_generators(cls) -> list[type[BaseArtifactPreviewGenerator]]:

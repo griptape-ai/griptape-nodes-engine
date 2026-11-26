@@ -25,7 +25,7 @@ from tests.workflow_context import unsaved_workflow_open
 
 RGB_CHANNELS = 3
 TEXT_KINDS = {b"tEXt", b"zTXt", b"iTXt"}
-PROVIDER_MODULE = "griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider"
+PROVIDER_MODULE = "griptape_nodes.retained_mode.managers.artifact_providers.image.base_image_artifact_provider"
 
 
 def _chunk(kind: bytes, payload: bytes) -> bytes:
