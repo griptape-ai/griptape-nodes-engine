@@ -12,12 +12,11 @@ ParameterRenderLocation = Literal["top", "bottom", "in-order"]
 VALID_PARAMETER_RENDER_LOCATIONS: frozenset[str] = frozenset(get_args(ParameterRenderLocation))
 
 
-# Types of Modes provided for Parameters
 @dataclass(frozen=True)
 class ParameterDeprecation:
     """Marks a parameter kept only so older workflows still load.
 
-    Matches the shape of a node's `deprecation` in its library JSON. Both fields are optional.
+    Shares `deprecation_message` with a node's `deprecation` in its library JSON. Both fields are optional.
 
     Attributes:
         deprecation_message: What to tell whoever reads the node's schema, for example why it was replaced.
@@ -28,6 +27,7 @@ class ParameterDeprecation:
     replacement: str | None = None
 
 
+# Types of Modes provided for Parameters
 class ParameterMode(Enum):
     OUTPUT = auto()
     INPUT = auto()
