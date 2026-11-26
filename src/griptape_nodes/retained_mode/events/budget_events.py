@@ -17,13 +17,10 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.utils.budget_refusal import BudgetExceededError, refusal_from_check
+from griptape_nodes.utils.budget_refusal import BUDGET_EXCEEDED_TYPE_NAME, BudgetExceededError, refusal_from_check
 
 ATTRIBUTION_HEADER_NAME = "X-Griptape-Attribution"
 ATTRIBUTION_SCHEMA_VERSION = 1
-
-# How a BudgetExceededError names its type once it has crossed the worker boundary.
-_BUDGET_EXCEEDED_TYPE = f"{BudgetExceededError.__module__}.{BudgetExceededError.__qualname__}"
 
 
 @dataclass
@@ -164,7 +161,7 @@ class BudgetAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
         super().__post_init__()
         # From a worker, the exception arrives as a ForwardedException without the refusal. Rebuild it
         # from `blocked_by` so the halt can name the node.
-        if isinstance(self.exception, ForwardedException) and self.exception.original_type == _BUDGET_EXCEEDED_TYPE:
+        if isinstance(self.exception, ForwardedException) and self.exception.original_type == BUDGET_EXCEEDED_TYPE_NAME:
             self.exception = BudgetExceededError(
                 str(self.exception), refusal_from_check({"blocked_by": self.blocked_by})
             )

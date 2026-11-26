@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from griptape_nodes.common.node_executor import ExecuteNodeFailedError, NodeExecutor
+from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.workflow_context_handoff import WorkflowContextSnapshot
 from griptape_nodes.exe_types import node_types
@@ -37,6 +37,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.events.failure_tree import ExecuteNodeFailureError, FailureKind, FailureLeaf
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
 
@@ -252,10 +253,11 @@ class TestExecuteFailureContract:
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
-        with pytest.raises(ExecuteNodeFailedError) as caught:
+        with pytest.raises(ExecuteNodeFailureError) as caught:
             await executor.execute(_in_workflow_of(executor, node))
 
-        assert caught.value.details is built
+        assert isinstance(caught.value.failure_tree, FailureLeaf)
+        assert caught.value.failure_tree.details is built
         assert caught.value.__cause__ is raised
 
     @pytest.mark.asyncio
@@ -267,10 +269,12 @@ class TestExecuteFailureContract:
         mock_engine = cast("MagicMock", executor.engine)
         mock_engine.ahandle_request = AsyncMock(return_value=failure)
 
-        with pytest.raises(ExecuteNodeFailedError) as caught:
+        with pytest.raises(ExecuteNodeFailureError) as caught:
             await executor.execute(_in_workflow_of(executor, node))
 
-        assert caught.value.details == NodeErrorDetails(message="no worker is available")
+        assert isinstance(caught.value.failure_tree, FailureLeaf)
+        assert caught.value.failure_tree.kind is FailureKind.ENGINE
+        assert caught.value.failure_tree.details == NodeErrorDetails(message="no worker is available")
         assert caught.value.__cause__ is None
 
 
@@ -396,9 +400,10 @@ class TestExecuteSpecialNodeRouting:
             error=details,
         )
 
-        with pytest.raises(ExecuteNodeFailedError) as excinfo:
+        with pytest.raises(ExecuteNodeFailureError) as excinfo:
             await executor.execute(_in_workflow_of(executor, node))
 
         mock_engine.node_manager.execution_failure.assert_called_once_with(raised, "Workflow")
-        assert excinfo.value.details is details
+        assert isinstance(excinfo.value.failure_tree, FailureLeaf)
+        assert excinfo.value.failure_tree.details is details
         assert excinfo.value.__cause__ is raised

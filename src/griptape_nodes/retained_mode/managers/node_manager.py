@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast
 from uuid import uuid4
 
+from griptape_nodes.common import failure_trees
 from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
 from griptape_nodes.common.strict_mode import (
     STRICT_MODE,
@@ -137,7 +138,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetLibraryMetadataRequest,
     GetLibraryMetadataResultSuccess,
 )
-from griptape_nodes.retained_mode.events.node_error_details import build_node_error_details
 from griptape_nodes.retained_mode.events.node_events import (
     AddNodesToNodeGroupRequest,
     AddNodesToNodeGroupResultFailure,
@@ -3746,11 +3746,15 @@ class NodeManager(EngineScoped):
                 request.workflow_working_directory,
             )
         except ContextManager.OrchestratorWorkflowError as err:
+            # The workflow could not be adopted here, so the node never ran. It is reported as this node's own failure.
+            adoption_failure_tree = failure_trees.failure_tree_from_exception(request.node_name, err)
             return ExecuteNodeResultFailure(
                 result_details=str(err),
                 exception=err,
-                error=build_node_error_details(request.node_name, err),
-            )
+                error=failure_trees.render_error_details(
+                    adoption_failure_tree, text=str(err), node_name=request.node_name
+                ),
+            ).attach_failure_tree(adoption_failure_tree)
         with self.engine.run_in_worker_workflow(workflow):
             return await self._run_worker_copy_in_workflow(workflow, request)
 
@@ -4086,13 +4090,10 @@ class NodeManager(EngineScoped):
             orch_worker_requests.pop(request.node_name, None)
         result_type_name = execute_raw.get("result_type", "")
         result_data = execute_raw.get("result", {})
-        # Route through cattrs structure (not ``**result_data`` spread)
-        # so the registered exception hook rebuilds ``self.exception``
-        # into a ``ForwardedException`` carrying the worker-side type
-        # name and traceback. A bare spread would leave ``exception``
-        # as the raw {type, message, traceback} dict, breaking the
-        # worker-frame surfacing in
-        # ``NodeExecutor._format_node_failure_message``.
+        # Route through cattrs structure (not ``**result_data`` spread) so the registered exception hook
+        # rebuilds ``self.exception`` into a ``ForwardedException`` carrying the worker-side type name and
+        # traceback. A bare spread would leave ``exception`` as the raw {type, message, traceback} dict,
+        # breaking the worker-frame surfacing in ``format_node_failure_message``.
         if result_type_name == ExecuteNodeResultSuccess.__name__:
             return cast("ExecuteNodeResultSuccess", converters.engine.structure(result_data, ExecuteNodeResultSuccess))
         return cast("ExecuteNodeResultFailure", converters.engine.structure(result_data, ExecuteNodeResultFailure))
@@ -4243,14 +4244,17 @@ class NodeManager(EngineScoped):
                 # run here. Letting it escape would report a node that declined as an engine crash.
                 validation_exceptions = [e]
             if validation_exceptions:
+                declined_failure_tree = failure_trees.failure_leaf_from_validation(node_name, validation_exceptions)
                 return ExecuteNodeResultFailure(
                     result_details=(
                         f"Attempted to execute node '{node_name}'. It declined to run: "
                         f"{'; '.join(str(exception) for exception in validation_exceptions)}"
                     ),
                     validation_exceptions=validation_exceptions,
-                    error=build_node_error_details(node_name, validation_exceptions),
-                )
+                    error=failure_trees.render_error_details(
+                        declined_failure_tree, text=str(validation_exceptions), node_name=node_name
+                    ),
+                ).attach_failure_tree(declined_failure_tree)
 
             try:
                 with aprocess_scope(request.variables, node):
@@ -4321,18 +4325,35 @@ class NodeManager(EngineScoped):
         return sendable
 
     def execution_failure(self, exc: Exception, node_name: str) -> ExecuteNodeResultFailure:
-        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call."""
+        """Report a node whose `aprocess` raised, as a budget halt when Griptape Cloud refused its call.
+
+        A halt found under Workflow nodes is reported in the halt's own wording, so the run stops exactly
+        as a halt at the top level does. The failure stays the Workflow node's, so a Workflow node above
+        adds itself to the path instead of starting a new one.
+        """
+        failure_tree = failure_trees.failure_tree_from_exception(node_name, exc)
+        nested_halt_wording = failure_trees.budget_halt_behind_workflow_node(failure_tree)
+        # A budget halt behind Workflow nodes is worded as the halt, while the failure stays the Workflow node's own.
+        if nested_halt_wording is not None:
+            return ExecuteNodeResultFailure(
+                result_details=nested_halt_wording,
+                exception=exc,
+                error=failure_trees.render_error_details(failure_tree, text=str(exc), node_name=node_name),
+            ).attach_failure_tree(failure_tree)
         budget_halt = self._budget_halt_for(exc, node_name)
         if budget_halt is not None:
             # The engine words the halt, so it carries no node-built details.
-            return ExecuteNodeResultFailure(result_details=str(budget_halt), exception=budget_halt)
+            return ExecuteNodeResultFailure(
+                result_details=str(budget_halt),
+                exception=budget_halt,
+            ).attach_failure_tree(failure_trees.failure_tree_from_exception(node_name, exc, budget_halt=budget_halt))
         # The raised exception itself, so its traceback crosses the worker boundary. The details are
         # built here, where the real exception and anything it attached still exist.
         return ExecuteNodeResultFailure(
             result_details=f"Attempted to execute node '{node_name}'. Failed with error: {exc}",
             exception=exc,
-            error=build_node_error_details(node_name, exc),
-        )
+            error=failure_trees.render_error_details(failure_tree, text=str(exc), node_name=node_name),
+        ).attach_failure_tree(failure_tree)
 
     def _budget_halt_for(self, exc: Exception, node_name: str) -> BudgetExceededError | None:
         """Return the halt for a node whose call Griptape Cloud refused over budget, or None.

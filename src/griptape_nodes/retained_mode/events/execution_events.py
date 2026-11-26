@@ -16,6 +16,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.failure_tree import CarriesFailureTree
 from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue, Value
@@ -146,8 +147,11 @@ class StartLocalSubflowResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess)
 
 @dataclass
 @PayloadRegistry.register
-class StartLocalSubflowResultFailure(ResultPayloadFailure):
-    """Local subflow failed to start. Check result_details for error information."""
+class StartLocalSubflowResultFailure(ResultPayloadFailure, CarriesFailureTree):
+    """Local subflow failed to start. Check result_details for error information.
+
+    ``failure_tree`` says what failed inside the subflow, when a node in it did.
+    """
 
 
 @dataclass
@@ -844,7 +848,7 @@ class ExecuteNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 
 @dataclass
 @PayloadRegistry.register
-class ExecuteNodeResultFailure(ResultPayloadFailure):
+class ExecuteNodeResultFailure(ResultPayloadFailure, CarriesFailureTree):
     """Failed result from executing a node directly.
 
     Args:
@@ -855,6 +859,8 @@ class ExecuteNodeResultFailure(ResultPayloadFailure):
         error: The failure in parts for `NodeErrorEvent.error`, built from the node's own exception
             where the node failed, so it is complete even when the node ran in a worker. None when
             the engine wrote `result_details` itself, such as for a worker that stopped responding.
+
+    ``failure_tree`` is the same failure as a `FailureTree`, built where the node failed.
     """
 
     validation_exceptions: list[Exception] | None = None

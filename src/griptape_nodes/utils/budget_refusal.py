@@ -89,6 +89,10 @@ class BudgetExceededError(Exception):
         self.node_name = node_name
 
 
+# The type name a forwarded BudgetExceededError carries once it has crossed the worker boundary.
+BUDGET_EXCEEDED_TYPE_NAME = f"{BudgetExceededError.__module__}.{BudgetExceededError.__qualname__}"
+
+
 class CloudHttpFailure(NamedTuple):
     """An HTTP failure found on an exception chain, and what it carried."""
 

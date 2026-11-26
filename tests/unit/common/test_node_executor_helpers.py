@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from griptape_nodes.common import failure_trees
 from griptape_nodes.common.isolated_execution_scope import IsolatedExecutionScope, current_isolated_execution_scope
 from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.node_groups import SubflowNodeGroup
@@ -361,7 +362,7 @@ class TestFormatNodeFailureMessage:
 
         exc = ForwardedException("rebuilt", original_type="builtins.RuntimeError")
 
-        msg = NodeExecutor._format_node_failure_message("MyNode", MagicMock(result_details="oops"), exc)
+        msg = failure_trees.format_node_failure_message("MyNode", MagicMock(result_details="oops"), exc)
 
         assert "[builtins.RuntimeError]" in msg
         assert "MyNode" in msg
@@ -375,7 +376,7 @@ class TestFormatNodeFailureMessage:
             original_traceback='Traceback...\n  File "a.py", line 1, in <module>\nValueError: rebuilt\n',
         )
 
-        msg = NodeExecutor._format_node_failure_message("MyNode", MagicMock(result_details="oops"), exc)
+        msg = failure_trees.format_node_failure_message("MyNode", MagicMock(result_details="oops"), exc)
 
         assert "Worker traceback:" in msg
         assert 'File "a.py"' in msg
@@ -383,7 +384,7 @@ class TestFormatNodeFailureMessage:
     def test_omits_worker_block_for_local_exceptions(self) -> None:
         # Plain Exception (not a ForwardedException) means we're on the
         # local path. No type prefix, no worker-traceback block.
-        msg = NodeExecutor._format_node_failure_message(
+        msg = failure_trees.format_node_failure_message(
             "MyNode", MagicMock(result_details="oops"), RuntimeError("local")
         )
 

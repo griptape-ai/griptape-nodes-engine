@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -32,9 +33,23 @@ from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, Work
 from griptape_nodes.retained_mode.engine import current_engine
 from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowRequest,
+    StartLocalSubflowResultFailure,
     StartLocalSubflowResultSuccess,
 )
-from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.events.failure_tree import (
+    FailureKind,
+    FailureLeaf,
+    FailureTreeError,
+    WorkflowNodeFailure,
+)
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
+)
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
+from griptape_nodes.retained_mode.events.node_events import GetFlowForNodeResultSuccess
+from griptape_nodes.retained_mode.events.workflow_events import ImportWorkflowAsReferencedSubFlowResultFailure
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
@@ -647,3 +662,113 @@ class TestAprocess:
 
         run.assert_awaited_once()
         assert scopes_seen_by_subflow == [IsolatedExecutionScope(owner_name="My Group")]
+
+
+def _leaf(node_name: str, message: str = "boom") -> FailureLeaf:
+    details = NodeErrorDetails(message=message, exception_type="builtins.ValueError")
+    return FailureLeaf(node_name=node_name, kind=FailureKind.RAISED, details=details)
+
+
+class TestAprocessSubflowFailure:
+    """`WorkflowNode.aprocess` reports the failure behind a subflow that did not finish."""
+
+    @pytest.fixture
+    def workflow_node(self) -> Mock:
+        node = Mock(spec=WorkflowNode)
+        node.name = "Outer"
+        node._load_subflow = AsyncMock(spec=WorkflowNode._load_subflow, return_value="Subflow")
+        node._raise_subflow_failure = lambda result: WorkflowNode._raise_subflow_failure(node, result)
+        return node
+
+    def run_with(self, workflow_node: Mock, result: Any) -> AsyncMock:
+        send = AsyncMock(spec=WorkflowNode._ahandle_request_in_workflow, return_value=result)
+        workflow_node._ahandle_request_in_workflow = send
+        return send
+
+    @pytest.mark.asyncio
+    async def test_raises_the_failure_inside_as_a_workflow_node_failure(self, workflow_node: Mock) -> None:
+        inner = _leaf("Inner")
+        self.run_with(
+            workflow_node, StartLocalSubflowResultFailure(result_details="did not finish").attach_failure_tree(inner)
+        )
+
+        with pytest.raises(FailureTreeError) as raised:
+            await WorkflowNode.aprocess(workflow_node)
+
+        assert raised.value.failure_tree == WorkflowNodeFailure(node_name="Outer", inner=inner)
+        assert str(raised.value) == (
+            "Attempted to run the workflow behind node 'Outer'. Failed because node 'Inner' inside it failed: boom"
+        )
+        workflow_node._collect_outputs.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_failure_that_names_no_node_is_reported_by_its_text(self, workflow_node: Mock) -> None:
+        self.run_with(workflow_node, StartLocalSubflowResultFailure(result_details="could not start"))
+
+        with pytest.raises(RuntimeError) as raised:
+            await WorkflowNode.aprocess(workflow_node)
+
+        assert not isinstance(raised.value, FailureTreeError)
+        assert str(raised.value) == (
+            "Attempted to run the workflow behind node 'Outer'. "
+            "Failed because the workflow did not finish: could not start"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_subflow_request_does_not_log_the_failure_the_node_reports(self, workflow_node: Mock) -> None:
+        send = self.run_with(
+            workflow_node, StartLocalSubflowResultFailure(result_details="no").attach_failure_tree(_leaf("X"))
+        )
+
+        with pytest.raises(FailureTreeError):
+            await WorkflowNode.aprocess(workflow_node)
+
+        send.assert_awaited_once()
+        request = send.await_args_list[0].args[0]
+        assert isinstance(request, StartLocalSubflowRequest)
+        assert (request.flow_name, request.failure_log_level) == ("Subflow", logging.DEBUG)
+
+    @pytest.mark.asyncio
+    async def test_collects_outputs_when_the_subflow_succeeds(self, workflow_node: Mock) -> None:
+        self.run_with(workflow_node, StartLocalSubflowResultSuccess(result_details="ok"))
+
+        await WorkflowNode.aprocess(workflow_node)
+
+        workflow_node._collect_outputs.assert_called_once()
+
+
+class TestLoadSubflowImportFailure:
+    """`WorkflowNode._load_subflow` reports a failed import as a plain error, without logging it a second time."""
+
+    @pytest.fixture
+    def workflow_node(self) -> Mock:
+        node = Mock(spec=WorkflowNode)
+        node.name = "Outer"
+        node.metadata = {}
+        node.workflow_file_path = "/library/wf.py"
+        node._handle_request_in_workflow.return_value = GetFlowForNodeResultSuccess(
+            flow_name="Parent", result_details="ok"
+        )
+        node._register_workflow.return_value = "registry-key"
+        node._ahandle_request_in_workflow = AsyncMock(
+            spec=WorkflowNode._ahandle_request_in_workflow,
+            return_value=ImportWorkflowAsReferencedSubFlowResultFailure(result_details="no such file"),
+        )
+        return node
+
+    @pytest.mark.asyncio
+    async def test_an_import_failure_is_a_plain_runtime_error(self, workflow_node: Mock) -> None:
+        with pytest.raises(RuntimeError, match="the workflow could not be loaded: no such file") as raised:
+            await WorkflowNode._load_subflow(workflow_node)
+
+        assert not isinstance(raised.value, FailureTreeError)
+
+    @pytest.mark.asyncio
+    async def test_the_import_request_does_not_log_the_failure_the_node_reports(self, workflow_node: Mock) -> None:
+        with pytest.raises(RuntimeError):
+            await WorkflowNode._load_subflow(workflow_node)
+
+        [call] = workflow_node._ahandle_request_in_workflow.await_args_list
+        request = call.args[0]
+        assert isinstance(request, ImportWorkflowAsReferencedSubFlowRequest)
+        assert request.failure_log_level == logging.DEBUG

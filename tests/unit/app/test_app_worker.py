@@ -36,8 +36,11 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import (
     ExecuteNodeRequest,
+    ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
 )
+from griptape_nodes.retained_mode.events.failure_tree import FailureKind, FailureLeaf
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
     GetParameterValueResultSuccess,
@@ -405,6 +408,24 @@ class TestRelayWorkerResult:
         assert relayed["result"]["value"] == [1, "b"]
         assert relayed["request_id"] == "r-1"
         assert relayed["response_topic"] == f"sessions/{_SESSION}/response"
+
+    @pytest.mark.asyncio
+    async def test_a_failed_node_result_a_worker_sends_never_holds_a_failure_tree(
+        self, worker_manager: WorkerManager
+    ) -> None:
+        details = NodeErrorDetails(message="boom", messages=["boom"])
+        result = ExecuteNodeResultFailure(
+            result_details="Node 'n' execution failed: boom", error=details
+        ).attach_failure_tree(FailureLeaf(node_name="n", kind=FailureKind.RAISED, details=details))
+        event = EventResultFailure(request=ExecuteNodeRequest(node_name="n"), result=result, request_id="r-1")
+        worker_reply = json.loads(converters.engine.dumps(event))
+        assert "failure_tree" not in worker_reply["result"]
+
+        await worker_manager.relay_worker_result(worker_reply)
+
+        relayed = json.loads(worker_manager._tx.send_message.call_args.args[1])  # type: ignore[union-attr]
+        assert "failure_tree" not in relayed["result"]
+        assert relayed["result"]["error"]["message"] == "boom"
 
 
 class TestRelayWorkerResultPendingFuture:
