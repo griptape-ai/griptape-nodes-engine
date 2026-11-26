@@ -179,7 +179,7 @@ For newcomers, a good default is:
 
 Examples you can reference in the docs:
 
-- [Start Flow](../../nodes/execution/start_flow.md) and [End Flow](../../nodes/execution/end_flow.md) for control-flow concepts and status reporting.
+- [Start Flow](https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/nodes/execution/StartFlow.md) and [End Flow](https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/nodes/execution/EndFlow.md) for control-flow concepts and status reporting.
 
 ## Common gotchas
 

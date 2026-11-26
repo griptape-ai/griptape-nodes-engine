@@ -76,12 +76,179 @@ plugins:
         projects/file_extension_directories.md: guides/projects/file_extension_directories.md
         projects/sequences.md: guides/projects/sequences.md
         projects/customization.md: guides/projects/customization.md
+        libraries/advanced_media/index.md: libraries/index.md
+        libraries/diffusers/add_latents.md: libraries/index.md
+        libraries/diffusers/configure_controlnet.md: libraries/index.md
+        libraries/diffusers/controlnet_pipeline.md: libraries/index.md
+        libraries/diffusers/create_noise_latents.md: libraries/index.md
+        libraries/diffusers/decode_hdr_latents.md: libraries/index.md
+        libraries/diffusers/decode_media_latent.md: libraries/index.md
+        libraries/diffusers/empty_latents.md: libraries/index.md
+        libraries/diffusers/encode_masked_media_latent.md: libraries/index.md
+        libraries/diffusers/encode_media_latent.md: libraries/index.md
+        libraries/diffusers/generate_media_latents.md: libraries/index.md
+        libraries/diffusers/index.md: libraries/index.md
+        libraries/diffusers/latent_upsampler.md: libraries/index.md
+        libraries/diffusers/latents_composite_mask.md: libraries/index.md
+        libraries/diffusers/load_lora.md: libraries/index.md
+        libraries/diffusers/lora_pipeline.md: libraries/index.md
+        libraries/diffusers/media_gen_conditioning.md: libraries/index.md
+        libraries/diffusers/multiply_latents.md: libraries/index.md
+        libraries/diffusers/pipeline_builder.md: libraries/index.md
+        libraries/diffusers/save_latent_tensor.md: libraries/index.md
+        libraries/diffusers/subtract_latents.md: libraries/index.md
+        libraries/nuke/index.md: libraries/index.md
+        libraries/nuke/nuke_end_flow.md: libraries/index.md
+        libraries/nuke/nuke_script.md: libraries/index.md
+        libraries/nuke/nuke_start_flow.md: libraries/index.md
+        libraries/opencolorio/index.md: libraries/index.md
+        libraries/opencolorio/load_ocio_config.md: libraries/index.md
+        libraries/opencolorio/ocio_color_parameters.md: libraries/index.md
+        libraries/openexr/display_exr_channel.md: libraries/index.md
+        libraries/openexr/display_exr_part.md: libraries/index.md
+        libraries/openexr/exr_sequence_to_preview.md: libraries/index.md
+        libraries/openexr/index.md: libraries/index.md
+        libraries/openexr/load_exr.md: libraries/index.md
+        libraries/openexr/load_exr_sequence.md: libraries/index.md
+        libraries/openexr/read_exr.md: libraries/index.md
+        libraries/openexr/save_exr.md: libraries/index.md
+        nodes/advanced_media_library/diffusion_pipelines.md: libraries/index.md
+        nodes/advanced_media_library/yolov8_face_detection.md: libraries/index.md
+        nodes/agents/create_agent.md: libraries/index.md
+        nodes/audio/load_audio.md: libraries/index.md
+        nodes/audio/microphone.md: libraries/index.md
+        nodes/audio/transcribe_audio.md: libraries/index.md
+        nodes/config/anthropic_prompt_driver.md: libraries/index.md
+        nodes/config/cohere_prompt_driver.md: libraries/index.md
+        nodes/config/griptape_cloud_image_driver.md: libraries/index.md
+        nodes/config/griptape_cloud_prompt_driver.md: libraries/index.md
+        nodes/config/grok_image_driver.md: libraries/index.md
+        nodes/config/grok_prompt_driver.md: libraries/index.md
+        nodes/config/groq_prompt_driver.md: libraries/index.md
+        nodes/config/openai_image_driver.md: libraries/index.md
+        nodes/config/openai_prompt_driver.md: libraries/index.md
+        nodes/convert/to_json.md: libraries/index.md
+        nodes/dict/create_dict.md: libraries/index.md
+        nodes/dict/display_dict.md: libraries/index.md
+        nodes/dict/key_value_pair.md: libraries/index.md
+        nodes/dict/merge_key_value_pair.md: libraries/index.md
+        nodes/execution/end_flow.md: libraries/index.md
+        nodes/execution/reroute.md: libraries/index.md
+        nodes/execution/start_flow.md: libraries/index.md
+        nodes/image/add_bounding_boxes.md: libraries/index.md
+        nodes/image/add_text_to_existing_image.md: libraries/index.md
+        nodes/image/adjust_image_eq.md: libraries/index.md
+        nodes/image/adjust_image_levels.md: libraries/index.md
+        nodes/image/apply_mask.md: libraries/index.md
+        nodes/image/bloom_effect.md: libraries/index.md
+        nodes/image/color_match.md: libraries/index.md
+        nodes/image/combine_masks.md: libraries/index.md
+        nodes/image/compare_images.md: libraries/index.md
+        nodes/image/create_color_bars.md: libraries/index.md
+        nodes/image/create_image.md: libraries/index.md
+        nodes/image/crop_image.md: libraries/index.md
+        nodes/image/describe_image.md: libraries/index.md
+        nodes/image/display_channel.md: libraries/index.md
+        nodes/image/display_image.md: libraries/index.md
+        nodes/image/display_image_grid.md: libraries/index.md
+        nodes/image/display_mask.md: libraries/index.md
+        nodes/image/extend_canvas.md: libraries/index.md
+        nodes/image/extract_key_colors.md: libraries/index.md
+        nodes/image/flip_image.md: libraries/index.md
+        nodes/image/gaussian_edge_fade.md: libraries/index.md
+        nodes/image/image_bash.md: libraries/index.md
+        nodes/image/image_blend_compositor.md: libraries/index.md
+        nodes/image/image_grid_splitter.md: libraries/index.md
+        nodes/image/invert_image.md: libraries/index.md
+        nodes/image/invert_mask.md: libraries/index.md
+        nodes/image/load_image.md: libraries/index.md
+        nodes/image/merge_images.md: libraries/index.md
+        nodes/image/paint_mask.md: libraries/index.md
+        nodes/image/rescale_image.md: libraries/index.md
+        nodes/image/save_image.md: libraries/index.md
+        nodes/image/webcam.md: libraries/index.md
+        nodes/json/display_json.md: libraries/index.md
+        nodes/json/json_extract_value.md: libraries/index.md
+        nodes/json/json_find.md: libraries/index.md
+        nodes/json/json_input.md: libraries/index.md
+        nodes/json/json_replace.md: libraries/index.md
+        nodes/lists/add_to_list.md: libraries/index.md
+        nodes/lists/combine_lists.md: libraries/index.md
+        nodes/lists/create_bool_list.md: libraries/index.md
+        nodes/lists/create_float_list.md: libraries/index.md
+        nodes/lists/create_int_list.md: libraries/index.md
+        nodes/lists/create_list.md: libraries/index.md
+        nodes/lists/create_text_list.md: libraries/index.md
+        nodes/lists/display_list.md: libraries/index.md
+        nodes/lists/get_from_list.md: libraries/index.md
+        nodes/lists/get_index_of_item.md: libraries/index.md
+        nodes/lists/get_list_contains_item.md: libraries/index.md
+        nodes/lists/get_list_is_empty.md: libraries/index.md
+        nodes/lists/get_list_length.md: libraries/index.md
+        nodes/lists/remove_from_list.md: libraries/index.md
+        nodes/lists/replace_in_list.md: libraries/index.md
+        nodes/lists/select_from_list.md: libraries/index.md
+        nodes/lists/split_list.md: libraries/index.md
+        nodes/number/askulator.md: libraries/index.md
+        nodes/number/create_bool.md: libraries/index.md
+        nodes/number/create_float.md: libraries/index.md
+        nodes/number/create_int.md: libraries/index.md
+        nodes/number/display_float.md: libraries/index.md
+        nodes/number/display_int.md: libraries/index.md
+        nodes/number/math.md: libraries/index.md
+        nodes/overview.md: libraries/index.md
+        nodes/rules/create_ruleset.md: libraries/index.md
+        nodes/rules/ruleset_list.md: libraries/index.md
+        nodes/text/create_multiline_text.md: libraries/index.md
+        nodes/text/date_and_time.md: libraries/index.md
+        nodes/text/display_text.md: libraries/index.md
+        nodes/text/evaluate_text_result.md: libraries/index.md
+        nodes/text/load_text.md: libraries/index.md
+        nodes/text/merge_texts.md: libraries/index.md
+        nodes/text/random_text.md: libraries/index.md
+        nodes/text/save_text.md: libraries/index.md
+        nodes/text/scrape_web.md: libraries/index.md
+        nodes/text/search_replace_text.md: libraries/index.md
+        nodes/text/search_web.md: libraries/index.md
+        nodes/text/summarize_text.md: libraries/index.md
+        nodes/three_d/load_gltf.md: libraries/index.md
+        nodes/tools/calculator_tool.md: libraries/index.md
+        nodes/tools/date_time_tool.md: libraries/index.md
+        nodes/tools/file_manager_tool.md: libraries/index.md
+        nodes/tools/rag_tool.md: libraries/index.md
+        nodes/tools/tool_list.md: libraries/index.md
+        nodes/tools/web_scraper_tool.md: libraries/index.md
+        nodes/tools/web_search_tool.md: libraries/index.md
+        nodes/utils/note.md: libraries/index.md
+        nodes/video/add_color_curves.md: libraries/index.md
+        nodes/video/add_film_grain.md: libraries/index.md
+        nodes/video/add_overlay.md: libraries/index.md
+        nodes/video/add_rgb_shift.md: libraries/index.md
+        nodes/video/add_vignette.md: libraries/index.md
+        nodes/video/adjust_mask_size.md: libraries/index.md
+        nodes/video/adjust_video_eq.md: libraries/index.md
+        nodes/video/change_speed.md: libraries/index.md
+        nodes/video/combine_masks_video.md: libraries/index.md
+        nodes/video/concatenate_videos.md: libraries/index.md
+        nodes/video/display_video.md: libraries/index.md
+        nodes/video/extract_audio.md: libraries/index.md
+        nodes/video/extract_last_frame.md: libraries/index.md
+        nodes/video/flip_video.md: libraries/index.md
+        nodes/video/hold_video_frames.md: libraries/index.md
+        nodes/video/load_video.md: libraries/index.md
+        nodes/video/resize_video.md: libraries/index.md
+        nodes/video/reverse_video.md: libraries/index.md
+        nodes/video/save_video.md: libraries/index.md
+        nodes/video/split_video.md: libraries/index.md
+        nodes/video/video_color_match.md: libraries/index.md
   - llmstxt:
       full_output: llms-full.txt
       markdown_description: |
         Documentation for the Griptape Nodes engine: scripting (retained mode),
-        the project system, custom node development, the built-in node
-        reference, and the engine MCP surface. Use these files to ground an
+        the project system, custom node development, and the engine MCP surface. Node and library docs ship with each
+        library, not on this site: see the libraries index for links to each
+        library's docs, or, with an engine running, use the documentation
+        requests described in the for-agents page. Use these files to ground an
         agent in the engine's actual API rather than scraping rendered HTML or
         fetching unrenderered raw markdown from `main`.
       sections:
@@ -207,12 +374,6 @@ plugins:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node libraries:
           - libraries/index.md: Overview of node libraries (installed by default and installable)
-          - nodes/*.md
-          - libraries/advanced_media/index.md: Advanced Media Library overview
-          - libraries/opencolorio/*.md
-          - libraries/openexr/*.md
-          - libraries/nuke/*.md
-          - libraries/diffusers/*.md
 
 extra_css:
   - assets/css/extra.css
@@ -367,200 +528,6 @@ nav:
           - Hugging Face Models: guides/integrations/hugging_face.md
   - Libraries:
       - Overview: libraries/index.md
-      - Standard Library:
-          - Overview: nodes/overview.md
-          - 3D:
-              - Load 3D: nodes/three_d/load_gltf.md
-          - Agents:
-              - Agent: nodes/agents/create_agent.md
-          - Audio:
-              - Load Audio: nodes/audio/load_audio.md
-              - Microphone: nodes/audio/microphone.md
-              - Transcribe Audio: nodes/audio/transcribe_audio.md
-          - Configs:
-              - Anthropic Prompt: nodes/config/anthropic_prompt_driver.md
-              - Cohere Prompt: nodes/config/cohere_prompt_driver.md
-              - Griptape Cloud Image: nodes/config/griptape_cloud_image_driver.md
-              - Griptape Cloud Prompt: nodes/config/griptape_cloud_prompt_driver.md
-              - Grok Image: nodes/config/grok_image_driver.md
-              - Grok Prompt: nodes/config/grok_prompt_driver.md
-              - Groq Prompt: nodes/config/groq_prompt_driver.md
-              - OpenAI Image: nodes/config/openai_image_driver.md
-              - OpenAI Prompt: nodes/config/openai_prompt_driver.md
-          - Convert:
-              - To JSON: nodes/convert/to_json.md
-          - Dict:
-              - Dict: nodes/dict/create_dict.md
-              - Display Dict: nodes/dict/display_dict.md
-              - Key Value Pair: nodes/dict/key_value_pair.md
-              - Merge Key Value Pairs: nodes/dict/merge_key_value_pair.md
-          - Execution:
-              - End Flow: nodes/execution/end_flow.md
-              - Reroute: nodes/execution/reroute.md
-              - Start Flow: nodes/execution/start_flow.md
-          - Image:
-              - Add Bounding Boxes: nodes/image/add_bounding_boxes.md
-              - Add Text to Existing Image: nodes/image/add_text_to_existing_image.md
-              - Adjust Image EQ: nodes/image/adjust_image_eq.md
-              - Adjust Image Levels: nodes/image/adjust_image_levels.md
-              - Apply Mask: nodes/image/apply_mask.md
-              - Bloom Effect: nodes/image/bloom_effect.md
-              - Color Match: nodes/image/color_match.md
-              - Combine Masks: nodes/image/combine_masks.md
-              - Compare Images: nodes/image/compare_images.md
-              - Create Color Bars: nodes/image/create_color_bars.md
-              - Crop Image: nodes/image/crop_image.md
-              - Describe Image: nodes/image/describe_image.md
-              - Display Channel: nodes/image/display_channel.md
-              - Display Image: nodes/image/display_image.md
-              - Display Image Grid: nodes/image/display_image_grid.md
-              - Display Mask: nodes/image/display_mask.md
-              - Extend Canvas: nodes/image/extend_canvas.md
-              - Extract Key Colors: nodes/image/extract_key_colors.md
-              - Flip Image: nodes/image/flip_image.md
-              - Gaussian Edge Fade: nodes/image/gaussian_edge_fade.md
-              - Generate Image: nodes/image/create_image.md
-              - Image Bash: nodes/image/image_bash.md
-              - Image Blend Compositor: nodes/image/image_blend_compositor.md
-              - Image Grid Splitter: nodes/image/image_grid_splitter.md
-              - Invert Image: nodes/image/invert_image.md
-              - Invert Mask: nodes/image/invert_mask.md
-              - Load Image: nodes/image/load_image.md
-              - Merge Images: nodes/image/merge_images.md
-              - Paint Mask: nodes/image/paint_mask.md
-              - Rescale Image: nodes/image/rescale_image.md
-              - Save Image: nodes/image/save_image.md
-              - Webcam: nodes/image/webcam.md
-          - JSON:
-              - Display JSON: nodes/json/display_json.md
-              - JSON Extract Value: nodes/json/json_extract_value.md
-              - JSON Find: nodes/json/json_find.md
-              - JSON Input: nodes/json/json_input.md
-              - JSON Replace: nodes/json/json_replace.md
-          - Lists:
-              - Add To List: nodes/lists/add_to_list.md
-              - Combine Lists: nodes/lists/combine_lists.md
-              - Create Bool List: nodes/lists/create_bool_list.md
-              - Create Float List: nodes/lists/create_float_list.md
-              - Create Int List: nodes/lists/create_int_list.md
-              - Create List: nodes/lists/create_list.md
-              - Create Text List: nodes/lists/create_text_list.md
-              - Display List: nodes/lists/display_list.md
-              - Get From List: nodes/lists/get_from_list.md
-              - Get Index Of Item: nodes/lists/get_index_of_item.md
-              - Get List Contains Item: nodes/lists/get_list_contains_item.md
-              - Get List Is Empty: nodes/lists/get_list_is_empty.md
-              - Get List Length: nodes/lists/get_list_length.md
-              - Remove From List: nodes/lists/remove_from_list.md
-              - Replace In List: nodes/lists/replace_in_list.md
-              - Select From List: nodes/lists/select_from_list.md
-              - Split List: nodes/lists/split_list.md
-          - Number:
-              - Askulator: nodes/number/askulator.md
-              - Bool Input: nodes/number/create_bool.md
-              - Display Float: nodes/number/display_float.md
-              - Display Int: nodes/number/display_int.md
-              - Float Input: nodes/number/create_float.md
-              - Int Input: nodes/number/create_int.md
-              - Math Operations: nodes/number/math.md
-          - Rules:
-              - Ruleset: nodes/rules/create_ruleset.md
-              - Ruleset List: nodes/rules/ruleset_list.md
-          - Text:
-              - Date and Time: nodes/text/date_and_time.md
-              - Display Text: nodes/text/display_text.md
-              - Evaluate Text Result: nodes/text/evaluate_text_result.md
-              - Load Text: nodes/text/load_text.md
-              - Merge Texts: nodes/text/merge_texts.md
-              - Random Text: nodes/text/random_text.md
-              - Save Text: nodes/text/save_text.md
-              - Scrape Web: nodes/text/scrape_web.md
-              - Search Replace Text: nodes/text/search_replace_text.md
-              - Search Web: nodes/text/search_web.md
-              - Summarize Text: nodes/text/summarize_text.md
-              - Text Input: nodes/text/create_multiline_text.md
-          - Tools:
-              - Calculator: nodes/tools/calculator_tool.md
-              - Date Time: nodes/tools/date_time_tool.md
-              - File Manager: nodes/tools/file_manager_tool.md
-              - Info Retriever: nodes/tools/rag_tool.md
-              - Tool List: nodes/tools/tool_list.md
-              - Web Scraper: nodes/tools/web_scraper_tool.md
-              - Web Search: nodes/tools/web_search_tool.md
-          - Utility:
-              - Note: nodes/utils/note.md
-          - Video:
-              - Add Color Curves: nodes/video/add_color_curves.md
-              - Add Film Grain: nodes/video/add_film_grain.md
-              - Add Overlay: nodes/video/add_overlay.md
-              - Add RGB Shift: nodes/video/add_rgb_shift.md
-              - Add Vignette: nodes/video/add_vignette.md
-              - Adjust Mask Size: nodes/video/adjust_mask_size.md
-              - Adjust Video EQ: nodes/video/adjust_video_eq.md
-              - Change Speed: nodes/video/change_speed.md
-              - Combine Masks Video: nodes/video/combine_masks_video.md
-              - Concatenate Videos: nodes/video/concatenate_videos.md
-              - Display Video: nodes/video/display_video.md
-              - Extract Audio: nodes/video/extract_audio.md
-              - Extract Last Frame: nodes/video/extract_last_frame.md
-              - Flip Video: nodes/video/flip_video.md
-              - Hold Video Frames: nodes/video/hold_video_frames.md
-              - Load Video: nodes/video/load_video.md
-              - Resize Video: nodes/video/resize_video.md
-              - Reverse Video: nodes/video/reverse_video.md
-              - Save Video: nodes/video/save_video.md
-              - Split Video: nodes/video/split_video.md
-              - Video Color Match: nodes/video/video_color_match.md
-      - Diffusers:
-          - Overview: libraries/diffusers/index.md
-          - Pipeline:
-              - Modular Diffusion Pipeline Builder: libraries/diffusers/pipeline_builder.md
-              - ControlNet Pipeline: libraries/diffusers/controlnet_pipeline.md
-              - Load LoRA: libraries/diffusers/load_lora.md
-              - LoRA Pipeline: libraries/diffusers/lora_pipeline.md
-          - Create:
-              - Create Noise Latents: libraries/diffusers/create_noise_latents.md
-              - Create Empty Latents: libraries/diffusers/empty_latents.md
-          - Processing:
-              - Generate Media Latents: libraries/diffusers/generate_media_latents.md
-              - Latent Upsampler: libraries/diffusers/latent_upsampler.md
-          - Transform:
-              - Add Latents: libraries/diffusers/add_latents.md
-              - Subtract Latents: libraries/diffusers/subtract_latents.md
-              - Multiply Latents: libraries/diffusers/multiply_latents.md
-              - Latents Composite Mask: libraries/diffusers/latents_composite_mask.md
-          - Conditioning:
-              - Configure ControlNet: libraries/diffusers/configure_controlnet.md
-              - Media Generation Conditioning: libraries/diffusers/media_gen_conditioning.md
-          - Encode / Decode:
-              - Encode Media Latent: libraries/diffusers/encode_media_latent.md
-              - Encode Masked Media Latent: libraries/diffusers/encode_masked_media_latent.md
-              - Decode Media Latent: libraries/diffusers/decode_media_latent.md
-              - Decode HDR Latents: libraries/diffusers/decode_hdr_latents.md
-          - IO:
-              - Save Latent Tensor: libraries/diffusers/save_latent_tensor.md
-      - Advanced Media Library:
-          - Overview: libraries/advanced_media/index.md
-          - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
-          - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
-      - OpenColorIO:
-          - Overview: libraries/opencolorio/index.md
-          - Load OCIO Config: libraries/opencolorio/load_ocio_config.md
-          - OCIO Color Parameters: libraries/opencolorio/ocio_color_parameters.md
-      - OpenEXR:
-          - Overview: libraries/openexr/index.md
-          - Read EXR: libraries/openexr/read_exr.md
-          - Load EXR: libraries/openexr/load_exr.md
-          - Load EXR Sequence: libraries/openexr/load_exr_sequence.md
-          - Display EXR Part: libraries/openexr/display_exr_part.md
-          - Display EXR Channel: libraries/openexr/display_exr_channel.md
-          - Save EXR: libraries/openexr/save_exr.md
-          - EXR Sequence to Preview: libraries/openexr/exr_sequence_to_preview.md
-      - Nuke:
-          - Overview: libraries/nuke/index.md
-          - Nuke Start Flow: libraries/nuke/nuke_start_flow.md
-          - Nuke End Flow: libraries/nuke/nuke_end_flow.md
-          - Nuke Script: libraries/nuke/nuke_script.md
   - Development:
       - Scripting: development/retained_mode.md
       - Custom Nodes:

@@ -416,7 +416,7 @@ All diffusion pipeline nodes have been replaced with the **Diffusion Pipeline Bu
 
 **Replacement:** Use `Diffusion Pipeline Builder` + `Generate Image (Diffusion Pipeline)` nodes
 
-**Documentation:** https://docs.griptapenodes.com/en/stable/nodes/advanced_media_library/diffusion_pipelines/
+**Documentation:** https://github.com/griptape-ai/griptape-nodes-library-advanced-media/blob/main/docs/nodes/diffusion/DiffusionPipelineBuilderNode.md
 
 **[See migration details ↓](#for-diffusion-pipeline-nodes)**
 
@@ -553,7 +553,7 @@ The Grayscale Image and Gaussian Blur Image replacement nodes have equivalent fu
 1. Replace each with a combination of:
     - **Diffusion Pipeline Builder** node (configure your model and settings)
     - **Generate Image (Diffusion Pipeline)** node (run the generation)
-1. Refer to the [Diffusion Pipeline documentation](https://docs.griptapenodes.com/en/stable/nodes/advanced_media_library/diffusion_pipelines/) for detailed examples
+1. Refer to the [Diffusion Pipeline documentation](https://github.com/griptape-ai/griptape-nodes-library-advanced-media/blob/main/docs/nodes/diffusion/DiffusionPipelineBuilderNode.md) for detailed examples
 1. The new system offers more flexibility with:
     - Composable pipeline components
     - Reusable pipeline configurations

@@ -12,4 +12,4 @@ The **Agent node** is how you bring AI into a workflow. Unlike the chat sidebar 
 
 ## Full reference
 
-See the [Agent node reference](../../nodes/agents/create_agent.md) for the complete parameter list, output schema examples, and common issues.
+See the [Agent node reference](https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/nodes/agents/Agent.md) for the complete parameter list, output schema examples, and common issues.

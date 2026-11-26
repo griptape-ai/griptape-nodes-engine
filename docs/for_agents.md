@@ -15,7 +15,7 @@ does not give you.
 - [`/llms.txt`](https://docs.griptapenodes.com/en/stable/llms.txt) is the curated
     index per the [llms.txt convention](https://llmstxt.org/). It groups the
     high-value pages (scripting, the project system, custom node development,
-    MCP integration, and the node reference) under named sections with short
+    MCP integration, and the libraries index) under named sections with short
     descriptions and absolute URLs.
 - [`/llms-full.txt`](https://docs.griptapenodes.com/en/stable/llms-full.txt) is the
     full concatenated post-processed markdown of every page in the nav. Use
@@ -53,6 +53,20 @@ five cover most of the engine's first-party API surface:
 - [Project system overview](https://docs.griptapenodes.com/en/stable/guides/projects/index.md)
 - [MCP integration overview](https://docs.griptapenodes.com/en/stable/guides/mcp/index.md)
 
+## Library docs
+
+Node and library docs are no longer on this site. Each library ships its own
+docs, and there are two ways to read them.
+
+- With an engine running, call `GetNodeDocumentationRequest`,
+    `ListLibraryDocumentationRequest`, and
+    `GetLibraryDocumentationPageRequest`. They return the docs of the
+    library version that is installed, so they match the nodes you are
+    working with.
+- Without an engine, use the [libraries index](libraries/index.md), hosted at
+    `/libraries/`. It links to each library's repository and to its
+    `docs/index.md`. The pages are plain markdown.
+
 ## Stability
 
 - The surface tracks `main` via the existing docs deploy pipeline. There is
@@ -60,5 +74,4 @@ five cover most of the engine's first-party API surface:
     currently published.
 - The set of pages is driven by the `llmstxt` plugin block in `mkdocs.yml`.
     Adding a new doc page does not automatically include it in `/llms.txt` or
-    `/llms-full.txt`; the page must be added under a section there. Reference
-    pages under `nodes/` are picked up via a glob.
+    `/llms-full.txt`; the page must be added under a section there.

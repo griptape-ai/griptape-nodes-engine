@@ -18,7 +18,7 @@ Each tutorial builds upon the knowledge gained in previous lessons, gradually in
 
     ![img](assets/FTUE_01_prompt_an_image.png)
 
-    Learn how to use the powerful [GenerateImage](../nodes/image/create_image.md) node to transform text descriptions into vivid visual creations.
+    Learn how to use the powerful [GenerateImage](https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/nodes/image/GenerateImage.md) node to transform text descriptions into vivid visual creations.
 
     This tutorial introduces you to one of the most popular and versatile nodes in the Griptape ecosystem.
 
