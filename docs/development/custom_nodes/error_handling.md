@@ -283,7 +283,10 @@ the error panel:
 raise NodeError(
     "Image format 'image/heic' is not supported.",
     links=[
-        NodeErrorLink(label="Supported image formats", url="https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/nodes/image/LoadImage.md")
+        NodeErrorLink(
+            label="Supported image formats",
+            url="https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/nodes/image/LoadImage.md",
+        )
     ],
 )
 ```
