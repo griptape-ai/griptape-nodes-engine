@@ -2350,21 +2350,15 @@ situations:
       create_dirs: true
 """
 
-    def _setup_system_defaults(
-        self, project_manager_with_empty_config: ProjectManager, workspace_dir: str = "/workspace"
-    ) -> None:
+    def _setup_system_defaults(self, pm: ProjectManager, workspace_dir: str = "/workspace") -> None:
         """Load system defaults into pm, mirroring _load_system_defaults."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, ProjectInfo
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
-        situation_schemas = project_manager_with_empty_config._parse_situation_macros(
-            DEFAULT_PROJECT_TEMPLATE.situations, validation
-        )
-        directory_schemas = project_manager_with_empty_config._parse_directory_macros(
-            DEFAULT_PROJECT_TEMPLATE.directories, validation
-        )
+        situation_schemas = pm._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
 
         project_info = ProjectInfo(
             project_id=SYSTEM_DEFAULTS_KEY,
@@ -2375,8 +2369,8 @@ situations:
             parsed_situation_schemas=situation_schemas,
             parsed_directory_schemas=directory_schemas,
         )
-        project_manager_with_empty_config._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
-        project_manager_with_empty_config._current_project_id = SYSTEM_DEFAULTS_KEY
+        pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
+        pm._current_project_id = SYSTEM_DEFAULTS_KEY
 
     @pytest.mark.asyncio
     async def test_load_workspace_project_not_present(
@@ -3088,7 +3082,7 @@ project_template_schema_version: "1.0.0"
 name: Modern Project
 """
 
-    async def _load_yaml(self, project_manager_with_empty_config: ProjectManager, tmp_path: Path, yaml_text: str):  # noqa: ANN202
+    async def _load_yaml(self, pm: ProjectManager, tmp_path: Path, yaml_text: str):  # noqa: ANN202
         from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         project_path = tmp_path / "griptape-nodes-project.yml"
@@ -3097,11 +3091,9 @@ name: Modern Project
             mock_file_instance = Mock()
             mock_file_instance.aread_text = AsyncMock(return_value=yaml_text)
             mock_file_cls.return_value = mock_file_instance
-            result = await project_manager_with_empty_config._load_and_cache_project_template(
-                project_path, persist_path=False
-            )
+            result = await pm._load_and_cache_project_template(project_path, persist_path=False)
         assert isinstance(result, LoadProjectTemplateResultSuccess)
-        return project_manager_with_empty_config._successfully_loaded_project_templates[str(project_path)].template
+        return pm._successfully_loaded_project_templates[str(project_path)].template
 
     @pytest.mark.asyncio
     async def test_v0_project_loads_onto_v0_layout(
@@ -3145,7 +3137,7 @@ project_template_schema_version: "0.5.1"
 name: Legacy Project
 """
 
-    async def _load(self, project_manager_with_empty_config: ProjectManager, tmp_path: Path, yaml_text: str) -> str:
+    async def _load(self, pm: ProjectManager, tmp_path: Path, yaml_text: str) -> str:
         """Load a project from disk and return its registry id."""
         from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
@@ -3155,13 +3147,11 @@ name: Legacy Project
             mock_file_instance = Mock()
             mock_file_instance.aread_text = AsyncMock(return_value=yaml_text)
             mock_file_cls.return_value = mock_file_instance
-            result = await project_manager_with_empty_config._load_and_cache_project_template(
-                project_path, persist_path=False
-            )
+            result = await pm._load_and_cache_project_template(project_path, persist_path=False)
         assert isinstance(result, LoadProjectTemplateResultSuccess)
         return next(
             pid
-            for pid, info in project_manager_with_empty_config._successfully_loaded_project_templates.items()
+            for pid, info in pm._successfully_loaded_project_templates.items()
             if info.project_file_path == canonicalize_for_identity(project_path)
         )
 
@@ -3275,9 +3265,7 @@ name: Legacy Project
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
 
-    async def _load_at(
-        self, project_manager_with_empty_config: ProjectManager, project_dir: Path, yaml_text: str
-    ) -> str:
+    async def _load_at(self, pm: ProjectManager, project_dir: Path, yaml_text: str) -> str:
         """Load a project from its own directory and return its registry id.
 
         Distinct from _load (which uses a single fixed path) so a parent and child can be loaded at
@@ -3288,13 +3276,11 @@ name: Legacy Project
         project_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
         project_path = project_dir / "griptape-nodes-project.yml"
         project_path.write_text(yaml_text)
-        result = await project_manager_with_empty_config._load_and_cache_project_template(
-            project_path, persist_path=False
-        )
+        result = await pm._load_and_cache_project_template(project_path, persist_path=False)
         assert isinstance(result, LoadProjectTemplateResultSuccess)
         return next(
             pid
-            for pid, info in project_manager_with_empty_config._successfully_loaded_project_templates.items()
+            for pid, info in pm._successfully_loaded_project_templates.items()
             if info.project_file_path == canonicalize_for_identity(project_path)
         )
 
@@ -3371,17 +3357,9 @@ name: Legacy Project
 class TestLoadSystemDefaults:
     """Test _load_system_defaults uses resolved workspace path for project_base_dir."""
 
-    @pytest.fixture
-    def pm(self) -> ProjectManager:
-        mock_event_manager = Mock()
-        mock_config_manager = Mock()
-        mock_config_manager.project_config = {}
-        mock_config_manager.env_config = {}
-        mock_config_manager.merged_config = {}
-        mock_config_manager.get_config_value.return_value = {}
-        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
-
-    def test_project_base_dir_uses_resolved_workspace_path(self, pm: ProjectManager) -> None:
+    def test_project_base_dir_uses_resolved_workspace_path(
+        self, project_manager_with_empty_config: ProjectManager
+    ) -> None:
         """Test that _load_system_defaults uses config_manager.workspace_path (resolved) for project_base_dir.
 
         This ensures project_base_dir matches the resolved paths used for macro resolution,
@@ -3390,14 +3368,14 @@ class TestLoadSystemDefaults:
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 
         resolved_path = Path("/Users/testuser/GriptapeNodes")
-        cast("Mock", pm._config_manager).workspace_path = resolved_path
+        cast("Mock", project_manager_with_empty_config._config_manager).workspace_path = resolved_path
 
-        pm._load_system_defaults()
+        project_manager_with_empty_config._load_system_defaults()
 
-        project_info = pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
+        project_info = project_manager_with_empty_config._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
         assert project_info.project_base_dir == resolved_path
 
-    def test_project_base_dir_not_raw_config_value(self, pm: ProjectManager) -> None:
+    def test_project_base_dir_not_raw_config_value(self, project_manager_with_empty_config: ProjectManager) -> None:
         """Test that _load_system_defaults does NOT use the raw config value with ~ for project_base_dir.
 
         Previously, _load_system_defaults used get_config_value("workspace_directory") which
@@ -3407,12 +3385,14 @@ class TestLoadSystemDefaults:
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 
         resolved_path = Path("/Users/testuser/GriptapeNodes")
-        cast("Mock", pm._config_manager).workspace_path = resolved_path
-        cast("Mock", pm._config_manager).get_config_value.return_value = "~/GriptapeNodes"
+        cast("Mock", project_manager_with_empty_config._config_manager).workspace_path = resolved_path
+        cast(
+            "Mock", project_manager_with_empty_config._config_manager
+        ).get_config_value.return_value = "~/GriptapeNodes"
 
-        pm._load_system_defaults()
+        project_manager_with_empty_config._load_system_defaults()
 
-        project_info = pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
+        project_info = project_manager_with_empty_config._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
         # Should use the resolved path, not the raw config value
         assert project_info.project_base_dir == resolved_path
         assert str(project_info.project_base_dir) != "~/GriptapeNodes"
@@ -8688,9 +8668,7 @@ directories:
         yaml_loader = YAML(typ="safe")
         return yaml_loader.load(yaml_text)
 
-    async def _load_parent(
-        self, project_manager_with_workspace: ProjectManager, parent_path: Path, parent_yaml: str
-    ) -> None:
+    async def _load_parent(self, pm: ProjectManager, parent_path: Path, parent_yaml: str) -> None:
         """Load `parent_yaml` from `parent_path` into the registry."""
         from griptape_nodes.retained_mode.events.project_events import (
             LoadProjectTemplateRequest,
@@ -8700,14 +8678,10 @@ directories:
         files = {parent_path: parent_yaml}
         mock_engine = MagicMock()
         mock_engine.only_open_workflow_or_none.return_value = None
-        with patch.object(project_manager_with_workspace, "_engine", mock_engine):
-            cast(
-                "Mock", project_manager_with_workspace._event_manager
-            ).evaluate_authorization_checkpoint.return_value = None
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_engine.ahandle_request = self._file_router(files)
-            result = await project_manager_with_workspace.on_load_project_template_request(
-                LoadProjectTemplateRequest(project_path=parent_path)
-            )
+            result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=parent_path))
         assert isinstance(result, LoadProjectTemplateResultSuccess)
 
     def test_save_refusal_names_the_real_reason_the_parent_could_not_be_resolved(
@@ -9230,9 +9204,7 @@ class TestValidateProjectTemplateParentChain:
     """
 
     @staticmethod
-    def _seed_registered_template(
-        project_manager_with_empty_project_list: ProjectManager, project_id: str, parent_project_path: str | None
-    ) -> str:
+    def _seed_registered_template(pm: ProjectManager, project_id: str, parent_project_path: str | None) -> str:
         r"""Insert a minimal ProjectInfo into the registry for chain-walking purposes.
 
         Returns the canonical registry key actually used so callers (and the
@@ -9260,7 +9232,7 @@ class TestValidateProjectTemplateParentChain:
             situations={},
             directories={},
         )
-        project_manager_with_empty_project_list._successfully_loaded_project_templates[canonical_id] = ProjectInfo(
+        pm._successfully_loaded_project_templates[canonical_id] = ProjectInfo(
             project_id=canonical_id,
             project_file_path=Path(canonical_id),
             project_base_dir=Path(canonical_id).parent,
@@ -10696,20 +10668,14 @@ situations:
       create_dirs: true
 """
 
-    def _setup_system_defaults(
-        self, project_manager_with_empty_config: ProjectManager, workspace_dir: str = "/workspace"
-    ) -> None:
+    def _setup_system_defaults(self, pm: ProjectManager, workspace_dir: str = "/workspace") -> None:
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, ProjectInfo
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
-        situation_schemas = project_manager_with_empty_config._parse_situation_macros(
-            DEFAULT_PROJECT_TEMPLATE.situations, validation
-        )
-        directory_schemas = project_manager_with_empty_config._parse_directory_macros(
-            DEFAULT_PROJECT_TEMPLATE.directories, validation
-        )
+        situation_schemas = pm._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
 
         project_info = ProjectInfo(
             project_id=SYSTEM_DEFAULTS_KEY,
@@ -10720,8 +10686,8 @@ situations:
             parsed_situation_schemas=situation_schemas,
             parsed_directory_schemas=directory_schemas,
         )
-        project_manager_with_empty_config._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
-        project_manager_with_empty_config._current_project_id = SYSTEM_DEFAULTS_KEY
+        pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
+        pm._current_project_id = SYSTEM_DEFAULTS_KEY
 
     @pytest.mark.asyncio
     async def test_no_workspace_project_is_success_noop(
@@ -10755,13 +10721,11 @@ situations:
         assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
         assert project_manager_with_empty_config._current_project_id == SYSTEM_DEFAULTS_KEY
 
-    def _configure_project_file(
-        self, project_manager_with_empty_config: ProjectManager, tmp_path: Path, project_file: Path
-    ) -> None:
+    def _configure_project_file(self, pm: ProjectManager, tmp_path: Path, project_file: Path) -> None:
         """Set up system defaults and a workspace project, with `project_file` pointing at `project_file`."""
         from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
 
-        self._setup_system_defaults(project_manager_with_empty_config, str(tmp_path))
+        self._setup_system_defaults(pm, str(tmp_path))
         (tmp_path / WORKSPACE_PROJECT_FILE).write_text(self.VALID_PROJECT_YAML)
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
@@ -10771,14 +10735,10 @@ situations:
                 return {}
             return str(tmp_path)
 
-        cast(
-            "Mock", project_manager_with_empty_config._config_manager
-        ).get_config_value.side_effect = get_config_value_side_effect
-        cast("Mock", project_manager_with_empty_config._config_manager).workspace_path = tmp_path
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-    async def _activate(
-        self, project_manager_with_empty_config: ProjectManager, *, fail_if_project_file_missing: bool
-    ) -> object:
+    async def _activate(self, pm: ProjectManager, *, fail_if_project_file_missing: bool) -> object:
         from griptape_nodes.retained_mode.events.project_events import ActivateWorkspaceProjectRequest
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
@@ -10787,7 +10747,7 @@ situations:
             mock_file_cls.return_value = mock_file_instance
 
             request = ActivateWorkspaceProjectRequest(fail_if_project_file_missing=fail_if_project_file_missing)
-            return await project_manager_with_empty_config.on_activate_workspace_project_request(request)
+            return await pm.on_activate_workspace_project_request(request)
 
     @pytest.mark.asyncio
     async def test_missing_project_file_fails_when_requested(
@@ -11570,10 +11530,6 @@ parent_project_id: "ghost-parent-id"
 
 class TestProjectActivationAuthorizationCheckpoint:
     """The license-policy checkpoint wired into project activation."""
-
-    @pytest.fixture
-    def project_manager(self) -> ProjectManager:
-        return ProjectManager(Mock(), Mock(), Mock())
 
     @pytest.mark.asyncio
     async def test_denied_activation_is_rejected_and_leaves_current_project(
