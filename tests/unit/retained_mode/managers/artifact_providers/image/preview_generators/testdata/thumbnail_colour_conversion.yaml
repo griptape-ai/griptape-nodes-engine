@@ -1,0 +1,373 @@
+schema_version: 1
+images:
+  # Retains the previous scene/display colour expectations: scene-linear 0.18
+  # becomes about 118/255 in sRGB; display-referred 0.5 stays about 128/255.
+  # PNG outputs from UINT16 DPX retain UINT16 storage after colour conversion.
+  - id: scene_grey
+    source:
+      dimensions:
+        width: 8
+        height: 8
+      channels: &rgb_channels [R, G, B]
+      pixels:
+        pattern: solid
+        colour: [0.18, 0.18, 0.18]
+    variants:
+      - id: exr
+        format: exr
+        sample_type: float16
+      - id: hdr
+        format: hdr
+        sample_type: float32
+      - id: tiff
+        format: tif
+        sample_type: float32
+      - id: linear_dpx
+        format: dpx
+        sample_type: uint16
+        metadata: &linear_dpx_transfer
+          dpx:Transfer: Linear
+        expect:
+          metadata:
+            equals: *linear_dpx_transfer
+    cases:
+      - id: srgb
+        operation: generate_thumbnail
+        inputs: [exr, hdr, tiff]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.4627450980392157, 0.4627450980392157, 0.4627450980392157]
+                    max_absolute_error: &one_uint8_level_with_float_epsilon 0.003921668627450981
+      - id: lossy
+        operation: generate_thumbnail
+        inputs: [exr]
+        parameters: {}
+        outputs:
+          - format: jpg
+            expect:
+              # JPEG tables transcribed from baseline_square.jpg at ff53552f2.
+              encoding:
+                quantization:
+                  0: [8, 6, 5, 8, 12, 20, 26, 31, 6, 6, 7, 10, 13, 29, 30, 28, 7, 7, 8, 12, 20, 29, 35, 28, 7,
+                        9, 11, 15, 26, 44, 40, 31, 9, 11, 19, 28, 34, 55, 52, 39, 12, 18, 28, 32, 41, 52, 57,
+                        46, 25, 32, 39, 44, 52, 61, 60, 51, 36, 46, 48, 49, 56, 50, 52, 50]
+                  1: [9, 9, 12, 24, 50, 50, 50, 50, 9, 11, 13, 33, 50, 50, 50, 50, 12, 13, 28, 50, 50, 50, 50,
+                        50, 24, 33, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50,
+                    50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50, 50]
+                sampling: 2
+                progressive: false
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.4627450980392157, 0.4627450980392157, 0.4627450980392157]
+                    max_absolute_error: &three_uint8_levels_with_float_epsilon 0.01176480588235294
+          - format: webp
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.4627450980392157, 0.4627450980392157, 0.4627450980392157]
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+      - id: srgb_dpx
+        operation: generate_thumbnail
+        inputs: [linear_dpx]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint16
+              channels: [R, G, B]
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.4627450980392157, 0.4627450980392157, 0.4627450980392157]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+  - id: highlight
+    source:
+      dimensions:
+        width: 8
+        height: 8
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: [4, 1, 0.1]
+    variants:
+      - id: exr
+        format: exr
+        sample_type: float16
+    cases:
+      - id: srgb
+        operation: generate_thumbnail
+        inputs: [exr]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 1, 0.34901960784313724]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+  - id: display_grey
+    source:
+      dimensions:
+        width: 8
+        height: 8
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: [0.5, 0.5, 0.5]
+    variants:
+      - id: png
+        format: png
+        sample_type: uint8
+      - id: tiff
+        format: tif
+        sample_type: uint8
+    cases:
+      - id: unchanged
+        operation: generate_thumbnail
+        inputs: [png, tiff]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.5019607843137255, 0.5019607843137255, 0.5019607843137255]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+  # OIIO stores the tested Rec709 DPX transfer as Undefined. Both the input
+  # read-back expectation and the unchanged display-value assertion record this.
+  - id: dpx_grey
+    source:
+      dimensions:
+        width: 8
+        height: 8
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: [0.45, 0.45, 0.45]
+    variants:
+      - id: rec709
+        format: dpx
+        sample_type: uint16
+        metadata: &undefined_dpx_transfer
+          dpx:Transfer: Undefined
+        expect:
+          metadata:
+            equals: *undefined_dpx_transfer
+      - id: log
+        format: dpx
+        sample_type: uint16
+        metadata: &logarithmic_dpx_transfer
+          dpx:Transfer: Logarithmic
+        expect:
+          metadata:
+            equals: *logarithmic_dpx_transfer
+    cases:
+      - id: unchanged
+        operation: generate_thumbnail
+        inputs: [rec709, log]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint16
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.45098039215686275, 0.45098039215686275, 0.45098039215686275]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+  # Premultiplied EXR colour 0.18 at alpha 0.5 becomes straight colour 0.36,
+  # or about 162/255 in sRGB. The previous colour/alpha expectations are retained.
+  - id: scene_alpha
+    source:
+      dimensions:
+        width: 8
+        height: 8
+      channels: &rgba_channels [R, G, B, A]
+      pixels:
+        pattern: solid
+        colour: [0.18, 0.18, 0.18, 0.5]
+      alpha_association: premultiplied
+    variants:
+      - id: exr
+        format: exr
+        sample_type: float16
+    cases:
+      - id: srgb
+        operation: generate_thumbnail
+        inputs: [exr]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: &straight_alpha_srgb_grey [0.6352941176470588, 0.6352941176470588, 0.6352941176470588,
+                          0.5019607843137255]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+          - format: webp
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *straight_alpha_srgb_grey
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+  - id: scene_grayscale_alpha
+    source:
+      dimensions:
+        width: 8
+        height: 8
+      channels: &scene_grayscale_alpha_channels [Y, A]
+      pixels:
+        pattern: solid
+        colour: [0.18, 0.5]
+      alpha_association: premultiplied
+    variants:
+      - id: exr
+        format: exr
+        sample_type: float16
+    cases:
+      - id: srgb
+        operation: generate_thumbnail
+        inputs: [exr]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *scene_grayscale_alpha_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.6352941176470588, 0.5019607843137255]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+          - format: webp
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.6352941176470588, 0.6352941176470588, 0.6352941176470588, 0.5019607843137255]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+  - id: scene_single
+    source:
+      dimensions:
+        width: 8
+        height: 8
+      channels: &scene_grayscale_channels [Y]
+      pixels:
+        pattern: solid
+        colour: [0.18]
+    variants:
+      - id: exr
+        format: exr
+        sample_type: float16
+    cases:
+      - id: srgb
+        operation: generate_thumbnail
+        inputs: [exr]
+        parameters: {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 8
+                height: 8
+              sample_type: uint8
+              channels: *scene_grayscale_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.4627450980392157]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+  - id: large_scene
+    source:
+      dimensions:
+        width: 64
+        height: 64
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: [0.18, 0.18, 0.18]
+    variants:
+      - id: exr
+        format: exr
+        sample_type: float16
+    cases:
+      - id: resized
+        operation: generate_thumbnail
+        inputs: [exr]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 16
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.4627450980392157, 0.4627450980392157, 0.4627450980392157]
+                    max_absolute_error: *one_uint8_level_with_float_epsilon

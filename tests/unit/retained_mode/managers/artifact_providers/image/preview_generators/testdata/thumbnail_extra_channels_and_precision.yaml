@@ -1,0 +1,237 @@
+schema_version: 1
+images:
+  - id: multichannel_5
+    source:
+      dimensions:
+        width: 64
+        height: 32
+      channels: [R, G, B, A, extra_0]
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0, 0.5019607843137255, 0.25]
+      alpha_association: straight
+    variants:
+      - id: tiff8
+        format: tiff
+        sample_type: uint8
+    cases:
+      - id: bounds_16
+        operation: generate_thumbnail
+        inputs: [tiff8]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: &rgba_channels [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: &exact_pixel_tolerance 1e-06
+          - format: webp
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: &three_uint8_levels_with_float_epsilon 0.01176480588235294
+      - id: bounds_64
+        operation: generate_thumbnail
+        inputs: [tiff8]
+        parameters:
+          max_width: 64
+          max_height: 64
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 64
+                height: 32
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: *exact_pixel_tolerance
+          - format: webp
+            expect:
+              dimensions:
+                width: 64
+                height: 32
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+  - id: multichannel_6
+    source:
+      dimensions:
+        width: 64
+        height: 32
+      channels: [R, G, B, A, extra_0, extra_1]
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0, 0.5019607843137255, 0.25, 0.75]
+      alpha_association: straight
+    variants:
+      - id: tiff8
+        format: tiff
+        sample_type: uint8
+    cases:
+      - id: bounds_16
+        operation: generate_thumbnail
+        inputs: [tiff8]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: *exact_pixel_tolerance
+          - format: webp
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+      - id: bounds_64
+        operation: generate_thumbnail
+        inputs: [tiff8]
+        parameters:
+          max_width: 64
+          max_height: 64
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 64
+                height: 32
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: *exact_pixel_tolerance
+          - format: webp
+            expect:
+              dimensions:
+                width: 64
+                height: 32
+              sample_type: uint8
+              channels: *rgba_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [1, 0, 0, 0.5019607843137255]
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+  - id: precision
+    source:
+      dimensions:
+        width: 64
+        height: 32
+      channels: &rgb_channels [R, G, B]
+      pixels:
+        pattern: solid
+        colour: [0.2501, 0.5001, 0.7501]
+    variants:
+      - id: png16
+        format: png
+        sample_type: uint16
+    cases:
+      - id: bounds_16
+        operation: generate_thumbnail
+        inputs: [png16]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint16
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.2501, 0.5001, 0.7501]
+                    # One UINT16 quantisation level: 1/65535.
+                    max_absolute_error: &one_uint16_level 1.5259021896696421e-05
+          - format: jpg
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+          - format: webp
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+      - id: bounds_64
+        operation: generate_thumbnail
+        inputs: [png16]
+        parameters:
+          max_width: 64
+          max_height: 64
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 64
+                height: 32
+              sample_type: uint16
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: [0.2501, 0.5001, 0.7501]
+                    max_absolute_error: *one_uint16_level
+          - format: jpg
+            expect:
+              dimensions:
+                width: 64
+                height: 32
+              sample_type: uint8
+              channels: *rgb_channels
+          - format: webp
+            expect:
+              dimensions:
+                width: 64
+                height: 32
+              sample_type: uint8
+              channels: *rgb_channels

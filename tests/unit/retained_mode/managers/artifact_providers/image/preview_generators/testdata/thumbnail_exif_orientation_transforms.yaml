@@ -1,0 +1,428 @@
+schema_version: 1
+images:
+  # Explicit permutations check the interior of each transformed quadrant.
+  # Rotated sources use spatial samples instead of full-image Pillow equivalence.
+  - id: orientation
+    source:
+      dimensions:
+        width: 120
+        height: 80
+      channels: &rgb_channels [R, G, B]
+      pixels:
+        pattern: quadrants
+        colours:
+          - &orientation_red [1, 0, 0]
+          - &orientation_blue [0, 0, 1]
+          - &orientation_green [0, 0.5019607843137255, 0]
+          - &orientation_yellow [1, 1, 0]
+    variants:
+      - id: orientation_1
+        format: png
+        sample_type: uint8
+        metadata: &orientation_normal
+          Orientation: 1
+        expect:
+          metadata:
+            equals: *orientation_normal
+      - id: orientation_2
+        format: png
+        sample_type: uint8
+        metadata: &orientation_flip_horizontal
+          Orientation: 2
+        expect:
+          metadata:
+            equals: *orientation_flip_horizontal
+      - id: orientation_3
+        format: png
+        sample_type: uint8
+        metadata: &orientation_rotate_180
+          Orientation: 3
+        expect:
+          metadata:
+            equals: *orientation_rotate_180
+      - id: orientation_4
+        format: png
+        sample_type: uint8
+        metadata: &orientation_flip_vertical
+          Orientation: 4
+        expect:
+          metadata:
+            equals: *orientation_flip_vertical
+      - id: orientation_5
+        format: png
+        sample_type: uint8
+        metadata: &orientation_transpose
+          Orientation: 5
+        expect:
+          metadata:
+            equals: *orientation_transpose
+      - id: orientation_6
+        format: png
+        sample_type: uint8
+        metadata: &orientation_rotate_90_clockwise
+          Orientation: 6
+        expect:
+          metadata:
+            equals: *orientation_rotate_90_clockwise
+      - id: orientation_7
+        format: png
+        sample_type: uint8
+        metadata: &orientation_transverse
+          Orientation: 7
+        expect:
+          metadata:
+            equals: *orientation_transverse
+      - id: orientation_8
+        format: png
+        sample_type: uint8
+        metadata: &orientation_rotate_90_counterclockwise
+          Orientation: 8
+        expect:
+          metadata:
+            equals: *orientation_rotate_90_counterclockwise
+    cases:
+      - id: orientation_1
+        operation: generate_thumbnail
+        inputs: [orientation_1]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 21
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_red
+                    # One byte level (1/255) plus 1e-7 float32 decoding epsilon.
+                    max_absolute_error: &one_uint8_level_with_float_epsilon 0.003921668627450981
+                    position:
+                      x: 8
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 15
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 15
+              metadata:
+                equals:
+                  Orientation: 1
+      - id: orientation_2
+        operation: generate_thumbnail
+        inputs: [orientation_2]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 21
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_red
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 15
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 15
+              metadata:
+                equals:
+                  Orientation: 1
+      - id: orientation_3
+        operation: generate_thumbnail
+        inputs: [orientation_3]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 21
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 15
+                  - kind: sample
+                    colour: *orientation_red
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 15
+              metadata:
+                equals:
+                  Orientation: 1
+      - id: orientation_4
+        operation: generate_thumbnail
+        inputs: [orientation_4]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 21
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 5
+                  - kind: sample
+                    colour: *orientation_red
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 15
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 15
+              metadata:
+                equals:
+                  Orientation: 1
+      - id: orientation_5
+        operation: generate_thumbnail
+        inputs: [orientation_5]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 48
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_red
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 36
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 36
+              metadata:
+                equals:
+                  Orientation: 1
+      - id: orientation_6
+        operation: generate_thumbnail
+        inputs: [orientation_6]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 48
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_red
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 36
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 36
+              metadata:
+                equals:
+                  Orientation: 1
+      - id: orientation_7
+        operation: generate_thumbnail
+        inputs: [orientation_7]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 48
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 36
+                  - kind: sample
+                    colour: *orientation_red
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 36
+              metadata:
+                equals:
+                  Orientation: 1
+      - id: orientation_8
+        operation: generate_thumbnail
+        inputs: [orientation_8]
+        parameters:
+          max_width: 32
+          max_height: 48
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 48
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: *orientation_blue
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_yellow
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 12
+                  - kind: sample
+                    colour: *orientation_red
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 8
+                      y: 36
+                  - kind: sample
+                    colour: *orientation_green
+                    max_absolute_error: *one_uint8_level_with_float_epsilon
+                    position:
+                      x: 24
+                      y: 36
+              metadata:
+                equals:
+                  Orientation: 1

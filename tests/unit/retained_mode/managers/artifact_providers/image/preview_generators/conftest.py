@@ -13,7 +13,7 @@ if find_spec("OpenImageIO") is not None:
 else:
     write_variant = None
 from tests.unit.retained_mode.managers.artifact_providers.image.preview_generators.image_fixtures.image_specifications import (
-    load_specifications,
+    load_thumbnail_specifications,
 )
 
 
@@ -23,7 +23,7 @@ def image_source(tmp_path_factory: pytest.TempPathFactory) -> Callable[[str, str
     writer = write_variant
     if writer is None:
         pytest.skip("Procedural image sources require OpenImageIO")
-    specification = load_specifications(Path(__file__).parent / "testdata" / "thumbnail_cases.yaml")
+    specification = load_thumbnail_specifications()
     images = {image.id: image for image in specification.images}
     directory = tmp_path_factory.mktemp("declarative-sources")
     cached: dict[tuple[str, str], Path] = {}

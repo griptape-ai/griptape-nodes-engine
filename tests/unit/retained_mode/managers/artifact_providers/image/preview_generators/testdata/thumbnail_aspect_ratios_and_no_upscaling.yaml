@@ -1,0 +1,1564 @@
+schema_version: 1
+images:
+  - id: vertical_4_to_1
+    source:
+      dimensions:
+        width: 512
+        height: 2048
+      channels: &rgb_channels [R, G, B]
+      pixels:
+        pattern: solid
+        colour: &vertical_4_to_1_red [1, 0, 0]
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+    cases:
+      - id: default
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: &default_bounds {}
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 1024
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: &exact_pixel_tolerance 1e-06
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 1024
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: &three_uint8_levels_with_float_epsilon 0.01176480588235294
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 1024
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: square-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: &square_bounds_512
+          max_width: 512
+          max_height: 512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 128
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 128
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 128
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: narrow-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: &narrow_bounds_256_512
+          max_width: 256
+          max_height: 512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 128
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 128
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 128
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: wide-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: &wide_bounds_512_256
+          max_width: 512
+          max_height: 256
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 64
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 64
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 64
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: no-upscaling
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: &no_upscaling_bounds_4096
+          max_width: 4096
+          max_height: 4096
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 2048
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 2048
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 2048
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+  - id: vertical_8_to_1
+    source:
+      dimensions:
+        width: 256
+        height: 2048
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: &vertical_8_to_1_red [1, 0, 0]
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+    cases:
+      - id: default
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *default_bounds
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 128
+                height: 1024
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 128
+                height: 1024
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 128
+                height: 1024
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: square-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *square_bounds_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 64
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 64
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 64
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: narrow-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *narrow_bounds_256_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 64
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 64
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 64
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: wide-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *wide_bounds_512_256
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 32
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 32
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 32
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: no-upscaling
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *no_upscaling_bounds_4096
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 2048
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 2048
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 2048
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *vertical_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+  - id: horizontal_4_to_1
+    source:
+      dimensions:
+        width: 2048
+        height: 512
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: &horizontal_4_to_1_red [1, 0, 0]
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+    cases:
+      - id: default
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *default_bounds
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 1024
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 1024
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 1024
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: square-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *square_bounds_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: narrow-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *narrow_bounds_256_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: wide-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *wide_bounds_512_256
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: no-upscaling
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *no_upscaling_bounds_4096
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 2048
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 2048
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 2048
+                height: 512
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_4_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+  - id: horizontal_8_to_1
+    source:
+      dimensions:
+        width: 2048
+        height: 256
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: &horizontal_8_to_1_red [1, 0, 0]
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+    cases:
+      - id: default
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *default_bounds
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 1024
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 1024
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 1024
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: square-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *square_bounds_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: narrow-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *narrow_bounds_256_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 32
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 32
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 32
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: wide-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *wide_bounds_512_256
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 64
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: no-upscaling
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *no_upscaling_bounds_4096
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 2048
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 2048
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 2048
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *horizontal_8_to_1_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+  - id: small_square
+    source:
+      dimensions:
+        width: 256
+        height: 256
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: &small_square_red [1, 0, 0]
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+    cases:
+      - id: default
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *default_bounds
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: square-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *square_bounds_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: narrow-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *narrow_bounds_256_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: wide-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *wide_bounds_512_256
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: no-upscaling
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *no_upscaling_bounds_4096
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_square_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+  - id: small_horizontal
+    source:
+      dimensions:
+        width: 512
+        height: 256
+      channels: *rgb_channels
+      pixels:
+        pattern: solid
+        colour: &small_horizontal_red [1, 0, 0]
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+    cases:
+      - id: default
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *default_bounds
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: square-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *square_bounds_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: narrow-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *narrow_bounds_256_512
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 256
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 256
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 256
+                height: 128
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: wide-bounds
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *wide_bounds_512_256
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]
+      - id: no-upscaling
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: *no_upscaling_bounds_4096
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *exact_pixel_tolerance
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: jpg
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                equals:
+                  Orientation: 1
+          - format: webp
+            expect:
+              dimensions:
+                width: 512
+                height: 256
+              sample_type: uint8
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: all_pixels
+                    colour: *small_horizontal_red
+                    max_absolute_error: *three_uint8_levels_with_float_epsilon
+              metadata:
+                absent: [Orientation]

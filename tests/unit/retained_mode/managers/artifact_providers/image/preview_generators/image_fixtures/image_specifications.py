@@ -366,6 +366,28 @@ def load_specifications(path: Path) -> Specification:
     return Specification.model_validate(data)
 
 
+def load_thumbnail_specifications() -> Specification:
+    """Load the thumbnail documents in the original collection order."""
+    directory = Path(__file__).parent.parent / "testdata"
+    filenames = (
+        "thumbnail_square_bounds_and_encoding.yaml",
+        "thumbnail_aspect_ratios_and_no_upscaling.yaml",
+        "thumbnail_exif_orientation_and_bounds.yaml",
+        "thumbnail_translucent_colour.yaml",
+        "thumbnail_colour_bars.yaml",
+        "thumbnail_grayscale_and_one_bit.yaml",
+        "thumbnail_exif_orientation_transforms.yaml",
+        "thumbnail_extra_channels_and_precision.yaml",
+        "thumbnail_colour_conversion.yaml",
+        "thumbnail_metadata.yaml",
+        "thumbnail_resampling.yaml",
+        "thumbnail_exr_display_windows.yaml",
+        "thumbnail_alpha_edges.yaml",
+    )
+    images = [image for filename in filenames for image in load_specifications(directory / filename).images]
+    return Specification(schema_version=1, images=images)
+
+
 def expand_cases(specification: Specification) -> list[ExpandedCase]:
     """Expand cases."""
     return [

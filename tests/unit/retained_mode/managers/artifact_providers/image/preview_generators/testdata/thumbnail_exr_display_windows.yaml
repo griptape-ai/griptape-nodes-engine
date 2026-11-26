@@ -1,0 +1,328 @@
+schema_version: 1
+images:
+  # Display-window expectations use literal frame geometry, independent of rendering code.
+  # Colours are sRGB primaries to isolate framing from colour conversion. Samples avoid
+  # Lanczos boundaries; PNG allows one quantisation level plus float decoding epsilon.
+  - id: window_offset_resized
+    source:
+      dimensions: {width: 64, height: 16}
+      data_origin: {x: 32, y: 64}
+      display_window: {x: 0, y: 0, width: 128, height: 128}
+      channels: [R, G, B]
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: display_frame
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 64, max_height: 64}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 64, height: 64}
+              data_window: {x: 0, y: 0, width: 64, height: 64}
+              display_window: {x: 0, y: 0, width: 64, height: 64}
+              channels: [R, G, B]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 24, y: 35}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 54, y: 35}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 24, y: 48}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+  - id: window_nonzero_display
+    source:
+      dimensions: {width: 16, height: 8}
+      data_origin: {x: 18, y: 28}
+      display_window: {x: 10, y: 20, width: 32, height: 32}
+      channels: [R, G, B]
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: display_frame
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 64, max_height: 64}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 32, height: 32}
+              data_window: {x: 0, y: 0, width: 32, height: 32}
+              display_window: {x: 0, y: 0, width: 32, height: 32}
+              channels: [R, G, B]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 23, y: 15}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 24, y: 15}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 8, y: 16}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+  - id: window_overscan
+    source:
+      dimensions: {width: 64, height: 48}
+      data_origin: {x: -16, y: -8}
+      display_window: {x: 0, y: 0, width: 32, height: 32}
+      channels: [R, G, B]
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: quadrants
+        colours: [[1, 0, 0], [0, 0, 1], [0, 1, 0], [1, 1, 0]]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: display_frame
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 16, max_height: 16}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 16}
+              data_window: {x: 0, y: 0, width: 16, height: 16}
+              display_window: {x: 0, y: 0, width: 16, height: 16}
+              channels: [R, G, B]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 4, y: 4}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 12, y: 4}
+                    colour: [0, 0, 1]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 4, y: 12}
+                    colour: [0, 1, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 12, y: 12}
+                    colour: [1, 1, 0]
+                    max_absolute_error: 0.003921668627450981
+  - id: window_alpha_unscaled
+    source:
+      dimensions: {width: 16, height: 8}
+      data_origin: {x: 8, y: 8}
+      display_window: {x: 0, y: 0, width: 32, height: 32}
+      channels: [R, G, B, A]
+      alpha_association: straight
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0, 1]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: display_frame
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 64, max_height: 64}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 32, height: 32}
+              data_window: {x: 0, y: 0, width: 32, height: 32}
+              display_window: {x: 0, y: 0, width: 32, height: 32}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 12, y: 12}
+                    colour: [1, 0, 0, 1]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 0, y: 0}
+                    colour: [0, 0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 30, y: 30}
+                    colour: [0, 0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+          - format: webp
+            expect:
+              dimensions: {width: 32, height: 32}
+              data_window: {x: 0, y: 0, width: 32, height: 32}
+              display_window: {x: 0, y: 0, width: 32, height: 32}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 12, y: 12}
+                    colour: [1, 0, 0, 1]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 0, y: 0}
+                    colour: [0, 0, 0, 0]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 30, y: 30}
+                    colour: [0, 0, 0, 0]
+                    max_absolute_error: 0.01176480588235294
+          - format: jpg
+            expect:
+              dimensions: {width: 32, height: 32}
+              data_window: {x: 0, y: 0, width: 32, height: 32}
+              display_window: {x: 0, y: 0, width: 32, height: 32}
+              channels: [R, G, B]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 12, y: 12}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 0, y: 0}
+                    # Independent Pillow probe: RGB black 32x32 with red rectangle
+                    # (8,8)-(24,16), JPEG quality=75, subsampling=2, progressive=False.
+                    # Lossy ringing gives (8,0,12); quality 98 previously hid it.
+                    colour: [0.03137254901960784, 0, 0.047058823529411764]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 30, y: 30}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.01176480588235294
+  - id: window_oriented
+    source:
+      dimensions: {width: 16, height: 8}
+      data_origin: {x: 8, y: 4}
+      display_window: {x: 0, y: 0, width: 64, height: 32}
+      channels: [R, G, B]
+      metadata: {"oiio:ColorSpace": sRGB, Orientation: 6}
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: display_frame
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 16, max_height: 32}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 32}
+              data_window: {x: 0, y: 0, width: 16, height: 32}
+              display_window: {x: 0, y: 0, width: 16, height: 32}
+              channels: [R, G, B]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 12, y: 8}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 2, y: 2}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 12, y: 24}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+  - id: window_disjoint
+    source:
+      dimensions: {width: 8, height: 8}
+      data_origin: {x: 40, y: 40}
+      display_window: {x: 0, y: 0, width: 32, height: 32}
+      channels: [R, G, B, A]
+      alpha_association: straight
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0, 1]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: display_frame
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 16, max_height: 16}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 16}
+              data_window: {x: 0, y: 0, width: 16, height: 16}
+              display_window: {x: 0, y: 0, width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [0, 0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+  - id: window_partial_overlap
+    source:
+      dimensions: {width: 16, height: 8}
+      data_origin: {x: -8, y: 8}
+      display_window: {x: 0, y: 0, width: 32, height: 32}
+      channels: [R, G, B]
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: display_frame
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 64, max_height: 64}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 32, height: 32}
+              data_window: {x: 0, y: 0, width: 32, height: 32}
+              display_window: {x: 0, y: 0, width: 32, height: 32}
+              channels: [R, G, B]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 0, y: 8}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 7, y: 15}
+                    colour: [1, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 8, y: 15}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 0, y: 16}
+                    colour: [0, 0, 0]
+                    max_absolute_error: 0.003921668627450981

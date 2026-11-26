@@ -1,0 +1,104 @@
+schema_version: 1
+images:
+  # Independently probed OIIO metadata outcomes: PNG preserves custom strings
+  # and discards the tested custom numeric attributes. JPEG/WebP discard these
+  # custom text keys. Read-back expectations make each outcome explicit.
+  # Publication injection is off by default. With injection enabled, the runner
+  # registers the image provider and opens a workflow with a fixed test ID.
+  # Its registry name, unsaved:00000000000000000000000000000000, replaces the
+  # source workflow key. Unrelated text survives and gtn_saved_at is added.
+  # Automatic workflow metadata injection currently applies only to PNG.
+  - id: metadata
+    source:
+      dimensions:
+        width: 64
+        height: 32
+      channels: &rgb_channels [R, G, B]
+      pixels:
+        pattern: solid
+        colour: [1, 0, 0]
+      metadata:
+        gtn_workflow_name: test_workflow
+        artist_note: keep_me
+        custom_integer: 7
+        custom_float: 0.25
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+        expect:
+          metadata:
+            equals:
+              gtn_workflow_name: test_workflow
+              artist_note: keep_me
+            absent: [custom_integer, custom_float]
+    cases:
+      - id: default_discards_text
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: {max_width: 16, max_height: 16}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 8}
+              metadata:
+                absent: [gtn_workflow_name, artist_note]
+      - id: pass_through
+        preserve_source_metadata: true
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              metadata:
+                equals:
+                  gtn_workflow_name: test_workflow
+                  artist_note: keep_me
+          - format: jpg
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              metadata:
+                absent: [gtn_workflow_name, artist_note]
+          - format: webp
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              metadata:
+                absent: [gtn_workflow_name, artist_note]
+      - id: publication
+        preserve_source_metadata: true
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint8
+              channels: *rgb_channels
+              metadata:
+                equals:
+                  gtn_workflow_name: unsaved:00000000000000000000000000000000
+                  artist_note: keep_me
+                present: [gtn_saved_at]
+        workflow_name: current_workflow
+        inject_metadata: true

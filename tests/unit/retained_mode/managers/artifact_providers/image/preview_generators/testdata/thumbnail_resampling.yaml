@@ -1,0 +1,96 @@
+schema_version: 1
+images:
+  # Independent resampling expectation: reducing a 64-pixel ramp to 16 maps
+  # source_x = (output_x + 0.5) * 4 - 0.5. A normalized symmetric filter
+  # reproduces the linear interior: pixels 7/8 are 29.5/63 and 33.5/63,
+  # within one UINT16 level. Expected values never use the production resizer.
+  - id: gradient
+    source:
+      dimensions:
+        width: 64
+        height: 32
+      channels: &rgb_channels [R, G, B]
+      pixels:
+        pattern: gradient
+        axis: x
+        start: [0, 0, 0]
+        end: [1, 1, 1]
+    variants:
+      - id: png16
+        format: png
+        sample_type: uint16
+    cases:
+      - id: resampling
+        operation: generate_thumbnail
+        inputs: [png16]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 8
+              sample_type: uint16
+              channels: *rgb_channels
+              pixels:
+                checks:
+                  - kind: sample
+                    colour: [0.46825396825396826, 0.46825396825396826, 0.46825396825396826]
+                    max_absolute_error: &one_uint16_level 1.5259021896696421e-05
+                    position:
+                      x: 7
+                      y: 4
+                  - kind: sample
+                    colour: [0.5317460317460317, 0.5317460317460317, 0.5317460317460317]
+                    max_absolute_error: *one_uint16_level
+                    position:
+                      x: 8
+                      y: 4
+  # A balanced one-pixel checkerboard reduced by eight averages to 0.5 away
+  # from edges. Check its interior within one UINT8 level. This and the ramp
+  # replace Pillow noise equivalence with explicit resampling properties.
+  - id: checkerboard
+    source:
+      dimensions:
+        width: 128
+        height: 128
+      channels: [Y]
+      pixels:
+        pattern: checkerboard
+        cell_dimensions:
+          width: 1
+          height: 1
+        colours:
+          - [0]
+          - [1]
+    variants:
+      - id: png8
+        format: png
+        sample_type: uint8
+    cases:
+      - id: resampling
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters:
+          max_width: 16
+          max_height: 16
+        outputs:
+          - format: png
+            expect:
+              dimensions:
+                width: 16
+                height: 16
+              sample_type: uint8
+              channels: [Y]
+              pixels:
+                checks:
+                  - kind: region
+                    colour: [0.5]
+                    max_absolute_error: 0.003921668627450981
+                    region:
+                      x: 4
+                      y: 4
+                      width: 8
+                      height: 8

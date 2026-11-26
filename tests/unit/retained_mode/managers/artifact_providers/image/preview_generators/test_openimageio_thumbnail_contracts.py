@@ -26,10 +26,10 @@ from tests.unit.retained_mode.managers.artifact_providers.image.preview_generato
 from tests.unit.retained_mode.managers.artifact_providers.image.preview_generators.image_fixtures.image_specifications import (
     ExpandedCase,
     expand_cases,
-    load_specifications,
+    load_thumbnail_specifications,
 )
 
-SPECIFICATION = load_specifications(Path(__file__).parent / "testdata" / "thumbnail_cases.yaml")
+SPECIFICATION = load_thumbnail_specifications()
 CASES = expand_cases(SPECIFICATION)
 
 

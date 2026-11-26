@@ -11,6 +11,7 @@ from tests.unit.retained_mode.managers.artifact_providers.image.preview_generato
     Specification,
     expand_cases,
     load_specifications,
+    load_thumbnail_specifications,
 )
 
 
@@ -58,8 +59,8 @@ def test_schema_declares_discriminated_models() -> None:
 
 
 def test_repository_specification_expands_unchanged() -> None:
-    """Characterize the committed case identifiers before simplifying validation."""
-    specification = load_specifications(Path(__file__).parent.parent / "testdata" / "thumbnail_cases.yaml")
+    """The split specification preserves the original case count and order."""
+    specification = load_thumbnail_specifications()
     cases = expand_cases(specification)
     expected_case_count = 303
     assert len(cases) == expected_case_count

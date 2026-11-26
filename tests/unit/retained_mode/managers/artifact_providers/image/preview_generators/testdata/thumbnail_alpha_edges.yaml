@@ -1,0 +1,189 @@
+schema_version: 1
+images:
+  # Opaque white beside transparent pixels must remain white at the filtered edge.
+  # Alpha values 0.935/0.065 approximate the independent OIIO Lanczos probe; the
+  # tolerance covers one 8-bit quantisation level and probe rounding.
+  - id: alpha_edge_black
+    source:
+      dimensions: {width: 64, height: 64}
+      channels: [R, G, B, A]
+      alpha_association: straight
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: colour_bars
+        axis: x
+        colours: [[1, 1, 1, 1], [0, 0, 0, 0]]
+    variants:
+      - {id: png8, format: png, sample_type: uint8}
+    cases:
+      - id: resize
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: {max_width: 16, max_height: 16}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 1, 1, 0.935]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 1, 1, 0.065]
+                    max_absolute_error: 0.003921668627450981
+          - format: webp
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 1, 1, 0.935]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 1, 1, 0.065]
+                    max_absolute_error: 0.01176480588235294
+  - id: alpha_edge_red
+    source:
+      dimensions: {width: 64, height: 64}
+      channels: [R, G, B, A]
+      alpha_association: straight
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: colour_bars
+        axis: x
+        colours: [[1, 1, 1, 1], [1, 0, 0, 0]]
+    variants:
+      - {id: png8, format: png, sample_type: uint8}
+    cases:
+      - id: resize
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: {max_width: 16, max_height: 16}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 1, 1, 0.935]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 1, 1, 0.065]
+                    max_absolute_error: 0.003921668627450981
+          - format: webp
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 1, 1, 0.935]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 1, 1, 0.065]
+                    max_absolute_error: 0.01176480588235294
+  - id: alpha_edge_grayscale
+    source:
+      dimensions: {width: 64, height: 64}
+      channels: [Y, A]
+      alpha_association: straight
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: colour_bars
+        axis: x
+        colours: [[1, 1], [0, 0]]
+    variants:
+      - {id: png8, format: png, sample_type: uint8}
+    cases:
+      - id: resize
+        operation: generate_thumbnail
+        inputs: [png8]
+        parameters: {max_width: 16, max_height: 16}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [Y, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 0.935]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 0.065]
+                    max_absolute_error: 0.003921668627450981
+          - format: webp
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 1, 1, 0.935]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 1, 1, 0.065]
+                    max_absolute_error: 0.01176480588235294
+  - id: alpha_edge_associated
+    source:
+      dimensions: {width: 64, height: 64}
+      channels: [R, G, B, A]
+      alpha_association: premultiplied
+      metadata: {"oiio:ColorSpace": sRGB}
+      pixels:
+        pattern: colour_bars
+        axis: x
+        colours: [[0.5, 0.5, 0.5, 0.5], [0, 0, 0, 0]]
+    variants:
+      - {id: exr_half, format: exr, sample_type: float16}
+    cases:
+      - id: resize
+        operation: generate_thumbnail
+        inputs: [exr_half]
+        parameters: {max_width: 16, max_height: 16}
+        outputs:
+          - format: png
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 1, 1, 0.4675]
+                    max_absolute_error: 0.003921668627450981
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 1, 1, 0.0325]
+                    max_absolute_error: 0.003921668627450981
+          - format: webp
+            expect:
+              dimensions: {width: 16, height: 16}
+              channels: [R, G, B, A]
+              pixels:
+                checks:
+                  - kind: sample
+                    position: {x: 7, y: 8}
+                    colour: [1, 1, 1, 0.4675]
+                    max_absolute_error: 0.01176480588235294
+                  - kind: sample
+                    position: {x: 8, y: 8}
+                    colour: [1, 1, 1, 0.0325]
+                    max_absolute_error: 0.01176480588235294
