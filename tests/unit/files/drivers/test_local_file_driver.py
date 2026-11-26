@@ -9,8 +9,13 @@ from unittest.mock import Mock, patch
 import pytest
 
 from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
-from griptape_nodes.files.path_utils import parse_file_uri
+from griptape_nodes.files.path_utils import parse_file_uri, strip_windows_long_path_prefix
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+
+
+def _without_long_path_prefix(path: Path) -> Path:
+    """The path without the Windows long-path prefix, which `_resolve_path` adds there."""
+    return Path(strip_windows_long_path_prefix(path))
 
 
 class TestLocalFileDriver:
@@ -32,6 +37,47 @@ class TestLocalFileDriver:
         assert driver.can_handle("relative/path/file.txt") is True
         assert driver.can_handle("http://example.com/file.txt") is True
         assert driver.can_handle("data:image/png;base64,abc") is True
+
+    def test_resolve_path_returns_absolute_path_unchanged(self, driver: LocalFileDriver, tmp_path: Path) -> None:
+        """An absolute path resolves to itself, whether or not the file exists."""
+        assert (
+            _without_long_path_prefix(driver._resolve_path(str(tmp_path / "missing.txt"))) == tmp_path / "missing.txt"
+        )
+
+    def test_resolve_path_anchors_relative_path_on_the_workspace(self, driver: LocalFileDriver, tmp_path: Path) -> None:
+        """A relative path is anchored on the workspace directory, never the process working directory."""
+        with patch("griptape_nodes.files.drivers.local_file_driver.current_engine") as current_engine:
+            current_engine.return_value.config_manager.workspace_path = tmp_path
+            resolved = driver._resolve_path("images/cat.png")
+
+        assert _without_long_path_prefix(resolved) == tmp_path / "images" / "cat.png"
+
+    def test_resolve_path_strips_shell_escapes_and_expands_the_home_directory(
+        self, driver: LocalFileDriver, tmp_path: Path
+    ) -> None:
+        escaped = str(tmp_path / "my file.txt").replace(" ", "\\ ")
+
+        assert _without_long_path_prefix(driver._resolve_path(escaped)) == tmp_path / "my file.txt"
+        assert _without_long_path_prefix(driver._resolve_path("~/cat.png")) == Path.home() / "cat.png"
+
+    def test_resolve_path_converts_file_uri(self, driver: LocalFileDriver, tmp_path: Path) -> None:
+        resolved = driver._resolve_path((tmp_path / "cat.png").as_uri())
+
+        assert _without_long_path_prefix(resolved) == tmp_path / "cat.png"
+
+    @pytest.mark.parametrize("location", ["", "   "])
+    def test_resolve_path_rejects_empty_location(self, driver: LocalFileDriver, location: str) -> None:
+        with pytest.raises(ValueError, match="Empty file path"):
+            driver._resolve_path(location)
+
+    def test_resolve_path_rejects_invalid_file_uri(
+        self, driver: LocalFileDriver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A host in a file:// URI is only valid on Windows, where it names a network share.
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+
+        with pytest.raises(ValueError, match="Invalid file:// URI"):
+            driver._resolve_path("file://remote-server.invalid/path/to/file.txt")
 
     @pytest.mark.asyncio
     async def test_read_existing_file(self, driver: LocalFileDriver, temp_file: Path) -> None:

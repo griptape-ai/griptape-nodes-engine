@@ -276,6 +276,26 @@ class TestReadFileRequest:
         assert isinstance(result, ReadFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
+    def test_read_directory_returns_is_directory(self, engine: Engine, tmp_path: Path) -> None:
+        """Reading a directory returns IS_DIRECTORY."""
+        result = engine.handle_request(ReadFileRequest(file_path=str(tmp_path)))
+
+        assert isinstance(result, ReadFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
+
+    def test_read_file_unexpected_error_returns_io_error_naming_the_file(self, engine: Engine, tmp_path: Path) -> None:
+        """An error the reader did not anticipate becomes an IO_ERROR that names the file."""
+        file_path = tmp_path / "test.txt"
+        file_path.write_text("Content")
+
+        with patch.object(Path, "open", side_effect=RuntimeError("unexpected")):
+            result = engine.handle_request(ReadFileRequest(file_path=str(file_path)))
+
+        assert isinstance(result, ReadFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IO_ERROR
+        assert str(file_path) in str(result.result_details)
+        assert "unexpected" in str(result.result_details)
+
     def test_read_file_invalid_path(self, engine: Engine) -> None:
         """Test reading with invalid path - empty path."""
         # Empty path is invalid

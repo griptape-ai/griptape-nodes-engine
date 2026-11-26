@@ -5,27 +5,10 @@ from io import BytesIO
 from PIL import Image, PngImagePlugin
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
-
-# Text longer than this, such as an embedded workflow, is stored compressed. Shorter text stays
-# uncompressed, where image viewers that only show plain text chunks can still read it.
-_COMPRESS_TEXT_LONGER_THAN = 1024
-
-
-def _should_compress_text(text: str) -> bool:
-    """Decide whether a text chunk can be compressed and still be read back.
-
-    Pillow rejects a zTXt/iTXt chunk whose decompressed size exceeds
-    PngImagePlugin.MAX_TEXT_CHUNK, raising ValueError from Image.open. Mirror the
-    encoding add_text falls back to (latin-1, then utf-8) to check the size Pillow
-    will actually decompress.
-    """
-    if len(text) <= _COMPRESS_TEXT_LONGER_THAN:
-        return False
-    try:
-        encoded_length = len(text.encode("latin-1"))
-    except UnicodeEncodeError:
-        encoded_length = len(text.encode("utf-8"))
-    return encoded_length <= PngImagePlugin.MAX_TEXT_CHUNK
+from griptape_nodes.drivers.image_metadata.png_chunks import (
+    rewrite_png_text_bytes,
+    should_compress_text,
+)
 
 
 class PngMetadataDriver(BaseImageMetadataDriver):
@@ -33,7 +16,8 @@ class PngMetadataDriver(BaseImageMetadataDriver):
 
     Supports both reading and writing metadata in PNG text chunks.
     Preserves existing text chunks when writing new metadata.
-    All PNG-specific logic is encapsulated in this driver.
+    The Pillow methods decode and re-encode the image. The bytes hook edits encoded
+    text chunks, so pixel data such as 16-bit channels stays as written.
     """
 
     def get_supported_formats(self) -> list[str]:
@@ -68,17 +52,25 @@ class PngMetadataDriver(BaseImageMetadataDriver):
             # Only preserve string key-value pairs (text chunks), skip binary data
             # Don't preserve keys that will be overwritten by new metadata
             if isinstance(key, str) and isinstance(value, str) and key not in metadata:
-                png_info.add_text(key, value, zip=_should_compress_text(value))
+                png_info.add_text(key, value, zip=should_compress_text(value))
 
         # Add new metadata
         for key, value in metadata.items():
             text = str(value)
-            png_info.add_text(key, text, zip=_should_compress_text(text))
+            png_info.add_text(key, text, zip=should_compress_text(text))
 
         # Save with metadata
-        output_buffer = BytesIO()
-        pil_image.save(output_buffer, format="PNG", pnginfo=png_info)
-        return output_buffer.getvalue()
+        with BytesIO() as output_buffer:
+            pil_image.save(output_buffer, format="PNG", pnginfo=png_info)
+            return output_buffer.getvalue()
+
+    def inject_metadata_into_bytes(self, data: bytes, metadata: dict[str, str]) -> bytes:
+        """Embed text in encoded PNG bytes without changing any non-text chunk.
+
+        Replaces text with matching keys and preserves unrelated text. Invalid keywords
+        raise ValueError; invalid or incomplete PNG data raises OSError.
+        """
+        return rewrite_png_text_bytes(data, {key: str(value) for key, value in metadata.items()})
 
     def extract_metadata(self, pil_image: Image.Image) -> dict[str, str]:
         """Extract all text chunks from PNG image.

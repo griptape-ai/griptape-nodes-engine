@@ -88,8 +88,9 @@ class TestImageArtifactProviderPrepareContentForWrite:
 
         mock_image = MagicMock()
         mock_image.format = "PNG"
+        mock_image.__enter__.return_value = mock_image
         mock_driver = MagicMock()
-        mock_driver.inject_metadata.return_value = injected_bytes
+        mock_driver.inject_metadata_into_bytes.return_value = injected_bytes
 
         with (
             patch(COLLECT_PATH) as mock_collect,
@@ -99,7 +100,8 @@ class TestImageArtifactProviderPrepareContentForWrite:
             result = image_provider.prepare_content_for_write(original_bytes, "image.png", metadata)
 
         assert result == injected_bytes
-        mock_driver.inject_metadata.assert_called_once_with(mock_image, metadata)
+        mock_driver.inject_metadata_into_bytes.assert_called_once_with(original_bytes, metadata)
+        mock_image.__exit__.assert_called_once()
         # It runs on a worker thread, so it must not read engine state itself.
         mock_collect.assert_not_called()
 
