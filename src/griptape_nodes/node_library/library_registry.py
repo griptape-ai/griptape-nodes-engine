@@ -166,11 +166,25 @@ class IconVariant(BaseModel):
     dark: str
 
 
+class NodeDeprecationReplacement(BaseModel):
+    """A node to use in place of a deprecated node. It may live in another library."""
+
+    # Left out when the replacement is in the deprecated node's own library.
+    library: str | None = None
+    node_type: str
+
+    def library_name(self, deprecated_node_library: str) -> str:
+        """The library the replacement is registered in."""
+        return self.library or deprecated_node_library
+
+
 class NodeDeprecationMetadata(BaseModel):
     """Metadata about a deprecated node."""
 
     deprecation_message: str | None = None
     removal_version: str | None = None
+    # Checked once every library has loaded and when one registers or unloads; an unresolved one is a library problem.
+    replacements: list[NodeDeprecationReplacement] = Field(default_factory=list)
 
 
 class NodeMetadata(BaseModel):
@@ -257,8 +271,9 @@ class LibrarySchema(BaseModel):
     # Dependencies.pip_dependencies_exec is optional, so a manifest written against an earlier
     # schema still validates: its absence means every dependency is edit-time. 0.14.0 adds the
     # optional beta_features list, which older engines ignore. 0.15.0 adds the optional
-    # documentation_path, which older engines ignore.
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.15.0"
+    # documentation_path, which older engines ignore. 0.16.0 adds the optional
+    # deprecation.replacements on node metadata, which older engines ignore.
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.16.0"
 
     name: str
     library_schema_version: str
@@ -446,6 +461,14 @@ class LibraryRegistry:
         """Unregister all widgets for a library (used during library unload)."""
         if library_name in cls._registered_widgets:
             del cls._registered_widgets[library_name]
+
+    @classmethod
+    def get_node_display_name(cls, library_name: str, node_type: str) -> str:
+        """The display name of a registered node type, or the node type itself when it isn't registered."""
+        library = cls._libraries.get(library_name)
+        if library is None or not library.has_node_type(node_type):
+            return node_type
+        return library.get_node_metadata(node_type).display_name or node_type
 
     @classmethod
     def get_libraries_with_node_type(cls, node_type: str) -> list[str]:

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import semver
 
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.beta_features import find_beta_feature_date_issues, parse_library_beta_features
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -41,7 +42,7 @@ from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.node_library.library_registry import LibrarySchema
+    from griptape_nodes.node_library.library_registry import LibrarySchema, NodeDeprecationReplacement
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
     from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.parameter_events import (
@@ -135,6 +136,18 @@ class SetParameterVersionCompatibilityCheck(EngineScoped, ABC):
         Returns:
             SetParameterValueResultSuccess or SetParameterValueResultFailure
         """
+
+
+def _replacement_names(deprecated_node_library: str, replacements: list[NodeDeprecationReplacement]) -> list[str]:
+    """Name each replacement as a user sees it: its display name, and its library when that differs."""
+    names = []
+    for replacement in replacements:
+        library_name = replacement.library_name(deprecated_node_library)
+        name = f"'{LibraryRegistry.get_node_display_name(library_name, replacement.node_type)}'"
+        if library_name != deprecated_node_library:
+            name = f"{name} from library '{library_name}'"
+        names.append(name)
+    return names
 
 
 class VersionCompatibilityManager(EngineScoped):
@@ -394,6 +407,7 @@ class VersionCompatibilityManager(EngineScoped):
                         workflow_library_version=workflow_library_version,
                         removal_version=deprecation.removal_version,
                         deprecation_message=deprecation.deprecation_message,
+                        replacement_names=_replacement_names(library_name, deprecation.replacements),
                     ),
                     severity=WorkflowStatus.FLAWED,
                 )

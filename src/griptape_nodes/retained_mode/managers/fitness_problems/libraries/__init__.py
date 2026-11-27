@@ -43,6 +43,7 @@ from .sandbox_directory_missing_problem import SandboxDirectoryMissingProblem
 from .shadowed_engine_packages_problem import ShadowedEnginePackagesProblem
 from .ui_options_field_modified_incompatible_problem import UiOptionsFieldModifiedIncompatibleProblem
 from .ui_options_field_modified_warning_problem import UiOptionsFieldModifiedWarningProblem
+from .unresolved_deprecation_replacement_problem import UnresolvedDeprecationReplacementProblem
 from .unresolved_model_provider_usage_reference_problem import UnresolvedModelProviderUsageReferenceProblem
 from .unresolved_model_usage_reference_problem import UnresolvedModelUsageReferenceProblem
 from .update_config_category_problem import UpdateConfigCategoryProblem
@@ -93,6 +94,7 @@ __all__ = [
     "ShadowedEnginePackagesProblem",
     "UiOptionsFieldModifiedIncompatibleProblem",
     "UiOptionsFieldModifiedWarningProblem",
+    "UnresolvedDeprecationReplacementProblem",
     "UnresolvedModelProviderUsageReferenceProblem",
     "UnresolvedModelUsageReferenceProblem",
     "UpdateConfigCategoryProblem",
