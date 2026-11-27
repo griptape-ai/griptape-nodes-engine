@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -92,7 +93,7 @@ class ParameterContainer(Parameter, ABC):
         return True
 
     @abstractmethod
-    def add_child_parameter(self) -> Parameter:
+    def add_child_parameter(self, name: str | None = None, *, auto_increment: bool = False) -> Parameter:
         pass
 
 
@@ -387,15 +388,23 @@ class ParameterList(ParameterContainer):
             converted.append(item)
         return converted
 
-    def add_child_parameter(self) -> Parameter:
-        # Generate a name. This needs to be UNIQUE because children need
-        # to be tracked as individuals and not as indices in the list.
-        # Ex: a Connection is made to Parameter List[1]. List[0] gets deleted.
-        # The OLD List[1] is now List[0], but we need to maintain the Connection
-        # to the original entry.
-        #
-        # (No, we're not renaming it List[0] everywhere for you)
-        name = f"{self.name}_ParameterListUniqueParamID_{uuid.uuid4().hex!s}"
+    def add_child_parameter(self, name: str | None = None, *, auto_increment: bool = False) -> Parameter:
+        """Add a row at the end of the list.
+
+        Args:
+            name: The exact name for the row. Must be unique within the node. When omitted, a
+                unique name of the form `<list>_ParameterListUniqueParamID_<hex>` is generated.
+            auto_increment: Treat `name` as a prefix and number the row `<prefix>_1`, `<prefix>_2`,
+                and so on, using one more than the highest number currently in the node. Deleting
+                the highest row frees its number for the next row, the same before and after a save
+                and reload. A trailing `_<number>` on `name` is dropped first, so `item_a` and
+                `item_a_3` both give `item_a_<n>`. Ignored when `name` is omitted.
+
+        Raises:
+            ValueError: If `auto_increment` is False and `name` is already used by another
+                parameter in the node.
+        """
+        name = self._resolve_child_name(name, auto_increment=auto_increment)
 
         param = Parameter(
             name=name,
@@ -547,6 +556,44 @@ class ParameterList(ParameterContainer):
             self._node_context.make_node_unresolved(
                 current_states_to_trigger_change_event={NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
             )
+
+    def _resolve_child_name(self, name: str | None, *, auto_increment: bool) -> str:
+        if name is not None and not auto_increment and self._name_in_use(name):
+            msg = (
+                f"Attempted to add a row named '{name}' to list '{self.name}'. "
+                "Failed because a parameter with that name already exists."
+            )
+            raise ValueError(msg)
+
+        if name is None:
+            # Generate a name. This needs to be UNIQUE because children need
+            # to be tracked as individuals and not as indices in the list.
+            # Ex: a Connection is made to Parameter List[1]. List[0] gets deleted.
+            # The OLD List[1] is now List[0], but we need to maintain the Connection
+            # to the original entry.
+            #
+            # (No, we're not renaming it List[0] everywhere for you)
+            return f"{self.name}_ParameterListUniqueParamID_{uuid.uuid4().hex!s}"
+
+        if not auto_increment:
+            return name
+
+        base = re.sub(r"_\d+$", "", name)
+        used = re.compile(rf"{re.escape(base)}_(\d+)$")
+        highest = 0
+        for element in self._name_scope().find_elements_by_type(BaseNodeElement, find_recursively=True):
+            match = used.match(element.name)
+            if match is not None:
+                highest = max(highest, int(match.group(1)))
+        return f"{base}_{highest + 1}"
+
+    def _name_in_use(self, name: str) -> bool:
+        return self._name_scope().find_element_by_name(name) is not None
+
+    def _name_scope(self) -> BaseNodeElement:
+        if self._node_context is None:
+            return self
+        return self._node_context.root_ui_element
 
 
 def _without_list_variants(input_types: list[str]) -> list[str]:
