@@ -253,13 +253,20 @@ class ListRows:
         old_values = {
             row.name: node.parameter_values[row.name] for row in old_rows if row.name in node.parameter_values
         }
+        # Rows other lists follow keep their names by position, so those lists keep their rows' values.
+        kept_names: list[str] = []
+        if self._lists_driven_by(parameter_list):
+            kept_names = [row.name for row in old_rows]
         self._being_replaced.add(parameter_list.name)
         try:
             with sanctioned_parameter_mutation():
                 for row in old_rows:
                     node.remove_parameter_element(row)
-            for item in items:
-                row = parameter_list.add_child_parameter()
+            for index, item in enumerate(items):
+                name = None
+                if index < len(kept_names):
+                    name = kept_names[index]
+                row = parameter_list.add_child_parameter(name=name)
                 node.set_parameter_value(row.name, item)
             self._notify(parameter_list)
         except Exception:

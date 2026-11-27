@@ -172,3 +172,24 @@ class TestReplacingTheDriver:
             node.set_parameter_value("cases", ["a", "b"])
 
         assert _rows(node, "values") == before
+
+    def test_replacing_the_driver_keeps_the_driven_values_of_rows_that_stay(self, node: MockNode) -> None:
+        node.set_parameter_value("cases", ["a", "b"])
+        first, second = _rows(node, "values")
+        node.set_parameter_value(first, "one")
+        node.set_parameter_value(second, "two")
+
+        node.set_parameter_value("cases", ["a", "b", "c"])
+
+        values = _rows(node, "values")
+        assert values[:2] == [first, second]
+        assert [node.get_parameter_value(name) for name in values[:2]] == ["one", "two"]
+        assert len(values) == 3  # noqa: PLR2004
+
+    def test_replacing_the_driver_with_fewer_rows_drops_the_extra_driven_rows(self, node: MockNode) -> None:
+        node.set_parameter_value("cases", ["a", "b", "c"])
+        first = _rows(node, "values")[0]
+
+        node.set_parameter_value("cases", ["a"])
+
+        assert _rows(node, "values") == [first]
