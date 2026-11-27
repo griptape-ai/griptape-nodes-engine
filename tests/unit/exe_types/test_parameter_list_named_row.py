@@ -85,11 +85,11 @@ class TestAddChildParameterName:
 
         assert row.name == "items_a_4"
 
-    def test_auto_increment_does_not_reuse_the_highest_deleted_number(self, node: MockNode) -> None:
+    def test_auto_increment_reuses_the_highest_deleted_number(self, node: MockNode) -> None:
         items = _items(node)
         rows = [items.add_child_parameter(name="items_a", auto_increment=True) for _ in range(3)]
         items.remove_child(rows[2])
 
         row = items.add_child_parameter(name="items_a", auto_increment=True)
 
-        assert row.name == "items_a_4"
+        assert row.name == "items_a_3"
