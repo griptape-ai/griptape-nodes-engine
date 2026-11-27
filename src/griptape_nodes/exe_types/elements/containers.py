@@ -413,10 +413,10 @@ class ParameterList(ParameterContainer):
             name: The exact name for the row. Must be unique within the node. When omitted, a
                 unique name of the form `<list>_ParameterListUniqueParamID_<hex>` is generated.
             auto_increment: Treat `name` as a prefix and number the row `<prefix>_1`, `<prefix>_2`,
-                and so on, using one more than the highest number currently in the node. Deleting the highest row
-                frees its number for the next row, the same before and after a save and reload. A trailing `_<number>` on `name` is
-                dropped first, so `item_a` and `item_a_3` both give `item_a_<n>`. Ignored when `name`
-                is omitted.
+                and so on, using one more than the highest number currently in the node. Deleting
+                the highest row frees its number for the next row, the same before and after a save
+                and reload. A trailing `_<number>` on `name` is dropped first, so `item_a` and
+                `item_a_3` both give `item_a_<n>`. Ignored when `name` is omitted.
 
         Raises:
             ValueError: If `auto_increment` is False and `name` is already used by another
