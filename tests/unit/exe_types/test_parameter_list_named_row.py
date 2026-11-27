@@ -75,3 +75,12 @@ class TestAddChildParameterName:
         ]
 
         assert names == ["items_a_1", "items_a_2", "items_a_3"]
+
+    def test_auto_increment_does_not_reuse_a_deleted_rows_number(self, node: MockNode) -> None:
+        items = _items(node)
+        rows = [items.add_child_parameter(name="items_a", auto_increment=True) for _ in range(3)]
+        items.remove_child(rows[0])
+
+        row = items.add_child_parameter(name="items_a", auto_increment=True)
+
+        assert row.name == "items_a_4"

@@ -395,7 +395,8 @@ class ParameterList(ParameterContainer):
             name: The exact name for the row. Must be unique within the node. When omitted, a
                 unique name of the form `<list>_ParameterListUniqueParamID_<hex>` is generated.
             auto_increment: Treat `name` as a prefix and number the row `<prefix>_1`, `<prefix>_2`,
-                and so on, using the lowest free number. A trailing `_<number>` on `name` is
+                and so on, using one more than the highest number in use, so a deleted row's name is not
+                handed out again. A trailing `_<number>` on `name` is
                 dropped first, so `item_a` and `item_a_3` both give `item_a_<n>`. Ignored when `name`
                 is omitted.
 
@@ -578,17 +579,21 @@ class ParameterList(ParameterContainer):
             return name
 
         base = re.sub(r"_\d+$", "", name)
-        suffix = 1
-        while self._name_in_use(f"{base}_{suffix}"):
-            suffix += 1
-        return f"{base}_{suffix}"
+        used = re.compile(rf"{re.escape(base)}_(\d+)$")
+        highest = 0
+        for element in self._name_scope().find_elements_by_type(BaseNodeElement, find_recursively=True):
+            match = used.match(element.name)
+            if match is not None:
+                highest = max(highest, int(match.group(1)))
+        return f"{base}_{highest + 1}"
 
     def _name_in_use(self, name: str) -> bool:
+        return self._name_scope().find_element_by_name(name) is not None
+
+    def _name_scope(self) -> BaseNodeElement:
         if self._node_context is None:
-            root = self
-        else:
-            root = self._node_context.root_ui_element
-        return root.find_element_by_name(name) is not None
+            return self
+        return self._node_context.root_ui_element
 
 
 def _without_list_variants(input_types: list[str]) -> list[str]:
