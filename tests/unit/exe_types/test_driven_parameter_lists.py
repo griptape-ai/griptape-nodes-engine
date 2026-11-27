@@ -193,3 +193,29 @@ class TestReplacingTheDriver:
         node.set_parameter_value("cases", ["a"])
 
         assert _rows(node, "values") == [first]
+
+
+class TestDrivenRowNaming:
+    def test_driven_row_name_keeps_a_lists_own_row_names(self) -> None:
+        node = MockNode()
+        node.add_parameter(_list("cases"))
+        node.add_parameter(_list("values", driven_by="cases", driven_row_name=lambda row: f"old_{row.name}"))
+
+        row = _cases(node).add_child_parameter()
+
+        assert _rows(node, "values") == [f"old_{row.name}"]
+
+    def test_replacing_a_list_nothing_follows_calls_add_child_parameter_without_a_name(self) -> None:
+        calls: list[dict] = []
+
+        class OldSignatureList(ParameterList):
+            def add_child_parameter(self, *args: object, **kwargs: object) -> Parameter:
+                calls.append(kwargs)
+                return super().add_child_parameter(*args, **kwargs)  # type: ignore[arg-type]
+
+        node = MockNode()
+        node.add_parameter(OldSignatureList(name="plain", tooltip="t", type="str", allowed_modes={ParameterMode.INPUT}))
+
+        node.set_parameter_value("plain", ["a", "b"])
+
+        assert calls == [{}, {}]

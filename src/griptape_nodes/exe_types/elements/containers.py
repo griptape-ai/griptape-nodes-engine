@@ -134,6 +134,7 @@ class ParameterList(ParameterContainer):
         grid_columns: int | None = None,
         driven_by: str | None = None,
         label_from_driver_value: bool = False,
+        driven_row_name: Callable[[Parameter], str] | None = None,
     ):
         if traits:
             self._original_traits = traits
@@ -149,6 +150,7 @@ class ParameterList(ParameterContainer):
         self._grid_columns = grid_columns
         self._driven_by = driven_by
         self._label_from_driver_value = label_from_driver_value
+        self._driven_row_name = driven_row_name
 
         # Remember: we're a Parameter, too, just like everybody else.
         super().__init__(
@@ -189,6 +191,15 @@ class ParameterList(ParameterContainer):
     def label_from_driver_value(self) -> bool:
         """Whether a row is labelled with its driver row's value instead of its own number."""
         return self._label_from_driver_value
+
+    @property
+    def driven_row_name(self) -> Callable[[Parameter], str] | None:
+        """Names the row that follows a driver row, or None for `<list>_for_<driver row name>`.
+
+        A list that was already saved with its own row names uses this to keep them. The name has to be
+        unique in the node and the same every time it is asked for the same driver row.
+        """
+        return self._driven_row_name
 
     @property
     def row_input_types(self) -> list[str]:

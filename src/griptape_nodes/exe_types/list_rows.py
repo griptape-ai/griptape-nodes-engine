@@ -263,10 +263,10 @@ class ListRows:
                 for row in old_rows:
                     node.remove_parameter_element(row)
             for index, item in enumerate(items):
-                name = None
                 if index < len(kept_names):
-                    name = kept_names[index]
-                row = parameter_list.add_child_parameter(name=name)
+                    row = parameter_list.add_child_parameter(name=kept_names[index])
+                else:
+                    row = parameter_list.add_child_parameter()
                 node.set_parameter_value(row.name, item)
             self._notify(parameter_list)
         except Exception:
@@ -416,6 +416,8 @@ class ListRows:
 
 
 def _driven_row_name(driven: ParameterList, driver_row: Parameter) -> str:
+    if driven.driven_row_name is not None:
+        return driven.driven_row_name(driver_row)
     return f"{driven.name}_for_{driver_row.name}"
 
 
