@@ -986,6 +986,7 @@ class BaseNode(ABC):
         if self.does_name_exist(param.name):
             msg = f"Cannot have duplicate names on parameters. Encountered two instances of '{param.name}'."
             raise ValueError(msg)
+        driver = self._driver_of(param)
         parameter_group = (
             self.get_group_by_name_or_element_id(param.parent_element_name) if param.parent_element_name else None
         )
@@ -993,8 +994,23 @@ class BaseNode(ABC):
             parameter_group.add_child(param)
         else:
             self.add_node_element(param)
+        if driver is not None:
+            self._list_rows.sync_driven_lists(driver)
         self._record_parameter_add_scope(param.name)
         self._emit_parameter_lifecycle_event(param)
+
+    def _driver_of(self, param: Parameter) -> ParameterList | None:
+        """The list `param` is driven by, or None. A driver has to be declared on the node before the list it drives."""
+        if not isinstance(param, ParameterList) or param.driven_by is None:
+            return None
+        driver = self.get_parameter_by_name(param.driven_by)
+        if driver is None:
+            msg = f"Attempted to add list '{param.name}' to node '{self.name}'. Failed because it is driven by '{param.driven_by}', which is not declared on the node yet."
+            raise ValueError(msg)
+        if not isinstance(driver, ParameterList):
+            msg = f"Attempted to add list '{param.name}' to node '{self.name}'. Failed because it is driven by '{param.driven_by}', which is not a list."
+            raise TypeError(msg)
+        return driver
 
     def remove_parameter_element_by_name(self, element_name: str) -> None:
         element = self.root_ui_element.find_element_by_name(element_name)

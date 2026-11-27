@@ -132,6 +132,9 @@ class ParameterList(ParameterContainer):
         child_prefix: str | None = None,
         grid: bool | None = None,
         grid_columns: int | None = None,
+        driven_by: str | None = None,
+        label_from_driver_value: bool = False,
+        driven_row_name: Callable[[Parameter], str] | None = None,
     ):
         if traits:
             self._original_traits = traits
@@ -145,6 +148,9 @@ class ParameterList(ParameterContainer):
         self._child_prefix = child_prefix
         self._grid = grid
         self._grid_columns = grid_columns
+        self._driven_by = driven_by
+        self._label_from_driver_value = label_from_driver_value
+        self._driven_row_name = driven_row_name
 
         # Remember: we're a Parameter, too, just like everybody else.
         super().__init__(
@@ -175,6 +181,25 @@ class ParameterList(ParameterContainer):
     @property
     def max_items(self) -> int | None:
         return self._max_items
+
+    @property
+    def driven_by(self) -> str | None:
+        """The name of the list on the same node whose rows this list's rows follow, one for one."""
+        return self._driven_by
+
+    @property
+    def label_from_driver_value(self) -> bool:
+        """Whether a row is labelled with its driver row's value instead of its own number."""
+        return self._label_from_driver_value
+
+    @property
+    def driven_row_name(self) -> Callable[[Parameter], str] | None:
+        """Names the row that follows a driver row, or None for `<list>_for_<driver row name>`.
+
+        A list that was already saved with its own row names uses this to keep them. The name has to be
+        unique in the node and the same every time it is asked for the same driver row.
+        """
+        return self._driven_row_name
 
     @property
     def row_input_types(self) -> list[str]:
@@ -263,6 +288,10 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
+        if self._driven_by is not None:
+            # The node keeps these rows in step with the driver's, so the editor offers no add, remove or reorder.
+            convenience_options["driven_by"] = self._driven_by
+
         if self._grid:
             convenience_options["display"] = "grid"
             if self._grid_columns is not None:
@@ -290,7 +319,7 @@ class ParameterList(ParameterContainer):
 
         # Set the base ui_options (excluding convenience parameters)
         base_ui_options = {
-            k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix"]
+            k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix", "driven_by"]
         }
         self._ui_options = base_ui_options
 
@@ -521,6 +550,9 @@ class ParameterList(ParameterContainer):
                 child._input_types = _without_list_variants(child._input_types)
         super().add_child(child)
 
+        if self._node_context is not None:
+            self._node_context._list_rows.sync_driven_lists(self)
+
         # Mark the parent node as unresolved since the parameter structure changed
         if self._node_context is not None:
             # Import at runtime to avoid circular import
@@ -531,10 +563,13 @@ class ParameterList(ParameterContainer):
             )
 
     def move_child(self, from_index: int, to_index: int) -> None:
-        """Move the row at `from_index` to `to_index`, then tell the node its list changed."""
+        """Move the row at `from_index` to `to_index`, then tell the editor and the node its list changed."""
         row = self.get_child_parameters()[from_index]
         self._children.remove(row)
         self._children.insert(to_index, row)
+        # The editor learns the new order only from an update event that carries the children.
+        self._changes["children"] = [child.to_dict() for child in self._children]
+        self._emit_alter_element_event_if_possible()
         if self._node_context is not None:
             self._node_context._list_rows.rows_changed(self)
 
