@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path  # noqa: TC003 - read at runtime by the converter
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from griptape_nodes.exe_types.elements.containers import ParameterList
 from griptape_nodes.node_library.library_registry import (
@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowAlteredMixin,
     WorkflowNotAlteredMixin,
 )
+from griptape_nodes.retained_mode.events.os_events import DeletionOutcome
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.serialization.values import DisplayValue
 from griptape_nodes.traits.options import Options
@@ -1419,6 +1420,211 @@ class ResetLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class ResetLibraryResultFailure(ResultPayloadFailure):
     """Library reset failed. Common causes: library not found, library disabled, the environment provides the libraries, the library failed to load again after its environments were rebuilt."""
+
+
+@dataclass
+class EnvironmentManagedBlocker:
+    """`library.provisioned_by` is 'environment', so the environment owns this library."""
+
+    kind: Literal["environment_managed"] = "environment_managed"
+
+
+@dataclass
+class SandboxLibraryBlocker:
+    """The sandbox library is a workspace folder rather than an install."""
+
+    kind: Literal["sandbox_library"] = "sandbox_library"
+
+
+@dataclass
+class UnsafePathBlocker:
+    """The resolved target is a filesystem root, a drive, a share, or holds `.`/`..` segments."""
+
+    path: str
+    kind: Literal["unsafe_path"] = "unsafe_path"
+
+
+@dataclass
+class NotFoundBlocker:
+    """No library is installed at the manifest path the request named."""
+
+    kind: Literal["not_found"] = "not_found"
+
+
+@dataclass
+class UnwritableConfigBlocker:
+    """The setting that registers this library lives in a config file the engine cannot write.
+
+    The entry would survive the uninstall, leaving the engine looking for files that are gone,
+    so whoever owns that file has to remove it there.
+
+    Args:
+        layer: Which layer supplies it, e.g. "project", "workspace", or "env".
+        config_key: The setting holding the entry, so the editor can name it.
+    """
+
+    layer: str
+    config_key: str
+    kind: Literal["unwritable_config"] = "unwritable_config"
+
+
+@dataclass
+class OutsideLibrariesDirectoryBlocker:
+    """The library's folder sits outside the engine's libraries directory, so the engine did not install it.
+
+    A `libraries_to_register` entry can name any folder on disk, including a checkout the user
+    is developing in. The engine removes only what it installed.
+
+    Args:
+        install_directory: The folder that would have been deleted.
+        libraries_directory: The folder the engine installs libraries into.
+    """
+
+    install_directory: str
+    libraries_directory: str
+    kind: Literal["outside_libraries_directory"] = "outside_libraries_directory"
+
+
+@dataclass
+class UnmatchedEntryBlocker:
+    """Nothing in the config matched this library.
+
+    Whatever registered it cannot be traced back to a setting, so an uninstall would delete the
+    files and leave that registration in place.
+    """
+
+    kind: Literal["unmatched_entry"] = "unmatched_entry"
+
+
+# Why an uninstall cannot proceed, as a union discriminated on `kind`; the editor owns the wording.
+# Not a shared base class: cattrs would serialize a base-typed field as the base and drop `kind`.
+UninstallBlocker = (
+    EnvironmentManagedBlocker
+    | SandboxLibraryBlocker
+    | UnsafePathBlocker
+    | NotFoundBlocker
+    | UnwritableConfigBlocker
+    | UnmatchedEntryBlocker
+    | OutsideLibrariesDirectoryBlocker
+)
+
+
+# Which step failed once an uninstall was under way. Refusals never get this far; they travel as
+# `blocked_by`.
+UninstallFailureReason = Literal["config_write_failed", "unload_failed"]
+
+
+@dataclass
+class SharedDirectoryEntryRemaining:
+    """A directory entry registers this library and others, so it was left in place."""
+
+    entry_path: str
+    library_names: list[str] = field(default_factory=list)
+    kind: Literal["shared_directory_entry"] = "shared_directory_entry"
+
+
+# What still registers the library after a successful uninstall, so the editor can warn. A union
+# of one, for the same serialization reason as `UninstallBlocker`.
+RemainingRegistration = SharedDirectoryEntryRemaining
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewUninstallLibraryRequest(RequestPayload):
+    """Resolve what uninstalling a library would do, without touching disk or config.
+
+    Args:
+        library_path: The manifest path of the copy to resolve, from the engine's own
+            `LoadMetadataForAllLibrariesRequest` response, echoed back. Two installs can share
+            a name, so the path is what picks one.
+
+    Results: PreviewUninstallLibraryResultSuccess | PreviewUninstallLibraryResultFailure
+    """
+
+    library_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewUninstallLibraryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The uninstall resolution for this library, computed without any mutation."""
+
+    library_name: str
+    library_path: str
+    install_directory: str | None
+    registered_path: str | None
+    registered_in: str | None
+    collateral_library_names: list[str] = field(default_factory=list)
+    blocked_by: UninstallBlocker | None = None
+    remaining_registrations: list[RemainingRegistration] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewUninstallLibraryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Uninstall preview failed. Common causes: no library with that name and path was found."""
+
+
+@dataclass
+@PayloadRegistry.register
+class UninstallLibraryRequest(RequestPayload):
+    """Remove a library's config entry, unload it from the registry, and delete its folder.
+
+    Applies the resolution `PreviewUninstallLibraryRequest` reports. The directory goes to the
+    recycle bin where the platform supports one.
+
+    Args:
+        library_path: The manifest path of the copy to uninstall, from the engine's own
+            `LoadMetadataForAllLibrariesRequest` response, echoed back. Two installs can share
+            a name, so the path is what picks one.
+
+    Results: UninstallLibraryResultSuccess | UninstallLibraryResultFailure
+    """
+
+    library_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UninstallLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """The library was uninstalled, or as much of it as this step order allows.
+
+    Carries the same resolution fields as `PreviewUninstallLibraryResultSuccess`, plus what
+    actually happened.
+    """
+
+    library_name: str
+    library_path: str
+    install_directory: str | None
+    registered_path: str | None
+    registered_in: str | None
+    collateral_library_names: list[str] = field(default_factory=list)
+    blocked_by: UninstallBlocker | None = None
+    remaining_registrations: list[RemainingRegistration] = field(default_factory=list)
+    unloaded: bool = False
+    config_entry_removed: bool = False
+    directory_deleted: bool = False
+    # True when the folder was in use and is removed at the next engine start instead. The
+    # library is unregistered and unloaded either way, and `restart_required` is set.
+    directory_removal_deferred: bool = False
+    # Which kind of delete the folder got. None when this call deleted nothing, including when
+    # the folder was already gone. `PREFER_RECYCLE_BIN` falls back to a permanent delete where
+    # the platform has no recycle bin, so the editor can only promise recovery when this says so.
+    deletion_outcome: DeletionOutcome | None = None
+    restart_required: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class UninstallLibraryResultFailure(ResultPayloadFailure):
+    """Uninstall failed.
+
+    A refusal sets `blocked_by` and leaves `failure_reason` None: nothing was touched, and the
+    preview reports the same blocker. `failure_reason` is for a step that ran and failed partway.
+    """
+
+    failure_reason: UninstallFailureReason | None = None
+    blocked_by: UninstallBlocker | None = None
 
 
 @dataclass

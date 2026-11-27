@@ -111,8 +111,12 @@ per entry:
 - The toggle (left) — flip off to keep the library on disk but stop
     loading it on engine start.
 - The trash icon (right) — remove the entry entirely. The clone on
-    disk stays put; delete its directory manually if you want the
-    disk space back.
+    disk stays put.
+
+To delete the files as well, use **Uninstall** on the library's row
+in **Manage → Library Management**, which sends the folder to the
+system trash. See
+[Removing a library](editor/managing_models_and_libraries.md#removing-a-library).
 
 Where a library's nodes run is not a setting. The library declares
 which of its dependencies are needed only while a node runs, and the

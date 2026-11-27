@@ -214,6 +214,10 @@ class LibraryProvisioning(EngineScoped):
 
         return failures
 
+    def clone_target_directory(self, git_url: str, libraries_path: Path) -> Path:
+        """Return the directory a git download clones into."""
+        return libraries_path / extract_repo_name_from_url(git_url)
+
     async def installed_manifest_path_for_download(
         self, download: LibraryDownload, libraries_path: Path
     ) -> Path | None:
@@ -234,8 +238,7 @@ class LibraryProvisioning(EngineScoped):
         if download.name is not None:
             return await self._installed_library_manifest_path(download.name, libraries_path)
 
-        repo_name = extract_repo_name_from_url(download.git_url)
-        repo_directory = libraries_path / repo_name
+        repo_directory = self.clone_target_directory(download.git_url, libraries_path)
         return find_file_in_directory(repo_directory, LIBRARY_CONFIG_GLOB_PATTERN)
 
     async def ensure_libraries_from_config(self) -> None:
@@ -331,8 +334,7 @@ class LibraryProvisioning(EngineScoped):
             """Download a single library if not already present."""
             # Parse URL to extract git URL and optional ref
             git_url, ref = parse_git_url_with_ref(git_url_with_ref)
-            target_directory_name = extract_repo_name_from_url(git_url)
-            target_path = libraries_path / target_directory_name
+            target_path = self.clone_target_directory(git_url, libraries_path)
 
             # Skip if already exists
             if target_path.exists():
