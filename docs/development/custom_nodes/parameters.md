@@ -895,7 +895,7 @@ The engine adds, removes and reorders the driven rows as the driver's rows chang
 
 By default a driven row is numbered like any list row. With `label_from_driver_value=True` it shows its driver row's value instead, and keeps its number while that value is empty.
 
-To read a driven list next to its driver, go row by row and look up each driven row by name (`<driven list>_for_<driver row name>`). A list's own value skips empty rows, which would shift the pairing. [`example_driven_lists_library`](example_driven_lists_library/nodes.py) is a node you can load to try this.
+To read a driven list next to its driver, go row by row and look up each driven row by name (`<driven list>_for_<driver row name>`). A list's own value skips empty rows, which would shift the pairing.
 
 ### Controlling Parameter Order in the UI
 
