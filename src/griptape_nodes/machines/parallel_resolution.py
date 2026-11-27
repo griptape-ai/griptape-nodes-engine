@@ -313,6 +313,8 @@ class ExecuteDagState(State):
                     )
                 )
             )
+        # A list this node feeds may now be offered more, or fewer, items than it holds.
+        context.engine.node_manager.refresh_over_limits_fed_by(context.workflow, current_node)
         # Output values should already be saved!
         library = LibraryRegistry.get_libraries_with_node_type(current_node.__class__.__name__)
         if len(library) == 1:
@@ -541,8 +543,8 @@ class ExecuteDagState(State):
                     )
                 )
                 if isinstance(result, SetParameterValueResultFailure):
-                    msg = f"Failed to set parameter value for node '{current_node.name}' and parameter '{parameter.name}'. Details: {result.result_details}"
-                    raise RuntimeError(msg)
+                    # The details already name the node and parameter and say why.
+                    raise RuntimeError(result.result_details)
 
     @staticmethod
     def _seed_deferred_data_sinks(context: ParallelResolutionContext) -> bool:

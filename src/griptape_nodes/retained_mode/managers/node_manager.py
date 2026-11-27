@@ -5,6 +5,7 @@ import copy
 import dataclasses
 import json
 import logging
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
 )
+from griptape_nodes.exe_types.connections import Direction, value_on_connection
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
     InvalidParameterValueError,
@@ -478,6 +480,10 @@ class NodeManager(EngineScoped):
         # in its finally. Used by on_cancel_execute_node_request to locate the
         # task to cancel.
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
+
+        # Held while a list's `over_limit` is worked out and written, so two threads refreshing the same
+        # list can't finish in the opposite order to the one they read in.
+        self._over_limit_lock = threading.Lock()
 
         event_manager.register_request_handlers(self)
 
@@ -2176,6 +2182,14 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to add Parameter to Container Parameter '{request.parent_container_name}' in node '{node_name}'. Failed because parameter wasn't a container."
                 result = AddParameterToNodeResultFailure(result_details=details)
                 return result
+            # A list already holding `max_items` items has no use for another item.
+            if isinstance(parameter, ParameterList):
+                full_reason = node._list_rows.full_reason(parameter)
+                if full_reason is not None:
+                    details = (
+                        f"Attempted to add an item to list '{node_name}.{parameter.name}'. Failed because {full_reason}"
+                    )
+                    return AddParameterToNodeResultFailure(result_details=details)
             try:
                 new_param = parameter.add_child_parameter()
             except Exception as e:
@@ -2474,11 +2488,17 @@ class NodeManager(EngineScoped):
 
         # Delete the Element itself.
         if element is not None:
+            output_snapshot = dict(node.parameter_output_values)
             with sanctioned_parameter_mutation():
                 node.remove_parameter_element(element)
             if isinstance(element, Parameter) and element.parent_container_name is not None:
                 # The list lost an item, so what reads it has to run again.
                 workflow.flows.connections.unresolve_future_nodes(node)
+                self.refresh_over_limit(workflow, node, element)
+                # The node may rebuild its outputs from the shorter list. Send them on, so a node they
+                # feed holds them, and counts them, before it runs.
+                self._propagate_changed_outputs(workflow, node, output_snapshot)
+                self.refresh_over_limits_fed_by(workflow, node)
         else:
             details = f"Attempted to remove Element '{request.parameter_name}' from Node '{node_name}'. Failed because element didn't exist."
 
@@ -3105,13 +3125,20 @@ class NodeManager(EngineScoped):
             details = f"Couldn't set '{node_name}.{request.parameter_name}'.\n\n{err}"
             return SetParameterValueResultFailure(result_details=details)
         except Exception as err:
-            details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because Exception: {err}"
+            self.refresh_over_limit(workflow, node, parameter)
+            details = (
+                f"Attempted to set parameter value for '{node_name}.{parameter.connection_label}'. Failed because {err}"
+            )
             return SetParameterValueResultFailure(result_details=details)
+        self.refresh_over_limit(workflow, node, parameter)
+        # A saved workflow connects first and sets values after, so a list fed by this node is only
+        # right once this value is in.
+        self.refresh_over_limits_fed_by(workflow, node)
         if not request.initial_setup and modified:
             try:
                 workflow.flows.connections.unresolve_future_nodes(node)
             except Exception as err:
-                details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because Exception: {err}"
+                details = f"Attempted to set parameter value for '{node_name}.{parameter.connection_label}'. Failed because {err}"
                 return SetParameterValueResultFailure(result_details=details)
         if request.initial_setup is False and not request.is_output and modified:
             # Mark node as unresolved, broadcast an event
@@ -3147,34 +3174,7 @@ class NodeManager(EngineScoped):
         # When after_value_set modifies output parameters, those
         # changes must reach downstream nodes.
         if output_snapshot is not None and modified:
-            for output_param_name, new_value in node.parameter_output_values.items():
-                old_value = output_snapshot.get(output_param_name)
-                if old_value is new_value or old_value == new_value:
-                    continue
-                output_param = node.get_parameter_by_name(output_param_name)
-                if output_param is None:
-                    continue
-                if ParameterMode.OUTPUT not in output_param.allowed_modes:
-                    continue
-                is_control = (
-                    ParameterType.attempt_get_builtin(output_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
-                )
-                if is_control:
-                    continue
-                conn_targets = self.engine.flow_manager.get_connected_output_parameters_in(workflow, node, output_param)
-                for target_node, target_parameter in conn_targets:
-                    if target_node.lock:
-                        continue
-                    workflow.handle_request(
-                        SetParameterValueRequest(
-                            parameter_name=target_parameter.name,
-                            node_name=target_node.name,
-                            value=new_value,
-                            data_type=output_param.output_type,
-                            incoming_connection_source_node_name=node.name,
-                            incoming_connection_source_parameter_name=output_param.name,
-                        )
-                    )
+            self._propagate_changed_outputs(workflow, node, output_snapshot)
 
         # Cool.
         details = f"Successfully set value on Node '{node_name}' Parameter '{request.parameter_name}'."
@@ -3185,6 +3185,97 @@ class NodeManager(EngineScoped):
             altered_workflow_state=modified,
         )
         return result
+
+    def refresh_over_limit(self, workflow: WorkflowRuntime, node: BaseNode, parameter: Parameter) -> None:
+        """Set `over_limit` on the list `parameter` belongs to, from what its connections offer now.
+
+        The list is over its limit when the values its sources offer, delivered together with its rows,
+        add up to more than `max_items`. That is the case right after a source's new value is refused,
+        and stops being the case once the source shrinks, the connection goes, or rows are removed.
+        Recomputed from the current state on every call. Runs on the event loop (requests), on worker
+        threads (node code setting values) and on run threads (a node finishing), so the read and the
+        write happen under one lock: whichever call writes last also read last.
+        """
+        parameter_list = node._list_rows.list_of(parameter)
+        if parameter_list is None or parameter_list.max_items is None:
+            return
+        with self._over_limit_lock:
+            self._refresh_over_limit_locked(workflow, node, parameter_list)
+
+    def _refresh_over_limit_locked(
+        self, workflow: WorkflowRuntime, node: BaseNode, parameter_list: ParameterList
+    ) -> None:
+        max_items = parameter_list.max_items
+        if max_items is None:
+            return
+        offered = {}
+        if not node.lock:
+            offered = self._values_offered_to_list(workflow, node, parameter_list)
+        item_count = node._list_rows.offered_item_count(parameter_list, offered)
+        if item_count <= max_items:
+            parameter_list.over_limit = None
+            return
+        parameter_list.over_limit = {"item_count": item_count, "max_items": max_items}
+
+    def refresh_over_limits_fed_by(self, workflow: WorkflowRuntime, source_node: BaseNode) -> None:
+        """Refresh `over_limit` on every list `source_node` is connected to, after its values changed."""
+        for connection in workflow.flows.connections.get_all_outgoing_connections(source_node):
+            self.refresh_over_limit(workflow, connection.target_node, connection.target_parameter)
+
+    def refresh_over_limits_of(self, workflow: WorkflowRuntime, node: BaseNode) -> None:
+        """Refresh `over_limit` on every list of `node` that has `max_items`."""
+        for parameter_list in node.root_ui_element.find_elements_by_type(ParameterList):
+            self.refresh_over_limit(workflow, node, parameter_list)
+
+    @staticmethod
+    def _values_offered_to_list(
+        workflow: WorkflowRuntime, node: BaseNode, parameter_list: ParameterList
+    ) -> dict[str, Any]:
+        """The value each source connected to the list, or to one of its rows, offers now, by target name."""
+        connections = workflow.flows.connections
+        offered = {}
+        for target in [parameter_list, *parameter_list.get_child_parameters()]:
+            upstream = connections.get_connected_node(node, target, direction=Direction.UPSTREAM)
+            if upstream is None:
+                continue
+            source_node, source_parameter = upstream
+            source_value = value_on_connection(source_node, source_parameter)
+            if source_value.found:
+                offered[target.name] = source_value.value
+        return offered
+
+    def _propagate_changed_outputs(
+        self, workflow: WorkflowRuntime, node: BaseNode, output_snapshot: dict[str, Any]
+    ) -> None:
+        """Send every output that changed since `output_snapshot` to the parameters connected to it."""
+        for output_param_name, new_value in node.parameter_output_values.items():
+            old_value = output_snapshot.get(output_param_name)
+            if old_value is new_value or old_value == new_value:
+                continue
+            output_param = node.get_parameter_by_name(output_param_name)
+            if output_param is None:
+                continue
+            if ParameterMode.OUTPUT not in output_param.allowed_modes:
+                continue
+            is_control = (
+                ParameterType.attempt_get_builtin(output_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
+            )
+            if is_control:
+                continue
+            conn_targets = self.engine.flow_manager.get_connected_output_parameters_in(workflow, node, output_param)
+            for target_node, target_parameter in conn_targets:
+                if target_node.lock:
+                    continue
+                workflow.handle_request(
+                    SetParameterValueRequest(
+                        parameter_name=target_parameter.name,
+                        node_name=target_node.name,
+                        value=new_value,
+                        data_type=output_param.output_type,
+                        incoming_connection_source_node_name=node.name,
+                        incoming_connection_source_parameter_name=output_param.name,
+                    )
+                )
 
     def _discard_stale_output_value(self, node: BaseNode, parameter_name: str, output_snapshot: dict[str, Any]) -> None:
         """Discard the output value that the set we just applied has invalidated.
@@ -5999,6 +6090,8 @@ class NodeManager(EngineScoped):
         altered = node.lock != request.lock
         node.lock = request.lock
         self._unresolve_unlocked_node_left_unexecuted(workflow, node)
+        # A locked node does not run, so its lists are never over their limit while it is locked.
+        self.refresh_over_limits_of(workflow, node)
         return SetLockNodeStateResultSuccess(
             node_name=node_name,
             locked=node.lock,
@@ -6022,6 +6115,7 @@ class NodeManager(EngineScoped):
             altered = altered or node.lock != request.lock
             node.lock = request.lock
             self._unresolve_unlocked_node_left_unexecuted(workflow, node)
+            self.refresh_over_limits_of(workflow, node)
             updated.append(name)
 
         if not updated:

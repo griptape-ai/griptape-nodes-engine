@@ -366,6 +366,17 @@ class Parameter(UIOptionsMixin, BaseNodeElement):
         return event_dict
 
     @property
+    def connection_label(self) -> str:
+        """The name to show a user for this connection target: a list's row is named by its list.
+
+        A row's real name carries a uuid (`items_ParameterListUniqueParamID_<hex>`), which means
+        nothing to someone reading an error message.
+        """
+        if self.parent_container_name is not None:
+            return self.parent_container_name
+        return self.name
+
+    @property
     def type(self) -> str:
         return self._custom_getter_for_property_type()
 

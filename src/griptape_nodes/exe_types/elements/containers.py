@@ -139,6 +139,7 @@ class ParameterList(ParameterContainer):
             self._original_traits = set()
 
         self._max_items = max_items
+        self._over_limit: dict[str, int] | None = None
         self._item_converters = list(item_converters or [])
         # Store the UI convenience parameters
         self._collapsed = collapsed
@@ -177,6 +178,19 @@ class ParameterList(ParameterContainer):
         return self._max_items
 
     @property
+    def over_limit(self) -> dict[str, int] | None:
+        """`{"item_count": ..., "max_items": ...}` while what is connected adds up to more than `max_items`, else None.
+
+        Set by the engine. The editor shows a "Too many items" message under the list from it. Not saved.
+        """
+        return self._over_limit
+
+    @over_limit.setter
+    @BaseNodeElement.emits_update_on_write
+    def over_limit(self, value: dict[str, int] | None) -> None:
+        self._over_limit = value
+
+    @property
     def row_input_types(self) -> list[str]:
         """What a row, or a drop on the list's header, accepts: each item type, a list of it, and a bare `list`."""
         return self.input_types_for_child(self._own_input_types())
@@ -189,16 +203,20 @@ class ParameterList(ParameterContainer):
         return list(dict.fromkeys([*input_types, *(f"list[{item_type}]" for item_type in input_types), "list"]))
 
     @property
-    def _rows_add_list_items(self) -> bool:
-        """Whether a list handed to a row adds its items.
+    def opens_nested_lists(self) -> bool:
+        """Whether a list in a row, or in a connected list, holds its items rather than being one item.
 
-        False when the list's items may themselves be lists (`any`, `all` or `list`), where it is one item.
+        The one rule for both what the list stores and what `max_items` counts. True when the list names
+        a concrete item type, alone or next to `list` (`["ImageArtifact", "list"]`); its value then matches
+        what `get_parameter_list_value` returns. False when its items may themselves be lists (`any`,
+        `all`, or `list` alone). Sent to the editor with the list, so the count it shows uses this rule.
         """
-        whole_item_bases = {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value, "list"}
-        item_types = self._own_input_types()
-        return all(
-            ParameterType._extract_base_type(item_type.lower()) not in whole_item_bases for item_type in item_types
-        )
+        base_types = {ParameterType._extract_base_type(item_type.lower()) for item_type in self._own_input_types()}
+        if base_types & {ParameterTypeBuiltin.ANY.value, ParameterTypeBuiltin.ALL.value}:
+            return False
+        if not base_types:
+            return True
+        return bool(base_types - {"list"})
 
     @property
     def collapsed(self) -> bool | None:
@@ -299,6 +317,8 @@ class ParameterList(ParameterContainer):
         data = super().to_dict()
         data["ui_options"] = self.ui_options
         data["row_input_types"] = self.row_input_types
+        data["opens_nested_lists"] = self.opens_nested_lists
+        data["over_limit"] = self.over_limit
         return data
 
     def save_dict(self) -> dict[str, Any]:
@@ -307,6 +327,8 @@ class ParameterList(ParameterContainer):
         Replaying `list[Thing]` through the setters would make the list a `list[list[Thing]]`.
         """
         data = super().save_dict()
+        # The engine works it out again from the connections, so a workflow is the same file either way.
+        data.pop("over_limit", None)
         data["type"] = super()._custom_getter_for_property_type()
         data["output_type"] = super()._custom_getter_for_property_output_type()
         return data
@@ -331,7 +353,7 @@ class ParameterList(ParameterContainer):
 
     def row_value_is_items(self, value: Any) -> bool:
         """Return whether a row's `value` contributes its items rather than one item."""
-        return isinstance(value, list) and self._rows_add_list_items
+        return isinstance(value, list) and self.opens_nested_lists
 
     def _custom_setter_for_property_output_type(self, value: str | None) -> None:
         # If we are setting a type, we need to propagate this to our children as well.
@@ -504,14 +526,10 @@ class ParameterList(ParameterContainer):
 
         When a ParameterList gains a child parameter, the parent node needs to be
         marked as unresolved to trigger re-evaluation of the node's state and outputs.
-        """
-        # Validate max_items before adding child
-        if self._max_items is not None:
-            current_count = len(self._children)
-            if current_count >= self._max_items:
-                msg = f"Cannot add more items to {self.name}. Maximum {self._max_items} items allowed."
-                raise ValueError(msg)
 
+        `max_items` is not checked here: it counts items with values, which a row can't see. Adding an
+        item is refused by `ListRows.full_reason`, and a value that doesn't fit by the checks on setting it.
+        """
         if isinstance(child, Parameter):
             # Saved rows also need the container's item converters.
             missing = [converter for converter in self._item_converters if converter not in child._converters]

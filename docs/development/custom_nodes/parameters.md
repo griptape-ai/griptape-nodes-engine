@@ -602,8 +602,23 @@ ParameterList(
 
 **Rows and whole lists:** a row accepts one item, a `list[...]` of the item type, or an untyped `list`. A row that
 receives a list adds its items to the list, so the list value is the concatenation of its rows, and `max_items` counts
-those items. A row value exceeding `max_items` is refused. Over a connection, it fails the run with an error naming
-the list. When the list's own items may be lists (`list`, `any` or `all`), a list in a row is one item.
+those items. A row value exceeding `max_items` is refused, and so is a connection that would deliver more items than
+fit: it is refused before the connection is made, with an error naming the list and the limit. Adding an item is
+refused once the list holds `max_items` items. An item with no value yet counts nothing. A source that has not
+run yet has no items to count, so a flow that overruns the limit fails when it runs instead. A list in a row adds its
+items when the list names a concrete item type, even if it also declares `list` or `list[...]` to say a row may take a
+list. They are added the way `get_parameter_list_value` reads them: lists inside lists are opened at every depth and
+`None` is skipped, so `get_parameter_value` and `get_parameter_list_value` return the same items. A list in a row is
+one item only when the list's own items may be lists (`any`, `all` or `list` on its own).
+
+**When a connected list grows past the limit:** when what is connected to a list built with `max_items` adds up
+to more than `max_items`, for example because an upstream list grew, the list keeps its previous items and the
+engine sets its `over_limit` to `{"item_count": ..., "max_items": ...}`. The editor shows a "Too many items" message
+under the list from it, including lists inside a group. `over_limit` goes back to `None` once they fit again: when
+the upstream list shrinks, the connection is deleted, or rows are removed. It is also checked when the upstream node
+runs, when a workflow is opened, and when the node is locked or unlocked (a locked node doesn't run, so it is never
+over the limit). It is not saved with the workflow, it leaves the list's badge alone, and it adds no element to the
+node, so the names and indices your node lays out stay as they are.
 
 **Setting a whole list:** a list nothing is connected to holds its items in rows and has no value of its own: reading
 it builds it from the rows. Setting a whole list, with `SetParameterValueRequest` or with

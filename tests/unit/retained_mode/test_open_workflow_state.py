@@ -218,6 +218,9 @@ def _add_node(workflow: WorkflowRuntime, metadata: dict[str, Any]) -> MagicMock:
     node = MagicMock(spec=BaseNode)
     node.name = "node"
     node.metadata = metadata
+    # `spec` leaves out attributes `BaseNode.__init__` sets; locking a node reads its lists from here.
+    node.root_ui_element = MagicMock()
+    node.root_ui_element.find_elements_by_type.return_value = []
     workflow.objects.add(node.name, node)
     return node
 
