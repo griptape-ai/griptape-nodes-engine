@@ -12,8 +12,10 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, TypeGuard
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterContainer, ParameterList, ParameterMode
+from griptape_nodes.exe_types.node_loading import loading_node_name
 from griptape_nodes.exe_types.parameter_mutation import sanctioned_parameter_mutation
 from griptape_nodes.retained_mode.events.connection_events import (
+    DeleteConnectionRequest,
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
@@ -178,12 +180,26 @@ class ListRows:
         Not while loading: whether the rows are what the list holds depends on a connection the load
         may not have made yet, and the list was checked when it was saved.
         """
+        if not initial_setup:
+            self.sync_driven_lists(container)
         if container.name in self._being_replaced or initial_setup:
             return
         # A connected list's before_value_set gets only what its connection delivers, and its return
         # is stored. A row change doesn't set that, so it runs only the validators and after_value_set.
         connected = isinstance(container, ParameterList) and not self.holds_no_value(container)
         self._notify(container, run_before_value_set=not connected)
+
+    def sync_driven_lists(self, driver: ParameterContainer) -> None:
+        """Make every list driven by `driver` hold one row per driver row, in the driver's order.
+
+        A driven row is named from its driver row, so the pairing survives reordering and is the same
+        after a reload. A driver row that is gone takes its driven row, and the wire into it, with it.
+        Not while the node is loading: its saved driven rows are restored as they were saved.
+        """
+        if loading_node_name() == self._node.name:
+            return
+        for driven in self._lists_driven_by(driver):
+            self._sync_driven_list(driver, driven)
 
     def has_connected_rows(self, parameter: Parameter) -> bool:
         """Whether `parameter` is a list with a row connected to another node, so its rows can't be replaced.
@@ -243,6 +259,74 @@ class ListRows:
         finally:
             self._being_replaced.discard(parameter_list.name)
 
+    def _lists_driven_by(self, driver: ParameterContainer) -> list[ParameterList]:
+        """The lists on the node that name `driver` as their driver, in declaration order."""
+        lists = self._node.root_ui_element.find_elements_by_type(ParameterList, find_recursively=True)
+        return [candidate for candidate in lists if candidate.driven_by == driver.name]
+
+    def _sync_driven_list(self, driver: ParameterContainer, driven: ParameterList) -> None:
+        driver_rows = driver.find_elements_by_type(Parameter, find_recursively=False)
+        wanted = {_driven_row_name(driven, row): row for row in driver_rows}
+
+        for row in driven.get_child_parameters():
+            if row.name not in wanted:
+                self._remove_driven_row(row)
+
+        existing = {row.name for row in driven.get_child_parameters()}
+        for name in wanted:
+            if name not in existing:
+                driven.add_child_parameter(name=name)
+
+        current = [row.name for row in driven.get_child_parameters()]
+        for index, name in enumerate(wanted):
+            if current[index] == name:
+                continue
+            driven.move_child(current.index(name), index)
+            current.remove(name)
+            current.insert(index, name)
+
+        if driven.label_from_driver_value:
+            self._label_from_driver_rows(driven, wanted)
+
+    def _label_from_driver_rows(self, driven: ParameterList, driver_rows: dict[str, Parameter]) -> None:
+        """Label each driven row with its driver row's value, or its own number while that value is empty."""
+        for row in driven.get_child_parameters():
+            value = self._node._get_raw_parameter_value(driver_rows[row.name].name)
+            label = None
+            if value is not None and value not in ("", []):
+                label = str(value)
+            if row.display_name != label:
+                row.display_name = label
+
+    def _remove_driven_row(self, row: Parameter) -> None:
+        node = self._node
+        result = node._handle_request_in_workflow(
+            ListConnectionsForNodeRequest(node_name=node.name, broadcast_result=False)
+        )
+        if isinstance(result, ListConnectionsForNodeResultSuccess):
+            for incoming in result.incoming_connections:
+                if incoming.target_parameter_name == row.name:
+                    node._handle_request_in_workflow(
+                        DeleteConnectionRequest(
+                            source_node_name=incoming.source_node_name,
+                            source_parameter_name=incoming.source_parameter_name,
+                            target_node_name=node.name,
+                            target_parameter_name=row.name,
+                        )
+                    )
+            for outgoing in result.outgoing_connections:
+                if outgoing.source_parameter_name == row.name:
+                    node._handle_request_in_workflow(
+                        DeleteConnectionRequest(
+                            source_node_name=node.name,
+                            source_parameter_name=row.name,
+                            target_node_name=outgoing.target_node_name,
+                            target_parameter_name=outgoing.target_parameter_name,
+                        )
+                    )
+        with sanctioned_parameter_mutation():
+            node.remove_parameter_element(row)
+
     def _container_of(self, parameter: Parameter) -> BaseNodeElement | None:
         if parameter.parent_container_name is None:
             return None
@@ -301,6 +385,10 @@ class ListRows:
         connected = {connection.target_parameter_name for connection in result.incoming_connections}
         connected.update(connection.source_parameter_name for connection in result.outgoing_connections)
         return connected & parameter_names
+
+
+def _driven_row_name(driven: ParameterList, driver_row: Parameter) -> str:
+    return f"{driven.name}_for_{driver_row.name}"
 
 
 def _accepts_whole_list(parameter_list: ParameterList) -> bool:

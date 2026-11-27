@@ -2176,6 +2176,9 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to add Parameter to Container Parameter '{request.parent_container_name}' in node '{node_name}'. Failed because parameter wasn't a container."
                 result = AddParameterToNodeResultFailure(result_details=details)
                 return result
+            if isinstance(parameter, ParameterList) and parameter.driven_by is not None:
+                details = f"Attempted to add an item to list '{request.parent_container_name}' in node '{node_name}'. Failed because the list follows the items of '{parameter.driven_by}', so add the item there."
+                return AddParameterToNodeResultFailure(result_details=details)
             try:
                 new_param = parameter.add_child_parameter()
             except Exception as e:
@@ -2429,6 +2432,12 @@ class NodeManager(EngineScoped):
 
             result = RemoveParameterFromNodeResultFailure(result_details=details)
             return result
+
+        if isinstance(element, Parameter) and element.parent_container_name is not None:
+            container = node.get_parameter_by_name(element.parent_container_name)
+            if isinstance(container, ParameterList) and container.driven_by is not None:
+                details = f"Attempted to remove item '{request.parameter_name}' from list '{container.name}' in node '{node_name}'. Failed because the list follows the items of '{container.driven_by}', so remove the item there."
+                return RemoveParameterFromNodeResultFailure(result_details=details)
 
         # Get all the connections to/from this Parameter.
         if isinstance(element, Parameter):
@@ -6749,7 +6758,7 @@ class NodeManager(EngineScoped):
         )
 
     @handles(ReorderParameterListItemRequest)
-    def on_reorder_parameter_list_item_request(  # noqa: PLR0911
+    def on_reorder_parameter_list_item_request(  # noqa: C901, PLR0911
         self, request: ReorderParameterListItemRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Handle reordering an item within a ParameterList.
@@ -6790,6 +6799,10 @@ class NodeManager(EngineScoped):
         # Validate it's actually a ParameterList
         if not isinstance(parameter_list, ParameterList):
             details = f"Attempted to reorder item in ParameterList '{request.parameter_list_name}' on Node '{node_name}'. Failed because '{request.parameter_list_name}' is not a ParameterList."
+            return ReorderParameterListItemResultFailure(result_details=details)
+
+        if parameter_list.driven_by is not None:
+            details = f"Attempted to reorder item in ParameterList '{request.parameter_list_name}' on Node '{node_name}'. Failed because the list follows the order of '{parameter_list.driven_by}', so reorder the items there."
             return ReorderParameterListItemResultFailure(result_details=details)
 
         # Get child parameters

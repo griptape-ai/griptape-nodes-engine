@@ -873,6 +873,28 @@ self.add_parameter(
 )
 ```
 
+### Lists Driven by Another List
+
+Pass `driven_by` to make a list hold one row for each row of another list on the same node, in the same order. Declare the driver first. A list that names a driver the node hasn't declared raises an error.
+
+```python
+self.add_parameter(ParameterList(name="cases", type="str", tooltip="Cases", allowed_modes={ParameterMode.INPUT}))
+self.add_parameter(
+    ParameterList(
+        name="optional_inputs",
+        type="any",
+        tooltip="Data to pass on for each case",
+        allowed_modes={ParameterMode.INPUT},
+        driven_by="cases",
+        label_from_driver_value=True,
+    )
+)
+```
+
+The engine adds, removes and reorders the driven rows as the driver's rows change, so the two lists never fall out of step. A driven row is named from its driver row, so it keeps its value and connection when the driver is reordered. Removing a driver row removes its driven row and any connection into it. Requests to add, remove or reorder a row of a driven list are rejected. Several lists can name the same driver, and a driven list can drive others.
+
+By default a driven row is numbered like any list row. With `label_from_driver_value=True` it shows its driver row's value instead, and keeps its number while that value is empty.
+
 ### Controlling Parameter Order in the UI
 
 Parameters appear in the UI in the order they are added via `add_parameter()`. This matters for user experience - related parameters should be grouped logically.

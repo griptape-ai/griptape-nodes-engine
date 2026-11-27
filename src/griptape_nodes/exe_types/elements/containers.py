@@ -132,6 +132,8 @@ class ParameterList(ParameterContainer):
         child_prefix: str | None = None,
         grid: bool | None = None,
         grid_columns: int | None = None,
+        driven_by: str | None = None,
+        label_from_driver_value: bool = False,
     ):
         if traits:
             self._original_traits = traits
@@ -145,6 +147,8 @@ class ParameterList(ParameterContainer):
         self._child_prefix = child_prefix
         self._grid = grid
         self._grid_columns = grid_columns
+        self._driven_by = driven_by
+        self._label_from_driver_value = label_from_driver_value
 
         # Remember: we're a Parameter, too, just like everybody else.
         super().__init__(
@@ -175,6 +179,16 @@ class ParameterList(ParameterContainer):
     @property
     def max_items(self) -> int | None:
         return self._max_items
+
+    @property
+    def driven_by(self) -> str | None:
+        """The name of the list on the same node whose rows this list's rows follow, one for one."""
+        return self._driven_by
+
+    @property
+    def label_from_driver_value(self) -> bool:
+        """Whether a row is labelled with its driver row's value instead of its own number."""
+        return self._label_from_driver_value
 
     @property
     def row_input_types(self) -> list[str]:
@@ -263,6 +277,10 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
+        if self._driven_by is not None:
+            # The node keeps these rows in step with the driver's, so the editor offers no add, remove or reorder.
+            convenience_options["driven_by"] = self._driven_by
+
         if self._grid:
             convenience_options["display"] = "grid"
             if self._grid_columns is not None:
@@ -290,7 +308,7 @@ class ParameterList(ParameterContainer):
 
         # Set the base ui_options (excluding convenience parameters)
         base_ui_options = {
-            k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix"]
+            k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix", "driven_by"]
         }
         self._ui_options = base_ui_options
 
@@ -523,6 +541,7 @@ class ParameterList(ParameterContainer):
 
         # Mark the parent node as unresolved since the parameter structure changed
         if self._node_context is not None:
+            self._node_context._list_rows.sync_driven_lists(self)
             # Import at runtime to avoid circular import
             from griptape_nodes.exe_types.node_types import NodeResolutionState
 
