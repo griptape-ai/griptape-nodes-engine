@@ -2280,7 +2280,9 @@ class NodeManager(EngineScoped):
                 if request.parent_container_name and request.initial_setup:
                     parameter_parent = node.get_parameter_by_name(request.parent_container_name)
                     if parameter_parent is not None:
-                        parameter_parent.add_child(new_param)
+                        # A saved row arrives with its driven rows saved beside it, so none are made for it.
+                        with node_loading(node_name):
+                            parameter_parent.add_child(new_param)
                 elif parent_group is not None:
                     parent_group.add_child(new_param)
                 else:
@@ -6830,12 +6832,6 @@ class NodeManager(EngineScoped):
         # Mark the node and what follows it as unresolved since the list's order changed
         node.state = NodeResolutionState.UNRESOLVED
         workflow.flows.connections.unresolve_future_nodes(node)
-
-        # Manually add the reordered children structure to _changes so the event includes it
-        parameter_list._changes["children"] = [child.to_dict() for child in parameter_list._children]
-
-        # Emit update event for the parameter list with the reordered children
-        parameter_list._emit_alter_element_event_if_possible()
 
         return ReorderParameterListItemResultSuccess(
             result_details=f"Successfully reordered item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' from index {request.from_index} to {request.to_index}."

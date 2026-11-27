@@ -114,7 +114,11 @@ class ListRows:
         if isinstance(value, list) and value == handle_container_parameter(self._node, parameter):
             # Already what the rows hold.
             return False
-        self._replace(parameter, value)
+        try:
+            self._replace(parameter, value)
+        finally:
+            # Held while the rows were replaced, so the driven rows follow the result, or the rows put back.
+            self.sync_driven_lists(parameter)
         return True
 
     def convert_and_validate(self, parameter: Parameter, value: Any, *, initial_setup: bool) -> Any:
@@ -196,7 +200,7 @@ class ListRows:
         after a reload. A driver row that is gone takes its driven row, and the wire into it, with it.
         Not while the node is loading: its saved driven rows are restored as they were saved.
         """
-        if loading_node_name() == self._node.name:
+        if loading_node_name() == self._node.name or driver.name in self._being_replaced:
             return
         for driven in self._lists_driven_by(driver):
             self._sync_driven_list(driver, driven)
@@ -204,11 +208,17 @@ class ListRows:
     def has_connected_rows(self, parameter: Parameter) -> bool:
         """Whether `parameter` is a list with a row connected to another node, so its rows can't be replaced.
 
+        The rows of every list driven by it count too, since replacing its rows replaces theirs.
         Checked only when there are rows: on a worker the question goes to the orchestrator.
         """
         if not isinstance(parameter, ParameterList):
             return False
-        rows = parameter.get_child_parameters()
+        rows: list[Parameter] = []
+        pending = [parameter]
+        while pending:
+            current = pending.pop()
+            rows.extend(current.get_child_parameters())
+            pending.extend(self._lists_driven_by(current))
         if not rows:
             return False
         return bool(self._connected_parameter_names({row.name for row in rows}))
@@ -237,7 +247,7 @@ class ListRows:
             raise ValueError(msg)
         old_rows = parameter_list.get_child_parameters()
         if self.has_connected_rows(parameter_list):
-            msg = f"Attempted to set list {list_label}. Failed because some of its items are connected to other nodes, and replacing the items would remove those connections. Disconnect them first."
+            msg = f"Attempted to set list {list_label}. Failed because some of its items, or items of lists that follow it, are connected to other nodes, and replacing the items would remove those connections. Disconnect them first."
             raise ValueError(msg)
 
         old_values = {
@@ -278,18 +288,12 @@ class ListRows:
                 driven.add_child_parameter(name=name)
 
         current = [row.name for row in driven.get_child_parameters()]
-        moved = False
         for index, name in enumerate(wanted):
             if current[index] == name:
                 continue
             driven.move_child(current.index(name), index)
             current.remove(name)
             current.insert(index, name)
-            moved = True
-        if moved:
-            # move_child tells the node, not the editor, which only learns the new order from an update event.
-            driven._changes["children"] = [child.to_dict() for child in driven._children]
-            driven._emit_alter_element_event_if_possible()
 
         if driven.label_from_driver_value:
             self._label_from_driver_rows(driven, wanted)

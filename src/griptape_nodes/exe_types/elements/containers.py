@@ -555,10 +555,13 @@ class ParameterList(ParameterContainer):
             )
 
     def move_child(self, from_index: int, to_index: int) -> None:
-        """Move the row at `from_index` to `to_index`, then tell the node its list changed."""
+        """Move the row at `from_index` to `to_index`, then tell the editor and the node its list changed."""
         row = self.get_child_parameters()[from_index]
         self._children.remove(row)
         self._children.insert(to_index, row)
+        # The editor learns the new order only from an update event that carries the children.
+        self._changes["children"] = [child.to_dict() for child in self._children]
+        self._emit_alter_element_event_if_possible()
         if self._node_context is not None:
             self._node_context._list_rows.rows_changed(self)
 

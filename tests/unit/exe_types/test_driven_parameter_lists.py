@@ -2,7 +2,9 @@ from unittest.mock import patch
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import ParameterList, ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterList, ParameterMode
+from griptape_nodes.exe_types.list_rows import ListRows
+from griptape_nodes.exe_types.node_loading import node_loading
 
 from .mocks import MockNode
 
@@ -132,3 +134,41 @@ class TestDrivenReorderEvent:
             f"values_for_{b.name}",
             f"values_for_{a.name}",
         ]
+
+
+class TestDrivenListsWhileLoading:
+    def test_saved_rows_restored_while_loading_do_not_get_extra_driven_rows(self, node: MockNode) -> None:
+        cases = _cases(node)
+        values = node.get_parameter_by_name("values")
+        assert isinstance(values, ParameterList)
+
+        with node_loading(node.name):
+            cases.add_child(Parameter(name="cases_saved", tooltip="t", type="str", parent_container_name="cases"))
+            values.add_child(
+                Parameter(name="values_for_cases_saved", tooltip="t", type="str", parent_container_name="values")
+            )
+
+        assert _rows(node, "values") == ["values_for_cases_saved"]
+        assert _rows(node, "notes") == []
+
+
+class TestReplacingTheDriver:
+    def test_setting_the_driver_as_a_whole_list_syncs_once_with_the_result(self, node: MockNode) -> None:
+        node.set_parameter_value("cases", ["a", "b"])
+
+        names = _rows(node, "cases")
+        assert len(names) == 2  # noqa: PLR2004
+        assert _rows(node, "values") == _driven_names("values", names)
+        assert _rows(node, "notes") == _driven_names("notes", names)
+
+    def test_a_wire_into_a_driven_row_blocks_replacing_the_driver(self, node: MockNode) -> None:
+        node.set_parameter_value("cases", ["a"])
+        before = _rows(node, "values")
+
+        with (
+            patch.object(ListRows, "_connected_parameter_names", side_effect=lambda names: set(names) & set(before)),
+            pytest.raises(ValueError, match="connected"),
+        ):
+            node.set_parameter_value("cases", ["a", "b"])
+
+        assert _rows(node, "values") == before
