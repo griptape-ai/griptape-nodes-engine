@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 
 from griptape_nodes.exe_types.core_types import ParameterList, ParameterMode
@@ -112,3 +114,21 @@ class TestDrivenLabels:
 
         node.set_parameter_value(row.name, "")
         assert driven.display_name is None
+
+
+class TestDrivenReorderEvent:
+    def test_reordering_the_driver_tells_the_editor_the_driven_lists_new_order(self, node: MockNode) -> None:
+        cases = _cases(node)
+        a = cases.add_child_parameter()
+        b = cases.add_child_parameter()
+        values = node.get_parameter_by_name("values")
+        assert isinstance(values, ParameterList)
+
+        with patch.object(ParameterList, "_emit_alter_element_event_if_possible") as emit:
+            cases.move_child(1, 0)
+
+        emit.assert_called()
+        assert [child["name"] for child in values._changes["children"]] == [
+            f"values_for_{b.name}",
+            f"values_for_{a.name}",
+        ]

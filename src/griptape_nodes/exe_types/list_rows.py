@@ -278,12 +278,18 @@ class ListRows:
                 driven.add_child_parameter(name=name)
 
         current = [row.name for row in driven.get_child_parameters()]
+        moved = False
         for index, name in enumerate(wanted):
             if current[index] == name:
                 continue
             driven.move_child(current.index(name), index)
             current.remove(name)
             current.insert(index, name)
+            moved = True
+        if moved:
+            # move_child tells the node, not the editor, which only learns the new order from an update event.
+            driven._changes["children"] = [child.to_dict() for child in driven._children]
+            driven._emit_alter_element_event_if_possible()
 
         if driven.label_from_driver_value:
             self._label_from_driver_rows(driven, wanted)
