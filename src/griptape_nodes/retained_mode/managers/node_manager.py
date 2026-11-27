@@ -2176,6 +2176,9 @@ class NodeManager(EngineScoped):
                 details = f"Attempted to add Parameter to Container Parameter '{request.parent_container_name}' in node '{node_name}'. Failed because parameter wasn't a container."
                 result = AddParameterToNodeResultFailure(result_details=details)
                 return result
+            if isinstance(parameter, ParameterList) and parameter.driven_by is not None:
+                details = f"Attempted to add an item to list '{request.parent_container_name}' in node '{node_name}'. Failed because the list follows the items of '{parameter.driven_by}', so add the item there."
+                return AddParameterToNodeResultFailure(result_details=details)
             try:
                 new_param = parameter.add_child_parameter()
             except Exception as e:
@@ -2277,7 +2280,9 @@ class NodeManager(EngineScoped):
                 if request.parent_container_name and request.initial_setup:
                     parameter_parent = node.get_parameter_by_name(request.parent_container_name)
                     if parameter_parent is not None:
-                        parameter_parent.add_child(new_param)
+                        # A saved row arrives with its driven rows saved beside it, so none are made for it.
+                        with node_loading(node_name):
+                            parameter_parent.add_child(new_param)
                 elif parent_group is not None:
                     parent_group.add_child(new_param)
                 else:
@@ -2429,6 +2434,12 @@ class NodeManager(EngineScoped):
 
             result = RemoveParameterFromNodeResultFailure(result_details=details)
             return result
+
+        if isinstance(element, Parameter) and element.parent_container_name is not None:
+            container = node.get_parameter_by_name(element.parent_container_name)
+            if isinstance(container, ParameterList) and container.driven_by is not None:
+                details = f"Attempted to remove item '{request.parameter_name}' from list '{container.name}' in node '{node_name}'. Failed because the list follows the items of '{container.driven_by}', so remove the item there."
+                return RemoveParameterFromNodeResultFailure(result_details=details)
 
         # Get all the connections to/from this Parameter.
         if isinstance(element, Parameter):
@@ -6749,7 +6760,7 @@ class NodeManager(EngineScoped):
         )
 
     @handles(ReorderParameterListItemRequest)
-    def on_reorder_parameter_list_item_request(  # noqa: PLR0911
+    def on_reorder_parameter_list_item_request(  # noqa: C901, PLR0911
         self, request: ReorderParameterListItemRequest, workflow: WorkflowRuntime
     ) -> ResultPayload:
         """Handle reordering an item within a ParameterList.
@@ -6792,6 +6803,10 @@ class NodeManager(EngineScoped):
             details = f"Attempted to reorder item in ParameterList '{request.parameter_list_name}' on Node '{node_name}'. Failed because '{request.parameter_list_name}' is not a ParameterList."
             return ReorderParameterListItemResultFailure(result_details=details)
 
+        if parameter_list.driven_by is not None:
+            details = f"Attempted to reorder item in ParameterList '{request.parameter_list_name}' on Node '{node_name}'. Failed because the list follows the order of '{parameter_list.driven_by}', so reorder the items there."
+            return ReorderParameterListItemResultFailure(result_details=details)
+
         # Get child parameters
         children = parameter_list.get_child_parameters()
         list_length = len(children)
@@ -6817,12 +6832,6 @@ class NodeManager(EngineScoped):
         # Mark the node and what follows it as unresolved since the list's order changed
         node.state = NodeResolutionState.UNRESOLVED
         workflow.flows.connections.unresolve_future_nodes(node)
-
-        # Manually add the reordered children structure to _changes so the event includes it
-        parameter_list._changes["children"] = [child.to_dict() for child in parameter_list._children]
-
-        # Emit update event for the parameter list with the reordered children
-        parameter_list._emit_alter_element_event_if_possible()
 
         return ReorderParameterListItemResultSuccess(
             result_details=f"Successfully reordered item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' from index {request.from_index} to {request.to_index}."
