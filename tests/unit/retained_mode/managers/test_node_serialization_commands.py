@@ -34,6 +34,12 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
     NodeMetadata,
 )
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    CreateConnectionResultSuccess,
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
@@ -55,8 +61,14 @@ from griptape_nodes.retained_mode.events.node_events import (
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
+    AddParameterToNodeResultFailure,
     AddParameterToNodeResultSuccess,
     AlterParameterDetailsRequest,
+    RemoveParameterFromNodeRequest,
+    RemoveParameterFromNodeResultFailure,
+    RemoveParameterFromNodeResultSuccess,
+    ReorderParameterListItemRequest,
+    ReorderParameterListItemResultFailure,
     SetParameterValueRequest,
     SetParameterValueResultSuccess,
 )
@@ -220,6 +232,19 @@ class _ListNode(DataNode):
         return None
 
 
+class _DrivenListsNode(DataNode):
+    """`values` follows the rows of `cases`."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name, metadata)
+        modes = {ParameterMode.INPUT, ParameterMode.PROPERTY}
+        self.add_parameter(ParameterList(name="cases", type="str", tooltip="", allowed_modes=modes))
+        self.add_parameter(ParameterList(name="values", type="str", tooltip="", allowed_modes=modes, driven_by="cases"))
+
+    def process(self) -> None:
+        return None
+
+
 class _GroupNode(BaseNodeGroup):
     """Minimal concrete BaseNodeGroup (not a SubflowNodeGroup) for group-serialization coverage."""
 
@@ -294,6 +319,9 @@ def library_name(engine: Engine) -> Generator[str, None, None]:
     )
     library.register_new_node_type(_GroupNode, NodeMetadata(category="test", description="d", display_name="Group"))
     library.register_new_node_type(_ListNode, NodeMetadata(category="test", description="d", display_name="List"))
+    library.register_new_node_type(
+        _DrivenListsNode, NodeMetadata(category="test", description="d", display_name="Driven Lists")
+    )
     opened = engine.handle_request(
         EnsureWorkflowAndFlowRequest(display_name="serialization_wf", flow_name="serialization_flow")
     )
@@ -742,10 +770,10 @@ class TestLockState:
         assert result.serialized_node_commands.create_node_command.resolution == expected_state.value
 
 
-class TestNodeUuidFreshness:
-    """node_uuid identifies one serialization pass, so duplicate/paste needs a new one each time."""
+class TestNodeUuid:
+    """node_uuid names a node within a serialization, so the same workflow always serializes the same."""
 
-    def test_two_serializations_of_same_node_yield_distinct_uuids(self, engine: Engine, library_name: str) -> None:
+    def test_a_node_is_named_by_its_own_name_every_time(self, engine: Engine, library_name: str) -> None:
         node_name = _create_text_node(engine, library_name, "N1")
 
         first = engine.node_manager.on_serialize_node_to_commands(
@@ -757,7 +785,8 @@ class TestNodeUuidFreshness:
 
         assert isinstance(first, SerializeNodeToCommandsResultSuccess)
         assert isinstance(second, SerializeNodeToCommandsResultSuccess)
-        assert first.serialized_node_commands.node_uuid != second.serialized_node_commands.node_uuid
+        assert first.serialized_node_commands.node_uuid == node_name
+        assert second.serialized_node_commands.node_uuid == node_name
 
 
 class TestParameterValueSerializationMode:
@@ -1147,3 +1176,84 @@ class TestAListRoundTrip:
 
         assert copy.get_parameter_value("items") == ["a", "b"]
         assert "items" not in copy.parameter_values
+
+
+class TestADrivenListThroughTheEngine:
+    """The driven rows have to survive a save and reload, and the requests that would break the pairing are refused."""
+
+    @staticmethod
+    def _create(engine: Engine, library_name: str) -> str:
+        result = engine.handle_request(
+            CreateNodeRequest(node_type="_DrivenListsNode", specific_library_name=library_name, node_name="Driven")
+        )
+        assert isinstance(result, CreateNodeResultSuccess), result
+        set_result = engine.handle_request(
+            SetParameterValueRequest(node_name="Driven", parameter_name="cases", value=["a", "b"])
+        )
+        assert isinstance(set_result, SetParameterValueResultSuccess), set_result
+        return result.node_name
+
+    @staticmethod
+    def _row_names(node: BaseNode, list_name: str) -> list[str]:
+        lst = node.get_parameter_by_name(list_name)
+        assert isinstance(lst, ParameterList)
+        return [row.name for row in lst.get_child_parameters()]
+
+    def test_a_reload_keeps_the_same_rows_and_values_and_adds_none(self, engine: Engine, library_name: str) -> None:
+        node_name = self._create(engine, library_name)
+        original = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(original, BaseNode)
+        first_value_row, second_value_row = self._row_names(original, "values")
+        original.set_parameter_value(first_value_row, "one")
+        original.set_parameter_value(second_value_row, "two")
+
+        copy = _round_trip(engine, node_name)
+
+        assert self._row_names(copy, "values") == [first_value_row, second_value_row]
+        assert self._row_names(copy, "cases") == self._row_names(original, "cases")
+        assert copy.get_parameter_value(first_value_row) == "one"
+        assert copy.get_parameter_value(second_value_row) == "two"
+
+    def test_the_requests_that_would_break_the_pairing_are_refused(self, engine: Engine, library_name: str) -> None:
+        node_name = self._create(engine, library_name)
+        node = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(node, BaseNode)
+        row = self._row_names(node, "values")[0]
+
+        added = engine.handle_request(AddParameterToNodeRequest(node_name=node_name, parent_container_name="values"))
+        removed = engine.handle_request(RemoveParameterFromNodeRequest(parameter_name=row, node_name=node_name))
+        reordered = engine.handle_request(
+            ReorderParameterListItemRequest(parameter_list_name="values", from_index=0, to_index=1, node_name=node_name)
+        )
+
+        assert isinstance(added, AddParameterToNodeResultFailure)
+        assert isinstance(removed, RemoveParameterFromNodeResultFailure)
+        assert isinstance(reordered, ReorderParameterListItemResultFailure)
+        assert len(self._row_names(node, "values")) == 2  # noqa: PLR2004
+
+    def test_removing_a_driver_row_removes_the_wire_into_its_driven_row(
+        self, engine: Engine, library_name: str
+    ) -> None:
+        node_name = self._create(engine, library_name)
+        node = engine.object_manager.get_object_by_name(node_name)
+        assert isinstance(node, BaseNode)
+        source = _create_text_node(engine, library_name, "Source")
+        driver_row = self._row_names(node, "cases")[0]
+        driven_row = self._row_names(node, "values")[0]
+        connected = engine.handle_request(
+            CreateConnectionRequest(
+                source_node_name=source,
+                source_parameter_name="text",
+                target_node_name=node_name,
+                target_parameter_name=driven_row,
+            )
+        )
+        assert isinstance(connected, CreateConnectionResultSuccess), connected
+
+        removed = engine.handle_request(RemoveParameterFromNodeRequest(parameter_name=driver_row, node_name=node_name))
+
+        assert isinstance(removed, RemoveParameterFromNodeResultSuccess), removed
+        connections = engine.handle_request(ListConnectionsForNodeRequest(node_name=node_name))
+        assert isinstance(connections, ListConnectionsForNodeResultSuccess)
+        assert connections.incoming_connections == []
+        assert driven_row not in self._row_names(node, "values")

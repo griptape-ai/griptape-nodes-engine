@@ -14,6 +14,7 @@ import anyio
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import SubprocessWebSocketUnavailableError
 from griptape_nodes.bootstrap.workflow_publishers.subprocess_workflow_publisher import SubprocessWorkflowPublisher
+from griptape_nodes.common import failure_trees
 from griptape_nodes.common.isolated_execution_scope import isolated_execution_scope
 from griptape_nodes.common.loop_body_scope import (
     LoopBodyScope,
@@ -54,7 +55,6 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import AgentStreamEvent
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
-    ForwardedException,
     ProgressEvent,
     ResultPayload,
 )
@@ -70,7 +70,6 @@ from griptape_nodes.retained_mode.events.execution_events import (
     CurrentControlNodeEvent,
     CurrentDataNodeEvent,
     ExecuteNodeRequest,
-    ExecuteNodeResultFailure,
     ExecuteNodeResultSuccess,
     GriptapeEvent,
     InvolvedNodesEvent,
@@ -87,6 +86,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     StartLocalSubflowResultFailure,
     StartLocalSubflowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.failure_tree import FailureTreeError
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowResultFailure,
     CreateFlowResultSuccess,
@@ -101,11 +101,6 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowRequest,
     PackageNodesAsSerializedFlowResultSuccess,
     PassthroughConnection,
-)
-from griptape_nodes.retained_mode.events.node_error_details import (
-    NodeErrorDetails,
-    build_engine_error_details,
-    build_node_error_details,
 )
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeResultFailure,
@@ -146,7 +141,7 @@ from griptape_nodes.retained_mode.managers.event_manager import (
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping, Sequence
 
     from griptape_nodes.common.directed_graph import DirectedGraph
     from griptape_nodes.exe_types.connections import Connections
@@ -172,40 +167,6 @@ class IterationControlAction(StrEnum):
     SKIP = "skip"  # Skip this iteration, don't add result
     BREAK = "break"  # Break out of loop immediately
 
-
-@dataclass(frozen=True)
-class IterationFailure:
-    """One loop iteration that did not finish, with the reason it gave.
-
-    ``iteration_index`` is zero-based to match the executor's internal indexing;
-    everything shown to an artist adds one, because a loop's first pass is
-    iteration 1 to the person who built it.
-    """
-
-    iteration_index: int
-    detail: str
-
-
-@dataclass(frozen=True)
-class IterationOutcome:
-    """What one parallel loop iteration did, as reported back by its task.
-
-    A bool would be enough to route the iteration, but not enough to explain it: the reason a
-    parallel iteration failed is only available inside the task that ran it, so the verdict and
-    the reason have to travel together or the reason is lost.
-    """
-
-    iteration_index: int
-    succeeded: bool
-    detail: str
-
-
-# How many distinct failure reasons a loop error message names before deferring to the log.
-MAX_REPORTED_ITERATION_FAILURES = 5
-
-# How many individual iteration numbers to name before switching to "(+N more)". Only reached when
-# the failed iterations are not a contiguous run, which is already summarised as "first-last".
-MAX_ENUMERATED_ITERATION_NUMBERS = 6
 
 # Results the engine produces while rebuilding a loop body into a transient flow. They describe
 # node copies the artist never placed, in a flow that is deleted before the run ends, so an editor
@@ -297,26 +258,6 @@ class LoopBodyNodes(NamedTuple):
     all_nodes: set[str]
     execution_type: str
     node_group_name: str | None
-
-
-class ExecuteNodeFailedError(RuntimeError):
-    """Raised by ``NodeExecutor`` when an ``ExecuteNodeRequest`` fails.
-
-    The message is the flattened text that ends up in ``NodeErrorEvent.error_message``, and
-    ``details`` is what goes in ``NodeErrorEvent.error``. The node's exception, if any, is chained
-    as ``__cause__``.
-    """
-
-    def __init__(self, message: str, *, details: NodeErrorDetails) -> None:
-        super().__init__(message)
-        self.details = details
-
-
-def node_error_details_for(node_name: str, exc: BaseException) -> NodeErrorDetails:
-    """Use the details built where the node failed, or build them from an engine exception that never became a result."""
-    if isinstance(exc, ExecuteNodeFailedError):
-        return exc.details
-    return build_node_error_details(node_name, exc)
 
 
 class NodeExecutor(EngineScoped):
@@ -449,8 +390,10 @@ class NodeExecutor(EngineScoped):
                 )
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
+                # The node did not succeed. The error carries the failure tree so whoever ran this node can report
+                # which node failed.
                 exc = getattr(result, "exception", None)
-                raise self._execute_node_failed_error(node.name, result, exc) from exc
+                raise failure_trees.execute_node_failure_error_from_result(node.name, result, exc) from exc
             # Copy outputs back onto the in-memory node. Write directly into
             # parameter_output_values (not through set_parameter_value, which
             # targets parameter_values and re-fires before/after_value_set and
@@ -463,6 +406,13 @@ class NodeExecutor(EngineScoped):
             # reads from parameter_output_values.
             for name, value in result.parameter_output_values.items():
                 node.parameter_output_values[name] = value
+            # So a node that ran in a worker computes with the same values next time, as one run here does.
+            node.take_values_set_by_run(
+                {
+                    **result.parameter_values_set_by_run,
+                    **{name: result.parameter_output_values[name] for name in result.outputs_set_by_run},
+                }
+            )
         finally:
             current_executing_node_name.reset(token)
             # A connection torn down while this node was running left its input value in place so the
@@ -481,7 +431,9 @@ class NodeExecutor(EngineScoped):
             await node.aprocess()
         except Exception as exc:
             failure = self.engine.node_manager.execution_failure(exc, node.name)
-            raise self._execute_node_failed_error(node.name, failure, failure.exception) from failure.exception
+            raise failure_trees.execute_node_failure_error_from_result(
+                node.name, failure, failure.exception
+            ) from failure.exception
 
     def _node_start_process_event(
         self, workflow: WorkflowRuntime, node: BaseNode, loop_body_scope: LoopBodyScope | None
@@ -517,7 +469,7 @@ class NodeExecutor(EngineScoped):
         error = None
         if failure is not None:
             error_message = str(failure)
-            error = node_error_details_for(start_event.node_name, failure)
+            error = failure_trees.error_details_from_exception(failure, start_event.node_name)
         return NodeFinishProcessEvent(
             node_name=start_event.node_name,
             node_type=start_event.node_type,
@@ -547,17 +499,6 @@ class NodeExecutor(EngineScoped):
             return NodeProcessOutcome.CANCELLED
         return NodeProcessOutcome.SUCCEEDED
 
-    def _execute_node_failed_error(self, node_name: str, result: Any, exc: Exception | None) -> ExecuteNodeFailedError:
-        message = self._format_node_failure_message(node_name, result, exc)
-        details = None
-        if isinstance(result, ExecuteNodeResultFailure):
-            details = result.error
-        if details is None:
-            # No node-built details means the engine wrote result_details, so its words are kept.
-            result_details = str(getattr(result, "result_details", result))
-            details = build_engine_error_details(node_name, result_details, exc)
-        return ExecuteNodeFailedError(message, details=details)
-
     def _resolve_variables_for_node(self, workflow: WorkflowRuntime, node_name: str) -> dict[str, str | int] | None:
         """Resolve the variable dict for a node's flow on the orchestrator.
 
@@ -583,129 +524,6 @@ class NodeExecutor(EngineScoped):
             logger.debug("Variable substitution skipped for node %s: %s", node_name, var_result.result_details)
             return None
         return VariableResolver._filter_for_substitution({v.name: v.value for v in var_result.variables})
-
-    @staticmethod
-    def _format_node_failure_message(node_name: str, result: Any, exc: BaseException | None) -> str:
-        """Compose the RuntimeError message for a failed node execution.
-
-        When the worker rebuilt a ``ForwardedException``, surface its
-        ``original_type`` and ``original_traceback`` directly in the
-        message. Chaining via ``from exc`` is not enough on its own:
-        a ForwardedException is constructed (not raised) on the
-        receiving side, so its ``__traceback__`` is None and Python's
-        chained-exception display prints only the cause's
-        ``Type: message`` line with no frames. Interpolating
-        ``original_traceback`` here is what actually puts the worker
-        frames in front of the user.
-        """
-        # A node that declined to run did not fail while running, and saying so sends the reader looking
-        # for a crash that never happened. Matched on the type rather than on the attribute's presence:
-        # `result` is typed `Any` here, and anything at all answers a `getattr`.
-        if isinstance(result, ExecuteNodeResultFailure) and result.validation_exceptions:
-            reasons = "; ".join(str(exception) for exception in result.validation_exceptions)
-            return f"Node '{node_name}' did not run because it failed validation: {reasons}"
-
-        type_prefix = ""
-        tb_suffix = ""
-        if isinstance(exc, ForwardedException):
-            if exc.original_type:
-                type_prefix = f"[{exc.original_type}] "
-            if exc.original_traceback:
-                tb_suffix = f"\nWorker traceback:\n{exc.original_traceback}"
-        return (
-            f"Node '{node_name}' execution failed: {type_prefix}{getattr(result, 'result_details', result)}{tb_suffix}"
-        )
-
-    @staticmethod
-    def _format_loop_failure_message(
-        loop_name: str, total_iterations: int, iteration_failures: list[IterationFailure]
-    ) -> str:
-        """Compose the RuntimeError message for a loop that lost iterations.
-
-        This lands on the artist's node via the execution machine, so it leads with what was
-        attempted and how much was lost, then names the iterations and their reasons.
-        """
-        summary = (
-            f"Attempted to run all {total_iterations} iterations of loop '{loop_name}'. "
-            f"Failed because {len(iteration_failures)} of them did not finish."
-        )
-        detail_lines = NodeExecutor._format_iteration_failure_lines(
-            iteration_failures, total_iterations=total_iterations
-        )
-        if not detail_lines:
-            return summary
-        return "\n".join([summary, *detail_lines])
-
-    @staticmethod
-    def _format_iteration_failure_lines(
-        iteration_failures: list[IterationFailure],
-        *,
-        total_iterations: int | None = None,
-        max_lines: int = MAX_REPORTED_ITERATION_FAILURES,
-    ) -> list[str]:
-        """Render one indented line per distinct failure reason.
-
-        Iterations that failed for the same reason share a line: the common case is every
-        iteration failing identically, and repeating one sentence dozens of times buries it.
-        At most ``max_lines`` reasons are rendered so a long loop cannot produce an unreadable
-        wall of text; the engine log has already recorded every iteration individually, so the
-        tail line points there.
-
-        ``total_iterations`` is optional only because the parallel path logs these lines without a
-        summary above them; pass it whenever it is known so a wholly-failed loop can say so.
-        """
-        if not iteration_failures:
-            return []
-
-        iterations_by_detail: dict[str, list[int]] = {}
-        for iteration_failure in iteration_failures:
-            iterations_by_detail.setdefault(iteration_failure.detail, []).append(iteration_failure.iteration_index + 1)
-
-        reported = list(iterations_by_detail.items())[:max_lines]
-        unreported = list(iterations_by_detail.items())[max_lines:]
-
-        lines = []
-        for detail, iteration_numbers in reported:
-            label = NodeExecutor._describe_failed_iterations(iteration_numbers, total_iterations)
-            lines.append(f"  {label}: {detail}")
-
-        if unreported:
-            # Count the iterations behind the omitted reasons, not just the reasons: the lines above
-            # are phrased in iterations, so a bare reason count reads as one and can undersell the
-            # tail by two orders of magnitude.
-            unreported_iterations = sum(len(iteration_numbers) for _, iteration_numbers in unreported)
-            lines.append(
-                f"  ... and {len(unreported)} more reason(s) affecting {unreported_iterations} iteration(s). "
-                f"See the engine log for every iteration."
-            )
-        return lines
-
-    @staticmethod
-    def _describe_failed_iterations(iteration_numbers: list[int], total_iterations: int | None) -> str:
-        """Name a group of failed iterations in a handful of characters, however many there are.
-
-        Capping the number of *reasons* is not enough on its own: a 500-iteration loop that fails
-        identically every time collapses to a single line, and enumerating all 500 numbers pushes
-        the reason -- the part worth reading -- kilobytes to the right.
-        """
-        sorted_numbers = sorted(iteration_numbers)
-        count = len(sorted_numbers)
-
-        # Naming the single iteration comes first: "Every iteration" is only more informative than
-        # a number when there is more than one, and a one-item loop satisfies both tests.
-        if count == 1:
-            return f"Iteration {sorted_numbers[0]}"
-        if total_iterations is not None and count >= total_iterations:
-            return "Every iteration"
-
-        spans_a_contiguous_run = sorted_numbers[-1] - sorted_numbers[0] == count - 1
-        if spans_a_contiguous_run:
-            return f"Iterations {sorted_numbers[0]}-{sorted_numbers[-1]}"
-        if count <= MAX_ENUMERATED_ITERATION_NUMBERS:
-            return f"Iterations {', '.join(str(number) for number in sorted_numbers)}"
-
-        shown = ", ".join(str(number) for number in sorted_numbers[:MAX_ENUMERATED_ITERATION_NUMBERS])
-        return f"Iterations {shown} (+{count - MAX_ENUMERATED_ITERATION_NUMBERS} more)"
 
     @staticmethod
     def _silence_packaged_node_creation_broadcasts(
@@ -949,8 +767,13 @@ class NodeExecutor(EngineScoped):
 
         sanitized_library_name = library_name.replace(" ", "_")
         # If we are packaging a SubflowNodeGroup, that means that we are packaging multiple nodes together, so we have to get the list of nodes from the group node.
+        # A single, non-group node has no entry port of its own to resolve: it is the only node in
+        # the package, so there is nothing to point an explicit entry at.
+        entry_control_node_name: str | None = None
+        entry_control_parameter_name: str | None = None
         if isinstance(node, SubflowNodeGroup):
             node_names = list(node.get_all_nodes().keys())
+            entry_control_node_name, entry_control_parameter_name = node.resolve_inner_entry_node()
         else:
             # Otherwise, it's a list of one node!
             node_names = [node.name]
@@ -968,8 +791,8 @@ class NodeExecutor(EngineScoped):
             start_node_library_name=workflow_start_end_nodes.start_flow_node_library_name,
             end_node_library_name=workflow_start_end_nodes.end_flow_node_library_name,
             output_parameter_prefix=output_parameter_prefix,
-            entry_control_node_name=None,
-            entry_control_parameter_name=None,
+            entry_control_node_name=entry_control_node_name,
+            entry_control_parameter_name=entry_control_parameter_name,
             node_group_name=node_group_name,
         )
         package_result = workflow.handle_request(request)
@@ -1479,13 +1302,13 @@ class NodeExecutor(EngineScoped):
 
         return tuple(source_that_reached_end) == source
 
-    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915
+    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
         parameter_values_per_iteration: dict[int, dict[str, Any]],
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
-    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool, list[IterationFailure]]:
+    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool, list[failure_trees.IterationFailure]]:
         """Execute loop iterations sequentially by running one flow instance N times.
 
         Args:
@@ -1528,6 +1351,7 @@ class NodeExecutor(EngineScoped):
                 # Track for cleanup as soon as the flow exists (iteration index 0 is a placeholder;
                 # the single flow is reused across all iterations).
                 deserialized_flows.append((0, flow_name, node_name_mappings))
+                self._record_iteration_flow_owner(workflow, flow_name, end_loop_node.name)
 
             logger.debug("Successfully deserialized flow for sequential execution: %s", flow_name)
             # Get node mappings
@@ -1538,7 +1362,7 @@ class NodeExecutor(EngineScoped):
 
             iteration_results: dict[int, Any] = {}
             successful_iterations: list[int] = []
-            iteration_failures: list[IterationFailure] = []
+            iteration_failures: list[failure_trees.IterationFailure] = []
             skipped_count = 0
             break_occurred = False
 
@@ -1609,12 +1433,29 @@ class NodeExecutor(EngineScoped):
                     )
                     # Don't immediately store None - try to extract results first in case there are partial results
                     # (e.g., nested loop that had some failures but still produced output)
-                    iteration_failures.append(
-                        IterationFailure(
-                            iteration_index=iteration_index,
-                            detail=str(start_subflow_result.result_details),
-                        )
+                    iteration_failure_tree = failure_trees.failure_tree_from_subflow_result(
+                        start_subflow_result, loop_body_scope.canvas_node_names
                     )
+                    iteration_failure = failure_trees.IterationFailure(
+                        iteration_index=iteration_index,
+                        detail=failure_trees.iteration_failure_detail(
+                            iteration_failure_tree, str(start_subflow_result.result_details)
+                        ),
+                        failure_tree=iteration_failure_tree,
+                    )
+                    iteration_failures.append(iteration_failure)
+                    # A workflow nested too deeply is refused again on every remaining iteration,
+                    # and each one re-runs the whole nested tree first, so the loop stops here and
+                    # reports it. The warning below names the recursion limit, the only failure that ends a loop early.
+                    if iteration_failure.failure_tree is not None and failure_trees.has_early_termination(
+                        iteration_failure.failure_tree
+                    ):
+                        logger.warning(
+                            "Stopping loop ending at '%s' after iteration %d: a workflow inside it is nested too deeply.",
+                            end_loop_node.name,
+                            iteration_index,
+                        )
+                        break
                 else:
                     successful_iterations.append(iteration_index)
 
@@ -1740,7 +1581,7 @@ class NodeExecutor(EngineScoped):
 
         # Execute iterations sequentially based on execution environment
         break_occurred = False
-        iteration_failures: list[IterationFailure] = []
+        iteration_failures: list[failure_trees.IterationFailure] = []
         if self._runs_locally(execution_type):
             with self._local_execution_scope(execution_type, end_node.name):
                 (
@@ -1791,12 +1632,13 @@ class NodeExecutor(EngineScoped):
         # Only the local sequential path reports per-iteration failures; private and cloud loops
         # leave this empty and fall through to the short-count branch below.
         elif iteration_failures:
-            msg = self._format_loop_failure_message(
-                loop_name=end_node.name,
-                total_iterations=total_iterations,
-                iteration_failures=iteration_failures,
+            loop_failure = failure_trees.loop_failure_from_iterations(
+                end_node.name,
+                total_iterations,
+                iteration_failures,
+                failure_trees.iterations_run_before_early_termination(iteration_failures),
             )
-            raise RuntimeError(msg)
+            raise FailureTreeError(loop_failure, failure_trees.render_loop_message(loop_failure))
         elif len(successful_iterations) < total_iterations:
             logger.debug(
                 "Loop execution stopped early at %d of %d iterations",
@@ -2036,7 +1878,7 @@ class NodeExecutor(EngineScoped):
 
         # Deserialize the flow once for sequential re-execution
         flow_name, node_name_mappings, packaged_start_node_name = self._deserialize_while_flow(
-            workflow, package_result, start_node_mapping.node_name
+            workflow, package_result, start_node_mapping.node_name, node.name
         )
 
         # Build reverse mapping for event translation
@@ -2108,6 +1950,7 @@ class NodeExecutor(EngineScoped):
         workflow: WorkflowRuntime,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         start_node_name: str,
+        loop_node_name: str,
     ) -> tuple[str, dict[str, str], str]:
         """Deserialize a packaged while-loop flow and return execution context.
 
@@ -2115,6 +1958,7 @@ class NodeExecutor(EngineScoped):
             workflow: The workflow the nodes are in.
             package_result: The packaged flow result
             start_node_name: Original name of the start node
+            loop_node_name: Name of the while group node that runs the flow
 
         Returns:
             Tuple of (flow_name, node_name_mappings, packaged_start_node_name)
@@ -2132,6 +1976,7 @@ class NodeExecutor(EngineScoped):
 
             flow_name = deserialize_result.flow_name
             node_name_mappings = deserialize_result.node_name_mappings
+            self._record_iteration_flow_owner(workflow, flow_name, loop_node_name)
 
         packaged_start_node_name = node_name_mappings.get(start_node_name)
         if packaged_start_node_name is None:
@@ -2139,6 +1984,13 @@ class NodeExecutor(EngineScoped):
             raise TypeError(msg)
 
         return flow_name, node_name_mappings, packaged_start_node_name
+
+    def _record_iteration_flow_owner(
+        self, workflow: WorkflowRuntime, iteration_flow_name: str, loop_node_name: str
+    ) -> None:
+        """Note which flow holds the loop that runs an iteration flow, for the recursion-depth count."""
+        owner_flow_name = workflow.nodes.parent_flow_name(loop_node_name)
+        self.engine.flow_manager.record_iteration_flow_owner(workflow, iteration_flow_name, owner_flow_name)
 
     async def _run_while_loop_iterations(  # noqa: PLR0913
         self,
@@ -2199,6 +2051,9 @@ class NodeExecutor(EngineScoped):
             execution_failed = isinstance(start_subflow_result, StartLocalSubflowResultFailure)
 
             if execution_failed:
+                self._raise_if_while_iteration_ended_early(
+                    node, iteration, start_subflow_result, loop_body_scope.canvas_node_names
+                )
                 logger.warning(
                     "While group '%s' iteration %d execution error: %s",
                     node.name,
@@ -2219,6 +2074,31 @@ class NodeExecutor(EngineScoped):
                 return result
 
         return False
+
+    def _raise_if_while_iteration_ended_early(
+        self,
+        node: BaseWhileNodeGroup,
+        iteration: int,
+        start_subflow_result: Any,
+        canvas_node_names: Mapping[str, str],
+    ) -> None:
+        """Stop the while group when a failed iteration would fail the same way on every retry.
+
+        Retrying would be refused again after re-running the whole nested tree. Recursion is currently
+        the only failure that ends a loop early.
+        """
+        failure_tree = failure_trees.failure_tree_from_subflow_result(start_subflow_result, canvas_node_names)
+        # Most failed iterations are left to the while group, which tries again; only one that would fail the same way
+        # every time stops it here.
+        if failure_tree is None or not failure_trees.has_early_termination(failure_tree):
+            return
+        iteration_failure = failure_trees.IterationFailure(
+            iteration_index=iteration,
+            detail=failure_trees.iteration_failure_detail(failure_tree, str(start_subflow_result.result_details)),
+            failure_tree=failure_tree,
+        )
+        loop_failure = failure_trees.loop_failure_from_while_iteration(node.name, iteration + 1, iteration_failure)
+        raise FailureTreeError(loop_failure, failure_trees.render_loop_message(loop_failure))
 
     async def _set_while_iteration_parameters(
         self,
@@ -2520,33 +2400,6 @@ class NodeExecutor(EngineScoped):
 
         return sources
 
-    def _resolve_on_each_entry(self, node: SubflowNodeGroup) -> tuple[str | None, str | None]:
-        """Return (entry_node_name, entry_param_name) from on_each connection, or (None, None)."""
-        workflow = node._require_workflow()
-        # on_each only exists on iterative groups; non-iterative subflows fall back to implicit child-discovery.
-        if not isinstance(node, BaseIterativeNodeGroup):
-            return None, None
-        connections = workflow.flows.connections
-        # Use node.on_each.name instead of a literal so renames stay in sync.
-        # Control outputs are single-target (enforced in connections.py), so index 0 is the only connection.
-        on_each_conns = connections.outgoing_index.get(node.name, {}).get(node.on_each.name, [])
-        if not on_each_conns:
-            return None, None
-        first_conn = connections.connections[on_each_conns[0]]
-        if first_conn.target_node.name == node.name:
-            # on_each is a proxy port on the group boundary. When the user wires on_each → a child node,
-            # two hops are stored: group→proxy (boundary edge) then proxy→child (internal edge).
-            # Follow both to find the actual entry node inside the group.
-            proxy_param = first_conn.target_parameter
-            proxy_conns = connections.outgoing_index.get(node.name, {}).get(proxy_param.name, [])
-            if proxy_conns:
-                # Control outputs are single-target, so index 0 is the only connection.
-                internal_conn = connections.connections[proxy_conns[0]]
-                if internal_conn.is_node_group_internal:
-                    return internal_conn.target_node.name, internal_conn.target_parameter.name
-            return None, None
-        return first_conn.target_node.name, first_conn.target_parameter.name
-
     async def _package_subflow_group_body(
         self, node: SubflowNodeGroup, label: str
     ) -> PackageNodesAsSerializedFlowResultSuccess | None:
@@ -2581,7 +2434,7 @@ class NodeExecutor(EngineScoped):
         sanitized_node_name = node.name.replace(" ", "_")
         output_parameter_prefix = f"{sanitized_node_name}_{label}_"
 
-        entry_control_node_name, entry_control_parameter_name = self._resolve_on_each_entry(node)
+        entry_control_node_name, entry_control_parameter_name = node.resolve_inner_entry_node()
 
         request = PackageNodesAsSerializedFlowRequest(
             node_names=node_names,
@@ -2778,7 +2631,7 @@ class NodeExecutor(EngineScoped):
 
         # Execute iterations sequentially based on execution environment
         break_occurred = False
-        iteration_failures: list[IterationFailure] = []
+        iteration_failures: list[failure_trees.IterationFailure] = []
         match execution_type:
             case _ if self._runs_locally(execution_type):
                 with self._local_execution_scope(execution_type, node.name):
@@ -2830,12 +2683,13 @@ class NodeExecutor(EngineScoped):
         # Only the local sequential path reports per-iteration failures; private and cloud loops
         # leave this empty and fall through to the short-count branch below.
         elif iteration_failures:
-            msg = self._format_loop_failure_message(
-                loop_name=node.name,
-                total_iterations=total_iterations,
-                iteration_failures=iteration_failures,
+            loop_failure = failure_trees.loop_failure_from_iterations(
+                node.name,
+                total_iterations,
+                iteration_failures,
+                failure_trees.iterations_run_before_early_termination(iteration_failures),
             )
-            raise RuntimeError(msg)
+            raise FailureTreeError(loop_failure, failure_trees.render_loop_message(loop_failure))
         elif len(successful_iterations) < total_iterations:
             logger.debug(
                 "Iterative group execution stopped early at %d of %d iterations",
@@ -3565,6 +3419,8 @@ class NodeExecutor(EngineScoped):
                     deserialized_flows.append(
                         (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
                     )
+                    self._record_iteration_flow_owner(workflow, deserialize_result.flow_name, end_loop_node.name)
+
                 logger.debug("Successfully deserialized %d flow instances for parallel execution", total_iterations)
                 # Step 2: Define the per-iteration coroutine
                 packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
@@ -3573,7 +3429,7 @@ class NodeExecutor(EngineScoped):
 
                 async def run_single_iteration(
                     flow_name: str, iteration_index: int, start_node_name: str, loop_body_scope: LoopBodyScope
-                ) -> IterationOutcome:
+                ) -> failure_trees.IterationOutcome:
                     """Run a single iteration flow and report whether it finished, and why not."""
                     async with concurrency_gate:
                         with entered_loop_body_scope(loop_body_scope):
@@ -3583,13 +3439,21 @@ class NodeExecutor(EngineScoped):
                             )
                             start_subflow_result = await workflow.ahandle_request(start_subflow_request)
                             if isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
-                                return IterationOutcome(iteration_index=iteration_index, succeeded=True, detail="")
+                                return failure_trees.IterationOutcome(
+                                    iteration_index=iteration_index, succeeded=True, detail=""
+                                )
                             # The reason travels out with the verdict: this closure is the only place that
                             # holds it, so anything narrower than IterationOutcome loses it for good.
-                            return IterationOutcome(
+                            iteration_failure_tree = failure_trees.failure_tree_from_subflow_result(
+                                start_subflow_result, loop_body_scope.canvas_node_names
+                            )
+                            return failure_trees.IterationOutcome(
                                 iteration_index=iteration_index,
                                 succeeded=False,
-                                detail=str(start_subflow_result.result_details),
+                                detail=failure_trees.iteration_failure_detail(
+                                    iteration_failure_tree, str(start_subflow_result.result_details)
+                                ),
+                                failure_tree=iteration_failure_tree,
                             )
 
                 # Step 3: Set input values on start nodes for each iteration
@@ -3653,7 +3517,7 @@ class NodeExecutor(EngineScoped):
                     for iteration_index, flow_name, node_name_mappings in deserialized_flows
                 ]
                 try:
-                    iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                    iteration_task_results = await self._run_iteration_tasks_until_early_termination(iteration_tasks)
                 except asyncio.CancelledError:
                     for task in iteration_tasks:
                         task.cancel()
@@ -3665,34 +3529,55 @@ class NodeExecutor(EngineScoped):
                 # Step 5: Collect successful and failed iterations
                 successful_iterations = []
                 failed_iteration_indices = []
-                iteration_failures: list[IterationFailure] = []
+                iteration_failures: list[failure_trees.IterationFailure] = []
 
                 for idx, result in enumerate(iteration_task_results):
+                    if isinstance(result, asyncio.CancelledError):
+                        # Only a sibling ending the loop early cancels an iteration here; the flow's
+                        # own cancellation raised above. Recursion is currently the only cause.
+                        failed_iteration_indices.append(idx)
+                        iteration_failures.append(
+                            failure_trees.iteration_failure_from_cancellation(end_loop_node.name, idx)
+                        )
+                        continue
                     if isinstance(result, Exception):
                         # Exception doesn't include iteration_index, use enumerate index
+                        # A task that raised returned no outcome, so there is no failure tree to carry.
                         failed_iteration_indices.append(idx)
-                        iteration_failures.append(IterationFailure(iteration_index=idx, detail=str(result)))
+                        iteration_failures.append(
+                            failure_trees.IterationFailure(iteration_index=idx, detail=str(result))
+                        )
                         continue
-                    if isinstance(result, IterationOutcome):
+                    if isinstance(result, failure_trees.IterationOutcome):
                         if result.succeeded:
                             successful_iterations.append(result.iteration_index)
                         else:
                             failed_iteration_indices.append(result.iteration_index)
                             iteration_failures.append(
-                                IterationFailure(
+                                failure_trees.IterationFailure(
                                     iteration_index=result.iteration_index,
                                     detail=result.detail or "The iteration reported failure without a reason.",
+                                    failure_tree=result.failure_tree,
                                 )
                             )
 
                 if failed_iteration_indices:
+                    loop_failure = failure_trees.loop_failure_from_iterations(
+                        end_loop_node.name, total_iterations, iteration_failures
+                    )
+                    # A workflow nested too deeply is not a partial result to carry on with: raising lets each
+                    # level above cancel its own siblings and report it, instead of re-running the tree.
+                    if failure_trees.has_early_termination(loop_failure):
+                        raise FailureTreeError(loop_failure, failure_trees.render_loop_message(loop_failure))
                     logger.warning(
                         "Loop execution: %d of %d parallel iterations failed. Results will contain None for failed "
                         "iterations.\n%s",
                         len(failed_iteration_indices),
                         total_iterations,
                         "\n".join(
-                            self._format_iteration_failure_lines(iteration_failures, total_iterations=total_iterations)
+                            failure_trees.format_iteration_failure_lines(
+                                iteration_failures, total_iterations=total_iterations
+                            )
                         ),
                     )
 
@@ -3734,6 +3619,26 @@ class NodeExecutor(EngineScoped):
                 # (success, raise, cancellation). deserialized_flows is complete because each flow is
                 # appended immediately after creation, inside this try.
                 await self._delete_iteration_flows(workflow, deserialized_flows, event_manager)
+
+    async def _run_iteration_tasks_until_early_termination(
+        self, iteration_tasks: Sequence[asyncio.Future[failure_trees.IterationOutcome]]
+    ) -> list[failure_trees.IterationOutcome | BaseException]:
+        """Wait for every iteration task, cancelling the rest once one ends the loop early.
+
+        Every iteration task already exists; cancelling stops those still waiting for a turn as well as those
+        running. Each cancelled task is awaited, so none is still running when its flow is deleted. Results are
+        in task order; a cancelled task's result is its CancelledError.
+        """
+        pending = set(iteration_tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            # One finished iteration ended the loop early, so the iterations still running are cancelled instead of
+            # waited for.
+            if any(failure_trees.task_hit_early_termination(task) for task in done):
+                for task in pending:
+                    task.cancel()
+                break
+        return await asyncio.gather(*iteration_tasks, return_exceptions=True)
 
     async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913, PLR0917
         self,

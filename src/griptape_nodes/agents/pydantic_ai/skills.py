@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Never
 
 from pydantic_ai.capabilities import AbstractCapability, Capability
 from pydantic_ai.workspaces import FileEntry, ReadOnlyWorkspace, Workspace, WorkspaceReadOnlyError
-from pydantic_ai_harness.filesystem import FileSystem
+from pydantic_ai_harness.file_system import FileSystem
 from pydantic_ai_harness.skills import Skills
 
 if TYPE_CHECKING:

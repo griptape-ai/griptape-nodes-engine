@@ -712,53 +712,51 @@ class TestDownloadLibraryRequestAutoRegister:
     """
 
     @pytest.mark.asyncio
-    async def test_auto_register_failure_returns_download_failure(self, engine: Engine) -> None:
+    async def test_auto_register_failure_returns_download_failure(self, engine: Engine, tmp_path: Path) -> None:
         """When RegisterLibraryFromFileRequest fails, download_library_request must return DownloadLibraryResultFailure.
 
         Regression guard: old code only logged a warning on registration failure and fell through to
         DownloadLibraryResultSuccess.
         """
         import json as _json
-        import tempfile
 
         mgr = engine.library_manager
         tracked: dict = {}
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_json_path = f"{tmpdir}/fake-library/griptape_nodes_library.json"
-            fake_json_content = _json.dumps({"name": "fake-library"})
+        fake_json_path = str(tmp_path / "fake-library" / "griptape_nodes_library.json")
+        fake_json_content = _json.dumps({"name": "fake-library"})
 
-            mock_path_instance = AsyncMock()
-            mock_path_instance.mkdir = AsyncMock(return_value=None)
-            # exists() → True forces skip_clone path, avoiding actual git clone
-            mock_path_instance.exists = AsyncMock(return_value=True)
-            mock_path_instance.read_text = AsyncMock(return_value=fake_json_content)
+        mock_path_instance = AsyncMock()
+        mock_path_instance.mkdir = AsyncMock(return_value=None)
+        # exists() → True forces skip_clone path, avoiding actual git clone
+        mock_path_instance.exists = AsyncMock(return_value=True)
+        mock_path_instance.read_text = AsyncMock(return_value=fake_json_content)
 
-            with (
-                patch(
-                    "griptape_nodes.retained_mode.managers.library.git_operations.anyio.Path",
-                    return_value=mock_path_instance,
-                ),
-                patch(
-                    "griptape_nodes.retained_mode.managers.library.git_operations.find_file_in_directory",
-                    return_value=fake_json_path,
-                ),
-                patch.object(
-                    engine,
-                    "ahandle_request",
-                    new_callable=AsyncMock,
-                    return_value=RegisterLibraryFromFileResultFailure(result_details="schema validation error"),
-                ),
-                patch.object(mgr, "_library_file_path_to_info", tracked),
-            ):
-                result = await mgr.git_operations.download_library_request(
-                    DownloadLibraryRequest(
-                        git_url="https://github.com/griptape-ai/fake-library.git",
-                        download_directory=tmpdir,
-                        auto_register=True,
-                        fail_on_exists=False,
-                    )
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library.git_operations.anyio.Path",
+                return_value=mock_path_instance,
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library.git_operations.find_file_in_directory",
+                return_value=fake_json_path,
+            ),
+            patch.object(
+                engine,
+                "ahandle_request",
+                new_callable=AsyncMock,
+                return_value=RegisterLibraryFromFileResultFailure(result_details="schema validation error"),
+            ),
+            patch.object(mgr, "_library_file_path_to_info", tracked),
+        ):
+            result = await mgr.git_operations.download_library_request(
+                DownloadLibraryRequest(
+                    git_url="https://github.com/griptape-ai/fake-library.git",
+                    download_directory=str(tmp_path),
+                    auto_register=True,
+                    fail_on_exists=False,
                 )
+            )
 
         assert isinstance(result, DownloadLibraryResultFailure)
         assert "downloaded but failed to register" in str(result.result_details)

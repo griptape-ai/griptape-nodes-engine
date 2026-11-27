@@ -377,6 +377,29 @@ class FlowManager(EngineScoped):
         msg = f"Flow with name {flow_name} doesn't exist"
         raise ValueError(msg)
 
+    def get_enclosing_flow(self, workflow: WorkflowRuntime, flow_name: str) -> str | None:
+        """Return the flow that `flow_name` runs inside, for walking upward through nested runs.
+
+        That is the flow of the loop that owns it when it is a loop iteration flow whose owner still exists,
+        otherwise its parent.
+        """
+        flows = workflow.flows
+        owner = flows.iteration_flow_to_owner_flow_name.get(flow_name)
+        # The flow holding the loop that runs this iteration flow encloses it, as long as that flow still exists.
+        if owner is not None and owner in flows.name_to_parent_name:
+            return owner
+        return self.get_parent_flow_in(workflow, flow_name)
+
+    def record_iteration_flow_owner(
+        self, workflow: WorkflowRuntime, iteration_flow_name: str, owner_flow_name: str
+    ) -> None:
+        """Remember which flow holds the loop that runs `iteration_flow_name`.
+
+        Iteration flows are parented to whatever flow was current when they were created, which says nothing
+        about the loop that runs them; this records that instead. Held in memory only.
+        """
+        workflow.flows.iteration_flow_to_owner_flow_name[iteration_flow_name] = owner_flow_name
+
     def reparent_flow_in(self, workflow: WorkflowRuntime, flow_name: str, new_parent_flow_name: str) -> None:
         """Move a Flow under a different parent Flow.
 
@@ -548,12 +571,20 @@ class FlowManager(EngineScoped):
                 details = f"Attempted to set metadata for a Flow '{flow_name}', but no such Flow was found."
                 return SetFlowMetadataResultFailure(result_details=details)
 
+        changed_keys = {
+            key for key, value in request.metadata.items() if key not in flow.metadata or flow.metadata[key] != value
+        }
+        removed_keys = {key for key in request.remove_keys if key in flow.metadata}
         # We can't completely overwrite metadata.
         for key, value in request.metadata.items():
             flow.metadata[key] = value
+        for key in removed_keys:
+            del flow.metadata[key]
         details = f"Successfully set metadata for a Flow '{flow_name}'."
 
-        return SetFlowMetadataResultSuccess(result_details=details)
+        return SetFlowMetadataResultSuccess(
+            result_details=details, altered_workflow_state=bool(changed_keys) or bool(removed_keys)
+        )
 
     def does_canvas_exist(self, workflow: WorkflowRuntime) -> bool:
         """Determines if there is already an existing flow with no parent flow.Returns True if there is an existing flow with no parent flow.Return False if there is no existing flow with no parent flow."""
@@ -745,6 +776,12 @@ class FlowManager(EngineScoped):
         # Clean up referenced workflow tracking
         if flow in flows.flow_to_referenced_workflow_name:
             del flows.flow_to_referenced_workflow_name[flow]
+        owners = flows.iteration_flow_to_owner_flow_name
+        owners.pop(flow.name, None)
+        # Records of iteration flows owned by the deleted flow are dropped too, so no record names an owner that no
+        # longer exists.
+        for iteration_flow in [name for name, owner in owners.items() if owner == flow.name]:
+            del owners[iteration_flow]
 
     @handles(GetIsFlowRunningRequest)
     def on_get_is_flow_running_request(
@@ -876,6 +913,18 @@ class FlowManager(EngineScoped):
         for flow_name, parent_name in name_to_parent_name.items():
             if parent_name == old_name:
                 name_to_parent_name[flow_name] = new_name
+
+        # The same name may be recorded as an iteration flow, or as the owner of one.
+        owners = workflow.flows.iteration_flow_to_owner_flow_name
+        renamed_owners: dict[str, str] = {}
+        for iteration_flow, owner in owners.items():
+            if iteration_flow == old_name:
+                iteration_flow = new_name  # noqa: PLW2901
+            if owner == old_name:
+                owner = new_name  # noqa: PLW2901
+            renamed_owners[iteration_flow] = owner
+        owners.clear()
+        owners.update(renamed_owners)
 
         # Let the Node Manager know about the change, too.
         self.engine.node_manager.handle_flow_rename(workflow, old_name=old_name, new_name=new_name)
@@ -1824,7 +1873,9 @@ class FlowManager(EngineScoped):
         if subflow_machine.resolution_machine.is_errored():
             error_message = subflow_machine.resolution_machine.get_error_message()
             # Pass through the error message directly without wrapping
-            return StartLocalSubflowResultFailure(result_details=error_message or "Subflow errored during execution")
+            return StartLocalSubflowResultFailure(
+                result_details=error_message or "Subflow errored during execution",
+            ).attach_failure_tree(subflow_machine.resolution_machine.get_error_failure_tree())
 
         return StartLocalSubflowResultSuccess(result_details=f"Successfully executed local subflow '{flow_name}'")
 
@@ -2285,6 +2336,7 @@ class FlowManager(EngineScoped):
         flows.run_queue.enqueue(run)
         self._start_next_run_if_idle(flows)
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
         return run
 
     async def cancel_run_in(self, workflow: WorkflowRuntime, run_id: str) -> bool:
@@ -2361,6 +2413,7 @@ class FlowManager(EngineScoped):
             self._leave_line(run)
             self._on_run_loop(run, self._end_without_executing, run, f"The run did not start: {reason}")
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
 
     def _end_without_executing(self, run: Run, details: str) -> None:
         """End a run that left the line without executing; its request returns `details`."""
@@ -2405,6 +2458,8 @@ class FlowManager(EngineScoped):
         run.state = RunState.RUNNING
         flows.run_in_progress = run
         flows.driving = True
+        if flows.workflow is not None:
+            flows.workflow.last_run_error = None
         # The run that just ended may have ended on a short-lived loop, such as a synchronous request's.
         self._on_run_loop(run, self._create_driver, run)
 
@@ -2432,6 +2487,7 @@ class FlowManager(EngineScoped):
             # The request awaiting the outcome reports the error, so the driver does not raise it again.
             run.outcome.set_exception(e)
             run.state = RunState.FAILED
+            run.failure = f"Attempted to run flow '{run.flow_name}'. Failed due to: {e}"
             flows.driving = False
             self._finish_run(run)
             return
@@ -2445,6 +2501,7 @@ class FlowManager(EngineScoped):
                 run.state = RunState.FINISHED
             else:
                 run.state = RunState.FAILED
+                run.failure = str(result.result_details)
         self._finish_run(run)
 
     def _finish_run_if_over(self, flows: WorkflowFlows) -> None:
@@ -2460,8 +2517,23 @@ class FlowManager(EngineScoped):
         if run is None or flows.driving or self._run_is_advancing(flows) or self._flow_is_running(flows):
             return
         if run.state is RunState.PAUSED:
-            run.state = RunState.FINISHED
+            # A node that failed while the user stepped or continued the run ends it as a failure.
+            failure = self._flow_failure(flows, run)
+            if failure is None:
+                run.state = RunState.FINISHED
+            else:
+                run.state = RunState.FAILED
+                run.failure = failure
         self._finish_run(run)
+
+    @staticmethod
+    def _flow_failure(flows: WorkflowFlows, run: Run) -> str | None:
+        """Why the flow of `run` failed, or None when it did not."""
+        machine = flows.global_control_flow_machine
+        if machine is None or not machine.resolution_machine.is_errored():
+            return None
+        error_message = machine.resolution_machine.get_error_message() or "A node failed."
+        return f"Attempted to run flow '{run.flow_name}'. Failed due to: {error_message}"
 
     def _finish_run(self, run: Run) -> None:
         """End `run`, the run in progress in its workflow, and start that workflow's next. The only place a run ends."""
@@ -2469,9 +2541,17 @@ class FlowManager(EngineScoped):
         if flows.run_in_progress is not run:
             return
         flows.run_in_progress = None
+        if flows.workflow is not None and run.state is RunState.FAILED:
+            flows.workflow.last_run_error = run.failure or f"The run of flow '{run.flow_name}' failed."
         self._on_run_loop(run, run.ended.set_result, None)
         self._start_next_run_if_idle(flows)
         self._report_places_in_line(flows)
+        self._report_workflow_state(flows)
+
+    def _report_workflow_state(self, flows: WorkflowFlows) -> None:
+        """Tell clients of the runs of the workflow `flows` belongs to, if it belongs to one."""
+        if flows.workflow is not None:
+            self.engine.report_workflow_state(flows.workflow)
 
     @staticmethod
     def _on_run_loop(run: Run, callback: Callable[..., object], *args: object) -> None:

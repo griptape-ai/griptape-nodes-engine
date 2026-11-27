@@ -101,5 +101,7 @@ class DeprecatedNodeGroupParametersCheck(SetParameterVersionCompatibilityCheck):
         return SetParameterValueResultSuccess(
             finalized_value=None,
             data_type="any",
+            # The parameter no longer exists, so nothing was set.
+            altered_workflow_state=False,
             result_details=f"Parameter '{parameter_name}' was removed in v{self.REMOVAL_VERSION}. Please resave this workflow.",
         )

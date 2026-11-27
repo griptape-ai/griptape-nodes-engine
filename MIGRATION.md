@@ -1,5 +1,19 @@
 # Unreleased
 
+## Thumbnail generator imports
+
+Use `ThumbnailGenerator` and `ThumbnailParameters` from `preview_generators.thumbnail_generator`
+for automatic backend selection. `PILThumbnailGenerator` remains available in
+`preview_generators.pil_thumbnail_generator` for callers that explicitly require Pillow.
+Replace imports of `PILThumbnailParameters` with the shared `ThumbnailParameters`. Both modules live under
+`griptape_nodes.retained_mode.managers.artifact_providers.image`.
+
+The generator's friendly name remains "Standard Thumbnail Generation", so existing preview
+settings keep the same configuration key. OpenImageIO is optional: install
+`griptape-nodes-engine[openimageio]` to prefer it, or use a plain engine installation for Pillow.
+The engine logs the selected backend at startup. Pillow retains its existing format and
+16-bit colour decoding limitations; PNG metadata injection still preserves encoded pixels.
+
 ## Flow and node context belongs to the caller
 
 A request that names no flow acts on the workflow's top-level flow. It no longer acts on a flow an
@@ -160,8 +174,8 @@ workflow the same way. On such a thread they find none.
 need no change: `push_workflow` now binds the workflow it opens, so the calls after it act on that
 workflow, and `pop_workflow` ends the binding.
 
-`WorkflowNotNamedError` in `griptape_nodes.retained_mode.runtime.binding` is no longer raised.
-Code that catches it keeps working; drop the catch when convenient.
+**Library authors.** `WorkflowNotNamedError` is removed from `griptape_nodes.retained_mode.runtime.binding`.
+Drop any import or `except` that names it.
 
 ## Parameter values keep their type
 

@@ -47,7 +47,7 @@ CATALOG_PREAMBLE = (
 )
 
 _LOADED_CAPABILITY = re.compile(
-    r'<context id="capability:(?P<name>[^"]+)">\n(?P<instructions>.*)\n</context>', re.DOTALL
+    r'<pyai:context id="capability:(?P<name>[^"]+)">\n(?P<instructions>.*?)\n</pyai:context>', re.DOTALL
 )
 
 
@@ -142,7 +142,7 @@ def _catalog(info: AgentInfo) -> str | None:
     if info.instructions is None or CATALOG_PREAMBLE not in info.instructions:
         return None
     entries = info.instructions.split(CATALOG_PREAMBLE, 1)[1]
-    return entries.split("\n</context>", 1)[0]
+    return entries.split("\n</pyai:context>", 1)[0]
 
 
 def _tool_names(info: AgentInfo) -> set[str]:

@@ -164,6 +164,7 @@ class TestSuppressionWindowLifetime:
                 finalized_value=1,
                 data_type="int",
                 result_details="Set parameter value.",
+                altered_workflow_state=True,
             ),
         )
 
@@ -306,6 +307,24 @@ class TestSuppressionIsScopedToItsCaller:
 
         with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
             assert await nested_handler() is True
+
+    @pytest.mark.asyncio
+    async def test_a_task_spawned_inside_the_block_is_suppressed_only_until_it_exits(self) -> None:
+        """Such as a node that fills in a dropdown a few seconds after an undo rebuilt it."""
+        event_manager = EventManager()
+        block_exited = asyncio.Event()
+
+        async def outlives_the_block() -> list[bool]:
+            inside = event_manager.should_suppress_event(_create_node_result_event())
+            await block_exited.wait()
+            return [inside, event_manager.should_suppress_event(_create_node_result_event())]
+
+        with EventSuppressionContext(event_manager, {CreateNodeResultSuccess}):
+            task = asyncio.create_task(outlives_the_block())
+            await asyncio.sleep(0)
+        block_exited.set()
+
+        assert await task == [True, False]
 
 
 class TestSuppressionSetReachability:

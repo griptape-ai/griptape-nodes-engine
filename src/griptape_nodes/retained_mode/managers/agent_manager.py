@@ -151,6 +151,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
+    UpdateProviderPayload,
 )
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
@@ -176,6 +177,7 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     ListLibraryMCPServersRequest,
     ListLibraryMCPServersResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointAction
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.retained_mode.request_handlers import handles
@@ -590,6 +592,10 @@ class _ActiveRun:
     loop: asyncio.AbstractEventLoop
 
 
+class ChatModelDeniedError(Exception):
+    """An agent run refused because policy denies its provider and model."""
+
+
 class _RunnerCacheKey(NamedTuple):
     """Everything baked into an agent at construction time.
 
@@ -604,6 +610,13 @@ class _RunnerCacheKey(NamedTuple):
     image_model_name: str
     base_url: str
     api_key: str
+
+
+class _ModelOfferSplit(NamedTuple):
+    """Chat/image model names split by `OfferModel` verdict: allowed, and denied mapped to its reason."""
+
+    allowed: list[str]
+    denied: dict[str, str]
 
 
 @dataclass
@@ -708,6 +721,73 @@ class AgentManager(EngineScoped):
                 return p
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         return ProviderConfig(name=_PROTECTED_PROVIDER_NAME, type=_PROTECTED_PROVIDER_NAME, model=default_model)
+
+    def _update_provider_denial_message(self, existing: ProviderConfig, pd: UpdateProviderPayload) -> str | None:
+        """The `OfferModel` refusal for an update's resulting type+model pair, or `None` when it's permitted.
+
+        Checked whenever the update sets `type` or `model`. The editor sends
+        `model` on every settings save, so saving a provider whose model is now
+        denied fails until an allowed model is picked.
+        """
+        if pd.type is None and pd.model is None:
+            return None
+        effective_type = pd.type if pd.type is not None else existing.type
+        effective_model = pd.model if pd.model is not None else existing.model
+        return self.engine.access_manager.chat_model_denial(
+            action=CheckpointAction.OFFER_MODEL, connection_id=effective_type, model_name=effective_model
+        )
+
+    def _configure_request_denial_message(self, request: ConfigureAgentRequest) -> str | None:
+        """The first `OfferModel` refusal among the provider+model pairs this request writes, or `None`.
+
+        `prompt_driver.model` lands on the provider active before any
+        `active_provider` switch in the same request, so it is checked there.
+        """
+        access_manager = self.engine.access_manager
+        pd = request.prompt_driver
+        if "model" in pd.model_fields_set and pd.model:
+            prompt_provider = self._get_provider(None)
+            denial_message = access_manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id=prompt_provider.type, model_name=pd.model
+            )
+            if denial_message is not None:
+                return denial_message
+        if request.active_provider:
+            switched_provider = self._get_provider(request.active_provider)
+            denial_message = access_manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL,
+                connection_id=switched_provider.type,
+                model_name=switched_provider.model,
+            )
+            if denial_message is not None:
+                return denial_message
+        if "model" in request.image_generation_driver:
+            new_image_model = str(request.image_generation_driver["model"])
+            if new_image_model:
+                denial_message = access_manager.chat_model_denial(
+                    action=CheckpointAction.OFFER_MODEL,
+                    connection_id=ProviderID.GRIPTAPE_CLOUD,
+                    model_name=new_image_model,
+                )
+                if denial_message is not None:
+                    return denial_message
+        return None
+
+    def _offer_split(
+        self, model_names: Sequence[str], *, connection_id: str = ProviderID.GRIPTAPE_CLOUD
+    ) -> _ModelOfferSplit:
+        """Split a list of model names into those `OfferModel` allows and those it denies, with reasons."""
+        allowed: list[str] = []
+        denied: dict[str, str] = {}
+        for name in model_names:
+            denial_message = self.engine.access_manager.chat_model_denial(
+                action=CheckpointAction.OFFER_MODEL, connection_id=connection_id, model_name=name
+            )
+            if denial_message is None:
+                allowed.append(name)
+            else:
+                denied[name] = denial_message
+        return _ModelOfferSplit(allowed=allowed, denied=denied)
 
     def _on_config_changed(self, event: ConfigChanged) -> None:
         _provider_keys = ("agent.providers", "agent.active_provider", "agent.griptape_cloud_model", "agent", "")
@@ -922,7 +1002,18 @@ class AgentManager(EngineScoped):
 
         ``active`` is the thread's claim from :meth:`_claim_thread`; its cancel event
         is what ``CancelAgentRequest`` sets. The instructions describe ``workflow``'s current flow.
+
+        The `InvokeModel` gate runs here, before `_build_runner`.
         """
+        provider = self._get_provider(provider_name)
+        effective_model_name = model_name or provider.model
+        denial_message = self.engine.access_manager.chat_model_denial(
+            action=CheckpointAction.INVOKE_MODEL, connection_id=provider.type, model_name=effective_model_name
+        )
+        if denial_message is not None:
+            msg = f"Attempted to run the agent. Failed because {denial_message}"
+            raise ChatModelDeniedError(msg)
+
         runner = self._build_runner(
             provider_name=provider_name,
             model_name=model_name,
@@ -1310,23 +1401,34 @@ class AgentManager(EngineScoped):
         ``api_key``. Image generation driver key honored: ``model``. Other
         keys are accepted but ignored. Any change that affects the runner
         flushes the runner cache so the next run picks up the new settings.
+
+        Refused when any pair the request actually writes is denied by license
+        policy; see `_configure_request_denial_message`.
         """
+        if request.active_provider:
+            provider_names = {p.name for p in self._providers}
+            if request.active_provider not in provider_names:
+                return ConfigureAgentResultFailure(
+                    result_details=f"Attempted to set active provider '{request.active_provider}'. Failed because it does not exist."
+                )
+
+        denial_message = self._configure_request_denial_message(request)
+        if denial_message is not None:
+            return ConfigureAgentResultFailure(
+                result_details=f"Attempted to configure agent. Failed because {denial_message}"
+            )
+
+        pd = request.prompt_driver
         try:
-            changed = self._apply_prompt_driver_config(request.prompt_driver)
+            changed = self._apply_prompt_driver_config(pd)
             if "model" in request.image_generation_driver:
                 new_image_model = str(request.image_generation_driver["model"])
                 if new_image_model != self._image_model_name:
                     self._image_model_name = new_image_model
                     changed = True
-            if request.active_provider:
-                provider_names = {p.name for p in self._providers}
-                if request.active_provider not in provider_names:
-                    return ConfigureAgentResultFailure(
-                        result_details=f"Attempted to set active provider '{request.active_provider}'. Failed because it does not exist."
-                    )
-                if request.active_provider != self._active_provider_name:
-                    self._active_provider_name = request.active_provider
-                    changed = True
+            if request.active_provider and request.active_provider != self._active_provider_name:
+                self._active_provider_name = request.active_provider
+                changed = True
             if changed:
                 self._persist_providers()
                 self._runner_cache.clear()
@@ -1358,9 +1460,13 @@ class AgentManager(EngineScoped):
 
     @handles(ListAgentModelsRequest)
     def on_handle_list_agent_models_request(self, _: ListAgentModelsRequest) -> ResultPayload:
+        prompt_split = self._offer_split(MODEL_CHOICES)
+        image_split = self._offer_split(IMAGE_MODEL_CHOICES)
         return ListAgentModelsResultSuccess(
-            prompt_models=list(MODEL_CHOICES),
-            image_models=list(IMAGE_MODEL_CHOICES),
+            prompt_models=prompt_split.allowed,
+            image_models=image_split.allowed,
+            denied_prompt_models=prompt_split.denied,
+            denied_image_models=image_split.denied,
             deprecated_models={**DEPRECATED_MODELS, **IMAGE_DEPRECATED_MODELS},
             providers=provider_catalog_entries(),
             result_details="Agent model lists retrieved successfully.",
@@ -1383,7 +1489,7 @@ class AgentManager(EngineScoped):
         try:
             if request.provider == ProviderID.GRIPTAPE_CLOUD:
                 return ListProviderModelsResultSuccess(
-                    models=list(MODEL_CHOICES),
+                    models=self._offer_split(MODEL_CHOICES).allowed,
                     result_details="Griptape Cloud model list retrieved.",
                 )
 
@@ -1403,9 +1509,12 @@ class AgentManager(EngineScoped):
 
             data = response.json()
             models = sorted(entry["id"] for entry in data.get("data", []) if "id" in entry)
+            # Derived ids (see `AccessManager.resolve_chat_model`): this provider has no
+            # fixed catalog, so a discovered model is gated on its provider alone.
+            allowed_models = self._offer_split(models, connection_id=request.provider).allowed
             return ListProviderModelsResultSuccess(
-                models=models,
-                result_details=f"Retrieved {len(models)} models from {base_url}.",
+                models=allowed_models,
+                result_details=f"Retrieved {len(allowed_models)} models from {base_url}.",
             )
         except (httpx2.HTTPStatusError, httpx2.RequestError, ValueError) as e:
             # Keep the raw exception in the logs for debugging, but surface a
@@ -1507,6 +1616,7 @@ class AgentManager(EngineScoped):
             system_prompt=self._system_prompt_extra or None,
             image_config=image_config,
             static_files_manager=self.static_files_manager,
+            access_manager=self.engine.access_manager,
             usage_limits=DEFAULT_AGENT_USAGE_LIMITS,
         )
         self._runner_cache[cache_key] = runner
@@ -1564,6 +1674,14 @@ class AgentManager(EngineScoped):
             return CreateAgentProviderResultFailure(
                 result_details=f"Attempted to create provider. Failed because a provider named '{name}' already exists."
             )
+        model = pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o")
+        denial_message = self.engine.access_manager.chat_model_denial(
+            action=CheckpointAction.OFFER_MODEL, connection_id=pd.type, model_name=model
+        )
+        if denial_message is not None:
+            return CreateAgentProviderResultFailure(
+                result_details=f"Attempted to create provider '{name}'. Failed because {denial_message}"
+            )
         raw_secret_name = pd.api_key_secret_name or ""
         api_key_secret_name = None
         if raw_secret_name and provider_accepts_customer_key(pd.type):
@@ -1571,7 +1689,7 @@ class AgentManager(EngineScoped):
         provider = ProviderConfig(
             name=name,
             type=pd.type,
-            model=pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"),
+            model=model,
             base_url=pd.base_url or None,
             api_key_secret_name=api_key_secret_name,
             enabled=pd.enabled,
@@ -1598,6 +1716,19 @@ class AgentManager(EngineScoped):
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because it is a protected provider and cannot be disabled."
             )
+        denial_message = self._update_provider_denial_message(existing, pd)
+        if denial_message is not None:
+            return UpdateAgentProviderResultFailure(
+                result_details=f"Attempted to update provider '{request.name}'. Failed because {denial_message}"
+            )
+        self._apply_provider_update(existing, pd)
+        self._persist_providers()
+        self._runner_cache.clear()
+        return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
+
+    @staticmethod
+    def _apply_provider_update(existing: ProviderConfig, pd: UpdateProviderPayload) -> None:
+        """Apply an update's explicitly-set fields onto `existing`. Omitted fields are preserved."""
         if pd.type is not None:
             existing.type = pd.type
         if pd.model is not None:
@@ -1611,9 +1742,6 @@ class AgentManager(EngineScoped):
             existing.enabled = pd.enabled
         if "icon" in pd.model_fields_set:
             existing.icon = pd.icon or None
-        self._persist_providers()
-        self._runner_cache.clear()
-        return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
 
     @handles(DeleteAgentProviderRequest)
     def on_handle_delete_agent_provider_request(self, request: DeleteAgentProviderRequest) -> ResultPayload:

@@ -62,11 +62,15 @@ class LocalFileDriver(BaseFileDriver):
             location: Absolute file path, file:// URI, path with ~, or a path
                 relative to the workspace directory
 
+        The path is not checked for existence. Resolving a UNC path can contact the network
+        host, so call this from a worker thread when running on an event loop.
+
         Returns:
-            Resolved Path object
+            Resolved Path object. On Windows it carries the long-path prefix.
 
         Raises:
             ValueError: Invalid file:// URI or empty location
+            OSError: A UNC host could not be reached
         """
         if not location or not location.strip():
             msg = f"Empty file path: {location!r}"

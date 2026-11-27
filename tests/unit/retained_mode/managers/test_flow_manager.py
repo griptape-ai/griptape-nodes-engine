@@ -3,12 +3,11 @@
 import asyncio
 import itertools
 import json
-import tempfile
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 from asyncio_thread_runner import ThreadRunner
@@ -120,37 +119,29 @@ class _ClassifyControlNode(ControlNode):
 
 
 @pytest.fixture
-def image_without_metadata() -> Generator[str, None, None]:
+def image_without_metadata(tmp_path: Path) -> str:
     """A plain PNG with no embedded text chunks."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        Image.new("RGB", (4, 4), color="red").save(f, format="PNG")
-        path = f.name
-    try:
-        yield path
-    finally:
-        Path(path).unlink(missing_ok=True)
+    path = tmp_path / "without_metadata.png"
+    Image.new("RGB", (4, 4), color="red").save(path, format="PNG")
+    return str(path)
 
 
 @pytest.fixture
-def image_with_unrelated_metadata() -> Generator[str, None, None]:
+def image_with_unrelated_metadata(tmp_path: Path) -> str:
     """A PNG that has metadata but no gtn flow commands key."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        info = PngInfo()
-        info.add_text("Description", "not a workflow")
-        Image.new("RGB", (4, 4), color="green").save(f, format="PNG", pnginfo=info)
-        path = f.name
-    try:
-        yield path
-    finally:
-        Path(path).unlink(missing_ok=True)
+    path = tmp_path / "unrelated_metadata.png"
+    info = PngInfo()
+    info.add_text("Description", "not a workflow")
+    Image.new("RGB", (4, 4), color="green").save(path, format="PNG", pnginfo=info)
+    return str(path)
 
 
-def _image_with_flow_commands_text(text: str) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        info = PngInfo()
-        info.add_text(FLOW_COMMANDS_KEY, text)
-        Image.new("RGB", (4, 4), color="blue").save(f, format="PNG", pnginfo=info)
-        return f.name
+def _image_with_flow_commands_text(text: str, directory: Path) -> str:
+    path = directory / "flow_commands.png"
+    info = PngInfo()
+    info.add_text(FLOW_COMMANDS_KEY, text)
+    Image.new("RGB", (4, 4), color="blue").save(path, format="PNG", pnginfo=info)
+    return str(path)
 
 
 @pytest.fixture
@@ -165,13 +156,10 @@ def empty_flow_commands(engine: Engine) -> SerializedFlowCommands:
 
 
 @pytest.fixture
-def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands) -> Generator[str, None, None]:
+def image_with_flow_commands(empty_flow_commands: SerializedFlowCommands, tmp_path: Path) -> str:
     """A PNG whose FLOW_COMMANDS_KEY payload is flow commands encoded as JSON."""
-    path = _image_with_flow_commands_text(json.dumps(encode_commands(empty_flow_commands)))
-    try:
-        yield path
-    finally:
-        Path(path).unlink(missing_ok=True)
+    path = _image_with_flow_commands_text(json.dumps(encode_commands(empty_flow_commands)), tmp_path)
+    return path
 
 
 def _a_workflow(engine: Engine) -> WorkflowRuntime:
@@ -250,20 +238,19 @@ class TestExtractFlowCommandsFromImageMetadata:
             ("not json or base64!", "neither JSON nor base64"),
         ],
     )
-    def test_returns_failure_when_flow_commands_are_unreadable(self, engine: Engine, text: str, reason: str) -> None:
-        path = _image_with_flow_commands_text(text)
-        try:
-            result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
-                ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
-            )
-        finally:
-            Path(path).unlink(missing_ok=True)
+    def test_returns_failure_when_flow_commands_are_unreadable(
+        self, engine: Engine, text: str, reason: str, tmp_path: Path
+    ) -> None:
+        path = _image_with_flow_commands_text(text, tmp_path)
+        result = engine.flow_manager.serialization.on_extract_flow_commands_from_image_metadata(
+            ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=path), _a_workflow(engine)
+        )
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
         assert reason in str(result.result_details)
 
-    def test_closes_the_image_when_flow_commands_are_damaged(self, engine: Engine) -> None:
-        path = _image_with_flow_commands_text(json.dumps({"version": 1, "commands": {"flow_name": "x"}}))
+    def test_closes_the_image_when_flow_commands_are_damaged(self, engine: Engine, tmp_path: Path) -> None:
+        path = _image_with_flow_commands_text(json.dumps({"version": 1, "commands": {"flow_name": "x"}}), tmp_path)
         opened: list[ImageFile.ImageFile] = []
         real_open = Image.open
 
@@ -279,7 +266,6 @@ class TestExtractFlowCommandsFromImageMetadata:
 
         (image,) = opened
         assert image.fp is None
-        Path(path).unlink()
 
 
 class TestStartFlowRequestDefaultsToCurrentContext:
@@ -1086,6 +1072,120 @@ class TestDeleteFlowByName:
 
         assert isinstance(result, DeleteFlowResultSuccess)
         assert engine.current_workflow().context.get_current_flow().name == canvas.flow_name
+
+
+class TestGetEnclosingFlow:
+    """`get_enclosing_flow` steps up to the owner of an iteration flow, and to the parent for any other flow."""
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_returns_the_parent_for_an_ordinary_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_parent_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        child = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="child", set_as_new_context=False)
+        )
+        assert isinstance(child, CreateFlowResultSuccess)
+
+        assert engine.flow_manager.get_enclosing_flow(engine.current_workflow(), child.flow_name) == top.flow_name
+        assert engine.flow_manager.get_enclosing_flow(engine.current_workflow(), top.flow_name) is None
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_returns_the_owner_for_an_iteration_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_owner_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        owner = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="owner", set_as_new_context=False)
+        )
+        assert isinstance(owner, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, owner.flow_name)
+
+        assert flow_manager.get_enclosing_flow(engine.current_workflow(), iteration.flow_name) == owner.flow_name
+        # The parent link is left alone.
+        assert flow_manager.get_parent_flow_in(engine.current_workflow(), iteration.flow_name) == top.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_iteration_flow_forgets_its_owner(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_delete_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, top.flow_name)
+
+        delete_result = engine.handle_request(DeleteFlowRequest(flow_name=iteration.flow_name))
+
+        assert isinstance(delete_result, DeleteFlowResultSuccess), delete_result
+        assert iteration.flow_name not in engine.current_workflow().flows.iteration_flow_to_owner_flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_ignores_an_owner_that_is_no_longer_a_flow(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_stale_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, "gone_flow")
+
+        assert flow_manager.get_enclosing_flow(engine.current_workflow(), iteration.flow_name) == top.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_deleting_the_owner_flow_forgets_the_entries_that_point_to_it(self, engine: Engine) -> None:
+        engine.context_manager.push_workflow("enclosing_delete_owner_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        owner = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="owner", set_as_new_context=False)
+        )
+        assert isinstance(owner, CreateFlowResultSuccess)
+        iteration = engine.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="iteration", set_as_new_context=False)
+        )
+        assert isinstance(iteration, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), iteration.flow_name, owner.flow_name)
+
+        delete_result = engine.handle_request(DeleteFlowRequest(flow_name=owner.flow_name))
+
+        assert isinstance(delete_result, DeleteFlowResultSuccess), delete_result
+        assert iteration.flow_name not in engine.current_workflow().flows.iteration_flow_to_owner_flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_renaming_a_flow_renames_it_as_an_iteration_flow_and_as_an_owner(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        engine.context_manager.push_workflow("enclosing_rename_wf")
+        top = engine.handle_request(CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False))
+        assert isinstance(top, CreateFlowResultSuccess)
+        flow_manager = engine.flow_manager
+        monkeypatch.setattr(
+            engine.node_manager, "handle_flow_rename", Mock(spec=engine.node_manager.handle_flow_rename)
+        )
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), top.flow_name, "owner_a")
+        flow_manager.record_iteration_flow_owner(engine.current_workflow(), "iteration_b", top.flow_name)
+
+        flow_manager.handle_flow_rename(engine.current_workflow(), top.flow_name, "top_renamed")
+        try:
+            assert engine.current_workflow().flows.iteration_flow_to_owner_flow_name == {
+                "top_renamed": "owner_a",
+                "iteration_b": "top_renamed",
+            }
+        finally:
+            # Only the manager's maps were renamed, so put the name back for the object cleanup.
+            flow_manager.handle_flow_rename(engine.current_workflow(), "top_renamed", top.flow_name)
 
 
 class TestReparentFlow:

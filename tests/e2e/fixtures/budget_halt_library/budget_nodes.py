@@ -1,6 +1,6 @@
 """Fixture nodes for the budget-halt e2e tests.
 
-Three node types, for the three ways a refusal reaches the engine.
+Five node types, for the ways a refusal reaches the engine.
 
 ``CloudCallNode`` is a ``SuccessFailureNode`` that makes one HTTP call to a URL the test supplies
 and hands whatever it raises to the same two functions a real credit-spending node uses:
@@ -20,6 +20,10 @@ spending through a Cloud driver does; the second raises a halt that names no nod
 driver several frames below the node does when it recognizes the refusal itself. Both rely on
 ``NodeManager`` recognizing and wording the halt at the one point every node failure crosses --
 without which the first reads as a bare 403 and the second never says where to look.
+
+``NamedHaltNode`` raises a halt that already names the node, and ``WrappedHaltNode`` catches the driver's
+halt and raises an exception of its own from it, as a library that wraps errors does. The engine has to word
+the first as it is and find the halt behind the second.
 
 Kept to ``httpx``, which the engine already requires, so the library registers cleanly in an
 isolated engine.
@@ -158,5 +162,51 @@ class DriverHaltNode(CloudCallNode):
             if refusal is None:
                 raise
             raise BudgetExceededError(describe_budget_refusal(refusal), refusal) from exc
+
+        self.parameter_output_values["result"] = response.text
+
+
+class NamedHaltNode(CloudCallNode):
+    """Raises a halt that already names this node, so the engine must keep its wording as it is."""
+
+    def process(self) -> None:
+        self._clear_execution_status()
+        self._record_that_it_ran()
+
+        url = self.get_parameter_value("url") or ""
+        try:
+            response = httpx.get(url, timeout=_REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            cloud_host = resolve_cloud_host(self.engine.secrets_manager)
+            refusal = refusal_from_exception(exc, cloud_host=cloud_host)
+            if refusal is None:
+                raise
+            raise BudgetExceededError(
+                describe_budget_refusal(refusal, node_name=self.name), refusal, node_name=self.name
+            ) from exc
+
+        self.parameter_output_values["result"] = response.text
+
+
+class WrappedHaltNode(CloudCallNode):
+    """Catches the driver's halt and raises an exception of its own from it, as a library that wraps errors does."""
+
+    def process(self) -> None:
+        self._clear_execution_status()
+        self._record_that_it_ran()
+
+        url = self.get_parameter_value("url") or ""
+        try:
+            response = httpx.get(url, timeout=_REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            cloud_host = resolve_cloud_host(self.engine.secrets_manager)
+            refusal = refusal_from_exception(exc, cloud_host=cloud_host)
+            if refusal is None:
+                raise
+            halt = BudgetExceededError(describe_budget_refusal(refusal), refusal)
+            msg = "The image service could not finish the generation."
+            raise RuntimeError(msg) from halt
 
         self.parameter_output_values["result"] = response.text

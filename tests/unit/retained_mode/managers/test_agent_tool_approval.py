@@ -128,6 +128,8 @@ def _manager_on(
         # neither the node types nor a flow.
         library_manager=SimpleNamespace(_libraries_loading_complete=asyncio.Event()),
         only_open_workflow_or_none=lambda: None,
+        # These tests are about the approval round trip, not policy: always allow.
+        access_manager=SimpleNamespace(chat_model_denial=lambda **_kw: None),
     )
     return manager
 

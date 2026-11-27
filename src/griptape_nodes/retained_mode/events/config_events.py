@@ -152,7 +152,7 @@ class SetConfigValueRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetConfigValueResultSuccess(ResultPayloadSuccess):
+class SetConfigValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Configuration value set successfully.
 
     Success means the write reached disk, not that the value took effect. Check `applied`.
@@ -244,7 +244,7 @@ class SetConfigCategoryRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class SetConfigCategoryResultSuccess(ResultPayloadSuccess):
+class SetConfigCategoryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Configuration category updated successfully.
 
     See `SetConfigValueResultSuccess` for what the four outcome fields mean. They are only
@@ -376,7 +376,7 @@ class ResetConfigRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class ResetConfigResultSuccess(ResultPayloadSuccess):
+class ResetConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Configuration reset successfully to default values."""
 
 

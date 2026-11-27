@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from pydantic_ai.usage import UsageLimits
 
     from griptape_nodes.drivers.thread_storage.base_thread_storage_driver import BaseThreadStorageDriver
+    from griptape_nodes.retained_mode.managers.access_manager import AccessManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
 
@@ -208,6 +209,7 @@ class PydanticAgentRunner:
     base_url: str | None = None
     image_config: ImageGenerationToolsetConfig | None = None
     static_files_manager: StaticFilesManager | None = None
+    access_manager: AccessManager | None = None
     auto_load_skills: bool = True
     skills_directory: str = DEFAULT_SKILLS_DIRECTORY
     usage_limits: UsageLimits | None = None
@@ -236,7 +238,12 @@ class PydanticAgentRunner:
             if self.static_files_manager is None:
                 msg = "image_config requires a static_files_manager to persist generated images."
                 raise ValueError(msg)
-            self._image_toolset = register_image_tools(self._agent, self.image_config, self.static_files_manager)
+            if self.access_manager is None:
+                msg = "image_config requires an access_manager to check the image model against policy."
+                raise ValueError(msg)
+            self._image_toolset = register_image_tools(
+                self._agent, self.image_config, self.static_files_manager, self.access_manager
+            )
         resolved_settings = model.settings or {}
         logger.debug(
             "PydanticAgentRunner ready: model=%s workspace=%s image_tool=%s skills_library=%s "

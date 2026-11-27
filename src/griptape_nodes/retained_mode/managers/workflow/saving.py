@@ -371,6 +371,8 @@ class WorkflowSaver(EngineScoped):
             details = f"Attempted to save workflow '{relative_file_path}'. Failed when serializing flow."
             return SaveWorkflowResultFailure(result_details=details)
         commands = serialized_flow_result.serialized_flow_commands
+        for value_left_out in serialized_flow_result.values_left_out:
+            logger.warning(value_left_out.save_warning())
 
         # Extract workflow shape if available; ignore failures
         try:
@@ -456,6 +458,10 @@ class WorkflowSaver(EngineScoped):
             continues_open_workflow=continues_open_workflow,
             continues_in_copy=continues_in_copy,
         )
+        # The open workflow's file now holds its graph, unless the save wrote a copy and left it on its own.
+        if continues_open_workflow or continues_in_copy:
+            workflow.has_unsaved_changes = False
+            self.engine.report_workflow_state(workflow)
 
         details = f"Successfully saved workflow to: {save_file_result.file_path}"
         return SaveWorkflowResultSuccess(
@@ -693,6 +699,8 @@ class WorkflowSaver(EngineScoped):
             details = f"Attempted to save subflow '{request.flow_name}' to '{file_path}'. Failed when serializing flow."
             return SaveSubflowToWorkflowResultFailure(result_details=details)
         commands = serialized_flow_result.serialized_flow_commands
+        for value_left_out in serialized_flow_result.values_left_out:
+            logger.warning(value_left_out.save_warning())
 
         # Strip parent_flow_name so the saved file stands alone as a top-level workflow.
         # If the subflow is tracked as a referenced workflow, replace the self-referential

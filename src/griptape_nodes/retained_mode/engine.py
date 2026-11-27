@@ -19,7 +19,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -40,11 +40,14 @@ from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionResultFailure,
     GetEngineVersionResultSuccess,
     OpenWorkflowInfo,
+    OpenWorkflowState,
     SessionHeartbeatRequest,
     SessionHeartbeatResultFailure,
     SessionHeartbeatResultSuccess,
     WorkflowClosedEvent,
+    WorkflowDetailsChangedEvent,
     WorkflowOpenedEvent,
+    WorkflowStateChangedEvent,
 )
 from griptape_nodes.retained_mode.events.base_events import (
     AppEvent,
@@ -113,6 +116,7 @@ if TYPE_CHECKING:
         StaticFilesManager,
     )
     from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+    from griptape_nodes.retained_mode.managers.undo.manager import UndoManager
     from griptape_nodes.retained_mode.managers.user_manager import UserManager
     from griptape_nodes.retained_mode.managers.variable_manager import (
         VariablesManager,
@@ -231,6 +235,7 @@ class Engine:
     _manifest_manager: ManifestManager
     _budget_manager: BudgetManager
     _diagnostics_manager: DiagnosticsManager
+    _undo_manager: UndoManager
     _worker_manager: WorkerManager
     _lifecycle: EngineLifecycle
     _workflow_registry: _WorkflowRegistry
@@ -275,6 +280,7 @@ class Engine:
             StaticFilesManager,
         )
         from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+        from griptape_nodes.retained_mode.managers.undo.manager import UndoManager
         from griptape_nodes.retained_mode.managers.user_manager import UserManager
         from griptape_nodes.retained_mode.managers.variable_manager import (
             VariablesManager,
@@ -341,6 +347,7 @@ class Engine:
         self._manifest_manager = ManifestManager(self._event_manager, engine=self)
         self._budget_manager = BudgetManager(self._event_manager, engine=self)
         self._diagnostics_manager = DiagnosticsManager(self._event_manager, engine=self)
+        self._undo_manager = UndoManager(self._event_manager, engine=self)
         # Attached by the app; None while this engine cannot reach other engines.
         self._engine_transports: EngineTransports | None = None
         self._lifecycle = EngineLifecycle(self)
@@ -466,6 +473,10 @@ class Engine:
     @property
     def diagnostics_manager(self) -> DiagnosticsManager:
         return self._diagnostics_manager
+
+    @property
+    def undo_manager(self) -> UndoManager:
+        return self._undo_manager
 
     @property
     def worker_manager(self) -> WorkerManager:
@@ -873,6 +884,51 @@ class Engine:
             workflow_file_path=file_path,
             is_saved=file_path is not None,
             has_active_flow=workflow.context.has_current_flow(),
+            description=entry.metadata.description,
+            image=entry.metadata.image,
+            is_template=bool(entry.metadata.is_template),
+            state=workflow.state(),
+        )
+
+    def report_workflow_details(self) -> None:
+        """Tell every client of each open workflow whose details changed since they were last told.
+
+        Details are everything `open_workflow_info` reports but the state, which
+        `report_workflow_state` reports. The event manager calls this after every request, since
+        requests that change them, such as a save, a rename or `SetWorkflowMetadataRequest`, need not
+        name the workflow they change. Says nothing of a workflow still building, which its
+        `WorkflowOpenedEvent` will report, or of one with no registry entry to report from.
+        """
+        for workflow in self._open_workflows.all_open():
+            if self.is_opening(workflow):
+                continue
+            # Runs after every request, so a missing entry must not fail the request that ran.
+            if self.workflow_registry.find_by_id(workflow.workflow_id) is None:
+                continue
+            info = self.open_workflow_info(workflow)
+            details = replace(info, state=OpenWorkflowState())
+            if details == workflow.reported_details:
+                continue
+            workflow.reported_details = details
+            self._event_manager.put_event(AppEvent(payload=WorkflowDetailsChangedEvent(open_workflow=info)))
+
+    def report_workflow_state(self, workflow: WorkflowRuntime) -> None:
+        """Tell every client of `workflow`'s state if it changed since they were last told.
+
+        Call after anything that can change it. Says nothing of a workflow that is closed or still
+        building, which its `WorkflowOpenedEvent` will report, or that an undo or redo is rebuilding,
+        which reports the workflow once it is done.
+        """
+        if self._open_workflows.find(workflow.workflow_id) is not workflow or self.is_opening(workflow):
+            return
+        if workflow.undo.restoring:
+            return
+        state = workflow.state()
+        if state == workflow.reported_state:
+            return
+        workflow.reported_state = state
+        self._event_manager.put_event(
+            AppEvent(payload=WorkflowStateChangedEvent(workflow_id=workflow.workflow_id, state=state))
         )
 
     def close_workflow(self, workflow: WorkflowRuntime) -> None:
@@ -1013,7 +1069,11 @@ class Engine:
         finally:
             build_ended = self._opening_workflows.pop(workflow)
             if not workflow.closed:
+                # What the block built, its file's graph or a new workflow's flow, is where its changes start.
+                workflow.has_unsaved_changes = False
                 opened_event = WorkflowOpenedEvent(open_workflow=self.open_workflow_info(workflow))
+                workflow.reported_state = opened_event.open_workflow.state
+                workflow.reported_details = replace(opened_event.open_workflow, state=OpenWorkflowState())
                 self._event_manager.put_event(AppEvent(payload=opened_event))
             build_ended.set()
 

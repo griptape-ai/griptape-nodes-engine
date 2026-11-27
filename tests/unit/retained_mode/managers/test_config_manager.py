@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import platform
-import tempfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -26,11 +25,16 @@ from griptape_nodes.retained_mode.events.config_events import (
 )
 from griptape_nodes.retained_mode.managers.config_manager import (
     DEFAULT_LIBRARIES_ROOT_ENV_VAR,
+    ENV_VAR_PREFIX,
     ConfigManager,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
-from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+from griptape_nodes.retained_mode.managers.settings import (
+    DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH,
+    LIBRARIES_TO_REGISTER_KEY,
+    REQUIRES_ENGINE_KEY,
+)
 from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
 
 
@@ -343,24 +347,23 @@ class TestConfigManager:
             assert value == 30.0  # noqa: PLR2004
             assert isinstance(value, float)
 
-    def test_nested_env_var_overrides_project_config_layer(self) -> None:
+    def test_nested_env_var_overrides_project_config_layer(self, tmp_path: Path) -> None:
         """A `__` env var wins over the same nested key set in a project-adjacent config file.
 
         Mirrors test_workspace_config_overrides_project_config_but_not_env_vars above, but for a
         nested key, to prove GTN_CONFIG_ precedence holds through the full layer stack and not
         only for top-level settings.
         """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"worker": {"library_load_timeout_s": 99.0}})
-            )
+        project_dir = tmp_path
+        (project_dir / "griptape_nodes_config.json").write_text(
+            json.dumps({"worker": {"library_load_timeout_s": 99.0}})
+        )
 
-            with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKER__LIBRARY_LOAD_TIMEOUT_S": "30"}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
 
-                assert manager.get_config_value("worker.library_load_timeout_s") == 30.0  # noqa: PLR2004
+            assert manager.get_config_value("worker.library_load_timeout_s") == 30.0  # noqa: PLR2004
 
     def test_nested_env_var_does_not_clobber_sibling_defaults(self) -> None:
         """Setting one leaf under a parent must not blank out its siblings.
@@ -553,42 +556,38 @@ class TestConfigManager:
             # and with no warning logged -- unlike every other invalid-value case in this class.
             assert manager.get_config_value("log_level") == "INFO"
 
-    def test_config_integration_with_env_vars(self) -> None:
+    def test_config_integration_with_env_vars(self, tmp_path: Path) -> None:
         """Test that environment variables are integrated into merged config with highest priority."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Set up a temporary project directory with a project-adjacent config
-            project_dir = Path(temp_dir)
-            project_config_path = project_dir / "griptape_nodes_config.json"
-            project_config_path.write_text('{"log_level": "ERROR"}')
+        # Set up a temporary project directory with a project-adjacent config
+        project_dir = tmp_path
+        project_config_path = project_dir / "griptape_nodes_config.json"
+        project_config_path.write_text('{"log_level": "ERROR"}')
 
-            # Set environment variable that should override the project config
-            with patch.dict(
-                os.environ, {"GTN_CONFIG_LOG_LEVEL": "DEBUG", "GTN_CONFIG_STORAGE_BACKEND": "gtc"}, clear=True
-            ):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
+        # Set environment variable that should override the project config
+        with patch.dict(os.environ, {"GTN_CONFIG_LOG_LEVEL": "DEBUG", "GTN_CONFIG_STORAGE_BACKEND": "gtc"}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
 
-                # Environment variable should override project config
-                assert manager.get_config_value("log_level") == "DEBUG"
-                assert manager.get_config_value("storage_backend") == "gtc"
+            # Environment variable should override project config
+            assert manager.get_config_value("log_level") == "DEBUG"
+            assert manager.get_config_value("storage_backend") == "gtc"
 
-    def test_load_project_config_sets_project_config_layer(self) -> None:
+    def test_load_project_config_sets_project_config_layer(self, tmp_path: Path) -> None:
         """Test that load_project_config reads project-adjacent config and merges it."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            project_config_path = project_dir / "griptape_nodes_config.json"
-            project_config_path.write_text('{"log_level": "ERROR"}')
+        project_dir = tmp_path
+        project_config_path = project_dir / "griptape_nodes_config.json"
+        project_config_path.write_text('{"log_level": "ERROR"}')
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                # Before loading project config, log_level is default
-                assert manager.get_config_value("log_level") != "ERROR"
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            # Before loading project config, log_level is default
+            assert manager.get_config_value("log_level") != "ERROR"
 
-                manager.load_project_config(project_dir)
+            manager.load_project_config(project_dir)
 
-                # After loading, project config value takes effect
-                assert manager.get_config_value("log_level") == "ERROR"
-                assert manager.project_config == {"log_level": "ERROR"}
+            # After loading, project config value takes effect
+            assert manager.get_config_value("log_level") == "ERROR"
+            assert manager.project_config == {"log_level": "ERROR"}
 
     def test_dotted_key_in_config_file_warns_and_is_not_applied(
         self, isolate_user_config: Path, caplog: pytest.LogCaptureFixture
@@ -649,39 +648,40 @@ class TestConfigManager:
             env_config = manager._load_config_from_env_vars()
             assert env_config == {"bar": "should_be_loaded"}
 
-    def test_workspace_path_reassigned_after_env_var_override(self) -> None:
+    def test_workspace_path_reassigned_after_env_var_override(self, tmp_path: Path) -> None:
         """Test that workspace path is reassigned after environment variable config is loaded."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Create initial workspace directory
-            initial_workspace = Path(temp_dir) / "initial_workspace"
-            initial_workspace.mkdir()
+        # Create initial workspace directory
+        initial_workspace = tmp_path / "initial_workspace"
+        initial_workspace.mkdir()
 
-            # Create override workspace directory
-            override_workspace = Path(temp_dir) / "override_workspace"
-            override_workspace.mkdir()
+        # Create override workspace directory
+        override_workspace = tmp_path / "override_workspace"
+        override_workspace.mkdir()
 
-            # Set environment variable to override workspace directory
-            with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(override_workspace)}, clear=True):
-                manager = ConfigManager()
-                # Initially set workspace to the initial directory
-                manager.workspace_path = initial_workspace
+        # Set environment variable to override workspace directory
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(override_workspace)}, clear=True):
+            manager = ConfigManager()
+            # Initially set workspace to the initial directory
+            manager.workspace_path = initial_workspace
 
-                # Load configs which should reassign workspace path from env var
-                manager.load_configs()
+            # Load configs which should reassign workspace path from env var
+            manager.load_configs()
 
-                # Verify workspace path was reassigned to the env var value
-                assert manager.workspace_path == override_workspace.resolve()
-                assert manager.get_config_value("workspace_directory") == str(override_workspace)
+            # Verify workspace path was reassigned to the env var value
+            assert manager.workspace_path == override_workspace.resolve()
+            assert manager.get_config_value("workspace_directory") == str(override_workspace)
 
-    def test_resolved_libraries_root_default_is_global_workspace_relative(self, isolate_user_config: Path) -> None:
+    def test_resolved_libraries_root_default_is_global_workspace_relative(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
         """With no override, the root is libraries_directory resolved against the GLOBAL workspace.
 
         The fallback uses configured_global_workspace_path() (the user/default config
         workspace_directory), NOT the active workspace_path override, so a self-contained project's
         workspace pin does not relocate the shared libraries dir.
         """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
+        with patch.dict(os.environ, {}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
@@ -689,12 +689,12 @@ class TestConfigManager:
             # default libraries_directory is "libraries" (relative -> under the global workspace)
             assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
 
-    def test_resolved_libraries_root_uses_override_verbatim(self, isolate_user_config: Path) -> None:
+    def test_resolved_libraries_root_uses_override_verbatim(self, isolate_user_config: Path, tmp_path: Path) -> None:
         """When an override is set, it is returned as-is, independent of the global workspace."""
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
+        with patch.dict(os.environ, {}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
-            shared = Path(temp_dir) / "shared-libs"
+            shared = tmp_path / "shared-libs"
             shared.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
@@ -706,11 +706,13 @@ class TestConfigManager:
             manager.set_libraries_root_override(None)
             assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
 
-    def test_clear_project_layers_clears_libraries_root_override(self, isolate_user_config: Path) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
+    def test_clear_project_layers_clears_libraries_root_override(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
-            shared = Path(temp_dir) / "shared-libs"
+            shared = tmp_path / "shared-libs"
             shared.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
@@ -721,7 +723,7 @@ class TestConfigManager:
             assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
 
     def test_resolved_libraries_root_fallback_ignores_active_workspace_override(
-        self, isolate_user_config: Path
+        self, isolate_user_config: Path, tmp_path: Path
     ) -> None:
         """A self-contained project's workspace override must NOT relocate the unset-libraries fallback.
 
@@ -729,10 +731,10 @@ class TestConfigManager:
         GLOBAL configured workspace, not set_workspace_override's per-project pin. This is what keeps a
         v1 self-contained project (workspace_dir "./") sharing the global libraries dir.
         """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            global_ws = Path(temp_dir) / "global_ws"
+        with patch.dict(os.environ, {}, clear=True):
+            global_ws = tmp_path / "global_ws"
             global_ws.mkdir()
-            project_dir = Path(temp_dir) / "project"
+            project_dir = tmp_path / "project"
             project_dir.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
             manager = ConfigManager()
@@ -744,7 +746,7 @@ class TestConfigManager:
             assert manager.resolved_libraries_root() == (global_ws / "libraries").resolve()
             assert manager.resolved_libraries_root() != (project_dir / "libraries").resolve()
 
-    def test_resolved_libraries_root_v0_style_is_noop(self, isolate_user_config: Path) -> None:
+    def test_resolved_libraries_root_v0_style_is_noop(self, isolate_user_config: Path, tmp_path: Path) -> None:
         """A v0-style project pins its workspace TO the global workspace, so the fallback is unchanged.
 
         A v0 project has no workspace_dir, so activation sets the override to the global workspace
@@ -752,8 +754,8 @@ class TestConfigManager:
         fallback did -- documenting that this change is a no-op for v0 and only affects self-contained
         v1 projects (whose override points at their own dir).
         """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            global_ws = Path(temp_dir) / "global_ws"
+        with patch.dict(os.environ, {}, clear=True):
+            global_ws = tmp_path / "global_ws"
             global_ws.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
             manager = ConfigManager()
@@ -763,7 +765,9 @@ class TestConfigManager:
 
             assert manager.resolved_libraries_root() == (global_ws / "libraries").resolve()
 
-    def test_default_libraries_root_falls_back_when_value_is_missing_or_empty(self, isolate_user_config: Path) -> None:
+    def test_default_libraries_root_falls_back_when_value_is_missing_or_empty(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
         """An absent, empty, or non-string libraries_directory resolves to `<global workspace>/libraries`.
 
         The fallback lives inside default_libraries_root so no caller can skip it. Without it, a
@@ -771,8 +775,8 @@ class TestConfigManager:
         `Path("")` is `Path(".")`, which would resolve the libraries root to the workspace itself and
         install libraries on top of the user's files.
         """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
+        with patch.dict(os.environ, {}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
@@ -786,14 +790,14 @@ class TestConfigManager:
             # A real value is still honored, relative to the global workspace.
             assert manager.default_libraries_root("custom-libs") == (workspace / "custom-libs").resolve()
 
-    def test_publishes_default_libraries_root_env_var(self, isolate_user_config: Path) -> None:
+    def test_publishes_default_libraries_root_env_var(self, isolate_user_config: Path, tmp_path: Path) -> None:
         """Construction publishes the default libraries root as an absolute path in os.environ.
 
         This is the variable project templates reference from `libraries_dir`, so it must be absolute:
         a relative value there would anchor to the project YAML's directory, not the workspace.
         """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
+        with patch.dict(os.environ, {}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
 
@@ -803,39 +807,42 @@ class TestConfigManager:
             assert Path(published).is_absolute()
             assert Path(published) == (workspace / "libraries").resolve()
 
-    def test_published_default_libraries_root_honors_config_env_overrides(self, isolate_user_config: Path) -> None:
+    def test_published_default_libraries_root_honors_config_env_overrides(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
         """The published value reflects GTN_CONFIG_ overrides of libraries_directory and the workspace.
 
         The variable describes where THIS engine installs libraries, so the customizations that move
         that location have to be visible in it. Only a project's own libraries_dir is excluded, and
         for a different reason (see test_published_default_libraries_root_ignores_libraries_root_override).
         """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir) / "ws"
-            workspace.mkdir()
-            env_workspace = Path(temp_dir) / "env_ws"
-            env_workspace.mkdir()
-            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        env_workspace = tmp_path / "env_ws"
+        env_workspace.mkdir()
+        isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
 
-            # A relative libraries_directory is resolved against the env-var workspace, not the config one.
-            with patch.dict(
-                os.environ,
-                {
-                    "GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_workspace),
-                    "GTN_CONFIG_LIBRARIES_DIRECTORY": "shared-libs",
-                },
-                clear=True,
-            ):
-                ConfigManager()
-                assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (env_workspace / "shared-libs").resolve()
+        # A relative libraries_directory is resolved against the env-var workspace, not the config one.
+        with patch.dict(
+            os.environ,
+            {
+                "GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_workspace),
+                "GTN_CONFIG_LIBRARIES_DIRECTORY": "shared-libs",
+            },
+            clear=True,
+        ):
+            ConfigManager()
+            assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (env_workspace / "shared-libs").resolve()
 
-            # An absolute libraries_directory wins outright and ignores the workspace.
-            absolute_libs = Path(temp_dir) / "absolute-libs"
-            with patch.dict(os.environ, {"GTN_CONFIG_LIBRARIES_DIRECTORY": str(absolute_libs)}, clear=True):
-                ConfigManager()
-                assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == absolute_libs.resolve()
+        # An absolute libraries_directory wins outright and ignores the workspace.
+        absolute_libs = tmp_path / "absolute-libs"
+        with patch.dict(os.environ, {"GTN_CONFIG_LIBRARIES_DIRECTORY": str(absolute_libs)}, clear=True):
+            ConfigManager()
+            assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == absolute_libs.resolve()
 
-    def test_published_default_libraries_root_ignores_libraries_root_override(self, isolate_user_config: Path) -> None:
+    def test_published_default_libraries_root_ignores_libraries_root_override(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
         """A project's libraries_dir must NOT change the published value. This is the circularity guard.
 
         `libraries_dir` is the field that READS this variable, so if the variable tracked
@@ -843,10 +850,10 @@ class TestConfigManager:
         consuming it. Publishing happens once at construction and carries default_libraries_root, so
         activating a project with its own libraries_dir leaves the variable alone.
         """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
+        with patch.dict(os.environ, {}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
-            project_libs = Path(temp_dir) / "project-libs"
+            project_libs = tmp_path / "project-libs"
             project_libs.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
@@ -860,18 +867,17 @@ class TestConfigManager:
             manager.load_configs()
             assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (workspace / "libraries").resolve()
 
-    def test_published_default_libraries_root_overwrites_stale_value(self, isolate_user_config: Path) -> None:
+    def test_published_default_libraries_root_overwrites_stale_value(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
         """A pre-existing value in the environment is replaced, not preserved.
 
         The variable is published, not configured. A stale shell value would misreport where this
         engine installs libraries; libraries_directory and libraries_dir are the supported ways to
         move that location.
         """
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch.dict(os.environ, {DEFAULT_LIBRARIES_ROOT_ENV_VAR: "/stale/from/the/users/shell"}, clear=True),
-        ):
-            workspace = Path(temp_dir) / "ws"
+        with patch.dict(os.environ, {DEFAULT_LIBRARIES_ROOT_ENV_VAR: "/stale/from/the/users/shell"}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
 
@@ -879,20 +885,22 @@ class TestConfigManager:
 
             assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (workspace / "libraries").resolve()
 
-    def test_published_default_libraries_root_resolves_in_a_project_path_field(self, isolate_user_config: Path) -> None:
+    def test_published_default_libraries_root_resolves_in_a_project_path_field(
+        self, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
         """End to end: the published variable is usable in `libraries_dir` with no user setup.
 
         This is the whole point of publishing it. A project naming an unset variable is refused at load
         time, so if publishing regressed, such a project would become unusable rather than degrade.
         """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
+        with patch.dict(os.environ, {}, clear=True):
+            workspace = tmp_path / "ws"
             workspace.mkdir()
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             ConfigManager()
 
             resolution = resolve_project_path_field(
-                f"${{{DEFAULT_LIBRARIES_ROOT_ENV_VAR}}}/shared", Path(temp_dir) / "project"
+                f"${{{DEFAULT_LIBRARIES_ROOT_ENV_VAR}}}/shared", tmp_path / "project"
             )
 
             assert resolution.unresolved_variables == []
@@ -980,183 +988,215 @@ class TestConfigManager:
             assert value_with_cast == int("100")
             assert isinstance(value_with_cast, int)
 
-    def test_load_workspace_config_sets_workspace_layer(self) -> None:
+    def test_load_workspace_config_sets_workspace_layer(self, tmp_path: Path) -> None:
         """Test that load_workspace_config reads workspace config and merges it above project config."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir) / "project"
-            project_dir.mkdir()
-            workspace_dir = Path(temp_dir) / "workspace"
-            workspace_dir.mkdir()
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
 
-            (project_dir / "griptape_nodes_config.json").write_text('{"log_level": "ERROR"}')
-            (workspace_dir / "griptape_nodes_config.json").write_text('{"log_level": "DEBUG"}')
+        (project_dir / "griptape_nodes_config.json").write_text('{"log_level": "ERROR"}')
+        (workspace_dir / "griptape_nodes_config.json").write_text('{"log_level": "DEBUG"}')
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                assert manager.get_config_value("log_level") == "ERROR"
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
+            assert manager.get_config_value("log_level") == "ERROR"
 
-                manager.load_workspace_config(workspace_dir)
-                # Workspace config overrides project-adjacent config
-                assert manager.get_config_value("log_level") == "DEBUG"
-                assert manager.workspace_config == {"log_level": "DEBUG"}
+            manager.load_workspace_config(workspace_dir)
+            # Workspace config overrides project-adjacent config
+            assert manager.get_config_value("log_level") == "DEBUG"
+            assert manager.workspace_config == {"log_level": "DEBUG"}
 
-    def test_load_workspace_config_skips_duplicate_when_same_as_project(self) -> None:
+    def test_load_workspace_config_skips_duplicate_when_same_as_project(self, tmp_path: Path) -> None:
         """Test that workspace config is skipped when workspace dir equals project dir."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir)
-            (project_dir / "griptape_nodes_config.json").write_text('{"log_level": "WARNING"}')
+        project_dir = tmp_path
+        (project_dir / "griptape_nodes_config.json").write_text('{"log_level": "WARNING"}')
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                # Now load workspace config from same dir — should be skipped
-                manager.load_workspace_config(project_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
+            # Now load workspace config from same dir — should be skipped
+            manager.load_workspace_config(project_dir)
 
-                assert manager.get_config_value("log_level") == "WARNING"
-                # workspace_config is empty because the duplicate was skipped
-                assert manager.workspace_config == {}
+            assert manager.get_config_value("log_level") == "WARNING"
+            # workspace_config is empty because the duplicate was skipped
+            assert manager.workspace_config == {}
 
-    def test_workspace_config_overrides_project_config_but_not_env_vars(self) -> None:
+    def test_workspace_config_overrides_project_config_but_not_env_vars(self, tmp_path: Path) -> None:
         """Test that workspace config wins over project config but loses to env vars."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir) / "project"
-            project_dir.mkdir()
-            workspace_dir = Path(temp_dir) / "workspace"
-            workspace_dir.mkdir()
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
 
-            (project_dir / "griptape_nodes_config.json").write_text('{"log_level": "ERROR"}')
-            (workspace_dir / "griptape_nodes_config.json").write_text('{"log_level": "WARNING"}')
+        (project_dir / "griptape_nodes_config.json").write_text('{"log_level": "ERROR"}')
+        (workspace_dir / "griptape_nodes_config.json").write_text('{"log_level": "WARNING"}')
 
-            with patch.dict(os.environ, {"GTN_CONFIG_LOG_LEVEL": "DEBUG"}, clear=True):
-                manager = ConfigManager()
-                manager.load_project_config(project_dir)
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {"GTN_CONFIG_LOG_LEVEL": "DEBUG"}, clear=True):
+            manager = ConfigManager()
+            manager.load_project_config(project_dir)
+            manager.load_workspace_config(workspace_dir)
 
-                # Env var wins over workspace config
-                assert manager.get_config_value("log_level") == "DEBUG"
+            # Env var wins over workspace config
+            assert manager.get_config_value("log_level") == "DEBUG"
 
-    def test_get_config_value_workspace_config_source(self) -> None:
+    def test_get_config_value_workspace_config_source(self, tmp_path: Path) -> None:
         """Test that get_config_value can read from workspace_config source specifically."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text('{"log_level": "DEBUG"}')
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text('{"log_level": "DEBUG"}')
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                value = manager.get_config_value("log_level", config_source="workspace_config")
-                assert value == "DEBUG"
+            value = manager.get_config_value("log_level", config_source="workspace_config")
+            assert value == "DEBUG"
 
-    def test_workspace_config_missing_file_is_empty(self) -> None:
+    def test_workspace_config_missing_file_is_empty(self, tmp_path: Path) -> None:
         """Test that load_workspace_config with no config file results in empty workspace_config."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            # No griptape_nodes_config.json created
+        workspace_dir = tmp_path
+        # No griptape_nodes_config.json created
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.workspace_config == {}
+            assert manager.workspace_config == {}
 
-    def test_workspace_override_survives_load_configs(self) -> None:
+    def test_workspace_override_survives_load_configs(self, tmp_path: Path) -> None:
         """Test that set_workspace_override persists through load_configs() calls."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            override_dir = Path(temp_dir)
+        override_dir = tmp_path
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.set_workspace_override(override_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(override_dir)
 
-                manager.load_configs()
+            manager.load_configs()
 
-                assert manager.workspace_path == override_dir.resolve()
-                assert manager.merged_config["workspace_directory"] == str(override_dir.resolve())
+            assert manager.workspace_path == override_dir.resolve()
+            assert manager.merged_config["workspace_directory"] == str(override_dir.resolve())
 
-    def test_workspace_override_loses_to_env_var(self) -> None:
+    def test_workspace_override_loses_to_env_var(self, tmp_path: Path) -> None:
         """Test that GTN_CONFIG_WORKSPACE_DIRECTORY still wins over the runtime override."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            override_dir = Path(temp_dir) / "override"
-            override_dir.mkdir()
-            env_dir = Path(temp_dir) / "env"
-            env_dir.mkdir()
+        override_dir = tmp_path / "override"
+        override_dir.mkdir()
+        env_dir = tmp_path / "env"
+        env_dir.mkdir()
 
-            with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_dir)}, clear=True):
-                manager = ConfigManager()
-                manager.set_workspace_override(override_dir)
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_dir)}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(override_dir)
 
-                manager.load_configs()
+            manager.load_configs()
 
-                assert manager.workspace_path == env_dir.resolve()
+            assert manager.workspace_path == env_dir.resolve()
 
-    def test_workspace_override_cleared_on_reset(self) -> None:
+    def test_workspace_override_cleared_on_reset(self, tmp_path: Path) -> None:
         """Test that reset_user_config clears the runtime workspace override."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            override_dir = Path(temp_dir)
+        override_dir = tmp_path
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.set_workspace_override(override_dir)
-                assert manager.workspace_path == override_dir.resolve()
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(override_dir)
+            assert manager.workspace_path == override_dir.resolve()
 
-                manager.reset_user_config()
+            manager.reset_user_config()
 
-                assert manager._workspace_dir_override is None
-                assert manager.workspace_path != override_dir.resolve()
+            assert manager._workspace_dir_override is None
+            assert manager.workspace_path != override_dir.resolve()
 
-    def test_set_workspace_override_none_clears(self) -> None:
+    def test_set_workspace_override_none_clears(self, tmp_path: Path) -> None:
         """Test that set_workspace_override(None) clears a previously set override."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            override_dir = Path(temp_dir)
+        override_dir = tmp_path
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                default_workspace = manager.workspace_path
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            default_workspace = manager.workspace_path
 
-                manager.set_workspace_override(override_dir)
-                assert manager.workspace_path == override_dir.resolve()
+            manager.set_workspace_override(override_dir)
+            assert manager.workspace_path == override_dir.resolve()
 
-                manager.set_workspace_override(None)
-                assert manager._workspace_dir_override is None
+            manager.set_workspace_override(None)
+            assert manager._workspace_dir_override is None
 
-                manager.load_configs()
-                assert manager.workspace_path == default_workspace
+            manager.load_configs()
+            assert manager.workspace_path == default_workspace
 
-    def test_clear_project_layers_resets_override_and_config_paths(self) -> None:
+    def test_clear_project_layers_resets_override_and_config_paths(self, tmp_path: Path) -> None:
         """clear_project_layers() drops the override and both config-file paths to None.
 
         Regression guard for the per-activation state-leak: switching projects (or rolling
         back to one) must not inherit the prior project's workspace override or its
         project-adjacent/workspace config-file layers.
         """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project_dir = Path(temp_dir) / "project"
-            project_dir.mkdir()
-            workspace_dir = Path(temp_dir) / "workspace"
-            workspace_dir.mkdir()
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        workspace_dir = tmp_path / "workspace"
+        workspace_dir.mkdir()
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.set_workspace_override(project_dir)
-                manager.load_project_config(project_dir)
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.set_workspace_override(project_dir)
+            manager.load_project_config(project_dir)
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager._workspace_dir_override is not None
-                assert manager._project_config_path is not None
-                assert manager._workspace_config_path is not None
+            assert manager._workspace_dir_override is not None
+            assert manager._project_config_path is not None
+            assert manager._workspace_config_path is not None
 
-                manager.clear_project_layers()
+            manager.clear_project_layers()
 
-                assert manager._workspace_dir_override is None
-                assert manager._project_config_path is None
-                assert manager._workspace_config_path is None
+            assert manager._workspace_dir_override is None
+            assert manager._project_config_path is None
+            assert manager._workspace_config_path is None
 
 
 @pytest.mark.skipif(
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
 )
+class TestMaxWorkflowRecursionDepth:
+    """The recursion limit reads as the setting, and a bad value in a config file never resets the rest of the config."""
+
+    @pytest.fixture(autouse=True)
+    def no_config_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Hide every GTN_CONFIG_ variable, so only the config file under test sets the limit."""
+        for name in list(os.environ):
+            if name.startswith(ENV_VAR_PREFIX):
+                monkeypatch.delenv(name)
+        # ConfigManager() publishes this variable; setting it first has monkeypatch remove it afterwards.
+        monkeypatch.setenv(DEFAULT_LIBRARIES_ROOT_ENV_VAR, "")
+
+    @staticmethod
+    def _manager_with_workspace_config(workspace_dir: Path, config: dict[str, Any]) -> ConfigManager:
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps(config))
+        manager = ConfigManager()
+        manager.load_workspace_config(workspace_dir)
+        return manager
+
+    def test_default_is_ten(self) -> None:
+        assert ConfigManager().max_workflow_recursion_depth == DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH
+
+    def test_configured_value_is_read(self, tmp_path: Path) -> None:
+        manager = self._manager_with_workspace_config(tmp_path, {"max_workflow_recursion_depth": 3})
+
+        assert manager.max_workflow_recursion_depth == 3  # noqa: PLR2004
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(0, 1), ("abc", DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH), (2.5, DEFAULT_MAX_WORKFLOW_RECURSION_DEPTH)],
+    )
+    def test_bad_value_in_config_file_is_replaced_without_resetting_other_settings(
+        self, tmp_path: Path, value: object, expected: int
+    ) -> None:
+        manager = self._manager_with_workspace_config(
+            tmp_path, {"max_workflow_recursion_depth": value, "max_nodes_in_parallel": 7}
+        )
+
+        assert manager.max_workflow_recursion_depth == expected
+        assert manager.get_config_value("max_nodes_in_parallel") == 7  # noqa: PLR2004
+
+
 class TestConfigManagerBlankValues:
     """A blank string means the layer holding it does not set that setting.
 
@@ -1171,122 +1211,112 @@ class TestConfigManagerBlankValues:
     """
 
     @pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"])
-    def test_blank_optional_setting_reads_as_unset(self, blank_value: str) -> None:
+    def test_blank_optional_setting_reads_as_unset(self, blank_value: str, tmp_path: Path) -> None:
         """A blank optional setting resolves to None, so the consumer derives its default."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"static_server_base_url": blank_value})
-            )
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"static_server_base_url": blank_value}))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("static_server_base_url") is None
+            assert manager.get_config_value("static_server_base_url") is None
 
-    def test_blank_layer_falls_through_to_the_layer_below(self, isolate_user_config: Path) -> None:
+    def test_blank_layer_falls_through_to_the_layer_below(self, isolate_user_config: Path, tmp_path: Path) -> None:
         """Clearing a setting in one file exposes the next layer's value, not the built-in default."""
         isolate_user_config.write_text(json.dumps({"static_server_base_url": "http://localhost:9999"}))
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"static_server_base_url": ""}))
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"static_server_base_url": ""}))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("static_server_base_url") == "http://localhost:9999"
+            assert manager.get_config_value("static_server_base_url") == "http://localhost:9999"
 
-    def test_blank_is_absent_from_both_the_layer_and_the_merged_config(self) -> None:
+    def test_blank_is_absent_from_both_the_layer_and_the_merged_config(self, tmp_path: Path) -> None:
         """The key is dropped as the layer loads, so no consumer of either dict sees the blank.
 
         `gtn config` prints `merged_config` verbatim, so a read-time fix would leave it
         disagreeing with a keyed read.
         """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"static_server_base_url": ""}))
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"static_server_base_url": ""}))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert "static_server_base_url" not in manager.workspace_config
-                assert manager.merged_config["static_server_base_url"] is None
+            assert "static_server_base_url" not in manager.workspace_config
+            assert manager.merged_config["static_server_base_url"] is None
 
-    def test_blank_keeps_a_non_blank_declared_default(self) -> None:
+    def test_blank_keeps_a_non_blank_declared_default(self, tmp_path: Path) -> None:
         """A setting with a non-blank declared default keeps it, read with no `default=` argument.
 
         The read sites that path-join or `.upper()` this class of setting pass no default, so a
         blank must not reach them as None. `SyncManager` path-joins `synced_workflows_directory`
         in its constructor, which runs during `Engine.__init__`.
         """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"synced_workflows_directory": ""}))
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"synced_workflows_directory": ""}))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("synced_workflows_directory") == "synced_workflows"
+            assert manager.get_config_value("synced_workflows_directory") == "synced_workflows"
 
-    def test_declared_blank_default_is_still_reported(self) -> None:
+    def test_declared_blank_default_is_still_reported(self, tmp_path: Path) -> None:
         """A setting whose own default is blank reports that blank rather than None.
 
         `ffmpeg_directory` ships `default=""`, so the defaults layer must not be stripped or a
         fresh install would report the setting as missing.
         """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"ffmpeg_directory": ""}))
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"ffmpeg_directory": ""}))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("ffmpeg_directory") == ""
+            assert manager.get_config_value("ffmpeg_directory") == ""
 
-    def test_blank_nested_setting_is_dropped(self) -> None:
+    def test_blank_nested_setting_is_dropped(self, tmp_path: Path) -> None:
         """Nested keys drop too: the rule is about the value, not the key's depth."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"agent": {"system_prompt": "  "}}))
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"agent": {"system_prompt": "  "}}))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("agent.system_prompt") == ""
+            assert manager.get_config_value("agent.system_prompt") == ""
 
-    def test_blank_undeclared_key_falls_back_to_caller_default(self) -> None:
+    def test_blank_undeclared_key_falls_back_to_caller_default(self, tmp_path: Path) -> None:
         """A key the Settings model never declares has no default below it but the caller's."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"some_library": {"api_base": ""}}))
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(json.dumps({"some_library": {"api_base": ""}}))
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("some_library.api_base") is None
-                assert manager.get_config_value("some_library.api_base", default="fallback") == "fallback"
+            assert manager.get_config_value("some_library.api_base") is None
+            assert manager.get_config_value("some_library.api_base", default="fallback") == "fallback"
 
-    def test_configured_value_is_untouched(self) -> None:
+    def test_configured_value_is_untouched(self, tmp_path: Path) -> None:
         """Only blank values drop; a real value passes through unchanged, surrounding space included."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            (workspace_dir / "griptape_nodes_config.json").write_text(
-                json.dumps({"static_server_base_url": " https://my-tunnel.ngrok.io "})
-            )
+        workspace_dir = tmp_path
+        (workspace_dir / "griptape_nodes_config.json").write_text(
+            json.dumps({"static_server_base_url": " https://my-tunnel.ngrok.io "})
+        )
 
-            with patch.dict(os.environ, {}, clear=True):
-                manager = ConfigManager()
-                manager.load_workspace_config(workspace_dir)
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            manager.load_workspace_config(workspace_dir)
 
-                assert manager.get_config_value("static_server_base_url") == " https://my-tunnel.ngrok.io "
+            assert manager.get_config_value("static_server_base_url") == " https://my-tunnel.ngrok.io "
 
     def test_blank_env_var_reads_as_unset(self) -> None:
         """An exported-but-empty variable is how the env layer holds a blank."""

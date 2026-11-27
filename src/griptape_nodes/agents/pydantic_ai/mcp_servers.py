@@ -85,11 +85,15 @@ GTN_APPROVAL_REQUIRED_REQUESTS: frozenset[str] = frozenset(
         "ResolveNodeRequest",
         "StartFlowRequest",
         "StartFlowFromNodeRequest",
+        "CloseWorkflowRequest",
+        "ClearAllObjectStateRequest",
     }
 )
-"""Engine MCP tools (bare names) that run work, so the chat agent asks before calling them.
+"""Engine MCP tools (bare names) that run work or close workflows, so the chat agent asks before calling them.
 
-Every other engine tool only reads or edits the workflow and runs without asking.
+Closing a workflow discards its unsaved changes, and `ClearAllObjectStateRequest` closes every
+open workflow, including the user's other tabs. Every other engine tool only reads or edits the
+workflow and runs without asking.
 Each name must be a key of ``servers.mcp.SUPPORTED_REQUEST_EVENTS``; a test holds
 the two in step.
 """

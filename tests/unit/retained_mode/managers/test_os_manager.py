@@ -276,6 +276,26 @@ class TestReadFileRequest:
         assert isinstance(result, ReadFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
 
+    def test_read_directory_returns_is_directory(self, engine: Engine, tmp_path: Path) -> None:
+        """Reading a directory returns IS_DIRECTORY."""
+        result = engine.handle_request(ReadFileRequest(file_path=str(tmp_path)))
+
+        assert isinstance(result, ReadFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IS_DIRECTORY
+
+    def test_read_file_unexpected_error_returns_io_error_naming_the_file(self, engine: Engine, tmp_path: Path) -> None:
+        """An error the reader did not anticipate becomes an IO_ERROR that names the file."""
+        file_path = tmp_path / "test.txt"
+        file_path.write_text("Content")
+
+        with patch.object(Path, "open", side_effect=RuntimeError("unexpected")):
+            result = engine.handle_request(ReadFileRequest(file_path=str(file_path)))
+
+        assert isinstance(result, ReadFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.IO_ERROR
+        assert str(file_path) in str(result.result_details)
+        assert "unexpected" in str(result.result_details)
+
     def test_read_file_invalid_path(self, engine: Engine) -> None:
         """Test reading with invalid path - empty path."""
         # Empty path is invalid
@@ -527,6 +547,194 @@ class TestRenameFileRequest:
 
         assert isinstance(result, RenameFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
+
+    def test_rename_file_overwrite_replaces_file(self, engine: Engine, tmp_path: Path) -> None:
+        """Overwrite replaces an existing destination file."""
+        os_manager = engine.os_manager
+        old_path = tmp_path / "old.txt"
+        new_path = tmp_path / "new.txt"
+        old_path.write_text("Old content")
+        new_path.write_text("New content")
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultSuccess)
+        assert not old_path.exists()
+        assert new_path.read_text() == "Old content"
+
+    def test_rename_file_overwrite_failure_keeps_destination_file(self, engine: Engine, tmp_path: Path) -> None:
+        """A failed overwrite leaves the existing destination file in place."""
+        os_manager = engine.os_manager
+        old_path = tmp_path / "old.txt"
+        new_path = tmp_path / "new.txt"
+        old_path.write_text("Old content")
+        new_path.write_text("New content")
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        with patch.object(Path, "replace", side_effect=PermissionError("Permission denied")):
+            result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
+        assert old_path.read_text() == "Old content"
+        assert new_path.read_text() == "New content"
+
+    def test_rename_file_overwrite_replaces_directory(self, engine: Engine, tmp_path: Path) -> None:
+        """Overwrite replaces a non-empty destination directory and leaves no backup behind."""
+        os_manager = engine.os_manager
+        old_path = tmp_path / "old_dir"
+        new_path = tmp_path / "new_dir"
+        old_path.mkdir()
+        (old_path / "a.txt").write_text("from old")
+        new_path.mkdir()
+        (new_path / "b.txt").write_text("from new")
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultSuccess)
+        assert not old_path.exists()
+        assert sorted(p.name for p in new_path.iterdir()) == ["a.txt"]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["new_dir"]
+
+    def test_rename_file_overwrite_failure_restores_directory(self, engine: Engine, tmp_path: Path) -> None:
+        """When the source can't be moved, the destination directory is put back."""
+        os_manager = engine.os_manager
+        old_path = tmp_path / "old_dir"
+        new_path = tmp_path / "new_dir"
+        old_path.mkdir()
+        new_path.mkdir()
+        (new_path / "b.txt").write_text("from new")
+        real_rename = Path.rename
+
+        def failing_rename(self: Path, target: Path) -> Path:
+            if self == old_path:
+                msg = "Permission denied"
+                raise PermissionError(msg)
+            return real_rename(self, target)
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        with patch.object(Path, "rename", failing_rename):
+            result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
+        assert old_path.is_dir()
+        assert (new_path / "b.txt").read_text() == "from new"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["new_dir", "old_dir"]
+
+    def test_rename_file_overwrite_replaces_directory_with_file(self, engine: Engine, tmp_path: Path) -> None:
+        """Overwrite can put a file where a directory was."""
+        os_manager = engine.os_manager
+        old_path = tmp_path / "old.txt"
+        new_path = tmp_path / "target"
+        old_path.write_text("Old content")
+        new_path.mkdir()
+        (new_path / "b.txt").write_text("from new")
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultSuccess)
+        assert new_path.read_text() == "Old content"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["target"]
+
+    def test_rename_file_overwrite_restore_failure_names_backup(self, engine: Engine, tmp_path: Path) -> None:
+        """When the destination can't be put back, the failure says where it was kept."""
+        os_manager = engine.os_manager
+        old_path = tmp_path / "old_dir"
+        new_path = tmp_path / "new_dir"
+        old_path.mkdir()
+        new_path.mkdir()
+        (new_path / "b.txt").write_text("from new")
+        real_rename = Path.rename
+
+        def failing_rename(self: Path, target: Path) -> Path:
+            if self == old_path or self.name.startswith(".gtn-replace-"):
+                msg = "Permission denied"
+                raise PermissionError(msg)
+            return real_rename(self, target)
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        with patch.object(Path, "rename", failing_rename):
+            result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultFailure)
+        backups = [p for p in tmp_path.iterdir() if p.name.startswith(".gtn-replace-")]
+        assert len(backups) == 1
+        assert (backups[0] / "b.txt").read_text() == "from new"
+        assert str(backups[0]) in str(result.result_details)
+
+    @pytest.mark.skipif(platform.system() == "Windows", reason="symlink creation needs privileges on Windows")
+    def test_rename_file_overwrite_replaces_symlink_not_target(self, engine: Engine, tmp_path: Path) -> None:
+        """A symlink at the destination is replaced; the directory it points to is left alone."""
+        os_manager = engine.os_manager
+        old_path = tmp_path / "old.txt"
+        link_target = tmp_path / "real_dir"
+        new_path = tmp_path / "link"
+        old_path.write_text("Old content")
+        link_target.mkdir()
+        (link_target / "b.txt").write_text("from target")
+        new_path.symlink_to(link_target, target_is_directory=True)
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultSuccess)
+        assert not new_path.is_symlink()
+        assert new_path.read_text() == "Old content"
+        assert (link_target / "b.txt").read_text() == "from target"
+
+    @pytest.mark.skipif(platform.system() == "Windows", reason="symlink creation needs privileges on Windows")
+    def test_rename_file_overwrite_rejects_symlink_onto_its_target(self, engine: Engine, tmp_path: Path) -> None:
+        """Overwrite refuses to replace a file with a link to that same file."""
+        os_manager = engine.os_manager
+        new_path = tmp_path / "f.txt"
+        old_path = tmp_path / "link"
+        new_path.write_text("Content")
+        old_path.symlink_to(new_path)
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+        assert not new_path.is_symlink()
+        assert new_path.read_text() == "Content"
+
+    def test_rename_file_overwrite_rejects_destination_containing_source(self, engine: Engine, tmp_path: Path) -> None:
+        """Overwrite refuses to replace a directory with something inside it."""
+        os_manager = engine.os_manager
+        new_path = tmp_path / "parent"
+        old_path = new_path / "child.txt"
+        new_path.mkdir()
+        old_path.write_text("Content")
+
+        request = RenameFileRequest(
+            old_path=str(old_path), new_path=str(new_path), workspace_only=False, overwrite=True
+        )
+        result = os_manager.on_rename_file_request(request)
+
+        assert isinstance(result, RenameFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+        assert old_path.read_text() == "Content"
 
 
 class TestListDirectoryRequest:

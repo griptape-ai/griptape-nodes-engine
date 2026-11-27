@@ -463,7 +463,7 @@ class TestClosing:
 
         failure = asyncio.run(
             engine.project_manager._reload_after_project_switch(
-                "another-project", workspace_changed=True, library_config_changed=False
+                "another-project", close_workflows=True, workspace_changed=True, library_config_changed=False
             )
         )
 
@@ -618,6 +618,9 @@ class TestWorkers:
             workflow_file_path=None,
             is_saved=False,
             has_active_flow=True,
+            description=None,
+            image=None,
+            is_template=False,
         )
 
         def relay_open(_request: _RelayedOpenRequest) -> ResultPayload:

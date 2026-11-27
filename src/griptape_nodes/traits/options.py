@@ -7,7 +7,15 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 @dataclass(eq=False)
 class Options(Trait):
-    """Offer a parameter's value as a list of choices."""
+    """Offer a parameter's value as a list of choices.
+
+    A value outside ``choices`` is replaced with ``choices[0]`` and then rejected, unless
+    ``allow_custom`` lets the artist type their own or ``keep_unlisted`` stores it as it is.
+    ``keep_unlisted`` accepts any value on every assignment but changes nothing in the dropdown;
+    nothing rejects the value, so it is only for a node that reports an unlisted value itself, as
+    ``ModelAccessComponent(keep_unlisted_values=True)`` does. It is the node's to set, so it is not
+    saved with the workflow.
+    """
 
     DEFAULT_CHOICES: ClassVar[list[str]] = ["choice 1", "choice 2", "choice 3"]
     CHOICES_KEYS: ClassVar[tuple[str, ...]] = ("simple_dropdown", "enum_choices")
@@ -16,6 +24,7 @@ class Options(Trait):
     show_search: bool = True
     search_filter: str = ""
     allow_custom: bool = False
+    keep_unlisted: bool = False
     element_id: str = field(default_factory=lambda: "Options")
 
     def __init__(
@@ -25,12 +34,14 @@ class Options(Trait):
         show_search: bool = True,
         search_filter: str = "",
         allow_custom: bool = False,
+        keep_unlisted: bool = False,
     ) -> None:
         super().__init__(element_id="Options")
         self._choices = list(self.DEFAULT_CHOICES) if choices is None else choices
         self.show_search = show_search
         self.search_filter = search_filter
         self.allow_custom = allow_custom
+        self.keep_unlisted = keep_unlisted
 
     @property
     def choices(self) -> list:
@@ -65,7 +76,7 @@ class Options(Trait):
         return state
 
     def converters_for_trait(self) -> list[Callable]:
-        if self.allow_custom:
+        if self.allow_custom or self.keep_unlisted:
             return []
 
         def converter(value: Any) -> Any:
@@ -76,7 +87,7 @@ class Options(Trait):
         return [converter]
 
     def validators_for_trait(self) -> list[Callable[[Parameter, Any], Any]]:
-        if self.allow_custom:
+        if self.allow_custom or self.keep_unlisted:
             return []
 
         def validator(param: Parameter, value: Any) -> None:  # noqa: ARG001

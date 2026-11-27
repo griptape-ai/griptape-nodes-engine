@@ -36,6 +36,38 @@ class OrganizationInfo:
     name: str
 
 
+class WorkflowRunState(StrEnum):
+    """Whether an open workflow has a run in progress."""
+
+    IDLE = "idle"
+    # Includes a debug run paused at a breakpoint, which still holds the workflow's line.
+    RUNNING = "running"
+
+
+@dataclass(frozen=True)
+class OpenWorkflowState:
+    """What an open workflow is doing, as `OpenWorkflowInfo` reports it and `WorkflowStateChangedEvent` announces.
+
+    Args:
+        has_unsaved_changes: Whether a request changed the workflow since it opened or its own file
+            was last written. A Save As that leaves the workflow on its original file keeps it.
+        run_state: Whether a run of the workflow is in progress.
+        queued_run_count: Runs waiting for the run in progress to end.
+        last_run_error: Why the latest run failed, or None when none failed. Cleared when the next run
+            starts, and left None by a run that succeeded or was cancelled.
+        undo_label: What `UndoRequest` would take back, such as "Set Parameter Value", or None when
+            there is nothing to undo.
+        redo_label: What `RedoRequest` would put back, or None when there is nothing to redo.
+    """
+
+    has_unsaved_changes: bool = False
+    run_state: WorkflowRunState = WorkflowRunState.IDLE
+    queued_run_count: int = 0
+    last_run_error: str | None = None
+    undo_label: str | None = None
+    redo_label: str | None = None
+
+
 @dataclass
 class OpenWorkflowInfo:
     """A workflow the engine has open, as the heartbeat reports it.
@@ -48,6 +80,11 @@ class OpenWorkflowInfo:
         workflow_file_path: Path to the workflow file. None exactly while the workflow is unsaved.
         is_saved: Whether the workflow has a file, for clients that are not sent its path.
         has_active_flow: Whether the workflow has a current flow.
+        description: The workflow's description, or None when it has none.
+        image: The workflow's thumbnail as its metadata names it: a file name under the
+            `save_workflow_thumbnail` situation, or a URL. None when it has none.
+        is_template: Whether the workflow is a template.
+        state: Its unsaved changes and runs.
     """
 
     workflow_id: str
@@ -56,6 +93,10 @@ class OpenWorkflowInfo:
     workflow_file_path: str | None
     is_saved: bool
     has_active_flow: bool
+    description: str | None
+    image: str | None
+    is_template: bool
+    state: OpenWorkflowState = field(default_factory=OpenWorkflowState)
 
 
 @runtime_checkable
@@ -99,7 +140,7 @@ class AppStartSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppStartSessionResultSuccess(ResultPayloadSuccess):
+class AppStartSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session started successfully.
 
     Args:
@@ -217,6 +258,37 @@ class WorkflowClosedEvent(AppPayload):
     """
 
     workflow_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowStateChangedEvent(AppPayload):
+    """An open workflow's unsaved changes or runs changed. Every client gets it, whichever client made the change.
+
+    Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries its state.
+
+    Args:
+        workflow_id: Id of the workflow, as `ListOpenWorkflowsRequest` lists it.
+        state: Its state now.
+    """
+
+    workflow_id: str
+    state: OpenWorkflowState
+
+
+@dataclass
+@PayloadRegistry.register
+class WorkflowDetailsChangedEvent(AppPayload):
+    """What clients are told of an open workflow, other than its state, changed. Every client gets it.
+
+    Sent for a change to its name, file, description, thumbnail, template flag or whether it has a flow,
+    whichever request made it. Not sent while a workflow is still building: its `WorkflowOpenedEvent` carries them.
+
+    Args:
+        open_workflow: The workflow as it is now.
+    """
+
+    open_workflow: OpenWorkflowInfo
 
 
 @dataclass
@@ -419,7 +491,7 @@ class GetEngineVersionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class GetEngineVersionResultSuccess(ResultPayloadSuccess):
+class GetEngineVersionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Engine version retrieved successfully.
 
     Args:
@@ -453,7 +525,7 @@ class AppEndSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppEndSessionResultSuccess(ResultPayloadSuccess):
+class AppEndSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session ended successfully.
 
     Args:
@@ -486,7 +558,7 @@ class AppJoinSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppJoinSessionResultSuccess(ResultPayloadSuccess):
+class AppJoinSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     session_id: str
 
 
@@ -506,7 +578,7 @@ class AppLeaveSessionRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class AppLeaveSessionResultSuccess(ResultPayloadSuccess):
+class AppLeaveSessionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """The client is no longer listed; leaving when never listed succeeds too."""
 
 
@@ -524,7 +596,7 @@ class SessionHeartbeatRequest(RequestPayload, SkipTheLineMixin):
 
 @dataclass
 @PayloadRegistry.register
-class SessionHeartbeatResultSuccess(ResultPayloadSuccess):
+class SessionHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Session heartbeat successful. Session is active and responsive.
 
     Also carries the engine state that changes while a client stays connected. A new run id means
@@ -575,7 +647,7 @@ class SessionClient:
 
 @dataclass
 @PayloadRegistry.register
-class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
+class EngineHeartbeatResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Engine heartbeat successful with comprehensive status information.
 
     Args:

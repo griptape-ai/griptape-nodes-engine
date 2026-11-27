@@ -56,7 +56,11 @@ from griptape_nodes.files.path_utils import (
     resolve_path_safely,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
-from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
+from griptape_nodes.retained_mode.events.app_events import (
+    AppInitializationComplete,
+    CurrentProjectChanged,
+    WorkflowRunState,
+)
 from griptape_nodes.retained_mode.events.base_events import AppEvent
 from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
@@ -496,13 +500,13 @@ class ProjectChainEntry:
 class _ProjectActivationOutcome(NamedTuple):
     """Result of establishing a project's config/workspace/env layers and reloading.
 
-    `failure` is the reload failure (None on success). `workspace_changed` reports
-    whether the workspace directory changed, so the caller can flag
+    `failure` is the reload failure (None on success). `closed_workflows` reports
+    whether the activation closed the open workflows, so the caller can flag
     `altered_workflow_state` on the success result.
     """
 
     failure: SetCurrentProjectResultFailure | None
-    workspace_changed: bool
+    closed_workflows: bool
 
 
 class _BuiltinResolutionResult(NamedTuple):
@@ -3090,15 +3094,16 @@ class ProjectManager(EngineScoped):
         return json.dumps(snapshot, sort_keys=True, default=str)
 
     async def _reload_after_project_switch(
-        self, project_id: str, *, workspace_changed: bool, library_config_changed: bool
+        self, project_id: str, *, close_workflows: bool, workspace_changed: bool, library_config_changed: bool
     ) -> SetCurrentProjectResultFailure | None:
-        """Close the open workflow, reload libraries, and re-register workflows after a switch.
+        """Close the open workflows, reload libraries, and re-register workflows after a switch.
 
-        A workspace change closes the open workflow, because re-registering the
-        workflows re-keys them against the new workspace: a context that outlives
-        its registry entry names a key nothing can look up again, and every
+        `close_workflows` closes every open workflow. Switching to another project does, because the
+        project applies to the whole engine: a workflow left open would write its outputs into the
+        new project's folders, with the new project's libraries and environment. A workspace change
+        does too, because re-registering the workflows re-keys them against the new workspace: a
+        context that outlives its registry entry names a key nothing can look up again, and every
         `workflow_dir` resolution against it warns for the life of the process.
-        Clients are expected to return the user to the workflow picker.
 
         Only reloads libraries when the project's library-affecting config
         actually changed: the reload triggers LibraryManager's reconcile, which
@@ -3119,7 +3124,7 @@ class ProjectManager(EngineScoped):
         # before the checks that can fail it, so the workflow is gone either way. A failure
         # that claimed otherwise would leave the client showing a workflow the engine has
         # dropped, which is the state this teardown exists to prevent.
-        if workspace_changed:
+        if close_workflows:
             clear_result = await self.engine.ahandle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
             if not clear_result.succeeded():
                 return SetCurrentProjectResultFailure(
@@ -3237,6 +3242,10 @@ class ProjectManager(EngineScoped):
         # still hits. SYSTEM_DEFAULTS_KEY is a synthetic id and is preserved as-is.
         resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
 
+        busy_failure = self._refuse_switch_during_runs(resolved_project_id, previous_project_id)
+        if busy_failure is not None:
+            return busy_failure
+
         # License-policy checkpoint: gate every activation on the project id,
         # including the system-defaults rest state. The engine bakes in no policy
         # of its own -- it always asks and the consumer decides, which keeps this
@@ -3270,8 +3279,10 @@ class ProjectManager(EngineScoped):
             # a project a CLI executor explicitly selected), and rolling back to it is
             # what keeps _current_project_id off the refused project so
             # on_app_initialization_complete still reaches its system-defaults fallback.
+            closed_workflows = outcome.closed_workflows
             if previous_project_id != resolved_project_id:
-                rollback = await self._activate_project(previous_project_id)
+                rollback = await self._activate_project(previous_project_id, restoring_previous=True)
+                closed_workflows = closed_workflows or rollback.closed_workflows
                 if rollback.failure is not None:
                     logger.error(
                         "Attempted to roll back to previous project '%s' after activation of '%s' failed. "
@@ -3280,12 +3291,14 @@ class ProjectManager(EngineScoped):
                         resolved_project_id,
                         rollback.failure.result_details,
                     )
+            if closed_workflows:
+                outcome.failure.altered_workflow_state = True
             return outcome.failure
 
         result = SetCurrentProjectResultSuccess(
             result_details=f"Successfully set current project. ID: {resolved_project_id}",
         )
-        if outcome.workspace_changed and self._initialization_complete:
+        if outcome.closed_workflows:
             result.altered_workflow_state = True
 
         # Push the switch to running workers so they adopt it even on a shallow switch (same
@@ -3304,6 +3317,35 @@ class ProjectManager(EngineScoped):
             # generation guard skips that pass (or retries an adoption that failed here).
             await self._event_manager.abroadcast_app_event(changed)
         return result
+
+    def _refuse_switch_during_runs(
+        self, resolved_project_id: ProjectID, previous_project_id: ProjectID
+    ) -> SetCurrentProjectResultFailure | None:
+        """Refuse to switch to another project while a workflow runs or has runs waiting, or None.
+
+        A switch closes every open workflow, which would cancel the run after it had written some of
+        its outputs into the old project. A worker follows the orchestrator, which already refused.
+        """
+        if resolved_project_id == previous_project_id or self.engine.library_manager.is_worker:
+            return None
+        busy_names = []
+        for workflow in self.engine.open_workflows.all_open():
+            state = workflow.state()
+            if state.run_state == WorkflowRunState.RUNNING or state.queued_run_count > 0:
+                busy_names.append(self.engine.open_workflow_info(workflow).display_name)
+        if not busy_names:
+            return None
+        quoted_names = ", ".join(f"'{name}'" for name in busy_names)
+        if len(busy_names) == 1:
+            still_running = "is still running"
+        else:
+            still_running = "are still running"
+        project_name = self._cached_project_name(resolved_project_id) or resolved_project_id
+        return SetCurrentProjectResultFailure(
+            result_details=f"Attempted to switch to project '{project_name}'. Failed because {quoted_names} "
+            f"{still_running}, and switching projects closes every open workflow. Wait for the runs to finish "
+            "or cancel them, then switch."
+        )
 
     def _refuse_unresolvable_declared_paths(
         self, project_info: ProjectInfo | None
@@ -3360,8 +3402,13 @@ class ProjectManager(EngineScoped):
 
         return self._refuse_unresolvable_declared_paths(project_info)
 
-    async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
+    async def _activate_project(
+        self, resolved_project_id: ProjectID, *, restoring_previous: bool = False
+    ) -> _ProjectActivationOutcome:
         """Establish a project's config/workspace/env layers and reload libraries.
+
+        `restoring_previous` marks the rollback after a failed switch. The open workflows still
+        belong to the project it restores, so it leaves them open.
 
         Captures workspace path before and after config layer changes. If the
         workspace actually changed and startup is complete, performs an expensive
@@ -3370,7 +3417,7 @@ class ProjectManager(EngineScoped):
         the workspace switch is skipped.
 
         `resolved_project_id` is already canonicalized. Returns the reload failure
-        (None on success) and whether the workspace changed. This is the shared
+        (None on success) and whether the open workflows were closed. This is the shared
         body used both for the requested switch and for rolling back to the
         previously active project when a switch fails.
         """
@@ -3386,11 +3433,12 @@ class ProjectManager(EngineScoped):
         # state, and the caller's rollback has nothing to repair.
         gate_failure = self._refuse_unactivatable_project(resolved_project_id, project_info)
         if gate_failure is not None:
-            return _ProjectActivationOutcome(failure=gate_failure, workspace_changed=False)
+            return _ProjectActivationOutcome(failure=gate_failure, closed_workflows=False)
 
         # Capture workspace and library-affecting config BEFORE config changes for comparison after
         old_workspace = self._config_manager.workspace_path
         old_library_config = self._snapshot_library_config()
+        project_changed = self._current_project_id != resolved_project_id
 
         self._current_project_id = resolved_project_id
 
@@ -3415,7 +3463,7 @@ class ProjectManager(EngineScoped):
                 # The gate refused an unresolvable parent-chain declaration. The config
                 # layers above have already changed, so the caller's rollback re-activates
                 # the previous project, which re-establishes its layers and env.
-                return _ProjectActivationOutcome(failure=apply_failure, workspace_changed=False)
+                return _ProjectActivationOutcome(failure=apply_failure, closed_workflows=False)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
@@ -3440,6 +3488,10 @@ class ProjectManager(EngineScoped):
         workspace_changed = old_workspace != new_workspace
         new_library_config = self._snapshot_library_config()
         library_config_changed = old_library_config != new_library_config
+        close_workflows = self._activation_closes_workflows(
+            project_changed=project_changed, workspace_changed=workspace_changed, restoring_previous=restoring_previous
+        )
+        closed_workflows = False
 
         if self._initialization_complete:
             # The orchestrator owns project_file in the shared config. A worker adopting
@@ -3466,16 +3518,28 @@ class ProjectManager(EngineScoped):
 
             failure = await self._reload_after_project_switch(
                 resolved_project_id,
+                close_workflows=close_workflows,
                 workspace_changed=workspace_changed,
                 library_config_changed=library_config_changed,
             )
+            closed_workflows = close_workflows
             if failure is not None:
-                return _ProjectActivationOutcome(failure=failure, workspace_changed=workspace_changed)
+                return _ProjectActivationOutcome(failure=failure, closed_workflows=closed_workflows)
 
         # Every path that reaches here established the project's layers completely: the
         # requested switch, the boot seed, and the rollback re-activation all commit.
         self._committed_project_id = resolved_project_id
-        return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
+        return _ProjectActivationOutcome(failure=None, closed_workflows=closed_workflows)
+
+    def _activation_closes_workflows(
+        self, *, project_changed: bool, workspace_changed: bool, restoring_previous: bool
+    ) -> bool:
+        if self.engine.library_manager.is_worker:
+            # A worker closes its workflows when the orchestrator closes them, not when it adopts the project.
+            return workspace_changed
+        if restoring_previous:
+            return False
+        return workspace_changed or project_changed
 
     async def _apply_workspace_and_libraries_layers(
         self, project_info: ProjectInfo, project_file_path: Path

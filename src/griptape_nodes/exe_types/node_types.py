@@ -11,7 +11,7 @@ from collections.abc import Callable, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from enum import StrEnum, auto
+from enum import Enum, StrEnum, auto
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar
 
 from griptape_nodes.common.strict_mode import STRICT_MODE, StrictModeScopeKind
@@ -141,6 +141,19 @@ _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=F
 # node, and on that node the value is an ordinary authored one, not something it produced.
 _running_node: ContextVar[BaseNode | None] = ContextVar("_node_types_running_node", default=None)
 
+# The node taking in a value through an incoming connection, while it sets that value and what its
+# hooks derive from it (see `connection_feed_scope`).
+_fed_node: ContextVar[BaseNode | None] = ContextVar("_node_types_fed_node", default=None)
+
+
+class _ValueOrigin(Enum):
+    """Where a parameter's value came from, when it wasn't an edit."""
+
+    # This node's own run set it.
+    RUN = "run"
+    # It came in through an incoming connection, or the node derived it from one as it came in.
+    CONNECTION = "connection"
+
 
 @functools.cache
 def _base_node_attribute_names() -> frozenset[str]:
@@ -225,6 +238,20 @@ def aprocess_scope(
         _in_aprocess.reset(token)
         _running_node.reset(node_token)
         VariableResolver.reset_cache(cache_token)
+
+
+@contextmanager
+def connection_feed_scope(node: BaseNode) -> Iterator[None]:
+    """Mark the enclosed block as ``node`` taking in a value through an incoming connection.
+
+    What ``node`` sets on itself meanwhile, the value and what its hooks derive from it, came from the
+    connection, not an edit (see `BaseNode.parameters_set_by_run_or_connection`).
+    """
+    token = _fed_node.set(node)
+    try:
+        yield
+    finally:
+        _fed_node.reset(token)
 
 
 class ImportDependency(NamedTuple):
@@ -378,6 +405,8 @@ class BaseNode(ABC):
     _deferred_inputs_were_reset: bool  # Whether one of those deferred resets actually fired
     _parameters_added_after_construction: set[str]
     _parameters_added_during_execution: set[str]
+    # Where each parameter's value came from, when it wasn't an edit, until an edit sets it.
+    _value_origins: dict[str, _ValueOrigin]
     _engine: Engine | None
 
     @property
@@ -406,6 +435,29 @@ class BaseNode(ABC):
         why this is narrower than ``parameters_added_after_construction``.
         """
         return self._parameters_added_during_execution
+
+    @property
+    def values_set_by_run(self) -> dict[str, Any]:
+        """The values this node's own run gave its parameters, which nothing has set since.
+
+        Such as a seed a node rolls while it runs. They are what the run computed with, so they
+        travel back from a worker with the run's outputs (see `take_values_set_by_run`).
+        """
+        return {
+            name: self.parameter_values[name]
+            for name, origin in self._value_origins.items()
+            if origin is _ValueOrigin.RUN and name in self.parameter_values
+        }
+
+    @property
+    def parameters_set_by_run_or_connection(self) -> frozenset[str]:
+        """The parameters whose value no edit set since a run or a connection did.
+
+        This node's own run set it, such as a seed it rolled or the status it reported, or it came in
+        through a connection, with what the node derived from it as it did, such as a preview. An undo
+        leaves these out of what it compares, as results rather than changes.
+        """
+        return frozenset(self._value_origins)
 
     def __hash__(self) -> int:
         return hash(self.name)
@@ -465,6 +517,7 @@ class BaseNode(ABC):
         self._deferred_inputs_were_reset = False
         self._parameters_added_after_construction = set()
         self._parameters_added_during_execution = set()
+        self._value_origins = {}
         self._parent_group = None
         self.set_entry_control_parameter(None)
 
@@ -933,6 +986,7 @@ class BaseNode(ABC):
         if self.does_name_exist(param.name):
             msg = f"Cannot have duplicate names on parameters. Encountered two instances of '{param.name}'."
             raise ValueError(msg)
+        driver = self._driver_of(param)
         parameter_group = (
             self.get_group_by_name_or_element_id(param.parent_element_name) if param.parent_element_name else None
         )
@@ -940,8 +994,23 @@ class BaseNode(ABC):
             parameter_group.add_child(param)
         else:
             self.add_node_element(param)
+        if driver is not None:
+            self._list_rows.sync_driven_lists(driver)
         self._record_parameter_add_scope(param.name)
         self._emit_parameter_lifecycle_event(param)
+
+    def _driver_of(self, param: Parameter) -> ParameterList | None:
+        """The list `param` is driven by, or None. A driver has to be declared on the node before the list it drives."""
+        if not isinstance(param, ParameterList) or param.driven_by is None:
+            return None
+        driver = self.get_parameter_by_name(param.driven_by)
+        if driver is None:
+            msg = f"Attempted to add list '{param.name}' to node '{self.name}'. Failed because it is driven by '{param.driven_by}', which is not declared on the node yet."
+            raise ValueError(msg)
+        if not isinstance(driver, ParameterList):
+            msg = f"Attempted to add list '{param.name}' to node '{self.name}'. Failed because it is driven by '{param.driven_by}', which is not a list."
+            raise TypeError(msg)
+        return driver
 
     def remove_parameter_element_by_name(self, element_name: str) -> None:
         element = self.root_ui_element.find_element_by_name(element_name)
@@ -1158,20 +1227,13 @@ class BaseNode(ABC):
         return None
 
     def get_parameter_by_name(self, param_name: str) -> Parameter | None:
-        for parameter in self.parameters:
-            if param_name == parameter.name:
-                return parameter
-        return None
+        return self.root_ui_element.find_element_by_type_and_name(Parameter, param_name)
 
     def get_element_by_name_and_type(
         self, elem_name: str, element_type: type[BaseNodeElement] | None = None
     ) -> BaseNodeElement | None:
         find_type = element_type if element_type is not None else BaseNodeElement
-        element_items = self.root_ui_element.find_elements_by_type(find_type)
-        for element_item in element_items:
-            if elem_name == element_item.name:
-                return element_item
-        return None
+        return self.root_ui_element.find_element_by_type_and_name(find_type, elem_name)
 
     def set_parameter_value(
         self,
@@ -1231,6 +1293,7 @@ class BaseNode(ABC):
                 # ACTUALLY SET THE NEW VALUE
                 self.parameter_values[param_name] = final_value
                 self._also_record_as_result(parameter, final_value)
+                self._record_who_set(parameter)
 
                 # Allow custom node logic to respond after it's been set.
                 # A connected list's hook sees the list the node now reads, its rows' items included.
@@ -1243,6 +1306,7 @@ class BaseNode(ABC):
         else:
             self.parameter_values[param_name] = candidate_value
             self._also_record_as_result(parameter, candidate_value)
+            self._record_who_set(parameter)
         if parameter.parent_container_name is not None:
             container = self.get_parameter_by_name(parameter.parent_container_name)
             if isinstance(container, ParameterContainer):
@@ -1296,6 +1360,33 @@ class BaseNode(ABC):
             and ParameterMode.OUTPUT in parameter.allowed_modes
         ):
             self.parameter_output_values[parameter.name] = value
+
+    def _record_who_set(self, parameter: Parameter) -> None:
+        """Record where `parameter`'s value came from, for `values_set_by_run` and `parameters_set_by_run_or_connection`.
+
+        The run's window is the same as `_also_record_as_result`'s: this node's body running. A
+        connection's is this node taking in a value through it (`connection_feed_scope`). A value set
+        any other way, such as by an edit or loading the workflow, is an edit. A container's child is
+        left out, as there: its container travels for it.
+        """
+        if parameter.parent_container_name is None:
+            if _running_node.get() is self:
+                self._value_origins[parameter.name] = _ValueOrigin.RUN
+                return
+            if _fed_node.get() is self:
+                self._value_origins[parameter.name] = _ValueOrigin.CONNECTION
+                return
+        self._value_origins.pop(parameter.name, None)
+
+    def take_values_set_by_run(self, values: dict[str, Any]) -> None:
+        """Take the values a run of this node set on its parameters where it ran, such as in a worker.
+
+        Written straight in, as the run's outputs are: the node's value hooks already ran where the
+        node ran, and running them again here would treat the run's value as an edit.
+        """
+        for name, value in values.items():
+            self.parameter_values[name] = value
+            self._value_origins[name] = _ValueOrigin.RUN
 
     def set_initial_node_size(
         self, width: int = NODE_DEFAULT_SIZE["width"], height: int = NODE_DEFAULT_SIZE["height"]

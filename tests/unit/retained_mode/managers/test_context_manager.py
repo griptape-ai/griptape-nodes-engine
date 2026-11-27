@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import tempfile
 import uuid
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
@@ -85,90 +84,96 @@ class TestPushWorkflow:
         finally:
             context_manager.pop_workflow()
 
-    def test_push_workflow_with_file_path_inside_workspace(self, engine: Engine) -> None:
+    def test_push_workflow_with_file_path_inside_workspace(self, engine: Engine, tmp_path: Path) -> None:
         """file_path inside workspace produces a workspace-relative registry key."""
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
+        workspace = tmp_path
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            workflow_file = workspace / "subdir" / "my_flow.py"
+            workflow_file.parent.mkdir()
+            workflow_file.write_text("# stub")
+            result = context_manager.push_workflow(file_path=str(workflow_file))
             try:
-                workflow_file = workspace / "subdir" / "my_flow.py"
-                workflow_file.parent.mkdir()
-                workflow_file.write_text("# stub")
-                result = context_manager.push_workflow(file_path=str(workflow_file))
-                try:
-                    assert result == "subdir/my_flow"
-                    assert context_manager.get_current_workflow_name() == "subdir/my_flow"
-                finally:
-                    context_manager.pop_workflow()
+                assert result == "subdir/my_flow"
+                assert context_manager.get_current_workflow_name() == "subdir/my_flow"
             finally:
-                config_manager.workspace_path = original
+                context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original
 
-    def test_push_workflow_with_file_path_outside_workspace(self, engine: Engine) -> None:
+    def test_push_workflow_with_file_path_outside_workspace(self, engine: Engine, tmp_path: Path) -> None:
         """file_path outside workspace uses the absolute path as the registry key."""
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as other_dir:
-            workspace = Path(workspace_dir)
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
+        workspace_dir = tmp_path / "workspace_dir"
+        workspace_dir.mkdir()
+        other_dir = tmp_path / "other_dir"
+        other_dir.mkdir()
+        workspace = workspace_dir
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            workflow_file = other_dir / "my_flow.py"
+            workflow_file.write_text("# stub")
+            result = context_manager.push_workflow(file_path=str(workflow_file))
             try:
-                workflow_file = Path(other_dir) / "my_flow.py"
-                workflow_file.write_text("# stub")
-                result = context_manager.push_workflow(file_path=str(workflow_file))
-                try:
-                    expected = (Path(other_dir) / "my_flow").as_posix()
-                    assert result == expected
-                    assert context_manager.get_current_workflow_name() == expected
-                finally:
-                    context_manager.pop_workflow()
+                expected = (other_dir / "my_flow").as_posix()
+                assert result == expected
+                assert context_manager.get_current_workflow_name() == expected
             finally:
-                config_manager.workspace_path = original
+                context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original
 
-    def test_push_workflow_by_file_registers_it_unlisted(self, engine: Engine) -> None:
+    def test_push_workflow_by_file_registers_it_unlisted(self, engine: Engine, tmp_path: Path) -> None:
         """Opening a file the registry does not know registers it, without adding it to the workflow list."""
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as other_dir:
-            original = config_manager.workspace_path
-            config_manager.workspace_path = Path(workspace_dir)
+        workspace_dir = tmp_path / "workspace_dir"
+        workspace_dir.mkdir()
+        other_dir = tmp_path / "other_dir"
+        other_dir.mkdir()
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace_dir
+        try:
+            workflow_file = other_dir / "my_flow.py"
+            workflow_file.write_text("# stub")
+            name = context_manager.push_workflow(file_path=str(workflow_file))
             try:
-                workflow_file = Path(other_dir) / "my_flow.py"
-                workflow_file.write_text("# stub")
-                name = context_manager.push_workflow(file_path=str(workflow_file))
-                try:
-                    workflow = engine.workflow_registry.find_by_path(workflow_file)
-                    assert workflow is not None
-                    assert workflow.workflow_id == context_manager.get_current_workflow_id()
-                    assert workflow.listed is False
-                    assert name not in engine.workflow_registry.list_workflows()
-                finally:
-                    context_manager.pop_workflow()
+                workflow = engine.workflow_registry.find_by_path(workflow_file)
+                assert workflow is not None
+                assert workflow.workflow_id == context_manager.get_current_workflow_id()
+                assert workflow.listed is False
+                assert name not in engine.workflow_registry.list_workflows()
             finally:
-                config_manager.workspace_path = original
+                context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original
 
-    def test_push_workflow_by_a_missing_file_opens_an_unsaved_workflow_in_its_folder(self, engine: Engine) -> None:
+    def test_push_workflow_by_a_missing_file_opens_an_unsaved_workflow_in_its_folder(
+        self, engine: Engine, tmp_path: Path
+    ) -> None:
         """A path with no file behind it opens as an unsaved workflow whose folder is the path's."""
         context_manager = engine.context_manager
 
-        with tempfile.TemporaryDirectory() as other_dir:
-            workflow_file = Path(other_dir).resolve() / "not_written_yet.py"
-            context_manager.push_workflow(file_path=str(workflow_file))
-            try:
-                workflow = context_manager.get_current_workflow()
-                assert not workflow.is_saved
-                assert workflow.metadata.name == "not_written_yet"
-                assert _file_path(context_manager) is None
-                assert context_manager.get_current_workflow().working_directory == str(workflow_file.parent)
-            finally:
-                context_manager.pop_workflow()
+        workflow_file = tmp_path / "not_written_yet.py"
+        context_manager.push_workflow(file_path=str(workflow_file))
+        try:
+            workflow = context_manager.get_current_workflow()
+            assert not workflow.is_saved
+            assert workflow.metadata.name == "not_written_yet"
+            assert _file_path(context_manager) is None
+            assert context_manager.get_current_workflow().working_directory == str(workflow_file.parent)
+        finally:
+            context_manager.pop_workflow()
 
-    def test_push_workflow_retains_file_path_independent_of_workspace(self, engine: Engine) -> None:
+    def test_push_workflow_retains_file_path_independent_of_workspace(self, engine: Engine, tmp_path: Path) -> None:
         """The pushed file path is retained verbatim and does NOT move with the workspace.
 
         Regression guard: the registry key is derived against whatever workspace is active at
@@ -178,22 +183,25 @@ class TestPushWorkflow:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as other_dir:
-            original = config_manager.workspace_path
-            config_manager.workspace_path = Path(workspace_dir)
-            try:
-                workflow_file = Path(other_dir) / "my_flow.py"
-                workflow_file.write_text("# stub")
-                context_manager.push_workflow(file_path=str(workflow_file))
+        workspace_dir = tmp_path / "workspace_dir"
+        workspace_dir.mkdir()
+        other_dir = tmp_path / "other_dir"
+        other_dir.mkdir()
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace_dir
+        try:
+            workflow_file = other_dir / "my_flow.py"
+            workflow_file.write_text("# stub")
+            context_manager.push_workflow(file_path=str(workflow_file))
 
-                assert _file_path(context_manager) == str(workflow_file)
+            assert _file_path(context_manager) == str(workflow_file)
 
-                # Simulate a project switch: the workspace moves under the open workflow.
-                config_manager.workspace_path = Path(other_dir)
-                assert _file_path(context_manager) == str(workflow_file)
-            finally:
-                config_manager.workspace_path = original
-                context_manager.pop_workflow()
+            # Simulate a project switch: the workspace moves under the open workflow.
+            config_manager.workspace_path = other_dir
+            assert _file_path(context_manager) == str(workflow_file)
+        finally:
+            config_manager.workspace_path = original
+            context_manager.pop_workflow()
 
     def test_push_workflow_by_name_captures_path_while_key_is_valid(self, engine: Engine) -> None:
         """Entering by key resolves the path immediately, not lazily at read time.
@@ -210,7 +218,7 @@ class TestPushWorkflow:
         finally:
             context_manager.pop_workflow()
 
-    def test_push_workflow_by_name_resolves_registered_path_and_keeps_it(self, engine: Engine) -> None:
+    def test_push_workflow_by_name_resolves_registered_path_and_keeps_it(self, engine: Engine, tmp_path: Path) -> None:
         """A registered workflow entered by key gets its complete path cached, and keeps it.
 
         This is the branch the interactive open-workflow flow takes for every already-saved
@@ -222,40 +230,43 @@ class TestPushWorkflow:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as other_dir:
-            workspace = Path(workspace_dir)
-            workflow_file = workspace / "subdir" / "my_flow.py"
-            workflow_file.parent.mkdir()
-            # Workflow.from_disk verifies the file exists; a stub is enough here.
-            workflow_file.write_text("# stub")
-            metadata = WorkflowMetadata(
-                name="my_flow",
-                schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-                engine_version_created_with="test",
-                node_libraries_referenced=[],
-                creation_date=datetime.now(UTC),
-            )
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                with empty_workflow_registry(engine):
-                    # Registered workspace-RELATIVE, so resolving the key genuinely depends on
-                    # which workspace is active.
-                    engine.workflow_registry.generate_new_workflow(
-                        registry_key="subdir/my_flow", metadata=metadata, file_path="subdir/my_flow.py"
-                    )
-                    context_manager.push_workflow(workflow_name="subdir/my_flow")
-                    try:
-                        expected = str(workflow_file.resolve())
-                        assert _file_path(context_manager) == expected
+        workspace_dir = tmp_path / "workspace_dir"
+        workspace_dir.mkdir()
+        other_dir = tmp_path / "other_dir"
+        other_dir.mkdir()
+        workspace = workspace_dir
+        workflow_file = workspace / "subdir" / "my_flow.py"
+        workflow_file.parent.mkdir()
+        # Workflow.from_disk verifies the file exists; a stub is enough here.
+        workflow_file.write_text("# stub")
+        metadata = WorkflowMetadata(
+            name="my_flow",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            with empty_workflow_registry(engine):
+                # Registered workspace-RELATIVE, so resolving the key genuinely depends on
+                # which workspace is active.
+                engine.workflow_registry.generate_new_workflow(
+                    registry_key="subdir/my_flow", metadata=metadata, file_path="subdir/my_flow.py"
+                )
+                context_manager.push_workflow(workflow_name="subdir/my_flow")
+                try:
+                    expected = str(workflow_file.resolve())
+                    assert _file_path(context_manager) == expected
 
-                        # Simulate a project switch: the key is now meaningless, the path is not.
-                        config_manager.workspace_path = Path(other_dir)
-                        assert _file_path(context_manager) == expected
-                    finally:
-                        context_manager.pop_workflow()
-            finally:
-                config_manager.workspace_path = original
+                    # Simulate a project switch: the key is now meaningless, the path is not.
+                    config_manager.workspace_path = other_dir
+                    assert _file_path(context_manager) == expected
+                finally:
+                    context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original
 
     def test_push_workflow_raises_when_both_provided(self, engine: Engine) -> None:
         """Raises ValueError when both workflow_name and file_path are given."""
@@ -271,22 +282,21 @@ class TestPushWorkflow:
         with pytest.raises(ValueError, match="must be provided"):
             context_manager.push_workflow()
 
-    def test_push_workflow_strips_extension(self, engine: Engine) -> None:
+    def test_push_workflow_strips_extension(self, engine: Engine, tmp_path: Path) -> None:
         """Registry key derived from file_path has no file extension."""
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                workflow_file = workspace / "my_workflow.py"
-                workflow_file.write_text("# stub")
-                result = context_manager.push_workflow(file_path=str(workflow_file))
-                context_manager.pop_workflow()
-            finally:
-                config_manager.workspace_path = original
+        workspace = tmp_path
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            workflow_file = workspace / "my_workflow.py"
+            workflow_file.write_text("# stub")
+            result = context_manager.push_workflow(file_path=str(workflow_file))
+            context_manager.pop_workflow()
+        finally:
+            config_manager.workspace_path = original
 
         assert result == "my_workflow"
         assert "." not in result
@@ -310,34 +320,33 @@ class TestWorkflowWorkingDirectory:
         assert isinstance(result, GetPathForMacroResultSuccess)
         return result.absolute_path
 
-    def test_unsaved_workflow_outputs_land_in_the_supplied_folder(self, engine: Engine) -> None:
+    def test_unsaved_workflow_outputs_land_in_the_supplied_folder(self, engine: Engine, tmp_path: Path) -> None:
         """The whole point: an unsaved workflow's outputs resolve under the folder it was created in."""
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir).resolve()
-            browsed = workspace / "shots" / "sh010"
-            browsed.mkdir(parents=True)
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
-                )
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
-                # The folder is NOT the registry key: the workflow is still unsaved.
-                assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
-                assert _file_path(context_manager) is None
+        workspace = tmp_path
+        browsed = workspace / "shots" / "sh010"
+        browsed.mkdir(parents=True)
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(
+                SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+            )
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
+            # The folder is NOT the registry key: the workflow is still unsaved.
+            assert result.workflow_name.startswith(engine.workflow_registry.UNSAVED_KEY_PREFIX)
+            assert _file_path(context_manager) is None
 
-                assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
-    def test_omitting_the_folder_keeps_the_workspace_root_fallback(self, engine: Engine) -> None:
+    def test_omitting_the_folder_keeps_the_workspace_root_fallback(self, engine: Engine, tmp_path: Path) -> None:
         """The field is optional, so the pre-existing behavior has to survive untouched.
 
         Only one of the places the editor creates a workflow has a folder to offer; the others
@@ -346,23 +355,24 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir).resolve()
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
-                assert context_manager.get_current_workflow().working_directory is None
+        workspace = tmp_path
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
+            assert context_manager.get_current_workflow().working_directory is None
 
-                assert self._resolve_outputs(engine) == workspace / "outputs" / "img.png"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            assert self._resolve_outputs(engine) == workspace / "outputs" / "img.png"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
-    def test_omitting_the_folder_does_not_warn(self, engine: Engine, caplog: pytest.LogCaptureFixture) -> None:
+    def test_omitting_the_folder_does_not_warn(
+        self, engine: Engine, caplog: pytest.LogCaptureFixture, tmp_path: Path
+    ) -> None:
         """A workflow nobody named a folder for still answers `workflow_dir`, so nothing degrades.
 
         The folder its first save would default to is a prediction rather than a fact, but it is
@@ -372,27 +382,26 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir).resolve()
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
+        workspace = tmp_path
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
 
-                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-                    resolved = self._resolve_outputs(engine)
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                resolved = self._resolve_outputs(engine)
 
-                assert resolved == workspace / "outputs" / "img.png"
-                warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-                assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            assert resolved == workspace / "outputs" / "img.png"
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
-    def test_required_workflow_dir_resolves_without_a_folder(self, engine: Engine) -> None:
+    def test_required_workflow_dir_resolves_without_a_folder(self, engine: Engine, tmp_path: Path) -> None:
         """`{workflow_dir}` with no `?` resolves too, rather than failing the whole request.
 
         A macro that names the directory outright has no degraded form to fall back to, so a
@@ -401,27 +410,26 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir).resolve()
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
+        workspace = tmp_path
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(SetWorkflowContextRequest(display_name="Untitled"))
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
 
-                resolved = engine.current_workflow().handle_request(
-                    GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
-                )
+            resolved = engine.current_workflow().handle_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{workflow_dir}/notes.txt"), variables={})
+            )
 
-                assert isinstance(resolved, GetPathForMacroResultSuccess)
-                assert resolved.absolute_path == workspace / "notes.txt"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            assert isinstance(resolved, GetPathForMacroResultSuccess)
+            assert resolved.absolute_path == workspace / "notes.txt"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
-    def test_relative_folder_is_anchored_to_the_workspace(self, engine: Engine) -> None:
+    def test_relative_folder_is_anchored_to_the_workspace(self, engine: Engine, tmp_path: Path) -> None:
         """A relative folder resolves against the workspace, not the process working directory.
 
         The path a caller holds is often built from the project base directory, which sits a
@@ -431,26 +439,25 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir).resolve()
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory="shots/sh020")
-                )
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
+        workspace = tmp_path
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(
+                SetWorkflowContextRequest(display_name="Untitled", working_directory="shots/sh020")
+            )
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
 
-                expected = workspace / "shots" / "sh020"
-                assert context_manager.get_current_workflow().working_directory == str(expected)
-                assert self._resolve_outputs(engine) == expected / "outputs" / "img.png"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            expected = workspace / "shots" / "sh020"
+            assert context_manager.get_current_workflow().working_directory == str(expected)
+            assert self._resolve_outputs(engine) == expected / "outputs" / "img.png"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
-    def test_saved_location_wins_over_the_supplied_folder(self, engine: Engine) -> None:
+    def test_saved_location_wins_over_the_supplied_folder(self, engine: Engine, tmp_path: Path) -> None:
         """Saving elsewhere repoints `{workflow_dir}`; the creation folder does not linger.
 
         The folder is only an answer for a workflow with no file of its own. Once there is a
@@ -460,33 +467,32 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir).resolve()
-            browsed = workspace / "shots" / "sh010"
-            browsed.mkdir(parents=True)
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
-                )
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
-                assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
+        workspace = tmp_path
+        browsed = workspace / "shots" / "sh010"
+        browsed.mkdir(parents=True)
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(
+                SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+            )
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
+            assert self._resolve_outputs(engine) == browsed / "outputs" / "img.png"
 
-                # What the save path does once the workflow gets a file.
-                saved_to = workspace / "elsewhere" / "my_flow.py"
-                saved_to.parent.mkdir()
-                saved_to.write_text("# stub")
-                engine.workflow_registry.set_file_path(context_manager.get_current_workflow(), saved_to)
+            # What the save path does once the workflow gets a file.
+            saved_to = workspace / "elsewhere" / "my_flow.py"
+            saved_to.parent.mkdir()
+            saved_to.write_text("# stub")
+            engine.workflow_registry.set_file_path(context_manager.get_current_workflow(), saved_to)
 
-                assert self._resolve_outputs(engine) == saved_to.parent / "outputs" / "img.png"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            assert self._resolve_outputs(engine) == saved_to.parent / "outputs" / "img.png"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
-    def test_supplying_a_file_as_the_folder_is_refused(self, engine: Engine) -> None:
+    def test_supplying_a_file_as_the_folder_is_refused(self, engine: Engine, tmp_path: Path) -> None:
         """A file where a folder was meant fails loudly rather than writing beside the file.
 
         The value becomes the parent of everything the workflow writes, so accepting a file
@@ -496,26 +502,25 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
-            not_a_folder = workspace / "notes.txt"
-            not_a_folder.write_text("not a folder")
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(not_a_folder))
-                )
+        workspace = tmp_path
+        not_a_folder = workspace / "notes.txt"
+        not_a_folder.write_text("not a folder")
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(
+                SetWorkflowContextRequest(display_name="Untitled", working_directory=str(not_a_folder))
+            )
 
-                assert isinstance(result, SetWorkflowContextFailure)
-                # Rejected before the context was pushed, so there is nothing to unwind.
-                assert not context_manager.has_current_workflow()
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            assert isinstance(result, SetWorkflowContextFailure)
+            # Rejected before the context was pushed, so there is nothing to unwind.
+            assert not context_manager.has_current_workflow()
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
-    def test_folder_need_not_exist_yet(self, engine: Engine) -> None:
+    def test_folder_need_not_exist_yet(self, engine: Engine, tmp_path: Path) -> None:
         """A folder that has not been created yet is accepted.
 
         Project directories are created on demand at write time, so requiring the folder to
@@ -524,26 +529,25 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir).resolve()
-            not_yet = workspace / "shots" / "sh030"
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(not_yet))
-                )
+        workspace = tmp_path
+        not_yet = workspace / "shots" / "sh030"
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(
+                SetWorkflowContextRequest(display_name="Untitled", working_directory=str(not_yet))
+            )
 
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
-                assert self._resolve_outputs(engine) == not_yet / "outputs" / "img.png"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
+            assert self._resolve_outputs(engine) == not_yet / "outputs" / "img.png"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
     def test_folder_silences_the_unresolved_workflow_dir_warning(
-        self, engine: Engine, caplog: pytest.LogCaptureFixture
+        self, engine: Engine, caplog: pytest.LogCaptureFixture, tmp_path: Path
     ) -> None:
         """With a folder to answer with, `{workflow_dir?:/}` no longer degrades.
 
@@ -554,28 +558,27 @@ class TestWorkflowWorkingDirectory:
         context_manager = engine.context_manager
         config_manager = engine.config_manager
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            workspace = Path(tmp_dir)
-            browsed = workspace / "shots" / "sh010"
-            browsed.mkdir(parents=True)
-            original = config_manager.workspace_path
-            config_manager.workspace_path = workspace
-            try:
-                result = engine.handle_request(
-                    SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
-                )
-                assert isinstance(result, SetWorkflowContextSuccess)
-                bind(the_open_workflow(engine))
+        workspace = tmp_path
+        browsed = workspace / "shots" / "sh010"
+        browsed.mkdir(parents=True)
+        original = config_manager.workspace_path
+        config_manager.workspace_path = workspace
+        try:
+            result = engine.handle_request(
+                SetWorkflowContextRequest(display_name="Untitled", working_directory=str(browsed))
+            )
+            assert isinstance(result, SetWorkflowContextSuccess)
+            bind(the_open_workflow(engine))
 
-                with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-                    self._resolve_outputs(engine)
+            with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+                self._resolve_outputs(engine)
 
-                warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-                assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
-            finally:
-                config_manager.workspace_path = original
-                while context_manager.has_current_workflow():
-                    context_manager.pop_workflow()
+            warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert not warnings, f"Expected no degradation warnings but got: {[r.getMessage() for r in warnings]}"
+        finally:
+            config_manager.workspace_path = original
+            while context_manager.has_current_workflow():
+                context_manager.pop_workflow()
 
 
 class TestUnsavedWorkflowNames:
@@ -863,7 +866,7 @@ class TestRunningANodeForAnotherEngineProcess:
     """An orchestrator and a worker are separate engines: each gives the files it scans ids of its own."""
 
     def test_the_worker_takes_the_orchestrators_id_for_the_file_and_runs_the_node_in_it(self, tmp_path: Path) -> None:
-        workspace = tmp_path.resolve() / "workspace"
+        workspace = tmp_path / "workspace"
         workflow_file = workspace / "shot.py"
         workflow_file.parent.mkdir()
         workflow_file.write_text(
@@ -918,9 +921,9 @@ class TestRunningANodeForAnotherEngineProcess:
         self, tmp_path: Path
     ) -> None:
         """The scan does not find a file outside the workspace, but the worker still runs that workflow's nodes."""
-        workspace = tmp_path.resolve() / "workspace"
+        workspace = tmp_path / "workspace"
         workspace.mkdir()
-        workflow_file = tmp_path.resolve() / "elsewhere" / "shot.py"
+        workflow_file = tmp_path / "elsewhere" / "shot.py"
         workflow_file.parent.mkdir()
         workflow_file.write_text("print('body')\n", encoding="utf-8")
         worker = Engine()

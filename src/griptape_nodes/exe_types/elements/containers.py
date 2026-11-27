@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -92,7 +93,7 @@ class ParameterContainer(Parameter, ABC):
         return True
 
     @abstractmethod
-    def add_child_parameter(self) -> Parameter:
+    def add_child_parameter(self, name: str | None = None, *, auto_increment: bool = False) -> Parameter:
         pass
 
 
@@ -131,6 +132,9 @@ class ParameterList(ParameterContainer):
         child_prefix: str | None = None,
         grid: bool | None = None,
         grid_columns: int | None = None,
+        driven_by: str | None = None,
+        label_from_driver_value: bool = False,
+        driven_row_name: Callable[[Parameter], str] | None = None,
     ):
         if traits:
             self._original_traits = traits
@@ -144,6 +148,9 @@ class ParameterList(ParameterContainer):
         self._child_prefix = child_prefix
         self._grid = grid
         self._grid_columns = grid_columns
+        self._driven_by = driven_by
+        self._label_from_driver_value = label_from_driver_value
+        self._driven_row_name = driven_row_name
 
         # Remember: we're a Parameter, too, just like everybody else.
         super().__init__(
@@ -174,6 +181,25 @@ class ParameterList(ParameterContainer):
     @property
     def max_items(self) -> int | None:
         return self._max_items
+
+    @property
+    def driven_by(self) -> str | None:
+        """The name of the list on the same node whose rows this list's rows follow, one for one."""
+        return self._driven_by
+
+    @property
+    def label_from_driver_value(self) -> bool:
+        """Whether a row is labelled with its driver row's value instead of its own number."""
+        return self._label_from_driver_value
+
+    @property
+    def driven_row_name(self) -> Callable[[Parameter], str] | None:
+        """Names the row that follows a driver row, or None for `<list>_for_<driver row name>`.
+
+        A list that was already saved with its own row names uses this to keep them. The name has to be
+        unique in the node and the same every time it is asked for the same driver row.
+        """
+        return self._driven_row_name
 
     @property
     def row_input_types(self) -> list[str]:
@@ -262,6 +288,10 @@ class ParameterList(ParameterContainer):
         if self._child_prefix is not None:
             convenience_options["child_prefix"] = self._child_prefix
 
+        if self._driven_by is not None:
+            # The node keeps these rows in step with the driver's, so the editor offers no add, remove or reorder.
+            convenience_options["driven_by"] = self._driven_by
+
         if self._grid:
             convenience_options["display"] = "grid"
             if self._grid_columns is not None:
@@ -289,7 +319,7 @@ class ParameterList(ParameterContainer):
 
         # Set the base ui_options (excluding convenience parameters)
         base_ui_options = {
-            k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix"]
+            k: v for k, v in value.items() if k not in ["display", "columns", "collapsed", "child_prefix", "driven_by"]
         }
         self._ui_options = base_ui_options
 
@@ -387,15 +417,23 @@ class ParameterList(ParameterContainer):
             converted.append(item)
         return converted
 
-    def add_child_parameter(self) -> Parameter:
-        # Generate a name. This needs to be UNIQUE because children need
-        # to be tracked as individuals and not as indices in the list.
-        # Ex: a Connection is made to Parameter List[1]. List[0] gets deleted.
-        # The OLD List[1] is now List[0], but we need to maintain the Connection
-        # to the original entry.
-        #
-        # (No, we're not renaming it List[0] everywhere for you)
-        name = f"{self.name}_ParameterListUniqueParamID_{uuid.uuid4().hex!s}"
+    def add_child_parameter(self, name: str | None = None, *, auto_increment: bool = False) -> Parameter:
+        """Add a row at the end of the list.
+
+        Args:
+            name: The exact name for the row. Must be unique within the node. When omitted, a
+                unique name of the form `<list>_ParameterListUniqueParamID_<hex>` is generated.
+            auto_increment: Treat `name` as a prefix and number the row `<prefix>_1`, `<prefix>_2`,
+                and so on, using one more than the highest number currently in the node. Deleting
+                the highest row frees its number for the next row, the same before and after a save
+                and reload. A trailing `_<number>` on `name` is dropped first, so `item_a` and
+                `item_a_3` both give `item_a_<n>`. Ignored when `name` is omitted.
+
+        Raises:
+            ValueError: If `auto_increment` is False and `name` is already used by another
+                parameter in the node.
+        """
+        name = self._resolve_child_name(name, auto_increment=auto_increment)
 
         param = Parameter(
             name=name,
@@ -512,6 +550,9 @@ class ParameterList(ParameterContainer):
                 child._input_types = _without_list_variants(child._input_types)
         super().add_child(child)
 
+        if self._node_context is not None:
+            self._node_context._list_rows.sync_driven_lists(self)
+
         # Mark the parent node as unresolved since the parameter structure changed
         if self._node_context is not None:
             # Import at runtime to avoid circular import
@@ -522,10 +563,13 @@ class ParameterList(ParameterContainer):
             )
 
     def move_child(self, from_index: int, to_index: int) -> None:
-        """Move the row at `from_index` to `to_index`, then tell the node its list changed."""
+        """Move the row at `from_index` to `to_index`, then tell the editor and the node its list changed."""
         row = self.get_child_parameters()[from_index]
         self._children.remove(row)
         self._children.insert(to_index, row)
+        # The editor learns the new order only from an update event that carries the children.
+        self._changes["children"] = [child.to_dict() for child in self._children]
+        self._emit_alter_element_event_if_possible()
         if self._node_context is not None:
             self._node_context._list_rows.rows_changed(self)
 
@@ -547,6 +591,44 @@ class ParameterList(ParameterContainer):
             self._node_context.make_node_unresolved(
                 current_states_to_trigger_change_event={NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING}
             )
+
+    def _resolve_child_name(self, name: str | None, *, auto_increment: bool) -> str:
+        if name is not None and not auto_increment and self._name_in_use(name):
+            msg = (
+                f"Attempted to add a row named '{name}' to list '{self.name}'. "
+                "Failed because a parameter with that name already exists."
+            )
+            raise ValueError(msg)
+
+        if name is None:
+            # Generate a name. This needs to be UNIQUE because children need
+            # to be tracked as individuals and not as indices in the list.
+            # Ex: a Connection is made to Parameter List[1]. List[0] gets deleted.
+            # The OLD List[1] is now List[0], but we need to maintain the Connection
+            # to the original entry.
+            #
+            # (No, we're not renaming it List[0] everywhere for you)
+            return f"{self.name}_ParameterListUniqueParamID_{uuid.uuid4().hex!s}"
+
+        if not auto_increment:
+            return name
+
+        base = re.sub(r"_\d+$", "", name)
+        used = re.compile(rf"{re.escape(base)}_(\d+)$")
+        highest = 0
+        for element in self._name_scope().find_elements_by_type(BaseNodeElement, find_recursively=True):
+            match = used.match(element.name)
+            if match is not None:
+                highest = max(highest, int(match.group(1)))
+        return f"{base}_{highest + 1}"
+
+    def _name_in_use(self, name: str) -> bool:
+        return self._name_scope().find_element_by_name(name) is not None
+
+    def _name_scope(self) -> BaseNodeElement:
+        if self._node_context is None:
+            return self
+        return self._node_context.root_ui_element
 
 
 def _without_list_variants(input_types: list[str]) -> list[str]:

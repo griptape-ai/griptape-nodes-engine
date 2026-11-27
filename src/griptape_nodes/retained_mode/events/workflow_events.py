@@ -58,7 +58,7 @@ class RunWorkflowFromScratchRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class RunWorkflowFromScratchResultSuccess(ResultPayloadSuccess):
+class RunWorkflowFromScratchResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Workflow loaded and started successfully from file.
 
     Args:
@@ -161,7 +161,7 @@ class RunWorkflowFromRegistryRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class RunWorkflowFromRegistryResultSuccess(ResultPayloadSuccess):
+class RunWorkflowFromRegistryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Workflow from registry started successfully.
 
     Args:
@@ -783,7 +783,7 @@ class PublishWorkflowRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class PublishWorkflowResultSuccess(ResultPayloadSuccess):
+class PublishWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Workflow published successfully.
 
     Args:

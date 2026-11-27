@@ -26,6 +26,21 @@
       "class_name": "WorkerFailingNode",
       "file_path": "worker_leaf_nodes.py",
       "metadata": {"category": "test", "description": "always fails", "display_name": "Worker Failing"}
+    },
+    {
+      "class_name": "WorkerValueErrorNode",
+      "file_path": "worker_leaf_nodes.py",
+      "metadata": {"category": "test", "description": "fails with a builtin ValueError", "display_name": "Worker Value Error"}
+    },
+    {
+      "class_name": "WorkerUnsendableOutputNode",
+      "file_path": "worker_leaf_nodes.py",
+      "metadata": {"category": "test", "description": "outputs a value that cannot be sent", "display_name": "Worker Unsendable Output"}
+    },
+    {
+      "class_name": "WorkerDeclinesNode",
+      "file_path": "worker_leaf_nodes.py",
+      "metadata": {"category": "test", "description": "declines to run in the worker", "display_name": "Worker Declines"}
     }
   ]
 }

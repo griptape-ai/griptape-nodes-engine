@@ -12,6 +12,145 @@ the engine's request API from working without edits. Migration steps live in
 
 <!-- Entries go in changelog.d/, one file each. See changelog.d/README.md. -->
 
+## [0.113.0] - 2026-11-23
+
+### Added
+
+- `Subflow Node Group` has an `On Start` port on its left side and a `Group Complete` port on its right,
+  like `On Each` and `Loop Complete` on a `ForEach Group`. Wire `On Start` to the first node inside the
+  group and the last node inside to `Group Complete`. Grouping a node that is already in a control chain
+  wires them for you.
+  [#6210](https://github.com/griptape-ai/griptape-nodes-engine/issues/6210)
+
+### Removed
+
+- **Breaking:** `WorkflowNotNamedError` is removed from `griptape_nodes.retained_mode.runtime.binding`.
+  The engine stopped raising it, so a node library that imports it fails to load. Remove the import
+  and any `except` that names it.
+
+### Fixed
+
+- **Breaking:** Switching projects (`SetCurrentProjectRequest`) now closes every open workflow, so a
+  workflow left open, such as in another tab, no longer saves its outputs into the new project's
+  folders. Reopen the workflows you need after switching. Switching now fails while a workflow is
+  running, so wait for the run to finish or cancel it first.
+- The chat agent now asks before it closes a workflow or clears everything. It could do either
+  without asking, and clearing everything closes every open workflow, including other tabs with
+  unsaved changes.
+- Reopening a workflow no longer restores models a node has retired; the model dropdown is rebuilt
+  from current models and the selected model moves to its replacement.
+  [#6052](https://github.com/griptape-ai/griptape-nodes-engine/issues/6052)
+- Nodes wired after a `Subflow Node Group` run. Grouping a node in the middle of a control chain keeps
+  its control wires on the group's own ports instead of adding extra ports: outside the group they meet
+  `Flow In` / `Flow Out`, inside they run from `On Start` and into `Group Complete`, or `On Each` and
+  `Loop Complete` on a `ForEach Group` or `For Loop Group`. The run continues past the group instead of
+  ending there and still reporting success. Ungrouping the node puts the chain back when only one wire
+  could have been its own. Grouping a node in the editor no longer deletes its data wires.
+  Groups saved before this still stop at the group. Ungroup and regroup the node, or wire the group's
+  `Flow Out` (`On Complete` on a loop) to the next node by hand; the old extra ports stay on the group.
+  Grouping or ungrouping a node, or wiring a control connection across a group boundary by hand, now
+  shows the resulting connection immediately instead of only after reopening the workflow.
+  [#6210](https://github.com/griptape-ai/griptape-nodes-engine/issues/6210)
+  [#5487](https://github.com/griptape-ai/griptape-nodes-engine/issues/5487)
+- Wiring a `Subflow Node Group`'s `On Start` to a node other than the one it would pick on its own
+  now actually sets where the group enters, both for its own run and for its packaged run under
+  Isolated or library execution. Previously the wiring had no effect either way.
+  [#6210](https://github.com/griptape-ai/griptape-nodes-engine/issues/6210)
+- Opening a workflow and closing it without changes no longer asks "Save Workflow?". Workflows
+  built by an agent or a script, and some built in the editor, used to open already marked as having
+  unsaved changes.
+- When YAML Input rejects text, the error names and quotes the line and, for a value that contains a
+  colon followed by a space, says to wrap the value in quotes or use `|` to put the text on its own
+  line. It reads "Couldn't set 'Node.param'." and the reason, without the "Failed because
+  Exception" wrapper.
+  [#6397](https://github.com/griptape-ai/griptape-nodes-engine/issues/6397)
+
+## [0.112.0] - 2026-11-19
+
+### Added
+
+- Situation macros in a project can now use `{media.width}`, `{media.height}`, `{media.fps}`,
+  `{media.duration}`, `{media.codec}`, `{media.channels}` and `{media.color_space}`, read from the
+  image or video being saved, to name files such as `render_1920x1080.png`. See
+  [Situations](docs/guides/projects/situations.md).
+  [#6342](https://github.com/griptape-ai/griptape-nodes-engine/issues/6342)
+- A node's log lines now name the workflow it ran in, so with several workflows open they show only
+  on that workflow.
+  [#6379](https://github.com/griptape-ai/griptape-nodes-engine/issues/6379)
+- Open workflows now report whether they have unsaved changes, a run in progress or waiting, or a
+  failed last run, and `WorkflowStateChangedEvent` announces each change.
+  [#6378](https://github.com/griptape-ai/griptape-nodes-engine/issues/6378)
+- `RequestClient.request` and `RequestClient.request_batch` now take an `open_workflow_id`
+  argument, so a Python script can name the open workflow its requests act on while several
+  workflows are open.
+  [#6381](https://github.com/griptape-ai/griptape-nodes-engine/issues/6381)
+- When a library's worker crashes after loading, for example by running out of memory, the
+  library's next node now starts it again instead of failing until the library is reloaded.
+- `AppGetSessionResultSuccess` now carries `engine_version`, `engine_run_id`, `engine_os`, and
+  `is_initializing`, and `SessionHeartbeatResultSuccess` carries `session_id`, `engine_run_id`, and
+  `is_initializing`, so a client can follow the engine's state without engine discovery.
+
+### Changed
+
+- **Breaking:** `FlowManager` methods that read the current workflow, such as
+  `check_for_existing_running_flow`, and the `global_*` properties are removed. Use the matching
+  `_in(workflow)` method. `WorkflowManager.run_workflow` now requires a `workflow` argument.
+- **Breaking:** A request that names no flow now acts on the workflow's top-level flow, because
+  requests can no longer make a flow or node current. `set_as_new_context` is ignored, and
+  `ContextManager`'s push and pop methods are removed in favor of its `flow()` and `node()` blocks.
+  See [MIGRATION.md](MIGRATION.md#flow-and-node-context-belongs-to-the-caller).
+- **Breaking:** Requests that work without a workflow, such as resolving a path, now act on no
+  workflow when they name none, instead of the only open one. `EnsureWorkflowAndFlowRequest` and
+  `RunWorkflowWithCurrentStateRequest` naming no workflow now open a new one. Node code sending one
+  from its own thread should use `self.workflow.handle_request(...)`.
+  [#6381](https://github.com/griptape-ai/griptape-nodes-engine/issues/6381)
+- **Breaking:** Requests that act on a workflow, such as `CreateNodeRequest` or `ListRunsRequest`,
+  now fail with `WorkflowNotNamedResultFailure` when they name none, even while only one workflow is
+  open. Send `open_workflow_id` on the request, or the `X-Griptape-Workflow-Id` header from MCP
+  clients. Node code that sends requests from a thread it starts must use
+  `self.workflow.handle_request(...)`.
+  [#6381](https://github.com/griptape-ai/griptape-nodes-engine/issues/6381)
+- `make run` and `make run/refresh` now run your engine checkout with the app's nightly build
+  instead of the published app. Without access to the app's internal repository, use
+  `make run/published`.
+
+### Removed
+
+- **Breaking:** Manager methods such as `NodeManager.on_get_parameter_value_request(request)` no
+  longer act on the open workflow. Send the request with `GriptapeNodes.handle_request(...)`
+  instead. See
+  [MIGRATION.md](MIGRATION.md#managers-no-longer-have-ambient-workflow-request-methods).
+
+### Fixed
+
+- `EnsureWorkflowAndFlowRequest` no longer marks a workflow as changed when it already had a flow.
+- When another engine has no room for a library's worker, the library's next node now asks again
+  instead of failing with the same "no room" reason until the library is reloaded.
+- Library environments are now created from the Python that runs Griptape Nodes instead of a
+  Python that uv downloads from GitHub, so libraries load on networks that block GitHub
+  release downloads.
+- A node blocked by your license now lists each rule that blocks it on its placeholder and names its
+  real library instead of "Unknown".
+- A node whose text holds a `{...}` token, such as `{inputs}/cat.png` on **Load Image**, no longer
+  runs again, along with the nodes below it, on every play or Run when nothing changed. It now runs
+  again only when its text would read differently.
+  [#6249](https://github.com/griptape-ai/griptape-nodes-engine/issues/6249),
+  [#6050](https://github.com/griptape-ai/griptape-nodes-engine/issues/6050)
+- Previewing a video whose properties ffprobe reports in an unexpected form, such as a malformed
+  frame rate, no longer fails. Only the unreadable property is left empty, and a warning names it.
+- Running a Workflow node no longer logs strict-mode warnings that blame it for the
+  `GriptapeNodes.ContextManager()` calls in the workflow file it runs.
+  [#6303](https://github.com/griptape-ai/griptape-nodes-engine/issues/6303)
+
+## [0.111.1] - 2026-11-18
+
+### Fixed
+
+- A node in a library that runs in its own process now names itself when Griptape Cloud refuses its
+  `BudgetAccessRequest` and it raises the refusal: the run stops with "Budget stopped this run.
+  'Node' was blocked by ...", as for a node in the engine, instead of "The next call was blocked by".
+  [#5869](https://github.com/griptape-ai/griptape-nodes-engine/issues/5869)
+
 ## [0.111.0] - 2026-11-16
 
 ### Changed
@@ -1331,7 +1470,10 @@ the engine's request API from working without edits. Migration steps live in
   than a copy of it, and a value that refers to itself no longer fails the node with a
   `RecursionError`. Inline `{VAR}` substitution returns a value it did not rewrite unchanged.
 
-[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.111.0...HEAD
+[Unreleased]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.113.0...HEAD
+[0.113.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.112.0...v0.113.0
+[0.112.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.111.1...v0.112.0
+[0.111.1]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.111.0...v0.111.1
 [0.111.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.110.0...v0.111.0
 [0.110.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.109.0...v0.110.0
 [0.109.0]: https://github.com/griptape-ai/griptape-nodes-engine/compare/v0.108.0...v0.109.0

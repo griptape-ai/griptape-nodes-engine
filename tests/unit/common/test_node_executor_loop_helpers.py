@@ -10,7 +10,7 @@ These tests cover small, near-pure helpers that decide loop control flow:
   read and clear the body exit that handed control to the packaged End node.
 * ``_check_control_source_fired`` - decide whether a (source_node, source_param)
   pair is the exit that handed control to the packaged End node.
-* ``_format_loop_failure_message`` / ``_format_iteration_failure_lines`` - compose
+* ``render_loop_message`` / ``format_iteration_failure_lines`` - compose
   the artist-facing error naming which iterations failed and why.
 * ``_silence_packaged_node_creation_broadcasts`` - keep a packaged loop body's node
   creations from reaching editors.
@@ -18,30 +18,65 @@ These tests cover small, near-pure helpers that decide loop control flow:
   from the loop's start node into the end node's ``new_item_to_add``.
 * ``_extract_iteration_results_from_subprocess`` - a failed isolated or publisher iteration
   keeps its place in the results as None.
+* ``_run_iteration_tasks_until_early_termination`` and the loop drivers - a workflow nested too deeply
+  stops the loop it happens in, and each iteration flow is recorded as owned by the flow that holds
+  its loop.
 """
 
+import asyncio
 import logging
 from typing import Any, cast
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-from griptape_nodes.common.node_executor import IterationControlAction, IterationFailure, NodeExecutor
-from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
+from griptape_nodes.common import failure_trees
+from griptape_nodes.common.failure_trees import IterationFailure, IterationOutcome
+from griptape_nodes.common.loop_body_scope import LoopBodyScope
+from griptape_nodes.common.node_executor import IterationControlAction, NodeExecutor
+from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
+from griptape_nodes.exe_types.node_groups.base_while_node_group import BaseWhileNodeGroup
+from griptape_nodes.exe_types.node_types import LOCAL_EXECUTION
+from griptape_nodes.exe_types.param_components.progress_bar_component import ProgressBarComponent
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.base_events import ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.execution_events import (
+    StartLocalSubflowResultFailure,
+    StartLocalSubflowResultSuccess,
+)
+from griptape_nodes.retained_mode.events.failure_tree import (
+    FailureKind,
+    FailureLeaf,
+    FailureTreeError,
+    IterationRange,
+    LoopFailure,
+    WorkflowNodeFailure,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
+    DeserializeFlowFromCommandsResultSuccess,
     OriginalNodeParameter,
     PackagedNodeParameterMapping,
+    PackageNodesAsSerializedFlowResultSuccess,
     PassthroughConnection,
+    SerializedFlowCommands,
 )
+from griptape_nodes.retained_mode.events.node_error_details import NodeErrorDetails
 from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     ListConnectionsForNodeResultSuccess,
     NodeDependencies,
     SerializedNodeCommands,
 )
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+from griptape_nodes.retained_mode.runtime.context import WorkflowContextStack
+from griptape_nodes.retained_mode.runtime.nodes import WorkflowNodes
 from griptape_nodes.retained_mode.runtime.workflow_runtime import WorkflowRuntime
+
+WHILE_TOTAL_ITERATIONS = 5
 
 
 def _workflow_of(executor: NodeExecutor) -> WorkflowRuntime:
@@ -432,28 +467,28 @@ class TestFormatIterationFailureLines:
     """Renders one indented line per distinct reason, collapsing iterations that agree."""
 
     def test_returns_no_lines_for_no_failures(self) -> None:
-        assert NodeExecutor._format_iteration_failure_lines([]) == []
+        assert failure_trees.format_iteration_failure_lines([]) == []
 
     def test_renders_one_based_iteration_number(self) -> None:
         """Iteration 0 internally is iteration 1 to the artist who built the loop."""
-        lines = NodeExecutor._format_iteration_failure_lines([IterationFailure(iteration_index=0, detail="boom")])
+        lines = failure_trees.format_iteration_failure_lines([IterationFailure(iteration_index=0, detail="boom")])
         assert lines == ["  Iteration 1: boom"]
 
     def test_collapses_iterations_sharing_a_detail(self) -> None:
         """The common case is every iteration failing identically; say the reason once."""
         failures = [IterationFailure(iteration_index=index, detail="same reason") for index in range(3)]
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 1-3: same reason"]
 
     def test_names_a_wholly_failed_loop_as_such(self) -> None:
         """When nothing survived, saying so beats naming every iteration."""
         failures = [IterationFailure(iteration_index=index, detail="same reason") for index in range(50)]
-        lines = NodeExecutor._format_iteration_failure_lines(failures, total_iterations=50)
+        lines = failure_trees.format_iteration_failure_lines(failures, total_iterations=50)
         assert lines == ["  Every iteration: same reason"]
 
     def test_names_the_iteration_when_the_loop_had_only_one(self) -> None:
         """A one-item loop satisfies both "every iteration" and "one iteration"; the number wins."""
-        lines = NodeExecutor._format_iteration_failure_lines(
+        lines = failure_trees.format_iteration_failure_lines(
             [IterationFailure(iteration_index=0, detail="boom")], total_iterations=1
         )
         assert lines == ["  Iteration 1: boom"]
@@ -468,30 +503,30 @@ class TestFormatIterationFailureLines:
         failures = [IterationFailure(iteration_index=index, detail="boom") for index in range(iteration_count)]
         # No total_iterations, so the "every iteration" shortcut cannot apply and the run must
         # still be summarised rather than enumerated.
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 1-500: boom"]
 
     def test_truncates_a_scattered_iteration_list(self) -> None:
         """A non-contiguous set has no range to collapse to, so the enumeration itself is capped."""
         scattered = [1, 3, 5, 7, 9, 11, 13, 15, 17]
         failures = [IterationFailure(iteration_index=index, detail="boom") for index in scattered]
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 2, 4, 6, 8, 10, 12 (+3 more): boom"]
 
     def test_names_a_two_iteration_gap_without_a_range(self) -> None:
         failures = [IterationFailure(iteration_index=index, detail="boom") for index in (0, 4)]
-        lines = NodeExecutor._format_iteration_failure_lines(failures)
+        lines = failure_trees.format_iteration_failure_lines(failures)
         assert lines == ["  Iterations 1, 5: boom"]
 
     def test_keeps_distinct_details_on_separate_lines(self) -> None:
-        lines = NodeExecutor._format_iteration_failure_lines(_make_iteration_failures(["first", "second"]))
+        lines = failure_trees.format_iteration_failure_lines(_make_iteration_failures(["first", "second"]))
         assert lines == ["  Iteration 1: first", "  Iteration 2: second"]
 
     def test_caps_lines_and_reports_the_remainder(self) -> None:
         reason_count = 8
         max_lines = 3
         failures = _make_iteration_failures([f"reason {index}" for index in range(reason_count)])
-        lines = NodeExecutor._format_iteration_failure_lines(failures, max_lines=max_lines)
+        lines = failure_trees.format_iteration_failure_lines(failures, max_lines=max_lines)
         assert len(lines) == max_lines + 1  # the capped reasons, plus the tail line
         assert f"... and {reason_count - max_lines} more reason(s)" in lines[-1]
         assert "engine log" in lines[-1]
@@ -509,61 +544,53 @@ class TestFormatIterationFailureLines:
             IterationFailure(iteration_index=max_lines + index, detail="the reason that got cut") for index in range(95)
         ]
 
-        lines = NodeExecutor._format_iteration_failure_lines(failures, total_iterations=100, max_lines=max_lines)
+        lines = failure_trees.format_iteration_failure_lines(failures, total_iterations=100, max_lines=max_lines)
 
         assert len(lines) == max_lines + 1
         assert "1 more reason(s) affecting 95 iteration(s)" in lines[-1]
 
     def test_does_not_add_a_tail_line_when_everything_fits(self) -> None:
         failures = _make_iteration_failures(["a", "b", "c"])
-        lines = NodeExecutor._format_iteration_failure_lines(failures, max_lines=len(failures) + 2)
+        lines = failure_trees.format_iteration_failure_lines(failures, max_lines=len(failures) + 2)
         assert len(lines) == len(failures)
         assert not any("more reason" in line for line in lines)
 
     def test_preserves_multiline_detail_text(self) -> None:
         """ResultDetails.__str__ joins several messages with newlines; keep them verbatim."""
         detail = "Attempted to run node 'Blur'.\nFailed because the input image was empty."
-        lines = NodeExecutor._format_iteration_failure_lines([IterationFailure(iteration_index=4, detail=detail)])
+        lines = failure_trees.format_iteration_failure_lines([IterationFailure(iteration_index=4, detail=detail)])
         assert lines == [f"  Iteration 5: {detail}"]
 
 
-class TestFormatLoopFailureMessage:
+def _loop_message(loop_name: str, total_iterations: int, iteration_failures: list[IterationFailure]) -> str:
+    """The message a loop raises when it lost the given iterations."""
+    loop_failure = failure_trees.loop_failure_from_iterations(loop_name, total_iterations, iteration_failures)
+    return failure_trees.render_loop_message(loop_failure)
+
+
+class TestRenderLoopMessage:
     """Leads with what was attempted and how much was lost, then names the reasons."""
 
     def test_includes_loop_name_and_counts(self) -> None:
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=4,
-            iteration_failures=_make_iteration_failures(["first", "second"]),
-        )
+        msg = _loop_message("Trim Frames End", 4, _make_iteration_failures(["first", "second"]))
         assert "'Trim Frames End'" in msg
         assert "all 4 iterations" in msg
         assert "2 of them did not finish" in msg
 
     def test_follows_the_attempted_failed_because_form(self) -> None:
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=1,
-            iteration_failures=_make_iteration_failures(["boom"]),
-        )
+        msg = _loop_message("Trim Frames End", 1, _make_iteration_failures(["boom"]))
         assert msg.startswith("Attempted to run all")
         assert ". Failed because " in msg
 
     def test_appends_one_detail_line_per_reason(self) -> None:
         failures = _make_iteration_failures(["first", "second"])
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=len(failures),
-            iteration_failures=failures,
-        )
+        msg = _loop_message("Trim Frames End", len(failures), failures)
         # One newline joining the summary to the detail block, then one per extra reason.
         assert msg.count("\n") == len(failures)
 
     def test_returns_summary_only_when_failures_empty(self) -> None:
         """Guards the branch even though production only calls this with failures."""
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End", total_iterations=3, iteration_failures=[]
-        )
+        msg = _loop_message("Trim Frames End", 3, [])
         assert "\n" not in msg
 
     def test_message_survives_str_of_result_details(self) -> None:
@@ -572,11 +599,7 @@ class TestFormatLoopFailureMessage:
             ResultDetail(message="Attempted to run node 'Blur'.", level=logging.ERROR),
             ResultDetail(message="Failed because the input image was empty.", level=logging.ERROR),
         )
-        msg = NodeExecutor._format_loop_failure_message(
-            loop_name="Trim Frames End",
-            total_iterations=1,
-            iteration_failures=[IterationFailure(iteration_index=0, detail=str(details))],
-        )
+        msg = _loop_message("Trim Frames End", 1, [IterationFailure(iteration_index=0, detail=str(details))])
         assert "Attempted to run node 'Blur'." in msg
         assert "Failed because the input image was empty." in msg
 
@@ -782,3 +805,652 @@ class TestExtractIterationResultsFromSubprocess:
 
         assert successful == [0, 2]
         assert results == {1: None}
+
+
+def _leaf(node_name: str, message: str = "boom") -> FailureLeaf:
+    details = NodeErrorDetails(message=message, exception_type="builtins.ValueError")
+    return FailureLeaf(node_name=node_name, kind=FailureKind.RAISED, details=details)
+
+
+def _early(node_name: str = "Inner Workflow") -> FailureLeaf:
+    """The failure of a Workflow node whose workflow was refused for nesting too deeply."""
+    return FailureLeaf(
+        node_name=node_name, kind=FailureKind.RECURSION_LIMIT, details=NodeErrorDetails(message="too deep")
+    )
+
+
+class TestRunIterationTasksUntilEarlyTermination:
+    """Parallel iterations run to the end unless one ends the loop early, which cancels the rest."""
+
+    @pytest.mark.asyncio
+    async def test_every_iteration_finishes_when_none_ends_the_loop(self) -> None:
+        async def finish(index: int) -> IterationOutcome:
+            await asyncio.sleep(0)
+            return IterationOutcome(iteration_index=index, succeeded=True, detail="")
+
+        tasks = [asyncio.ensure_future(finish(index)) for index in range(3)]
+
+        results = await NodeExecutor(engine=Mock(spec=Engine))._run_iteration_tasks_until_early_termination(tasks)
+
+        assert [result.iteration_index for result in results if isinstance(result, IterationOutcome)] == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_does_not_stop_the_others(self) -> None:
+        async def fail() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x", failure_tree=_leaf("Body"))
+
+        async def finish_later() -> IterationOutcome:
+            await asyncio.sleep(0.01)
+            return IterationOutcome(iteration_index=1, succeeded=True, detail="")
+
+        tasks = [asyncio.ensure_future(fail()), asyncio.ensure_future(finish_later())]
+
+        results = await NodeExecutor(engine=Mock(spec=Engine))._run_iteration_tasks_until_early_termination(tasks)
+
+        assert isinstance(results[1], IterationOutcome)
+        assert results[1].succeeded
+
+    @pytest.mark.asyncio
+    async def test_an_early_termination_cancels_the_iterations_still_running(self) -> None:
+        async def terminated() -> IterationOutcome:
+            return IterationOutcome(iteration_index=0, succeeded=False, detail="x", failure_tree=_early())
+
+        async def run_forever() -> IterationOutcome:
+            await asyncio.sleep(3600)
+            return IterationOutcome(iteration_index=1, succeeded=True, detail="")
+
+        tasks = [asyncio.ensure_future(terminated()), asyncio.ensure_future(run_forever())]
+
+        results = await asyncio.wait_for(
+            NodeExecutor(engine=Mock(spec=Engine))._run_iteration_tasks_until_early_termination(tasks), timeout=5
+        )
+
+        assert isinstance(results[0], IterationOutcome)
+        assert results[0].failure_tree == _early()
+        assert isinstance(results[1], asyncio.CancelledError)
+        assert tasks[1].cancelled()
+
+
+class _StopAfterDeserializingError(RuntimeError):
+    """Raised by a test to end a run once the iteration flows have been created."""
+
+
+def _holding_workflow() -> Mock:
+    """A workflow whose loop nodes all sit in the flow `Holding_flow`."""
+    workflow = Mock(spec=WorkflowRuntime)
+    workflow.nodes = Mock(spec=WorkflowNodes)
+    workflow.nodes.parent_flow_name.return_value = "Holding_flow"
+    workflow.context = Mock(spec=WorkflowContextStack)
+    workflow.context.has_current_flow.return_value = False
+    workflow.ahandle_request = AsyncMock(spec=WorkflowRuntime.ahandle_request)
+    return workflow
+
+
+class LoopIterationFixtures:
+    """The collaborators every loop-iteration executor test mocks."""
+
+    @pytest.fixture
+    def workflow(self) -> Mock:
+        workflow = _holding_workflow()
+        workflow.handle_request.return_value = DeserializeFlowFromCommandsResultSuccess(
+            result_details="ok", flow_name="Iteration_flow", node_name_mappings={"Start": "Start_1"}
+        )
+        return workflow
+
+    @pytest.fixture
+    def engine(self) -> Mock:
+        engine = Mock(spec=Engine)
+        engine.node_manager = Mock(spec=NodeManager)
+        engine.flow_manager = Mock(spec=FlowManager)
+        engine.event_manager = Mock(spec=EventManager)
+        engine.config_manager = Mock(spec=ConfigManager)
+        return engine
+
+    @pytest.fixture
+    def executor(self, engine: Mock, monkeypatch: pytest.MonkeyPatch) -> NodeExecutor:
+        executor = NodeExecutor(engine=engine)
+        monkeypatch.setattr(
+            executor,
+            "_loop_body_scope",
+            Mock(
+                spec=executor._loop_body_scope,
+                return_value=LoopBodyScope(
+                    canvas_node_names={"Body_1": "Body"}, engine_node_names=frozenset({"Start_1"})
+                ),
+            ),
+        )
+        mapping = PackagedNodeParameterMapping(node_name="Start", parameter_mappings={})
+        monkeypatch.setattr(
+            executor,
+            "get_node_parameter_mappings",
+            Mock(spec=executor.get_node_parameter_mappings, return_value=mapping),
+        )
+        monkeypatch.setattr(
+            executor,
+            "_forget_control_source_that_reached_end",
+            Mock(spec=executor._forget_control_source_that_reached_end),
+        )
+        monkeypatch.setattr(
+            executor,
+            "_get_iteration_control_action",
+            Mock(spec=executor._get_iteration_control_action, return_value=IterationControlAction.ADD),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_parameter_values_from_iterations",
+            Mock(spec=executor.get_parameter_values_from_iterations, return_value={}),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_last_iteration_values_for_packaged_nodes",
+            Mock(spec=executor.get_last_iteration_values_for_packaged_nodes, return_value={}),
+        )
+        monkeypatch.setattr(executor, "_delete_iteration_flows", AsyncMock(spec=executor._delete_iteration_flows))
+        monkeypatch.setattr(
+            NodeExecutor,
+            "_silence_packaged_node_creation_broadcasts",
+            Mock(spec=NodeExecutor._silence_packaged_node_creation_broadcasts),
+        )
+        return executor
+
+    @pytest.fixture
+    def package_result(self) -> Mock:
+        package_result = Mock(spec=PackageNodesAsSerializedFlowResultSuccess)
+        package_result.serialized_flow_commands = Mock(spec=SerializedFlowCommands)
+        return package_result
+
+
+class TestIterationFlowOwner(LoopIterationFixtures):
+    """Each iteration flow is recorded as owned by the flow that holds the loop, at every site that makes one."""
+
+    PARALLEL_ITERATIONS = 2
+
+    @pytest.fixture(autouse=True)
+    def unlimited_parallelism(self, engine: Mock) -> None:
+        engine.config_manager.get_config_value.return_value = 0
+
+    def test_while_group_flow_is_owned_by_the_flow_holding_the_group(
+        self, executor: NodeExecutor, engine: Mock, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.handle_request.return_value = DeserializeFlowFromCommandsResultSuccess(
+            result_details="ok", flow_name="While_subflow_1", node_name_mappings={"Start": "Start_1"}
+        )
+
+        executor._deserialize_while_flow(workflow, package_result, "Start", "While")
+
+        workflow.nodes.parent_flow_name.assert_called_once_with("While")
+        engine.flow_manager.record_iteration_flow_owner.assert_called_once_with(
+            workflow, "While_subflow_1", "Holding_flow"
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_iteration_flows_are_owned_by_the_flow_holding_the_loop(
+        self,
+        executor: NodeExecutor,
+        engine: Mock,
+        workflow: Mock,
+        package_result: Mock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            executor,
+            "get_node_parameter_mappings",
+            Mock(spec=NodeExecutor.get_node_parameter_mappings, side_effect=_StopAfterDeserializingError),
+        )
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+
+        with pytest.raises(_StopAfterDeserializingError):
+            await executor._execute_loop_iterations_locally(
+                package_result=package_result,
+                total_iterations=self.PARALLEL_ITERATIONS,
+                parameter_values_per_iteration={},
+                end_loop_node=end_node,
+            )
+
+        workflow.nodes.parent_flow_name.assert_called_with("Loop")
+        engine.flow_manager.record_iteration_flow_owner.assert_called_with(workflow, "Iteration_flow", "Holding_flow")
+        assert engine.flow_manager.record_iteration_flow_owner.call_count == self.PARALLEL_ITERATIONS
+
+
+class TestExecuteLoopIterationsSequentially(LoopIterationFixtures):
+    """A sequential loop reuses one iteration flow, names failures as the artist sees them, and stops once one ends it early."""
+
+    SEQUENTIAL_ITERATIONS = 3
+
+    async def _run(self, executor: NodeExecutor, workflow: Mock, package_result: Mock) -> Any:
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+        return await executor._execute_loop_iterations_sequentially(
+            package_result=package_result,
+            total_iterations=self.SEQUENTIAL_ITERATIONS,
+            parameter_values_per_iteration={index: {} for index in range(self.SEQUENTIAL_ITERATIONS)},
+            end_loop_node=end_node,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failing_iteration_names_the_original_node_not_its_own_iteration_copy(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        copy_failure = _leaf("Body_1")
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(copy_failure)
+
+        _results, _successful, _last, _skipped, _broke, failures = await self._run(executor, workflow, package_result)
+
+        assert len(failures) == self.SEQUENTIAL_ITERATIONS
+        for failure in failures:
+            assert failure.failure_tree == _leaf("Body")
+
+    @pytest.mark.asyncio
+    async def test_a_failing_workflow_node_is_described_by_its_nested_message_and_named_as_the_artist_sees_it(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow_node_failure = WorkflowNodeFailure(node_name="Body_1", inner=_leaf("Deeper", "boom"))
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(workflow_node_failure)
+
+        _results, _successful, _last, _skipped, _broke, failures = await self._run(executor, workflow, package_result)
+
+        assert {failure.detail for failure in failures} == {
+            "Attempted to run the workflow behind node 'Body'. Failed because node 'Deeper' inside it failed: boom"
+        }
+        for failure in failures:
+            assert failure.failure_tree == WorkflowNodeFailure(node_name="Body", inner=_leaf("Deeper", "boom"))
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_is_recorded_and_the_loop_carries_on(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_leaf("Body_1"))
+
+        _results, successful_iterations, _last, _skipped, _broke, failures = await self._run(
+            executor, workflow, package_result
+        )
+
+        assert workflow.ahandle_request.await_count == self.SEQUENTIAL_ITERATIONS
+        assert successful_iterations == []
+        assert [failure.iteration_index for failure in failures] == [0, 1, 2]
+
+    @pytest.mark.asyncio
+    async def test_the_reused_flow_is_owned_by_the_flow_holding_the_loop(
+        self, executor: NodeExecutor, engine: Mock, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultSuccess(result_details="ok")
+
+        _results, successful_iterations, _last, _skipped, _broke, failures = await self._run(
+            executor, workflow, package_result
+        )
+
+        engine.flow_manager.record_iteration_flow_owner.assert_called_once_with(
+            workflow, "Iteration_flow", "Holding_flow"
+        )
+        assert successful_iterations == [0, 1, 2]
+        assert failures == []
+
+    @pytest.mark.asyncio
+    async def test_an_early_termination_stops_the_loop_and_is_logged(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_early("Body_1"))
+
+        with caplog.at_level(logging.WARNING):
+            _results, successful_iterations, _last, _skipped, _broke, failures = await self._run(
+                executor, workflow, package_result
+            )
+
+        assert workflow.ahandle_request.await_count == 1
+        assert successful_iterations == []
+        assert [failure.iteration_index for failure in failures] == [0]
+        assert failures[0].failure_tree == _early("Body")
+        assert "Stopping loop ending at 'Loop' after iteration 0" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_an_early_termination_after_an_ordinary_failure_stops_the_loop_there(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.side_effect = [
+            StartLocalSubflowResultFailure(result_details="failed").attach_failure_tree(_leaf("Body_1")),
+            StartLocalSubflowResultFailure(result_details="failed").attach_failure_tree(_early("Body_1")),
+            StartLocalSubflowResultSuccess(result_details="ok"),
+        ]
+
+        _results, _successful, _last, _skipped, _broke, failures = await self._run(executor, workflow, package_result)
+
+        assert workflow.ahandle_request.await_count == 2  # noqa: PLR2004
+        assert [failure.iteration_index for failure in failures] == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_an_early_termination_inside_a_workflow_node_stops_the_loop(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(WorkflowNodeFailure(node_name="Body_1", inner=_early("Deeper")))
+
+        _results, _successful, _last, _skipped, _broke, failures = await self._run(executor, workflow, package_result)
+
+        assert workflow.ahandle_request.await_count == 1
+        assert [failure.iteration_index for failure in failures] == [0]
+
+
+class TestExecuteLoopIterationsLocally(LoopIterationFixtures):
+    """A parallel loop names the failures its iterations report, and raises when one ended the loop early."""
+
+    PARALLEL_ITERATIONS = 2
+
+    async def _run(self, executor: NodeExecutor, workflow: Mock, package_result: Mock) -> Any:
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+        return await executor._execute_loop_iterations_locally(
+            package_result=package_result,
+            total_iterations=self.PARALLEL_ITERATIONS,
+            parameter_values_per_iteration={index: {} for index in range(self.PARALLEL_ITERATIONS)},
+            end_loop_node=end_node,
+        )
+
+    @pytest.fixture
+    def failure_lines(self, monkeypatch: pytest.MonkeyPatch) -> Mock:
+        lines = Mock(spec=failure_trees.format_iteration_failure_lines, return_value=[])
+        monkeypatch.setattr(failure_trees, "format_iteration_failure_lines", lines)
+        return lines
+
+    @pytest.fixture(autouse=True)
+    def unlimited_parallelism(self, engine: Mock) -> None:
+        engine.config_manager.get_config_value.return_value = 0
+
+    @pytest.mark.asyncio
+    async def test_a_failing_iteration_names_the_original_node_not_its_own_iteration_copy(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock, failure_lines: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_leaf("Body_1"))
+        end_node = Mock(spec=BaseIterativeNodeGroup)
+        end_node.name = "Loop"
+        end_node._require_workflow.return_value = workflow
+
+        await executor._execute_loop_iterations_locally(
+            package_result=package_result,
+            total_iterations=self.PARALLEL_ITERATIONS,
+            parameter_values_per_iteration={index: {} for index in range(self.PARALLEL_ITERATIONS)},
+            end_loop_node=end_node,
+        )
+
+        iteration_failures = failure_lines.call_args.args[0]
+        assert [failure.failure_tree for failure in iteration_failures] == [_leaf("Body")] * self.PARALLEL_ITERATIONS
+
+    @pytest.mark.asyncio
+    async def test_an_iteration_that_ended_the_loop_early_raises_a_loop_failure_holding_it(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_early("Body_1"))
+
+        with pytest.raises(FailureTreeError, match="Attempted to run all 2 iterations of loop 'Loop'") as raised:
+            await self._run(executor, workflow, package_result)
+
+        loop = raised.value.failure_tree
+        assert isinstance(loop, LoopFailure)
+        assert loop.node_name == "Loop"
+        assert loop.reasons == ()
+        assert loop.early_termination is not None
+        assert loop.early_termination.failure_tree == _early("Body")
+        assert loop.cancelled is None
+        assert loop.iterations_run is None
+        assert "not run" not in str(raised.value)
+        cast("AsyncMock", executor._delete_iteration_flows).assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_the_raised_text_is_the_loops_message_for_the_iterations(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_early("Body_1"))
+
+        with pytest.raises(FailureTreeError) as raised:
+            await self._run(executor, workflow, package_result)
+
+        assert str(raised.value) == (
+            "Attempted to run all 2 iterations of loop 'Loop'. Failed because 2 of them did not finish.\n"
+            "  Every iteration: failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_siblings_cancelled_by_an_early_termination_are_cancelled_leaves_in_their_own_field(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        async def terminate_first_and_hang_second(_request: object) -> StartLocalSubflowResultFailure:
+            if workflow.ahandle_request.await_count == 1:
+                return StartLocalSubflowResultFailure(result_details="failed").attach_failure_tree(_early("Body_1"))
+            await asyncio.sleep(3600)
+            msg = "unreachable"
+            raise AssertionError(msg)
+
+        workflow.ahandle_request.side_effect = terminate_first_and_hang_second
+
+        with pytest.raises(FailureTreeError, match="Attempted to run all 2 iterations of loop 'Loop'") as raised:
+            await self._run(executor, workflow, package_result)
+
+        loop = raised.value.failure_tree
+        assert isinstance(loop, LoopFailure)
+        assert loop.reasons == ()
+        assert loop.early_termination is not None
+        assert loop.early_termination.iterations == (IterationRange(first=1, last=1),)
+        assert loop.cancelled is not None
+        assert loop.cancelled.iterations == (IterationRange(first=2, last=2),)
+        assert isinstance(loop.cancelled.failure_tree, FailureLeaf)
+        assert loop.cancelled.failure_tree.kind is FailureKind.CANCELLED
+        assert str(raised.value) == (
+            "Attempted to run all 2 iterations of loop 'Loop'. Failed because 2 of them did not finish.\n"
+            "  Iteration 1: failed\n"
+            "  Iteration 2: Stopped because another iteration ran a workflow nested deeper than "
+            "`max_workflow_recursion_depth` allows."
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_still_returns_partial_results(
+        self, executor: NodeExecutor, workflow: Mock, package_result: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_leaf("Body_1"))
+
+        _results, successful_iterations, _last = await self._run(executor, workflow, package_result)
+
+        assert successful_iterations == []
+        cast("AsyncMock", executor._delete_iteration_flows).assert_awaited_once()
+
+
+class TestHandleSequentialIterativeGroupExecutionEarlyTermination:
+    """A sequential group stopped early says how many iterations were never run."""
+
+    @pytest.mark.asyncio
+    async def test_the_error_reports_the_iterations_that_were_not_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        executor = NodeExecutor(engine=Mock(spec=Engine))
+        monkeypatch.setattr(
+            executor,
+            "_package_subflow_group_body",
+            AsyncMock(
+                spec=executor._package_subflow_group_body,
+                return_value=Mock(spec=PackageNodesAsSerializedFlowResultSuccess),
+            ),
+        )
+        monkeypatch.setattr(
+            executor,
+            "_get_merged_parameter_values_for_iterative_group",
+            Mock(spec=executor._get_merged_parameter_values_for_iterative_group, return_value={}),
+        )
+        terminated = IterationFailure(iteration_index=0, detail="too deep", failure_tree=_early())
+        monkeypatch.setattr(
+            executor,
+            "_execute_loop_iterations_sequentially",
+            AsyncMock(
+                spec=executor._execute_loop_iterations_sequentially,
+                return_value=({}, [], {}, 0, False, [terminated]),
+            ),
+        )
+        group = Mock(spec=BaseIterativeNodeGroup)
+        group.name = "Group"
+        group._get_total_iterations.return_value = 3
+
+        with pytest.raises(FailureTreeError, match="The remaining 2 iterations were not run") as raised:
+            await executor._handle_sequential_iterative_group_execution(group, LOCAL_EXECUTION)
+
+        assert isinstance(raised.value.failure_tree, LoopFailure)
+        assert raised.value.failure_tree.iterations_run == 1
+        assert str(raised.value) == (
+            "Attempted to run all 3 iterations of loop 'Group'. Failed because 1 of them did not finish. "
+            "The remaining 2 iterations were not run.\n"
+            "  Iteration 1: too deep"
+        )
+
+
+class TestHandleSequentialLoopExecutionEarlyTermination:
+    """A sequential loop stopped early says how many iterations were never run."""
+
+    @pytest.mark.asyncio
+    async def test_the_error_reports_the_iterations_that_were_not_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        executor = NodeExecutor(engine=Mock(spec=Engine))
+        package_result = Mock(spec=PackageNodesAsSerializedFlowResultSuccess)
+        package_result.packaged_node_names = []
+        monkeypatch.setattr(
+            executor,
+            "_package_loop_body",
+            AsyncMock(spec=executor._package_loop_body, return_value=(package_result, LOCAL_EXECUTION)),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_parameter_values_per_iteration",
+            Mock(spec=executor.get_parameter_values_per_iteration, return_value={}),
+        )
+        monkeypatch.setattr(
+            executor,
+            "get_resolved_upstream_values",
+            Mock(spec=executor.get_resolved_upstream_values, return_value={}),
+        )
+        terminated = IterationFailure(iteration_index=0, detail="too deep", failure_tree=_early())
+        monkeypatch.setattr(
+            executor,
+            "_execute_loop_iterations_sequentially",
+            AsyncMock(
+                spec=executor._execute_loop_iterations_sequentially,
+                return_value=({}, [], {}, 0, False, [terminated]),
+            ),
+        )
+        start_node = Mock(spec=BaseIterativeStartNode)
+        start_node.name = "Start"
+        start_node._get_total_iterations.return_value = 3
+        start_node._progress_bar = Mock(spec=ProgressBarComponent)
+        end_node = Mock(spec=BaseIterativeEndNode)
+        end_node.name = "End"
+
+        with pytest.raises(FailureTreeError, match="The remaining 2 iterations were not run") as raised:
+            await executor._handle_sequential_loop_execution(start_node, end_node)
+
+        assert isinstance(raised.value.failure_tree, LoopFailure)
+        assert raised.value.failure_tree.iterations_run == 1
+
+
+class TestRunWhileLoopIterations:
+    """A while group keeps retrying a failed iteration, except one that ended it early."""
+
+    @pytest.fixture
+    def executor(self, monkeypatch: pytest.MonkeyPatch) -> NodeExecutor:
+        executor = NodeExecutor(engine=Mock(spec=Engine))
+        monkeypatch.setattr(
+            executor, "_set_while_iteration_parameters", AsyncMock(spec=executor._set_while_iteration_parameters)
+        )
+        return executor
+
+    @pytest.fixture
+    def workflow(self) -> Mock:
+        return _holding_workflow()
+
+    async def _run(self, executor: NodeExecutor, workflow: Mock) -> bool:
+        node = Mock(spec=BaseWhileNodeGroup)
+        node.name = "While"
+        node._require_workflow.return_value = workflow
+        return await executor._run_while_loop_iterations(
+            node=node,
+            flow_name="flow",
+            node_name_mappings={},
+            end_node_mapping=_make_end_node_mapping(),
+            packaged_start_node_name="Start_1",
+            resolved_upstream_values={},
+            iteration_startflow_params=[],
+            reverse_node_mapping={"Inner Workflow_1": "Inner Workflow"},
+            loop_body_scope=LoopBodyScope(
+                canvas_node_names={"Inner Workflow_1": "Inner Workflow"}, engine_node_names=frozenset()
+            ),
+            event_manager=Mock(spec=EventManager),
+            max_iterations=WHILE_TOTAL_ITERATIONS - 1,
+            total_iterations=WHILE_TOTAL_ITERATIONS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_early_termination_ends_the_loop_with_a_loop_failure_holding_it(
+        self, executor: NodeExecutor, workflow: Mock
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_early("Inner Workflow_1"))
+
+        with pytest.raises(
+            FailureTreeError, match=r"Attempted to run iteration 1 of while group 'While'\. Failed because failed"
+        ) as raised:
+            await self._run(executor, workflow)
+
+        loop = raised.value.failure_tree
+        assert isinstance(loop, LoopFailure)
+        assert loop.node_name == "While"
+        assert loop.reasons == ()
+        assert loop.early_termination is not None
+        assert loop.early_termination.failure_tree == _early("Inner Workflow")
+        assert loop.iterations_run == 1
+        assert loop.total_iterations is None
+        assert loop.failed_iterations is None
+        assert workflow.ahandle_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_is_retried_until_iterations_run_out(
+        self, executor: NodeExecutor, workflow: Mock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(
+            result_details="failed"
+        ).attach_failure_tree(_leaf("Inner Workflow_1"))
+        monkeypatch.setattr(
+            executor,
+            "_evaluate_while_iteration_result",
+            Mock(spec=executor._evaluate_while_iteration_result, side_effect=[None, None, None, None, False]),
+        )
+
+        assert await self._run(executor, workflow) is False
+
+        assert workflow.ahandle_request.await_count == WHILE_TOTAL_ITERATIONS
+
+    @pytest.mark.asyncio
+    async def test_a_failure_that_names_no_node_is_retried(
+        self, executor: NodeExecutor, workflow: Mock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workflow.ahandle_request.return_value = StartLocalSubflowResultFailure(result_details="failed")
+        monkeypatch.setattr(
+            executor,
+            "_evaluate_while_iteration_result",
+            Mock(spec=executor._evaluate_while_iteration_result, side_effect=[None, False]),
+        )
+
+        assert await self._run(executor, workflow) is False
+
+        assert workflow.ahandle_request.await_count == 2  # noqa: PLR2004

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, NoReturn, TypeVar
+from typing import Any, NoReturn, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -132,12 +132,23 @@ class RequestPayload(Payload, ABC):
                 Framework fields (result_details, altered_workflow_state) are always
                 included regardless of what fields specifies. Filtering is skipped
                 entirely on failure results.
+        undo_group: Names the user action a request belongs to, making what it changes undoable.
+                Requests that share a group undo as one step, so a client starts a new group for
+                each user input, such as one drag. A request without one is not an undo step: what
+                it changes is taken back along with the undo step before it, and drops what could be
+                redone. A client reacting to an UndoRequest or RedoRequest, such as by writing back
+                what it measured, sends its requests without a group, and only when they change
+                something.
+        undo_label: Names the action in the undo history, such as "Move 3 nodes". The last label
+                sent in a group wins. Without one, the action is named after its first request.
     """
 
     broadcast_result: bool = True
     request_id: str | None = None
     failure_log_level: int | None = None
     fields: list[str] | None = None
+    undo_group: str | None = None
+    undo_label: str | None = None
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.
@@ -176,12 +187,32 @@ class WorkflowNotAlteredMixin:
     altered_workflow_state: bool = field(default=False, init=False)
 
 
+@dataclass
+class WorkflowAlteredReportedMixin:
+    """Mixin for a ResultPayload whose handler decides whether the workflow was altered.
+
+    The field has no default, so a handler that forgets to decide fails to build the result rather
+    than reporting no change, which would hide the change from whatever tracks edits, such as the
+    unsaved marker.
+    """
+
+    altered_workflow_state: bool = field(kw_only=True)
+
+
 class GraphAccessMixin:
     """Marks a request that reads or changes connections, flows, flow variables, or node group membership.
 
     A node must not send one while it is being created or having its saved state applied (strict-mode
     rule ``graph-access-while-loading``): the graph around a loading node is incomplete, so the answer
     would depend on how the node was loaded.
+    """
+
+
+class RunControlMixin:
+    """Marks a request that runs a workflow, stops a run, or resets what a run produced.
+
+    What it changes, and what the nodes it runs change, is the outcome of a run rather than an edit,
+    so it is never an undo step, nor part of the step that started it.
     """
 
 
@@ -218,20 +249,16 @@ class ResultPayloadSuccess(ResultPayload, ABC):
 class ForwardedException(Exception):  # noqa: N818
     """Placeholder for an exception that crossed the worker boundary.
 
-    The converter's Exception hook emits worker-side exceptions as a
-    ``{type, message, traceback}`` dict, then rebuilds them into a
-    ``ForwardedException`` on the receiving side. The placeholder is
-    still an ``Exception`` (so ``raise ... from result.exception``
-    chains) and carries the worker-side class name and formatted
-    traceback so the orchestrator can show both.
+    The converter's Exception hook emits worker-side exceptions as a ``{type, message, traceback}`` dict, then
+    rebuilds them into a ``ForwardedException`` on the receiving side. The placeholder is still an
+    ``Exception`` (so ``raise ... from result.exception`` chains) and carries the worker-side class name and
+    formatted traceback so the orchestrator can show both.
 
-    ``NodeExecutor._format_node_failure_message`` is the consumer:
-    it reads ``original_type`` for the ``[builtins.ValueError]``
-    prefix on the user-visible ``RuntimeError`` message, and
-    ``original_traceback`` for the ``Worker traceback:`` block.
-    Without these attributes the chained exception would print only
-    ``Type: message`` with no frames, because the placeholder is
-    constructed (not raised) and so its ``__traceback__`` is ``None``.
+    ``format_node_failure_message`` is the consumer: it reads ``original_type`` for the
+    ``[builtins.ValueError]`` prefix on the user-visible ``RuntimeError`` message, and ``original_traceback``
+    for the ``Worker traceback:`` block. Without these attributes the chained exception would print only
+    ``Type: message`` with no frames, because the placeholder is constructed (not raised) and so its
+    ``__traceback__`` is ``None``.
     """
 
     def __init__(
@@ -281,6 +308,19 @@ class ExecutionPayload(Payload):
 
 class AppPayload(Payload):
     pass
+
+
+@runtime_checkable
+class BelongsToBoundWorkflow(Protocol):
+    """An app payload that can belong to the workflow bound when it is queued, such as a node's log line.
+
+    `EventManager` names that workflow on the payload's `AppEvent` when `belongs_to_bound_workflow`
+    says so. Other app payloads belong to no workflow.
+    """
+
+    def belongs_to_bound_workflow(self) -> bool:
+        """Whether this payload belongs to the workflow bound when it is queued."""
+        ...
 
 
 # Type variables for our generic payloads
@@ -500,7 +540,10 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
 
 # Events sent as part of the lifecycle of the Griptape Nodes application.
 class AppEvent[A: AppPayload](BaseEvent):
+    """An event about the application. `open_workflow_id` names the open workflow it belongs to, or None."""
+
     payload: A
+    open_workflow_id: str | None = None
 
     def __init__(self, **data) -> None:
         """Initialize an AppEvent, inferring the generic type if needed."""

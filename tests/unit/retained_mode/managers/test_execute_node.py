@@ -230,6 +230,23 @@ class TestExecuteNodeOrchestratorPath:
         assert event_manager.in_node_execution() is False
 
     @pytest.mark.asyncio
+    async def test_its_result_carries_no_values_the_run_set(self) -> None:
+        """The executor copies the result onto this same node, which holds them already."""
+        mock_node = _make_mock_node()
+        mock_node.values_set_by_run = {"seed": 7}
+        workflow = _make_workflow(existing_node=mock_node)
+        node_manager = _make_node_manager(library_manager=_make_mock_library_manager(is_worker=False))
+
+        request = ExecuteNodeRequest(
+            node_name="test_node", node_metadata=cast("ExecutionNodeMetadata", {"node_type": "T"})
+        )
+        result = await node_manager.on_execute_node_request(request, workflow)
+
+        assert isinstance(result, ExecuteNodeResultSuccess)
+        assert result.parameter_values_set_by_run == {}
+        assert result.outputs_set_by_run == []
+
+    @pytest.mark.asyncio
     async def test_no_params(self) -> None:
         mock_node = _make_mock_node()
         workflow = _make_workflow(existing_node=mock_node)

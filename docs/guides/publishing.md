@@ -2,8 +2,8 @@
 
 Publishing turns a saved workflow into a self-contained bundle — the workflow
 plus the libraries, Python dependencies, configuration, and files it needs — and
-delivers it somewhere it can run: a folder on your disk, a Structure on Griptape
-Cloud, or a gizmo inside Foundry Nuke. The component that packages and delivers
+delivers it somewhere it can run: a folder on your disk or a gizmo inside Foundry
+Nuke. The component that packages and delivers
 the bundle is called a *publisher*, and each destination has its own.
 
 Every publisher follows the same lifecycle and discovers dependencies the same
@@ -16,18 +16,16 @@ video, or text file), skip ahead to
 
 Publishing is built into the engine, but publishers come from node libraries. Any
 library can register one, so the list you see depends on which libraries are
-installed. Griptape ships several:
+installed. Griptape ships these:
 
 | Publisher             | Provided by            | Where the workflow goes                                                                   |
 | --------------------- | ---------------------- | ----------------------------------------------------------------------------------------- |
 | **Publish To Folder** | Griptape Nodes Library | A self-contained folder on your disk that you can run headlessly.                         |
-| **Griptape Cloud**    | Griptape Cloud Library | A deployed Structure on Griptape Cloud that you can run and integrate remotely.           |
 | **Publish To Nuke**   | Foundry Nuke Library   | A versioned `.gizmo` installed into a Foundry Nuke installation, runnable from Nuke's UI. |
 
 When you publish, you pick which publisher to use. Each publisher decides what
 options it needs from you — Publish To Folder asks for an output directory;
-Griptape Cloud reads its target from your configured cloud bucket and the
-workflow's Griptape Cloud Start Flow node; Publish To Nuke asks which Nuke
+Publish To Nuke asks which Nuke
 installation and gizmo directory to install into, and whether to update an
 existing version or publish a new one.
 
@@ -67,13 +65,11 @@ flowchart TD
     E --> F[Bundles workflow + dependencies + config]
     F --> G{Destination}
     G -->|Publish To Folder| H[Self-contained folder on disk]
-    G -->|Griptape Cloud| I[Deployed Structure in the cloud]
     G -->|Publish To Nuke| J[Versioned gizmo in Nuke]
 ```
 
 As it works, the publisher reports progress with messages such as
-`Copying libraries...` or `Deploying workflow to Griptape Cloud...`, so you can
-watch the bundle come together.
+`Copying libraries...`, so you can watch the bundle come together.
 
 ## What ends up in the bundle
 
@@ -115,11 +111,6 @@ What differs is the *shape* of the delivered result:
 - **Publish To Folder** writes these into a folder on your disk, plus a `run.py`
     entrypoint and a `README.md`. The README documents installing dependencies
     (`uv sync`) and running the workflow (`uv run python run.py --help`).
-- **Griptape Cloud** zips these into a Structure package, uploads it, and creates
-    or updates a Structure in your account. It can also create a webhook
-    integration and generates a separate *executor* workflow you can use to invoke
-    the deployed Structure. On success it returns a link to the Structure in the
-    Griptape Cloud console.
 - **Publish To Nuke** installs these as a versioned `.gizmo` (plus a runner
     script) into the chosen Nuke installation's gizmo directory, and adds a
     Griptape submenu to Nuke's toolbar so you can run the workflow from inside
@@ -170,7 +161,7 @@ it guarantees the file travels with the published workflow.
     When the selected file lives inside your project, `SelectFromProject`
     resolves it to a project-relative [macro](projects/macros.md) path rather
     than an absolute path. That keeps the reference valid after the bundle is
-    moved to another machine or deployed to the cloud.
+    moved to another machine.
 
 !!! warning "Files outside your project folder don't travel"
 
@@ -209,18 +200,13 @@ any destination, and its nodes can declare exactly which files they need.
 via `LibraryManager.on_register_event_handler(...)`. The registration also names
 the library's own start/end flow node types (and, optionally, a
 `get_publish_options` callback that supplies the dialog fields). The handler
-becomes a selectable publisher in the publish dialog. Several reference
-implementations exist:
+becomes a selectable publisher in the publish dialog. Reference implementations
+include:
 
 - **Publish To Folder** — the
     [Griptape Nodes Library](https://github.com/griptape-ai/griptape-nodes-library-standard)
     (`griptape_nodes_library_advanced.py`), which supplies publish options for the
     output directory and packages to a local folder.
-- **Griptape Cloud** — the
-    [Griptape Cloud Library](https://github.com/griptape-ai/griptape-nodes-library-griptape-cloud)
-    (`griptape_cloud_library_advanced.py`), which registers its own
-    `GriptapeCloudStartFlow`/`GriptapeCloudEndFlow` node types and deploys to the
-    cloud rather than to disk.
 - **Publish To Nuke** — the
     [Foundry Nuke Library](https://github.com/griptape-ai/griptape-nodes-library-nuke)
     (`nuke_library_advanced.py`), which registers `NukeStartFlow`/`NukeEndFlow`

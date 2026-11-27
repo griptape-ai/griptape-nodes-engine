@@ -64,11 +64,24 @@ failure-routing idiom that matches their base class:
   - SuccessFailureNode / GriptapeProxyNode nodes call ``selection_denial()``
     and route the reason into ``self._set_status_results(was_successful=False,
     result_details=denial.reason())``.
+  - A caller that leads the reason with wording of its own, such as "is not
+    permitted", calls ``selection_denial_message()`` instead, which words the
+    sentence for the kind of denial.
 
 Both read the current selection off the parameter the component owns, so a node
 never restates its own parameter's name. ``query_for_denial(value)`` and
 ``raise_if_denied(value)`` remain for the rare caller holding a model id from
 somewhere other than the dropdown.
+
+A saved value outside ``model_choices`` that no ``deprecated_values`` key
+covers is replaced with ``choices[0]`` by default. A node whose list used to be
+open-ended (fetched from the provider, say) passes ``keep_unlisted_values=True``
+instead: the value is stored as saved, and the existing selection gate --
+``query_for_denial`` / ``raise_if_denied`` / ``selection_denial`` /
+``raise_if_selection_denied`` -- reports it, naming that model, so the run
+fails the same way a license denial does rather than quietly using another.
+The parameter's badge names it too, worded as an unlisted model rather than
+a license verdict.
 
 Nodes that reinstall the ``Options`` trait themselves (e.g. after a driver
 disconnect) call ``reinstall_options()`` to put the component's trait +
@@ -96,13 +109,16 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.exe_types.elements import parameter_messages
 from griptape_nodes.exe_types.param_components.model_policy import (
+    UNLISTED_DECORATION,
     ModelPolicySnapshot,
     apply_denial_badge,
     node_access_request,
     query_model_policy,
 )
 from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeResultSuccess
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -111,7 +127,6 @@ logger = logging.getLogger("griptape_nodes")
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
     from griptape_nodes.traits.button import ButtonDetailsMessagePayload
 
 _REFRESH_ICON = "list-restart"
@@ -156,7 +171,7 @@ class ModelAccessComponent:
     -- gate the node's execute path against the current policy.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         *,
         node: BaseNode,
@@ -164,6 +179,7 @@ class ModelAccessComponent:
         model_choices: list[str],
         default_model: str,
         deprecated_values: dict[str, str] | None = None,
+        keep_unlisted_values: bool = False,
     ) -> None:
         """Attach the component to an already-added Parameter and decorate it.
 
@@ -179,6 +195,14 @@ class ModelAccessComponent:
         parameter's current stored value is migrated the same way at
         construction, before the denied-default relocation described in the
         class docstring.
+
+        ``keep_unlisted_values`` stores a value outside both ``model_choices``
+        and ``deprecated_values`` as it is, rather than replacing it with
+        ``choices[0]``. That holds on every assignment, not only workflow load,
+        so a script or an upstream string is not rejected when it is set either.
+        The dropdown still offers only ``model_choices``. The parameter shows a
+        "Model Not Available" badge naming the value, and the existing selection
+        gate reports it itself -- see ``query_for_denial``.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -201,6 +225,11 @@ class ModelAccessComponent:
         self._model_choices = list(model_choices)
         self._default_model = default_model
         self._deprecated_values = dict(deprecated_values or {})
+        self._keep_unlisted_values = keep_unlisted_values
+        # The node's callout about a repaired dropdown. Named per parameter so a node with two
+        # model parameters can hold two components.
+        self._repair_message_name = f"{parameter.name}_model_list_updated"
+        self._repair_message_shown = False
 
         # Fail-fast preconditions -- see docstring.
         self._raise_if_misconfigured()
@@ -213,7 +242,7 @@ class ModelAccessComponent:
         # Install decoration + traits. Options accepts legacy values too, so an
         # assignment carrying one is never snapped to choices[0] before the
         # migration converter (added below) gets a chance to run.
-        parameter.add_trait(Options(choices=self._dropdown_choices()))
+        parameter.add_trait(self._build_options())
         parameter.add_trait(
             Button(
                 icon=_REFRESH_ICON,
@@ -224,7 +253,17 @@ class ModelAccessComponent:
             )
         )
         parameter.update_ui_options(self._build_ui_options())
-        parameter.add_converter(self._convert_legacy_value)
+        parameter.add_converter(self._convert_stored_value)
+        node.add_node_element(
+            parameter_messages.ParameterMessage(
+                name=self._repair_message_name,
+                variant="warning",
+                title="Model list updated",
+                value="",
+                markdown=True,
+                hide=True,
+            )
+        )
 
         # Migrate a legacy stored value to its canonical choice before
         # considering whether that choice is currently permitted.
@@ -285,10 +324,14 @@ class ModelAccessComponent:
         Nodes that remove and later re-add ``Options`` on the model parameter
         (e.g. after a driver connection is dropped) call this to put the
         component's state back. Idempotent: safe to call when ``Options`` is
-        already present -- ``add_trait`` will replace the existing instance.
+        already present -- the existing trait is removed first, because
+        ``add_trait`` appends rather than replaces and a second ``Options``
+        would leave two dropdowns' worth of converters and validators active.
         """
         parameter = self._parameter
-        parameter.add_trait(Options(choices=self._dropdown_choices()))
+        for existing in parameter.find_elements_by_type(Options):
+            parameter.remove_trait(existing)
+        parameter.add_trait(self._build_options())
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
@@ -303,6 +346,10 @@ class ModelAccessComponent:
         parameter = self._parameter
         if not isinstance(value, str):
             parameter.clear_badge()
+            return
+        unlisted_denial = self._unlisted_denial(value)
+        if unlisted_denial is not None:
+            apply_denial_badge(parameter, value, unlisted_denial, decoration=UNLISTED_DECORATION)
             return
         apply_denial_badge(parameter, value, self._cached_denial(value), decoration=self._snapshot.decoration)
 
@@ -349,6 +396,10 @@ class ModelAccessComponent:
 
         - Non-string values (driver objects, ``None``, anything else): return
           ``None``. Bypasses the gate entirely -- see paragraph above.
+        - A node built with ``keep_unlisted_values=True`` holding a value outside
+          ``model_choices``: return a denial naming that model. Checked before
+          every license question below, since a model this node does not offer
+          is not something license policy was ever asked about.
         - Initial snapshot resolution failed (see ``ModelPolicySnapshot``): return
           a **synthesized** denial saying the models could not be checked. This
           is the fail-closed contract -- a broken library registration must not
@@ -369,6 +420,9 @@ class ModelAccessComponent:
         # source of truth for the model in this state; bypass the gate.
         if not isinstance(value, str):
             return None
+        unlisted_denial = self._unlisted_denial(value)
+        if unlisted_denial is not None:
+            return unlisted_denial
         # Snapshot-level refusals first: an unresolvable node (a developer setup bug must not
         # silently open the gate) and a denial policy handed us that no row can carry. Both are
         # decisions about the whole parameter, so the live per-id re-query below cannot answer
@@ -408,10 +462,10 @@ class ModelAccessComponent:
         subclasses should call ``query_for_denial`` directly instead so they
         can route the failure into ``_set_status_results``.
         """
-        denial = self.query_for_denial(value)
-        if denial is None:
+        message = self._denial_message(value)
+        if message is None:
             return
-        msg = f"Cannot run {type(self._node).__name__}: '{value}' is not permitted. {denial.reason()}"
+        msg = f"Cannot run {type(self._node).__name__}: {message}"
         raise RuntimeError(msg)
 
     def selection_denial(self) -> CheckpointDenial | None:
@@ -423,6 +477,15 @@ class ModelAccessComponent:
         per node.
         """
         return self.query_for_denial(self.selected_value)
+
+    def selection_denial_message(self) -> str | None:
+        """The artist-facing sentence for the current selection's denial, or ``None`` if it is allowed.
+
+        Surface it as is rather than prefixing ``selection_denial().reason()`` with wording of your
+        own: only the component knows whether a denial is a license verdict or a model this node
+        does not offer, and the two must not read alike.
+        """
+        return self._denial_message(self.selected_value)
 
     def raise_if_selection_denied(self) -> None:
         """``raise_if_denied`` against the current selection. See ``selection_denial``."""
@@ -462,8 +525,8 @@ class ModelAccessComponent:
             return None
         return self._deprecated_values.get(value)
 
-    def _convert_legacy_value(self, value: Any) -> Any:
-        """Migrate a legacy stored value to its canonical choice; everything else passes through.
+    def _convert_stored_value(self, value: Any) -> Any:
+        """Repair a stale saved dropdown, then migrate a legacy stored value to its canonical choice.
 
         Installed as a directly-attached converter (``Parameter.add_converter``)
         rather than hooked into ``before_value_set`` / ``after_value_set``,
@@ -474,11 +537,98 @@ class ModelAccessComponent:
         ``before_value_set`` at all. A converter is the only hook a saved
         workflow's stored value is guaranteed to pass through, so it is the
         only place this migration can live.
+
+        The same property makes it the place to repair the dropdown itself. A
+        saved workflow replays the dropdown it was saved with
+        (``AlterParameterDetailsRequest``) after the node is built and before it
+        sets the stored value, so the value's assignment is the first moment the
+        node can see what the replay left behind.
         """
+        retired = self._repair_stale_dropdown()
+        selected = value
         migrated = self.migrate_value(value)
         if migrated is not None:
-            return migrated
+            value = migrated
+        if retired and isinstance(value, str):
+            # The trait converters that ran before this one belonged to the stale
+            # ``Options``, so a retired value with no migration passed them. Run the
+            # repaired trait's own, so it is handled like any other assignment outside
+            # the list: it lands on ``choices[0]``, or is kept with ``keep_unlisted_values``.
+            for options in self._parameter.find_elements_by_type(Options):
+                for converter in options.converters_for_trait():
+                    value = converter(value)
+        if retired:
+            self._show_repair_message(retired, selected=selected, current=value)
+        else:
+            self._hide_repair_message()
+        if isinstance(value, str) and self._unlisted_denial(value) is not None:
+            # Workflow load assigns with ``initial_setup=True``, which skips ``after_value_set``,
+            # so a kept unlisted value's badge has to be raised here.
+            self.on_value_changed(value)
         return value
+
+    def _repair_stale_dropdown(self) -> list[str]:
+        """Rebuild the ``Options`` trait and rows if a replayed workflow left retired models in them.
+
+        Returns the retired models the saved rows named, or an empty list when it left the dropdown
+        alone. A dropdown is stale when its saved rows name at least one
+        ``deprecated_values`` key (a key is accepted but never offered, so such a row can only
+        predate that model's retirement) and name nothing outside this node's own vocabulary of
+        current choices plus deprecated keys.
+
+        Deliberately not "the saved list differs from ``model_choices``". A node may repopulate
+        this parameter on purpose -- an Agent pointing the same dropdown at a third-party
+        provider's models, then assigning one of them -- and this runs on every assignment, so a
+        difference test would revert that on the spot. The vocabulary condition keeps a provider's
+        list safe even when it happens to include an id this node has retired, because the list
+        also names models this node has never offered.
+
+        A parameter with no ``Options`` trait is left alone. A node strips it
+        deliberately while a driver is connected and puts it back through
+        ``reinstall_options``.
+        """
+        parameter = self._parameter
+        if not parameter.find_elements_by_type(Options):
+            return []
+        row_names = self._row_names(parameter.ui_options.get("data"))
+        retired = [name for name in row_names if name in self._deprecated_values]
+        if not retired:
+            return []
+        vocabulary = {*self._model_choices, *self._deprecated_values}
+        if any(name not in vocabulary for name in row_names):
+            return []
+
+        self.reinstall_options()
+        logger.warning(
+            "Attempted to open the model list for parameter '%s' on node '%s'. The saved workflow listed %s, "
+            "which this node no longer offers, so the list was replaced with the current models. "
+            "Save the workflow to keep the update.",
+            parameter.name,
+            self._node.name,
+            ", ".join(repr(model) for model in dict.fromkeys(retired)),
+        )
+        return list(dict.fromkeys(retired))
+
+    def _show_repair_message(self, retired: list[str], *, selected: Any, current: Any) -> None:
+        """Tell the artist, on the node, that its model list was updated and the file needs saving."""
+        message = self._node.get_message_by_name_or_element_id(self._repair_message_name)
+        if message is None:
+            return
+        models = ", ".join(f"`{model}`" for model in retired)
+        text = f"These models are no longer available: {models}. This node's model list was updated."
+        if isinstance(selected, str) and isinstance(current, str) and selected != current:
+            text += f" The selected model changed from `{selected}` to `{current}`."
+        text += " Save the workflow to keep the update."
+        message.value = text
+        self._node.show_message_by_name(self._repair_message_name)
+        self._repair_message_shown = True
+
+    def _hide_repair_message(self) -> None:
+        """Hide the callout once the model is assigned again. Quiet when it is not showing."""
+        if not self._repair_message_shown:
+            return
+        self._node.hide_message_by_name(self._repair_message_name)
+        self._repair_message_shown = False
 
     def _raise_if_misconfigured(self) -> None:
         """Raise on any constructor misuse, before the component touches the parameter.
@@ -534,6 +684,10 @@ class ModelAccessComponent:
             )
             raise ValueError(msg)
 
+    def _build_options(self) -> Options:
+        """The ``Options`` trait the component installs, over ``_dropdown_choices``."""
+        return Options(choices=self._dropdown_choices(), keep_unlisted=self._keep_unlisted_values)
+
     def _dropdown_choices(self) -> list[str]:
         """The list handed to ``Options.choices``: current choices plus legacy keys.
 
@@ -544,6 +698,35 @@ class ModelAccessComponent:
         so they are accepted but never offered.
         """
         return [*self._model_choices, *self._deprecated_values]
+
+    def _denial_message(self, value: Any) -> str | None:
+        """``query_for_denial`` as one artist-facing sentence, worded for the kind of denial."""
+        denial = self.query_for_denial(value)
+        if denial is None:
+            return None
+        if isinstance(value, str) and self._unlisted_denial(value) is not None:
+            return denial.reason()
+        return f"Model '{value}' is not permitted. {denial.reason()}"
+
+    def _unlisted_denial(self, value: str) -> CheckpointDenial | None:
+        """The denial for ``value`` if it is a model this node does not offer, else ``None``.
+
+        Only reachable on a node built with ``keep_unlisted_values=True`` and
+        holding such a value; without that flag ``Options`` replaces the value
+        on assignment, so no stored selection can ever be unlisted.
+        """
+        if not self._keep_unlisted_values or value in self._model_choices:
+            return None
+        return CheckpointDenial(
+            failures=(
+                CheckpointFailure(
+                    detail=(
+                        f"Attempted to use model '{value}'. Failed because this node does not offer "
+                        "that model. Pick a model from the list."
+                    )
+                ),
+            )
+        )
 
     def _cached_denial(self, choice: str) -> CheckpointDenial | None:
         """The cached verdict for ``choice``, via the shared snapshot rules.
@@ -615,3 +798,10 @@ class ModelAccessComponent:
     ) -> None:
         """Handler for the inline refresh button. Delegates to ``refresh()``."""
         self.refresh()
+
+    @staticmethod
+    def _row_names(rows: Any) -> list[Any]:
+        """The ``name`` of each dropdown row in ``rows``, or an empty list if ``rows`` is not a list of rows."""
+        if not isinstance(rows, list):
+            return []
+        return [row.get("name") for row in rows if isinstance(row, dict)]

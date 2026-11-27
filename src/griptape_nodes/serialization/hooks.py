@@ -47,7 +47,7 @@ def _refuse_griptape_object(obj: SerializableMixin) -> Any:
 #   ``message``   -> ``ForwardedException.args[0]``            -> message body
 #   ``traceback`` -> ``ForwardedException.original_traceback`` -> ``Worker traceback:`` block
 # ``_structure_exception`` rebuilds the placeholder on the receiving side, and
-# ``NodeExecutor._format_node_failure_message`` renders the prefix and block
+# ``format_node_failure_message`` renders the prefix and block
 # into the user-visible ``RuntimeError`` message.
 def _unstructure_exception(obj: Exception) -> dict[str, Any]:
     if obj.__traceback__ is None:
@@ -139,12 +139,10 @@ def _structure_enum_union(value: Any, cls: Any) -> Enum | None:
 
 # Exception <- structured dict.
 #
-# Rebuilds a ``ForwardedException`` on the receiving side because the
-# worker-side class is rarely importable on the orchestrator. The
-# ``original_type`` and ``original_traceback`` fields are read by
-# ``NodeExecutor._format_node_failure_message`` to render the
-# ``[<type>] ... Worker traceback: ...`` block in the orchestrator's
-# user-visible ``RuntimeError`` message.
+# Rebuilds a ``ForwardedException`` on the receiving side because the worker-side class is rarely importable
+# on the orchestrator. The ``original_type`` and ``original_traceback`` fields are read by
+# ``format_node_failure_message`` to render the ``[<type>] ... Worker traceback: ...`` block in the
+# orchestrator's user-visible ``RuntimeError`` message.
 def _structure_exception(obj: Any, _cls: type) -> Exception:
     if not isinstance(obj, dict):
         return ForwardedException(str(obj))

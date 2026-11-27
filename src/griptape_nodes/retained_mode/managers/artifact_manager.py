@@ -107,6 +107,9 @@ from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_mo
     PreviewGeneratorSchema,
     ProviderSchema,
 )
+from griptape_nodes.retained_mode.managers.artifact_providers.image.preview_generators.thumbnail_generator import (
+    THUMBNAIL_BACKEND,
+)
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
 )
@@ -202,6 +205,7 @@ class ArtifactManager(EngineScoped):
         super().__init__(engine)
         # Provider registry for managing artifact providers
         self._registry = ProviderRegistry(engine=engine)
+        self._thumbnail_backend_logged = False
         # Providers each library registered while it loaded, so unloading the library can remove them.
         self._library_provider_classes: dict[str, list[type[BaseArtifactProvider]]] = {}
 
@@ -442,6 +446,10 @@ class ArtifactManager(EngineScoped):
         # AppInitializationComplete before executing them. Process-wide and installed once;
         # later broadcasts (and later engines) no-op. See utils/ffmpeg_cache.py.
         install_ffmpeg_resolution(self.engine.config_manager.get_config_value("ffmpeg_directory", default=""))
+
+        if not self._thumbnail_backend_logged:
+            logger.info("Standard thumbnail backend: %s", THUMBNAIL_BACKEND)
+            self._thumbnail_backend_logged = True
 
         # Register default providers (order matters: Image, Video, Audio)
         # Generator settings are now registered automatically via _register_provider_settings()

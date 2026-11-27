@@ -18,7 +18,13 @@ from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultSuccess,
 )
+from griptape_nodes.retained_mode.events.flow_events import (
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
+)
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
     SerializeNodeToCommandsRequest,
     SerializeNodeToCommandsResultSuccess,
 )
@@ -35,6 +41,10 @@ from tests.workflow_context import bind, the_open_workflow
 _LIBRARY_NAME = "trait-state-serialization-test-library"
 
 NARROWED_MAX = 50
+
+# What `_DeclaredControls.__init__` reads to offer the model's choices. A test flips it to stand in for
+# engine state, like the model catalog, that changes what a node type builds between saves.
+_declared_node_config = {"model_choices": ["a", "b"]}
 
 
 class _ModelPicker(BaseNode):
@@ -97,7 +107,7 @@ class _DeclaredControls(BaseNode):
         self.add_parameter(width)
 
         model = Parameter(name="model", type="str", input_types=["str"], output_type="str", tooltip="t")
-        model.add_trait(Options(choices=["a", "b"]))
+        model.add_trait(Options(choices=list(_declared_node_config["model_choices"])))
         self.add_parameter(model)
 
         reload_button = Parameter(name="reload", type="str", input_types=["str"], output_type="str", tooltip="t")
@@ -618,3 +628,67 @@ class TestBehaviorComesFromTheNode:
         reloaded = _round_trip(engine, node)
 
         assert _control(reloaded, "reload", Button).on_click_callback.__self__ is not node  # type: ignore[union-attr]
+
+
+def _saved_model_traits(engine: Engine) -> list[dict[str, Any]] | None:
+    """The trait changes a flow save records for the `model` parameter, or None if it records none."""
+    flow = engine.current_workflow().top_level_flow()
+    assert flow is not None
+    result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow.name))
+    assert isinstance(result, SerializeFlowToCommandsResultSuccess)
+    for node_commands in result.serialized_flow_commands.serialized_node_commands:
+        for command in node_commands.element_modification_commands:
+            if isinstance(command, AlterParameterDetailsRequest) and command.parameter_name == "model":
+                return command.traits
+    return None
+
+
+class TestReferenceCopiesAreSharedInABatch:
+    """Serializing compares each node with a copy its type builds, and one copy serves a whole save."""
+
+    def test_one_copy_per_type_is_built_for_a_flow(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        _ensure_workflow(engine)
+        for name in ("first", "second"):
+            created = engine.handle_request(
+                CreateNodeRequest(
+                    node_type=_DeclaredControls.__name__, specific_library_name=_LIBRARY_NAME, node_name=name
+                )
+            )
+            assert isinstance(created, CreateNodeResultSuccess), created.result_details
+        built = []
+        original_init = _DeclaredControls.__init__
+
+        def counting_init(self: _DeclaredControls, **kwargs) -> None:
+            built.append(kwargs["name"])
+            original_init(self, **kwargs)
+
+        monkeypatch.setattr(_DeclaredControls, "__init__", counting_init)
+        flow = engine.current_workflow().top_level_flow()
+        assert flow is not None
+
+        result = engine.handle_request(SerializeFlowToCommandsRequest(flow_name=flow.name))
+
+        assert isinstance(result, SerializeFlowToCommandsResultSuccess)
+        assert built == ["REFERENCE NODE"]
+
+    def test_what_a_type_builds_is_read_again_by_the_next_save(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _ensure_workflow(engine)
+        created = engine.handle_request(
+            CreateNodeRequest(
+                node_type=_DeclaredControls.__name__, specific_library_name=_LIBRARY_NAME, node_name="source"
+            )
+        )
+        assert isinstance(created, CreateNodeResultSuccess), created.result_details
+        assert _saved_model_traits(engine) is None
+
+        monkeypatch.setitem(_declared_node_config, "model_choices", ["c"])
+
+        assert _saved_model_traits(engine) == [
+            {
+                "trait_name": "Options",
+                "trait_module": "griptape_nodes.traits.options",
+                "trait_state": {"choices": ["a", "b"]},
+            }
+        ]
