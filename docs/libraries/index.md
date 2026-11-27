@@ -1,41 +1,43 @@
 # Node Libraries
 
-This section documents **node libraries** — installable bundles of
-nodes that extend Griptape Nodes. The [Standard Library](../nodes/overview.md)
-ships installed by default; every other library lives in its own Git
-repository and is installed through the editor's **Libraries** panel or the
-`gtn` CLI.
+Node libraries are installable bundles of nodes that extend Griptape Nodes.
+The Standard Library is installed by default. Every other library lives in its
+own Git repository and is installed through the editor's **Libraries** panel
+or the `gtn` CLI.
 
-For how installation, updating, dependency isolation, and process
-isolation work, see the
-[Libraries guide](../guides/libraries.md).
+For how installation, updating, dependency isolation, and process isolation
+work, see the [Libraries guide](../guides/libraries.md).
 
-## Documented libraries
+## Library documentation
 
-| Library                                           | Nodes | What it's for                                                                                                          | Requirements                                              |
-| ------------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| [Standard Library](../nodes/overview.md)          | 284   | The default nodes — agents, text, images, video, audio, lists, dicts, JSON, execution flow, and more                   | None (installed by default)                               |
-| [Advanced Media Library](advanced_media/index.md) | 28    | Local media generation and manipulation — diffusion pipelines, image/video aux processing, LoRAs, face detection       | GPU recommended; Hugging Face account for model downloads |
-| [OpenColorIO](opencolorio/index.md)               | 2     | Professional color management using OCIO configs — the industry-standard system for film, VFX, and animation pipelines | An OCIO config (`$OCIO` or explicit path)                 |
-| [OpenEXR](openexr/index.md)                       | 7     | Read, inspect, display, and save OpenEXR files and frame sequences for VFX and HDR image workflows                     | Engine 0.104.0+ (optionally pairs with OpenColorIO)       |
-| [Nuke](nuke/index.md)                             | 3     | Run `.nk` scripts headlessly from the canvas and publish workflows as versioned Nuke gizmos                            | A local Foundry Nuke installation and license             |
-| [Diffusers](diffusers/index.md)                   | 19    | Modular 🧨 Diffusers pipelines — build media generation workflows from individual, connectable diffusion stages        | GPU (CUDA or MPS)                                         |
+The docs for each library, including a page for each node, ship in the
+library's own `docs/` folder. From engine 0.110.0 they show in the editor's
+**Docs** panel. On an older engine, read them on GitHub. The pages are plain
+markdown.
 
-This is not an exhaustive list — many more first-party and community
-libraries are available in the
+- **[Standard Library](https://github.com/griptape-ai/griptape-nodes-library-standard)**: The default nodes: agents, text, images, video, audio, lists, dicts, JSON, execution flow, and more. Installed by default.
+    [Docs folder](https://github.com/griptape-ai/griptape-nodes-library-standard/tree/main/docs) | [docs/index.md](https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/index.md)
+- **[Diffusers](https://github.com/griptape-ai/griptape-nodes-library-diffusers)**: Modular Diffusers pipelines. Build media generation workflows from individual, connectable diffusion stages. Needs a GPU (CUDA or MPS).
+    [Docs folder](https://github.com/griptape-ai/griptape-nodes-library-diffusers/tree/main/docs) | [docs/index.md](https://github.com/griptape-ai/griptape-nodes-library-diffusers/blob/main/docs/index.md)
+- **[Nuke](https://github.com/griptape-ai/griptape-nodes-library-nuke)**: Run `.nk` scripts headlessly from the canvas and publish workflows as versioned Nuke gizmos. Needs a local Foundry Nuke installation and license.
+    [Docs folder](https://github.com/griptape-ai/griptape-nodes-library-nuke/tree/main/docs) | [docs/index.md](https://github.com/griptape-ai/griptape-nodes-library-nuke/blob/main/docs/index.md)
+- **[OpenColorIO](https://github.com/griptape-ai/griptape-nodes-library-opencolorio)**: Color management with OCIO configs, the standard for film, VFX, and animation pipelines. Needs an OCIO config.
+    [Docs folder](https://github.com/griptape-ai/griptape-nodes-library-opencolorio/tree/main/docs) | [docs/index.md](https://github.com/griptape-ai/griptape-nodes-library-opencolorio/blob/main/docs/index.md)
+- **[OpenEXR](https://github.com/griptape-ai/griptape-nodes-library-openexr)**: Read, inspect, display, and save OpenEXR files and frame sequences for VFX and HDR image workflows. Needs engine 0.104.0 or newer.
+    [Docs folder](https://github.com/griptape-ai/griptape-nodes-library-openexr/tree/main/docs) | [docs/index.md](https://github.com/griptape-ai/griptape-nodes-library-openexr/blob/main/docs/index.md)
+
+Many more first-party and community libraries are available in the
 [Griptape Nodes directory](https://github.com/griptape-ai/griptape-nodes-directory).
 You can also browse them from the editor via the **Browse Community
 Libraries** button in the **Add Library** modal.
 
 ## Installing a library
 
-The Standard Library is registered automatically, and the Advanced Media
-Library is offered during `gtn init`. Every other library on this page
-installs the same way:
+The Standard Library is registered automatically. Every other library on this
+page installs the same way:
 
 1. In the editor, open **Manage → Library Management**.
-1. Click **Add Library** and paste the library's Git URL (listed on each
-    library's overview page).
+1. Click **Add Library** and paste the library's Git URL.
 1. Click **Install**. The engine clones the repository, installs the library's
     Python dependencies into an isolated virtual environment, and registers its
     nodes.
@@ -50,12 +52,3 @@ Each library's dependencies are isolated from the engine and from every other
 library, so installing any combination of these libraries is safe. See
 [Coexistence guarantees](../guides/libraries.md#coexistence-guarantees) for
 details.
-
-## How these docs are organized
-
-Each library gets:
-
-- An **overview page** — what the library does, how to install it, any
-    prerequisites (environment variables, hardware, accounts), and its settings.
-- A **reference page per node** — a consistent format with a TL;DR, the node's
-    typical position in a workflow, and inputs/outputs/parameters tables.

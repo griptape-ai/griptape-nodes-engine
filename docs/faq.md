@@ -53,43 +53,6 @@ If you prefer working in the command line, you can also use:
 gtn config show
 ```
 
-## How do I install the Advanced Media Library after Initial Setup?
-
-For the broader story on installing and managing libraries (including non-Advanced-Media libraries), see [Libraries](guides/libraries.md).
-
-If you initially declined to install the Advanced Media Library during setup but now want to add it, you can do so by running:
-
-```bash
-gtn init
-```
-
-This will restart the configuration process. You can press Enter to keep your existing workspace and Griptape Cloud API Key settings. When prompted with:
-
-```
-Register Advanced Media Library? [y/n] (n):
-```
-
-Press **y** to install the Advanced Media Library, or **n** to skip installation.
-
-!!! note
-
-    Some nodes in the Advanced Media Library require specific models to function properly. You will need to install these models separately.
-
-    Refer to each node's documentation to determine which nodes need which models; they each have links to specific requirements.
-
-## What happened to deprecated nodes from the Advanced Media Library?
-
-Version 0.64.0 removed deprecated nodes from the Advanced Media Library. These nodes were previously marked for deprecation and have been replaced with more flexible alternatives.
-
-If you have workflows that use deprecated nodes, please refer to the [MIGRATION.md](https://github.com/griptape-ai/griptape-nodes-engine/blob/main/MIGRATION.md) guide. This comprehensive guide provides:
-
-- A complete list of removed nodes and their replacements
-- Step-by-step migration instructions
-- Visual examples of replacement nodes
-- Details about the new Diffusion Pipeline Builder system
-
-The migration guide includes replacements for all deprecated image processing, diffusion pipeline, upscaling, and LoRA nodes.
-
 ## How do I uninstall Griptape Nodes?
 
 See [Uninstalling Griptape Nodes](uninstalling.md).

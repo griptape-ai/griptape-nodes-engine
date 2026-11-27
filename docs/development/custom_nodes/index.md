@@ -130,7 +130,7 @@ It provides the necessary boilerplate, testing framework, and documentation patt
 1. **Register with the engine** - Add your library to Griptape Nodes through the settings interface
 1. **Test and use** - Create flows using your custom nodes in the Griptape Nodes interface
 
-To understand how to design your nodes, explore the patterns used in the standard library: [node reference](../../nodes/overview.md).
+To understand how to design your nodes, explore the patterns used in the standard library: [node reference](https://github.com/griptape-ai/griptape-nodes-library-standard/blob/main/docs/index.md).
 
 ## Quick Links
 
