@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.node_library.library_registry import (
+    DeprecatedNodeNotice,
     LibraryRegistry,
+    LibraryRegistryError,
     LibrarySchema,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
@@ -374,9 +376,24 @@ class LibraryManager(EngineScoped):
                     fitness=lib_info.fitness.value,
                     disabled=lib_info.lifecycle_state == LibraryLifecycleState.DISABLED,
                     problems=self.catalog.collate_problems_for_lib_info(lib_info),
+                    deprecated_nodes=self._deprecated_nodes_of_loaded_library(lib_info),
                 )
             )
         return statuses
+
+    def _deprecated_nodes_of_loaded_library(self, lib_info: LibraryInfo) -> list[DeprecatedNodeNotice]:
+        """The deprecated nodes of a library that loaded, or none for one that didn't.
+
+        Only a LOADED record is asked: another record with the same name (a duplicate copy that lost,
+        or a failed load) would otherwise report the loaded copy's nodes as its own.
+        """
+        if lib_info.lifecycle_state != LibraryLifecycleState.LOADED or lib_info.library_name is None:
+            return []
+        try:
+            library = LibraryRegistry.get_library(name=lib_info.library_name)
+        except LibraryRegistryError:
+            return []
+        return library.get_library_data().deprecated_nodes()
 
     async def _load_and_track_library(self, lib_path: str, index: int, total: int) -> None:
         """Load a single library and emit the corresponding progress event."""

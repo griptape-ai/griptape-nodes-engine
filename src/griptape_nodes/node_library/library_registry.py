@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
+    LifecycleStage,
+    LifecycleStageNodeProperty,
     ModelCatalogLibraryProperty,
     NodeDeclaration,
     find_model_catalog,
@@ -173,6 +175,19 @@ class NodeDeprecationMetadata(BaseModel):
     removal_version: str | None = None
 
 
+class DeprecatedNodeNotice(BaseModel):
+    """A node its library marks deprecated, reported to clients apart from the library's problems.
+
+    Deprecation isn't a fault in the library, so it travels on its own instead of as a problem that
+    clients would show as an error.
+    """
+
+    node_type: str
+    display_name: str
+    deprecation_message: str | None = None
+    removal_version: str | None = None
+
+
 class NodeMetadata(BaseModel):
     """Metadata about each node within the library, which informs where in the hierarchy it sits, details on usage, and tags to assist search."""
 
@@ -188,6 +203,26 @@ class NodeMetadata(BaseModel):
     # Declarative properties / capabilities for this node.
     # See griptape_nodes.node_library.library_declarations for the supported types.
     declarations: list[NodeDeclaration] = Field(default_factory=list)
+
+    def deprecation_notice(self, node_type: str) -> DeprecatedNodeNotice | None:
+        """The node's deprecation, or None when the node isn't deprecated.
+
+        A node is deprecated when its metadata has a `deprecation` entry, which can carry a message
+        and removal version, or when it declares its own `lifecycle_stage` of DEPRECATED. A node that
+        only inherits a deprecated library's stage isn't: the library's own stage already says so.
+        """
+        declares_deprecated = any(
+            isinstance(declaration, LifecycleStageNodeProperty) and declaration.stage == LifecycleStage.DEPRECATED
+            for declaration in self.declarations
+        )
+        if self.deprecation is None and not declares_deprecated:
+            return None
+
+        notice = DeprecatedNodeNotice(node_type=node_type, display_name=self.display_name)
+        if self.deprecation is not None:
+            notice.deprecation_message = self.deprecation.deprecation_message
+            notice.removal_version = self.deprecation.removal_version
+        return notice
 
 
 class CategoryDefinition(BaseModel):
@@ -281,6 +316,19 @@ class LibrarySchema(BaseModel):
     # Set it to reach docs outside the manifest's folder, such as "../docs" when the manifest sits
     # in a package subfolder.
     documentation_path: str | None = None
+
+    def deprecated_nodes(self) -> list[DeprecatedNodeNotice]:
+        """Every node and workflow node this library marks deprecated, in manifest order."""
+        notices: list[DeprecatedNodeNotice] = []
+        for node in self.nodes:
+            notice = node.metadata.deprecation_notice(node.class_name)
+            if notice is not None:
+                notices.append(notice)
+        for workflow_node in self.workflow_nodes or []:
+            notice = workflow_node.metadata.deprecation_notice(workflow_node.node_type)
+            if notice is not None:
+                notices.append(notice)
+        return notices
 
 
 class LibraryRegistry:

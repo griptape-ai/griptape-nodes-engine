@@ -355,7 +355,7 @@ def _render_node_types(libraries: Mapping[str, Mapping[str, NodeMetadata]]) -> s
 
 def _render_node_type(node_type: str, metadata: NodeMetadata) -> str:
     label = node_type
-    if metadata.deprecation is not None:
+    if metadata.deprecation_notice(node_type) is not None:
         label = f"{label} (deprecated, do not use for new work)"
     description = " ".join(metadata.description.split())
     if len(description) > _MAX_NODE_DESCRIPTION_LENGTH:

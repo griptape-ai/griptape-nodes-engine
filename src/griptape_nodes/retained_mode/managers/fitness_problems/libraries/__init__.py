@@ -7,7 +7,6 @@ from .before_library_callback_problem import BeforeLibraryCallbackProblem
 from .beta_feature_settings_collision_problem import BetaFeatureSettingsCollisionProblem
 from .create_config_category_problem import CreateConfigCategoryProblem
 from .dependency_installation_failed_problem import DependencyInstallationFailedProblem
-from .deprecated_node_warning_problem import DeprecatedNodeWarningProblem
 from .duplicate_library_problem import DuplicateLibraryProblem
 from .duplicate_model_id_problem import DuplicateModelIdProblem
 from .duplicate_node_registration_problem import DuplicateNodeRegistrationProblem
@@ -57,7 +56,6 @@ __all__ = [
     "BetaFeatureSettingsCollisionProblem",
     "CreateConfigCategoryProblem",
     "DependencyInstallationFailedProblem",
-    "DeprecatedNodeWarningProblem",
     "DuplicateLibraryProblem",
     "DuplicateModelIdProblem",
     "DuplicateNodeRegistrationProblem",

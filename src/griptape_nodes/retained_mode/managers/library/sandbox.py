@@ -931,6 +931,7 @@ class LibrarySandbox(EngineScoped):
             enabled=True,
             is_registered=is_library_name_registered(library_schema.name),
             result_details=details,
+            deprecated_nodes=library_schema.deprecated_nodes(),
         )
 
     def _create_placeholder_node_definitions(
