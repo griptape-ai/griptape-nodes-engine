@@ -1,0 +1,32 @@
+{
+  "name": "Driven Lists Demo",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "Griptape",
+    "description": "Demonstrates lists whose rows follow the rows of another list.",
+    "library_version": "0.1.0",
+    "engine_version": "0.114.0",
+    "tags": ["demo", "parameter-list"]
+  },
+  "categories": [
+    {
+      "driven_lists": {
+        "title": "Driven Lists",
+        "description": "Nodes for trying out driven parameter lists",
+        "color": "border-teal-500",
+        "icon": "List"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "DrivenListsDemo",
+      "file_path": "nodes.py",
+      "metadata": {
+        "category": "driven_lists",
+        "description": "Two lists that follow the rows of a Cases list, with a JSON output pairing each case with its value and note.",
+        "display_name": "Driven Lists Demo"
+      }
+    }
+  ]
+}
