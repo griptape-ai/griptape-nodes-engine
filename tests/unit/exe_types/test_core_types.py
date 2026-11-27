@@ -10,6 +10,7 @@ from griptape_nodes.exe_types.core_types import (
     NodeMessagePayload,
     Parameter,
     ParameterButtonGroup,
+    ParameterDeprecation,
     ParameterGroup,
     ParameterList,
     ParameterType,
@@ -136,6 +137,7 @@ class TestBaseNodeElement:
                             "private": False,
                             "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
+                            "deprecation": None,
                             "ui_options": {},
                             "parent_container_name": None,
                             "parent_element_name": None,
@@ -235,6 +237,7 @@ class TestBaseNodeElement:
                             "private": False,
                             "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
+                            "deprecation": None,
                             "ui_options": {},
                             "parent_container_name": None,
                             "parent_element_name": None,
@@ -351,6 +354,7 @@ class TestBaseNodeElement:
                             "private": False,
                             "exclude_from_metadata": False,
                             "allow_variable_substitution": True,
+                            "deprecation": None,
                             "ui_options": {},
                             "parent_container_name": None,
                             "parent_element_name": None,
@@ -537,6 +541,32 @@ class TestParameter:
         param_false_dict = param_false.to_dict()
         assert "settable" in param_false_dict
         assert param_false_dict["settable"] is False
+
+    def test_to_dict_reports_no_deprecation_by_default(self) -> None:
+        param = Parameter(name="test", input_types=["str"], type="str", output_type="str", tooltip="test")
+
+        assert param.deprecation is None
+        assert param.to_dict()["deprecation"] is None
+
+    def test_to_dict_reports_deprecation_passed_to_constructor(self) -> None:
+        param = Parameter(
+            name="image",
+            input_types=["ImageArtifact"],
+            type="ImageArtifact",
+            tooltip="Image to describe",
+            deprecation=ParameterDeprecation(replacement="images", deprecation_message="Takes several images now."),
+        )
+
+        assert param.to_dict()["deprecation"] == {
+            "deprecation_message": "Takes several images now.",
+            "replacement": "images",
+        }
+
+    def test_to_dict_reports_deprecation_set_after_construction(self) -> None:
+        param = ParameterList(name="items", input_types=["str"], type="str", tooltip="test")
+        param.deprecation = ParameterDeprecation(replacement="entries")
+
+        assert param.to_dict()["deprecation"] == {"deprecation_message": None, "replacement": "entries"}
 
     def test_traits_go_in_the_same_order_every_time(self) -> None:
         # A set of traits iterates in an order that varies from one set to the next.

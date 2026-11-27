@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum, StrEnum, auto
 from typing import ClassVar, Literal, NamedTuple, get_args
 
@@ -9,6 +10,21 @@ from typing import ClassVar, Literal, NamedTuple, get_args
 # "top": render at the top (default), "bottom": render at the bottom, "in-order": render in-line with other parameters
 ParameterRenderLocation = Literal["top", "bottom", "in-order"]
 VALID_PARAMETER_RENDER_LOCATIONS: frozenset[str] = frozenset(get_args(ParameterRenderLocation))
+
+
+@dataclass(frozen=True)
+class ParameterDeprecation:
+    """Marks a parameter kept only so older workflows still load.
+
+    Shares `deprecation_message` with a node's `deprecation` in its library JSON. Both fields are optional.
+
+    Attributes:
+        deprecation_message: What to tell whoever reads the node's schema, for example why it was replaced.
+        replacement: The name of the parameter on the same node to use instead.
+    """
+
+    deprecation_message: str | None = None
+    replacement: str | None = None
 
 
 # Types of Modes provided for Parameters
