@@ -8,6 +8,8 @@ from pydantic import TypeAdapter
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from griptape_nodes.exe_types.flow import ControlFlow
+    from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.library_registry import Library, LibrarySchema
     from griptape_nodes.retained_mode.events.base_events import (
         AppPayload,
@@ -287,6 +289,21 @@ class AdvancedNodeLibrary:
                 ]
         """
         return []
+
+    def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None:
+        """Validate a flow, and the nodes about to run, before they start.
+
+        Unlike the other hooks on this class, this one can block: a non-empty return, or a
+        raised exception, is reported as a validation failure and stops the run. Every
+        library's hook runs and every failure is collected, so fixing one library's rejection
+        doesn't require a second attempt just to find the next one. Keep it quick; the run
+        waits for this to return.
+
+        Called once per fresh, user-initiated entry point — starting a flow, or resolving a
+        single node — not for an automatic continuation of a run already validated at its
+        entry point (a subflow or loop-iteration start). `nodes` includes nodes nested inside
+        groups, but not a `WorkflowNode`'s subflow, which is only built once it starts running.
+        """
 
     def get_app_event_listeners(
         self,

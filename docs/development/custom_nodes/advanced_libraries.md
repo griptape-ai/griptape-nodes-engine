@@ -38,6 +38,8 @@ list in the manifest. That is the common case and it needs no Python beyond the 
     [`get_app_event_listeners`](#get_app_event_listeners).
 - **Register a competing provider** for an engine request type, such as a workflow
     publisher. See [Publishing](../../guides/publishing.md).
+- **Block a flow from running** when it, or the graph around it, breaks a rule only your
+    library knows about. See [`validate_flow_before_run`](#validate_flow_before_run).
 
 ## Wiring one up
 
@@ -475,6 +477,60 @@ load while Griptape Nodes starts up, so a listener for `AppInitializationComplet
 hear the startup that loaded its library. Do that work in
 [`after_library_nodes_loaded`](#after_library_nodes_loaded) instead.
 
+### `validate_flow_before_run`
+
+```python
+def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None: ...
+```
+
+Runs once per library, for every library loaded in the process, at a fresh, user-initiated
+entry point — starting a flow, or resolving a single node — after every node's own
+`validate_before_workflow_run()` has already run, and before any of the entry point's nodes
+execute. `nodes` is the nodes that entry point is about to run, not just the ones your
+library owns, so this is the place for a rule that only makes sense looking at several
+nodes at once: a node count against a license limit, two node types that must not appear
+together, a required node that is missing. `nodes` includes nodes nested inside groups.
+
+This is the one hook on this page that is **not** notification only. Every other hook —
+most pointedly [`get_execution_event_listeners`](#get_execution_event_listeners), which
+also watches a run but can only observe it — is notification only, and a callback that
+raises is logged and ignored while the run carries on. Here, a non-empty return value, or
+an exception you raise, **stops the flow from starting**:
+
+```python
+class LicenseLibrary(AdvancedNodeLibrary):
+    def validate_flow_before_run(self, flow: ControlFlow, nodes: list[BaseNode]) -> list[Exception] | None:
+        if len(nodes) > self._max_nodes_per_run:
+            return [RuntimeError(f"Flow '{flow.name}' exceeds the node limit for this license.")]
+        return None
+```
+
+The exceptions you return land in the same list as any raised by the nodes' own
+`validate_before_workflow_run()`, and the caller sees them as validation failures, not as
+a run that started and then failed.
+
+Constraints on the mechanism:
+
+- **Every library's hook runs.** A failure doesn't stop the engine from checking the rest —
+    every registered library's hook runs, and every failure is collected, the same way
+    per-node `validate_before_workflow_run()` failures already are. Fixing one library's
+    rejection and re-running isn't needed just to find the next one.
+- **Keep it quick.** The run waits for this to return before it can start.
+- **What `nodes` contains depends on the entry point.** Starting a flow with no node given
+    passes every node in the flow, including nodes nested inside groups (a plain
+    `BaseNodeGroup` or a `SubflowNodeGroup`, any depth) — a `SubflowNodeGroup`'s children live
+    in the group's own `nodes`, and once the group runs, in a separate flow, so they'd
+    otherwise be invisible to a check that only looks at the top-level flow. Starting a flow
+    from a given node passes every node in that node's connected component, which can include
+    upstream nodes that already ran and won't run again. Resolving a single node
+    (`ResolveNodeRequest`) passes only that node's own dependency chain, not the rest of the
+    flow. A `WorkflowNode`'s own subflow is excluded in every case — it's only built once the
+    node starts running, so there's nothing to check beforehand.
+- **Called once per fresh entry point, not per continuation.** A subflow or loop-iteration
+    start (for example a `ForEachGroupNode` body) is an automatic continuation of a run
+    already validated at its entry point, not a new one, so it doesn't call library hooks
+    again.
+
 ## Registering node types without listing them in the manifest
 
 If your node set is data-driven, generated, or simply large enough that hand-maintaining
@@ -587,7 +643,7 @@ Prefer synthesizing definitions anyway, for two reasons:
 
 ## Examples
 
-Six complete, working libraries. Copy any of the folders into your workspace's
+Seven complete, working libraries. Copy any of the folders into your workspace's
 `libraries` directory, register it through the editor's library settings, and restart the
 engine.
 
@@ -800,3 +856,25 @@ Things to know about this example:
 - **Nodes inside a loop body are not covered.** The event names the canvas node, which only
     receives the last iteration's outputs once the whole loop has finished. During the loop
     the check reads stale outputs.
+
+### Example: a library that blocks a flow from running
+
+A library that refuses to let a flow start at all, toggled by a flag file on disk so you
+can flip pass/fail from a terminal without restarting the engine:
+
+- [`griptape_nodes_library.json`](example_flow_validation_library/griptape_nodes_library.json):
+    manifest declaring the advanced library and no nodes of its own
+- [`advanced_library.py`](example_flow_validation_library/advanced_library.py): implements
+    `validate_flow_before_run`, returning an exception whenever a flag file exists
+
+```sh
+touch /tmp/gtn_flow_validation_should_fail   # the next flow start is blocked
+rm /tmp/gtn_flow_validation_should_fail      # the next flow start succeeds
+```
+
+Run any workflow. With the flag file present, `StartFlowRequest` fails before any node
+runs and `result_details` names the library and the reason. Remove the file and the same
+flow runs normally. Resolving a single node (`ResolveNodeRequest`) is blocked the same way.
+Starting a subflow or a loop iteration is unaffected either way — those are automatic
+continuations of a run already validated at its entry point, not fresh entry points of
+their own.

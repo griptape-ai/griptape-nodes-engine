@@ -4514,6 +4514,8 @@ class NodeManager(EngineScoped):
             exceptions = dependent_node.validate_before_workflow_run()
             if exceptions:
                 all_exceptions = all_exceptions + exceptions
+
+        all_exceptions = all_exceptions + self.engine.flow_manager.run_library_flow_validation_hooks(flow, nodes)
         return ValidateNodeDependenciesResultSuccess(
             validation_succeeded=(len(all_exceptions) == 0),
             exceptions=all_exceptions,

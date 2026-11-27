@@ -187,6 +187,7 @@ ignore-names = ["OpenImageIO"]
 "docs/development/custom_nodes/example_node_inputs_library/**" = ["INP001", "TID251"]
 "docs/development/custom_nodes/example_node_blocked_terms_library/**" = ["INP001", "TID251"]
 "docs/development/custom_nodes/example_node_output_check_library/**" = ["INP001", "TID251"]
+"docs/development/custom_nodes/example_flow_validation_library/**" = ["INP001"]
 "docs/development/custom_nodes/example_request_handler_library/**" = [
   "INP001",
   "TID251",
