@@ -300,32 +300,43 @@ class ListRows:
 
     def _remove_driven_row(self, row: Parameter) -> None:
         node = self._node
+        for request in self._delete_requests_for_connections_of(row):
+            node._handle_request_in_workflow(request)
+        with sanctioned_parameter_mutation():
+            node.remove_parameter_element(row)
+
+    def _delete_requests_for_connections_of(self, row: Parameter) -> list[DeleteConnectionRequest]:
+        node = self._node
         result = node._handle_request_in_workflow(
             ListConnectionsForNodeRequest(node_name=node.name, broadcast_result=False)
         )
-        if isinstance(result, ListConnectionsForNodeResultSuccess):
-            for incoming in result.incoming_connections:
-                if incoming.target_parameter_name == row.name:
-                    node._handle_request_in_workflow(
-                        DeleteConnectionRequest(
-                            source_node_name=incoming.source_node_name,
-                            source_parameter_name=incoming.source_parameter_name,
-                            target_node_name=node.name,
-                            target_parameter_name=row.name,
-                        )
-                    )
-            for outgoing in result.outgoing_connections:
-                if outgoing.source_parameter_name == row.name:
-                    node._handle_request_in_workflow(
-                        DeleteConnectionRequest(
-                            source_node_name=node.name,
-                            source_parameter_name=row.name,
-                            target_node_name=outgoing.target_node_name,
-                            target_parameter_name=outgoing.target_parameter_name,
-                        )
-                    )
-        with sanctioned_parameter_mutation():
-            node.remove_parameter_element(row)
+        if not isinstance(result, ListConnectionsForNodeResultSuccess):
+            return []
+
+        requests = []
+        for incoming in result.incoming_connections:
+            if incoming.target_parameter_name != row.name:
+                continue
+            requests.append(
+                DeleteConnectionRequest(
+                    source_node_name=incoming.source_node_name,
+                    source_parameter_name=incoming.source_parameter_name,
+                    target_node_name=node.name,
+                    target_parameter_name=row.name,
+                )
+            )
+        for outgoing in result.outgoing_connections:
+            if outgoing.source_parameter_name != row.name:
+                continue
+            requests.append(
+                DeleteConnectionRequest(
+                    source_node_name=node.name,
+                    source_parameter_name=row.name,
+                    target_node_name=outgoing.target_node_name,
+                    target_parameter_name=outgoing.target_parameter_name,
+                )
+            )
+        return requests
 
     def _container_of(self, parameter: Parameter) -> BaseNodeElement | None:
         if parameter.parent_container_name is None:

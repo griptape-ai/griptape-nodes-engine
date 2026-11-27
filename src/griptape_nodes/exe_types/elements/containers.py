@@ -539,9 +539,11 @@ class ParameterList(ParameterContainer):
                 child._input_types = _without_list_variants(child._input_types)
         super().add_child(child)
 
-        # Mark the parent node as unresolved since the parameter structure changed
         if self._node_context is not None:
             self._node_context._list_rows.sync_driven_lists(self)
+
+        # Mark the parent node as unresolved since the parameter structure changed
+        if self._node_context is not None:
             # Import at runtime to avoid circular import
             from griptape_nodes.exe_types.node_types import NodeResolutionState
 
