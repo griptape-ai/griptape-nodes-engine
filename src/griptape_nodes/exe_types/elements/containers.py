@@ -145,6 +145,8 @@ class ParameterList(ParameterContainer):
         self._child_prefix = child_prefix
         self._grid = grid
         self._grid_columns = grid_columns
+        # The highest number auto_increment has handed out for each name prefix, so a deleted row's number stays retired.
+        self._issued_numbers: dict[str, int] = {}
 
         # Remember: we're a Parameter, too, just like everybody else.
         super().__init__(
@@ -395,8 +397,9 @@ class ParameterList(ParameterContainer):
             name: The exact name for the row. Must be unique within the node. When omitted, a
                 unique name of the form `<list>_ParameterListUniqueParamID_<hex>` is generated.
             auto_increment: Treat `name` as a prefix and number the row `<prefix>_1`, `<prefix>_2`,
-                and so on, using one more than the highest number in use, so a deleted row's name is not
-                handed out again. A trailing `_<number>` on `name` is
+                and so on, using one more than the highest number in use or already handed out, so a deleted
+                row's name is not reused while the list stays loaded. A list rebuilt from a saved
+                workflow continues from the highest row it holds. A trailing `_<number>` on `name` is
                 dropped first, so `item_a` and `item_a_3` both give `item_a_<n>`. Ignored when `name`
                 is omitted.
 
@@ -585,7 +588,9 @@ class ParameterList(ParameterContainer):
             match = used.match(element.name)
             if match is not None:
                 highest = max(highest, int(match.group(1)))
-        return f"{base}_{highest + 1}"
+        number = max(highest, self._issued_numbers.get(base, 0)) + 1
+        self._issued_numbers[base] = number
+        return f"{base}_{number}"
 
     def _name_in_use(self, name: str) -> bool:
         return self._name_scope().find_element_by_name(name) is not None
